@@ -27,11 +27,6 @@ profile = "black"
 requires = [
     "setuptools>=61.0",
     "wheel",
-    "torch",
-    "ninja",
-    "packaging",
-    "cuda-python",
-    "seaborn"
 ]
 build-backend = "setuptools.build_meta"
 
