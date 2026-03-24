@@ -54,5 +54,3 @@ MAGI_SHARED_BIN_PATH = "/dev/shm"
 
 # Logging level for MagiCompiler (DEBUG / INFO / WARNING / ERROR). Read once at import time.
 MAGI_LOGGING_LEVEL: str = os.getenv("MAGI_LOGGING_LEVEL", "WARNING").upper()
-
-MAGI_DYNAMIC_COMPILE: bool = _env_to_bool("MAGI_DYNAMIC_COMPILE", default=True)

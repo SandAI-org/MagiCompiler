@@ -28,7 +28,7 @@ import torch
 from magi_compiler.config import CompileConfig, model_rank_dir_name
 from magi_compiler.magi_backend.magi_backend import init_backend
 from magi_compiler.magi_depyf.timeline import emit_after_dynamo_bytecode_transform, observe_lifecycle
-from magi_compiler.utils import OrderedSet, compute_code_hash, compute_hash, envs, magi_logger
+from magi_compiler.utils import OrderedSet, compute_code_hash, compute_hash, magi_logger
 
 
 def _source_meta_path(aot_path: str) -> str:
@@ -143,7 +143,7 @@ class MagiCompileState:
         # delegates to ``torch._dynamo.aot_compile.aot_compile_fullgraph``
         # (aot_compile.py:108).
         self._compiled_callable = torch.compile(
-            self._target_callable, fullgraph=True, dynamic=envs.MAGI_DYNAMIC_COMPILE, backend=backend, options=options
+            self._target_callable, fullgraph=True, dynamic=True, backend=backend, options=options
         )
 
     @property

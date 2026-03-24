@@ -103,8 +103,8 @@ def _run_orchestration(state: MagiCompileState, original_invoker, args, kwargs):
     # First compilation
     state._ensure_compiled()
 
-    # Mark dynamic shapes
-    _mark_dynamic_shapes(state, args, kwargs)
+    # Mark dynamic and static shapes
+    _apply_shape_marks(state, args, kwargs)
 
     magi_logger.info(f"Start compiling function {state.original_code_object}")
     torch._dynamo.eval_frame.remove_from_cache(state.original_code_object)
@@ -312,9 +312,9 @@ def _resolve_nested_arg(bound_args: inspect.BoundArguments, key: str):
     return arg
 
 
-def _mark_dynamic_shapes(state: MagiCompileState, args, kwargs):
+def _apply_shape_marks(state: MagiCompileState, args, kwargs):
     """
-    Manually mark dynamic dimensions for arguments specified in dynamic_arg_dims.
+    Main entry point for applying dynamic and static shape marks.
 
     This is called just before Dynamo tracing to ensure dimensions are
     correctly generalized in the captured graph.
@@ -322,14 +322,74 @@ def _mark_dynamic_shapes(state: MagiCompileState, args, kwargs):
     sig = inspect.signature(state._target_callable)
     bound = sig.bind(*args, **kwargs)
     bound.apply_defaults()
+
+    dynamic_records = _mark_dynamic_shapes(state, bound)
+
+    _mark_static_shapes(bound, dynamic_records)
+
+
+def _mark_dynamic_shapes(state: MagiCompileState, bound):
+    """
+    Manually mark dynamic dimensions for arguments specified in dynamic_arg_dims.
+    """
+    dynamic_records = {}
+
     for k, dims in state.dynamic_arg_dims.items():
         arg = _resolve_nested_arg(bound, k)
         if arg is None:
             continue
+
         dims = [dims] if isinstance(dims, int) else dims
         assert isinstance(arg, torch.Tensor), f"Expected tensor for {k}, got {type(arg)}"
+
         final_dims = [arg.ndim + d if d < 0 else d for d in dims]
+
         torch._dynamo.mark_dynamic(arg, final_dims)
+
+        dynamic_records[id(arg)] = set(final_dims)
+
+    return dynamic_records
+
+
+def _mark_static_shapes(bound, dynamic_records):
+    """
+    Mark static dimensions for tensors that are not marked as dynamic,
+    dynamic_records is a dictionary that maps the id of the tensor to the set of dynamic dimensions.
+    """
+    visited = set()
+
+    def traverse_and_mark(obj):
+        obj_id = id(obj)
+        if obj_id in visited or isinstance(obj, (int, float, str, bool, type(None))):
+            return
+        visited.add(obj_id)
+
+        if isinstance(obj, torch.Tensor):
+            dyn_dims = dynamic_records.get(obj_id, set())
+            for dim_idx in range(obj.ndim):
+                if dim_idx not in dyn_dims:
+                    torch._dynamo.mark_static(obj, dim_idx)
+            return
+
+        if isinstance(obj, (list, tuple, set)):
+            for item in obj:
+                traverse_and_mark(item)
+
+        elif isinstance(obj, dict):
+            for val in obj.values():
+                traverse_and_mark(val)
+
+        elif hasattr(obj, '__dict__'):
+            for val in vars(obj).values():
+                traverse_and_mark(val)
+
+        elif hasattr(obj, '__slots__'):
+            for slot in obj.__slots__:
+                if hasattr(obj, slot):
+                    traverse_and_mark(getattr(obj, slot))
+
+    for arg_val in bound.arguments.values():
+        traverse_and_mark(arg_val)
 
 
 @contextmanager
