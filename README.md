@@ -78,7 +78,19 @@ Toggle `MAGI_ENABLE_FX_GRAPH_VIZ=1` and let our powerful introspection toolchain
 - PyTorch >= 2.9
 - CUDA Toolkit
 
+> **Recommended for reproducibility:** start from the prebuilt Docker image first, then run examples inside the container.
+
 ```bash
+# Option A (recommended) — Use prebuilt image
+# Step 1 — Pull the image
+docker pull sandai/magi-compiler:latest
+# Step 2 - Start the container
+docker run --name my-magi-compiler -it -d --privileged --gpus all --network host --ipc host \
+  -v /path/on/host:/workspace sandai/magi-compiler:latest /bin/bash
+# Step 3 - Attach the container
+docker exec -it my-magi-compiler /bin/bash
+
+# Option B — Local source installation
 # Step 1 — Clone the repo
 git clone https://github.com/SandAI-org/MagiCompiler.git
 cd MagiCompiler
