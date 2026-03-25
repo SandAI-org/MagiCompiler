@@ -1,0 +1,21 @@
+name: Enforce PR Description
+
+on:
+    pull_request:
+        types: [opened, edited, reopened]
+
+jobs:
+    check-description:
+        runs-on: ubuntu-latest
+        steps:
+        -   name: Validate PR body
+            uses: actions/github-script@v7
+            with:
+                script: |
+                    const body = context.payload.pull_request.body;
+
+                    if (!body || body.trim().length < 10) {
+                      core.setFailed("PR description must not be empty and should contain at least 10 characters. Please update your PR with a meaningful description.");
+                    } else {
+                      core.info("PR description check passed.");
+                    }
