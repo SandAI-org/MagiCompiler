@@ -30,6 +30,8 @@
 
 ## 📢 1. Latest News
 
+- **[03/25/2026]** ⚡️ **[LightX2V-MagiCompiler](https://github.com/SandAI-org/LightX2V-MagiCompiler) is now available!** This fork of [LightX2V](https://github.com/ModelTC/lightx2v) showcases how to seamlessly integrate MagiCompiler into a SOTA framework. With **minimal code changes**, it unlocks even greater acceleration! Try it out, check the [benchmark](https://github.com/SandAI-org/MagiCompiler#-6-benchmark) for details, and stay tuned for more integration demos!
+
 - **[03/23/2026]** 🚀 **MagiCompiler is officially open-sourced!** Delivering whole-graph compilation for multi-modality inference and FSDP-aware whole-layer compilation for large model training.
 
 ---
