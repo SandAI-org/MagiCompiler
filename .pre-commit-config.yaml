@@ -57,4 +57,4 @@ repos:
     hooks:
     -   id: pretty-format-yaml
         args: [--autofix, --indent, '4']
-        additional_dependencies: [setuptools]
+        additional_dependencies: [setuptools<81]
