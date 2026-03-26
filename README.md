@@ -28,7 +28,7 @@
 
 ---
 
-## 📢 1. Latest News
+## 📢 Latest News
 
 - **[03/25/2026]** ⚡️ **[LightX2V-MagiCompiler](https://github.com/SandAI-org/LightX2V-MagiCompiler) is now available!** This fork of [LightX2V](https://github.com/ModelTC/lightx2v) showcases how to seamlessly integrate MagiCompiler into a SOTA framework. With **minimal code changes**, it unlocks even greater acceleration! Try it out, check the [benchmark](https://github.com/SandAI-org/MagiCompiler#-6-benchmark) for details, and stay tuned for more integration demos!
 
@@ -36,7 +36,7 @@
 
 ---
 
-## 📖 2. About
+## 📖 About
 
 MagiCompiler is an advanced compiler and runtime augmentation framework built on top of `torch.compile`. Designed specifically for large-scale Transformer-like architectures, it addresses the critical bottlenecks of memory walls and operator overheads.
 
@@ -44,7 +44,7 @@ By stepping beyond traditional local operator optimization, MagiCompiler introdu
 
 ---
 
-## 💡 3. Design Philosophy
+## 💡 Design Philosophy
 
 ### Compiler as Manager
 
@@ -73,7 +73,7 @@ Meet **magi_depyf**, MagiCompiler’s native introspection toolkit. Compilation 
 
 ---
 
-## ⚙️ 4. Installation
+## ⚙️ Installation
 
 **Requirements:**
 - Python >= 3.12
@@ -110,7 +110,7 @@ pip install .   # End users (recommended)
 
 ---
 
-## 🚀 5. Quick Start
+## 🚀 Quick Start
 
 ### 🧹 1. One Decorator to Rule Them All (`@magi_compile`)
 Remove scattered `torch.compile` or `torch.compiler.disable` calls. Decorate your core Transformer block once for automatic full-graph capture and dynamic shape support (defaulting to dim 0).
@@ -161,7 +161,7 @@ Explore `magi_compiler/config.py` for power-user features like custom backend to
 
 ---
 
-## 📊 6. Benchmark
+## 📊 Benchmark
 
 ### 🔥 H100 Extreme Acceleration
 
@@ -181,7 +181,7 @@ Thanks to our underlying JIT offloading engine, [daVinci-MagiHuman](https://gith
 
 ---
 
-## 🗺 7. Roadmap
+## 🗺 Roadmap
 
 We are actively developing MagiCompiler. Here is a glimpse into our upcoming milestones:
 
@@ -192,7 +192,7 @@ We are actively developing MagiCompiler. Here is a glimpse into our upcoming mil
 
 ---
 
-## 📝 8. Citation
+## 📝 Citation
 
 If you find MagiCompiler useful in your research or production, please consider citing us:
 
@@ -207,7 +207,7 @@ If you find MagiCompiler useful in your research or production, please consider 
 
 ---
 
-## 🙏 9. Acknowledgement
+## 🙏 Acknowledgement
 
 MagiCompiler is deeply inspired by and builds upon the shoulders of giants. We extend our heartfelt gratitude to the [PyTorch](https://pytorch.org/) team for their foundational work on `torch.compile` and `torch.fx`, and to the [vLLM](https://github.com/vllm-project/vllm) community for their pioneering contributions to large model inference.
 
@@ -215,6 +215,16 @@ MagiCompiler is deeply inspired by and builds upon the shoulders of giants. We e
 
 ---
 
-## 📜 10. License
+## ⭐ Star History
+
+<div align="center">
+  <a href="https://star-history.com/#SandAI-org/MagiCompiler&Date">
+    <img src="https://api.star-history.com/svg?repos=SandAI-org/MagiCompiler&type=Date" alt="Star History Chart" style="max-width: 60%; height: auto;"/>
+  </a>
+</div>
+
+---
+
+## 📜 License
 
 This project is licensed under the [Apache License 2.0](LICENSE).
