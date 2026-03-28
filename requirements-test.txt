@@ -1,0 +1,4 @@
+# Test-only dependencies (not required for magi_compiler itself)
+diffusers==0.32.2
+timm==1.0.15
+transformers==4.48.3

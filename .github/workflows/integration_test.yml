@@ -1,0 +1,72 @@
+name: Integration Test on PR
+
+on:
+    pull_request:
+        types: [opened, reopened, synchronize, ready_for_review]
+        branches:
+        -   main
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-run-test
+    cancel-in-progress: true
+
+jobs:
+    integration_test:
+        name: Integration Test
+        runs-on: [self-hosted, magi-compiler]
+        timeout-minutes: 30
+        env:
+            http_proxy: ${{ secrets.HTTP_PROXY }}
+            https_proxy: ${{ secrets.HTTPS_PROXY }}
+            no_proxy: localhost,127.0.0.1,::1
+            PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+            PIP_TRUSTED_HOST: pypi.tuna.tsinghua.edu.cn
+            GIT_HTTP_CONNECT_TIMEOUT: 10   # Connection timeout in seconds
+            GIT_HTTP_LOW_SPEED_LIMIT: 100  # Minimum speed threshold (bytes/s)
+            GIT_HTTP_LOW_SPEED_TIME: 10    # Abort if below threshold for this many seconds
+        permissions:
+            pull-requests: read
+            contents: read
+        defaults:
+            run:
+                shell: bash
+        steps:
+        -   name: Configure git proxy
+            run: |
+                git config --global http.proxy "${{ secrets.HTTP_PROXY }}"
+                git config --global https.proxy "${{ secrets.HTTPS_PROXY }}"
+
+        -   name: Checkout base branch
+            uses: actions/checkout@v4
+            timeout-minutes: 5
+            with:
+                ref: ${{ github.event.pull_request.base.sha }}
+                fetch-depth: 1
+                persist-credentials: false
+
+        -   name: Checkout PR head
+            uses: actions/checkout@v4
+            timeout-minutes: 5
+            with:
+                ref: ${{ github.event.pull_request.head.sha }}
+                fetch-depth: 1
+                persist-credentials: false
+                clean: false
+
+        -   name: Check Chinese Characters
+            run: python3 .github/workflows/check_chinese_chars.py
+            env:
+                BASE_REF: ${{ github.event.pull_request.base.sha }}
+                HEAD_REF: ${{ github.event.pull_request.head.sha }}
+
+        -   name: Check Code Style
+            run: pre-commit run --show-diff-on-failure --color=always --all-files
+
+        -   name: Install MagiCompiler
+            run: pip install --no-build-isolation --force-reinstall . --break-system-packages
+
+        -   name: Install test dependencies
+            run: pip install -r requirements-test.txt --break-system-packages
+
+        -   name: Run MagiCompiler Unit Tests
+            run: pytest -v tests/

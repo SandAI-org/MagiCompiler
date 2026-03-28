@@ -3,6 +3,6 @@
 cuda-python
 depyf
 graphviz
-seaborn
 pydantic-settings
+seaborn
 triton==3.5.0
