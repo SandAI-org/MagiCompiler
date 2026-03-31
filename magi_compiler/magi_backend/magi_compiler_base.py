@@ -97,7 +97,7 @@ class MagiCompileState:
 
         if isinstance(obj, torch.nn.Module):
             self.original_code_object: CodeType = obj.__class__.forward.__code__
-            self._target_callable = obj.forward
+            self._target_callable = getattr(obj, "_magi_original_forward", obj.forward)
         elif callable(obj):
             self.original_code_object: CodeType = inspect.unwrap(obj).__code__
             self._target_callable = obj
@@ -315,7 +315,13 @@ class MagiCompileState:
             assert self.compiled_code is not None
             if isinstance(self.obj, torch.nn.Module):
                 self.obj.__class__.forward.__code__ = self.compiled_code
-                yield
+                if hasattr(self.obj, "_magi_original_forward"):
+                    original_forward = self.obj.forward
+                    self.obj.forward = self.obj.__class__.forward.__get__(self.obj, self.obj.__class__)
+                    yield
+                    self.obj.forward = original_forward
+                else:
+                    yield
                 self.obj.__class__.forward.__code__ = self.original_code_object
             else:
                 # Function/Method level

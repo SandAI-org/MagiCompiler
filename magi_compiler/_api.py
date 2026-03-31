@@ -241,6 +241,7 @@ def _magi_compile_instance(
     # module.__class__.forward is the unbound class method — never affected by our
     # instance-level override, so calling it goes straight to original forward logic.
     old_call = module.__class__.forward
+    module._magi_original_forward = module.forward
 
     @torch.compiler.disable()
     def new_call(*args, **kwargs):
@@ -250,7 +251,7 @@ def _magi_compile_instance(
             return old_call(module, *args, **kwargs)
 
         with _isolated_dynamo_config():
-            return _run_orchestration(state, lambda: old_call(module, *args, **kwargs), args, kwargs)
+            return _run_orchestration(state, lambda: module.__class__.__call__(module, *args, **kwargs), args, kwargs)
 
     module.forward = new_call
     module._magi_compiled = True
