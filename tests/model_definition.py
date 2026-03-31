@@ -232,6 +232,7 @@ class TransformerMLP(nn.Module):
         up = self.up_proj(x)
         return self.down_proj(gate * up)
 
+
 @magi_compile(dynamic_arg_dims={"x": 0})
 class TransformerBlock(nn.Module):
     """A single Transformer block"""
@@ -242,6 +243,7 @@ class TransformerBlock(nn.Module):
         self.self_attn = Attention(config)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = TransformerMLP(config)
+
     def forward(self, x: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
         residual = x
         x = self.input_layernorm(x).to(torch.bfloat16)
@@ -267,6 +269,7 @@ class Transformer(nn.Module):
         self.layers = nn.ModuleList([TransformerBlock(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=config.params_dtype)
+
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
         """Forward pass of the Transformer model.
 
