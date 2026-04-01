@@ -221,6 +221,12 @@ class InductorStandaloneAdaptor(CompilerInterface):
         restart_analysis_count = self._restart_analysis_counts.get(key, 0)
         if hasattr(self, "cache_dir") and self.cache_dir is not None:
             try:
+                # Workaround for empty aot_autograd artifacts
+                if getattr(compiled_graph, "_artifacts", None) is not None:
+                    _, cache_info = compiled_graph._artifacts
+                    if not cache_info.artifacts.get("aot_autograd"):
+                        cache_info.artifacts["aot_autograd"] = [key]
+
                 path: Path = self.cache_dir / key
                 compiled_graph.save(path=path.as_posix(), format="unpacked")
                 compilation_counter.num_compiled_artifacts_saved += 1
