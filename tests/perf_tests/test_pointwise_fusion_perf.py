@@ -19,6 +19,9 @@ Covers all supported compilation paths (class, instance, instance+TC, method).
 Measured baseline (H100):
   torch.compile  ~5.9x vs eager
   magi_compile   ~3.5x vs eager (all paths)
+
+TODO(perf-fusion-gap): magi_compile still trails torch.compile in fusion-heavy workloads;
+investigate graph partitioning/fusion opportunities and reduce the gap.
 """
 
 import pytest
