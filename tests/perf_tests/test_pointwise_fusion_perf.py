@@ -31,6 +31,7 @@ import torch.nn as nn
 from magi_compiler import magi_compile
 from magi_compiler.config import CompileMode
 from tests.perf_tests import cuda_benchmark, print_perf_comparison
+from tests.perf_tests.utils import assert_speedup
 
 HIDDEN_SIZE = 4096
 NUM_TOKENS = 16384
@@ -73,17 +74,6 @@ def pointwise_baselines(pointwise_device, pointwise_input):
     return eager_result, torch_result
 
 
-# ── Helpers ────────────────────────────────────────────────────────────
-
-
-def _assert_speedup(magi_vs_eager, eager_result, magi_result, label):
-    assert magi_vs_eager >= SPEEDUP_VS_EAGER_THRESHOLD, (
-        f"[{label}] magi_compile must achieve >= {SPEEDUP_VS_EAGER_THRESHOLD:.2f}x over eager. "
-        f"Got {magi_vs_eager:.2f}x "
-        f"(eager={eager_result.median:.3f}ms, magi={magi_result.median:.3f}ms)"
-    )
-
-
 # ── Tests ──────────────────────────────────────────────────────────────
 
 
@@ -108,7 +98,7 @@ def test_pointwise_class_decoration(pointwise_device, pointwise_input, pointwise
         torch_result,
         extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})",
     )
-    _assert_speedup(magi_vs_eager, eager_result, magi_result, "class")
+    assert_speedup(magi_vs_eager, eager_result, magi_result, "class", SPEEDUP_VS_EAGER_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
@@ -129,7 +119,7 @@ def test_pointwise_instance_decoration(pointwise_device, pointwise_input, pointw
         torch_result,
         extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})",
     )
-    _assert_speedup(magi_vs_eager, eager_result, magi_result, "instance")
+    assert_speedup(magi_vs_eager, eager_result, magi_result, "instance", SPEEDUP_VS_EAGER_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
@@ -154,7 +144,7 @@ def test_pointwise_instance_torch_compile_mode(pointwise_device, pointwise_input
         torch_result,
         extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})",
     )
-    _assert_speedup(magi_vs_eager, eager_result, magi_result, "instance_tc")
+    assert_speedup(magi_vs_eager, eager_result, magi_result, "instance_tc", SPEEDUP_VS_EAGER_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
@@ -178,7 +168,7 @@ def test_pointwise_function_decoration(pointwise_device, pointwise_input, pointw
         torch_result,
         extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})",
     )
-    _assert_speedup(magi_vs_eager, eager_result, magi_result, "function")
+    assert_speedup(magi_vs_eager, eager_result, magi_result, "function", SPEEDUP_VS_EAGER_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
@@ -199,4 +189,4 @@ def test_pointwise_method_decoration(pointwise_device, pointwise_input, pointwis
         torch_result,
         extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})",
     )
-    _assert_speedup(magi_vs_eager, eager_result, magi_result, "method")
+    assert_speedup(magi_vs_eager, eager_result, magi_result, "method", SPEEDUP_VS_EAGER_THRESHOLD)
