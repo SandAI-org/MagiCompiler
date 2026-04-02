@@ -55,9 +55,11 @@ class RMSNorm(nn.Module):
         return x.to(input_dtype)
 
 
-@magi_compile(dynamic_arg_dims={"x": 0})
-class MLP(torch.nn.Module):
-    """MLP module with traditional architecture (up-projection, activation, and down-projection)"""
+class RawMLP(torch.nn.Module):
+    """MLP module with traditional architecture (up-projection, activation, and down-projection).
+
+    This is the uncompiled base class. Use ``MLP`` for the magi_compile-wrapped variant.
+    """
 
     config: MLPConfig
 
@@ -81,20 +83,25 @@ class MLP(torch.nn.Module):
             - x: (num_tokens, hidden_size)
             - output: (num_tokens, hidden_size)
         """
-        # Pre-normalization
         x = self.pre_norm(x).to(torch.bfloat16)
-        # Up-projection
         x = self.up_proj(x).to(torch.float32)
-        # Activation (SiLU)
         x = F.silu(x).to(torch.bfloat16)
-        # Down-projection
         x = self.down_proj(x).to(torch.float32)
         return x
 
 
 @magi_compile(dynamic_arg_dims={"x": 0})
-class RMSNormModule(torch.nn.Module):
-    """Compiled RMSNorm module for testing"""
+class MLP(RawMLP):
+    """Compiled MLP module (magi_compile-wrapped ``RawMLP``)."""
+
+    pass
+
+
+class RawRMSNormModule(torch.nn.Module):
+    """RMSNorm module for testing.
+
+    This is the uncompiled base class. Use ``RMSNormModule`` for the magi_compile-wrapped variant.
+    """
 
     config: RMSNormConfig
 
@@ -117,6 +124,13 @@ class RMSNormModule(torch.nn.Module):
             - output: (num_tokens, hidden_size)
         """
         return self.norm(x)
+
+
+@magi_compile(dynamic_arg_dims={"x": 0})
+class RMSNormModule(RawRMSNormModule):
+    """Compiled RMSNorm module (magi_compile-wrapped ``RawRMSNormModule``)."""
+
+    pass
 
 
 def create_rms_norm_model(config: RMSNormConfig, device: torch.device) -> RMSNormModule:
