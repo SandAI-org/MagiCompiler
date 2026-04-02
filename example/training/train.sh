@@ -1,5 +1,4 @@
 #!/bin/bash
-
 # Copyright (c) 2026 SandAI. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,41 +18,25 @@ set -e
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 PROJECT_ROOT=$(cd "$SCRIPT_DIR/../.." &> /dev/null && pwd)
 
-### Distributed args ###
-MASTER_ADDR=${MASTER_ADDR:-localhost}
-MASTER_PORT=${MASTER_PORT:-29500}
-
 GPUS_PER_NODE=${GPUS_PER_NODE:-1}
 NNODES=${NNODES:-1}
-NODE_RANK=${NODE_RANK:-0}
-WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
-DISTRIBUTED_ARGS="--nnodes=$NNODES --node_rank=$NODE_RANK --nproc_per_node=$GPUS_PER_NODE --rdzv-backend=c10d --rdzv-endpoint=$MASTER_ADDR:$MASTER_PORT"
 
-### Nsys args ###
-NSYS_PROFILE=${NSYS_PROFILE:-true}
-
-if [ "$NSYS_PROFILE" = true ]; then
+if [ "${NSYS_PROFILE:-true}" = "true" ]; then
     mkdir -p "$PROJECT_ROOT/nsys_reports"
 
-    BASE_NAME="nsys_llama3"
-    TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-    NSYS_SUFFIX="ts_${TIMESTAMP}"
-
-    [ -n "$WORLD_SIZE" ] && NSYS_SUFFIX="${NSYS_SUFFIX}_worldsize_${WORLD_SIZE}"
-    [ -n "$COMPILE_MODE" ] && NSYS_SUFFIX="${NSYS_SUFFIX}_compile_${COMPILE_MODE}"
-    [ -n "$CUDA_GRAPH_MODE" ] && NSYS_SUFFIX="${NSYS_SUFFIX}_cudagraph_${CUDA_GRAPH_MODE}"
-
-    NSYS_OUTPUT="$PROJECT_ROOT/nsys_reports/${BASE_NAME}_${NSYS_SUFFIX}"
+    NSYS_OUTPUT="$PROJECT_ROOT/nsys_reports/nsys_llama3_ts_$(date +%Y%m%d_%H%M%S)_worldsize_$((GPUS_PER_NODE * NNODES))"
+    [ -n "$COMPILE_MODE" ] && NSYS_OUTPUT="${NSYS_OUTPUT}_compile_${COMPILE_MODE}"
+    [ -n "$CUDA_GRAPH_MODE" ] && NSYS_OUTPUT="${NSYS_OUTPUT}_cudagraph_${CUDA_GRAPH_MODE}"
 
     NSYS_CMD="nsys profile --force-overwrite true -o $NSYS_OUTPUT --trace=cuda,nvtx --capture-range=cudaProfilerApi"
-else
-    NSYS_CMD=""
 fi
 
-### Environment Variables For Debugging ###
-export ENABLE_REMOTE_DEBUG=${ENABLE_REMOTE_DEBUG:-false}
 export MAGI_COMPILE_CACHE_ROOT_DIR=${MAGI_COMPILE_CACHE_ROOT_DIR:-"$PROJECT_ROOT/.cache"}
-export MAGI_ENABLE_FX_GRAPH_VIZ=${MAGI_ENABLE_FX_GRAPH_VIZ:-false}
 
-$NSYS_CMD torchrun $DISTRIBUTED_ARGS $SCRIPT_DIR/train.py \
-    $NSYS_ARGS
+$NSYS_CMD torchrun \
+    --nnodes=$NNODES \
+    --node_rank=${NODE_RANK:-0} \
+    --nproc_per_node=$GPUS_PER_NODE \
+    --rdzv-backend=c10d \
+    --rdzv-endpoint=${MASTER_ADDR:-localhost}:${MASTER_PORT:-29500} \
+    "$SCRIPT_DIR/train.py"

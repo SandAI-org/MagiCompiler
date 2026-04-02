@@ -72,8 +72,8 @@ def main():
     else:
         device = torch.device("cpu")
 
-    # Initialize a small config for testing
-    config = ModelArgs(n_layers=10, max_batch_size=2, max_seq_len=1024)
+    # Initialize model config
+    config = ModelArgs(max_batch_size=2, max_seq_len=1024)
 
     # Create Model
     if global_rank == 0:
