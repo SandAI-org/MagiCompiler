@@ -20,6 +20,7 @@ import json
 import os
 import sys
 from contextlib import contextmanager
+from pyclbr import Class
 from types import CodeType
 from typing import Callable, Literal
 
@@ -81,11 +82,12 @@ class MagiCompileState:
 
     def __init__(
         self,
-        obj: torch.nn.Module | Callable,
+        obj: Callable | Class,
         compile_config: CompileConfig,
         model_idx: int,
         model_tag: str,
         dynamic_arg_dims: dict[str, int | list[int]],
+        target_method_name: str | None = None,
     ):
         self.obj = obj
         self.compile_config = compile_config
@@ -94,20 +96,24 @@ class MagiCompileState:
         self.dynamic_arg_dims = dynamic_arg_dims
         self.traced_files: OrderedSet = OrderedSet()
         self.inductor_compile_config: dict = {}
+        self.target_method_name: str | None = None
+        self.target_function: Callable | None = None
 
-        if isinstance(obj, torch.nn.Module):
-            self.original_code_object: CodeType = obj.__class__.forward.__code__
-            self._target_callable = getattr(obj, "_magi_original_forward", obj.forward)
+        if target_method_name:
+            self.target_method_name = target_method_name
+            self.target_function = getattr(obj.__class__, self.target_method_name)
+            self.original_code_for_hook: CodeType = self.target_function.__code__
+            self.original_entry = self.target_function.__get__(obj, obj.__class__)
         elif callable(obj):
-            self.original_code_object: CodeType = inspect.unwrap(obj).__code__
-            self._target_callable = obj
+            self.original_code_for_hook: CodeType = inspect.unwrap(obj).__code__
+            self.original_entry = obj
         else:
             raise TypeError(f"Unsupported object type for MagiCompileState: {type(obj)}")
 
-        self.compiled_code: CodeType | None = None
-        self._aot_compiled_fn: Callable | None = None
-        self._compile_artifacts: object | None = None
-        self._compiled_callable: Callable | None = None
+        self.compiled_entry: Callable | None = None
+        self.jit_compiled_code: CodeType | None = None
+        self.aot_compiled_fn: Callable | None = None
+        self.aot_compile_artifacts: object | None = None
 
     def _ensure_compiled(self):
         """Lazy initialization of the ``torch.compile`` wrapper.
@@ -115,7 +121,7 @@ class MagiCompileState:
         Called on first actual compilation (JIT or AOT cache miss).
         On AOT cache hits, this is never called — avoiding ``torch.compile`` overhead entirely.
         """
-        if self._compiled_callable is not None:
+        if self.compiled_entry is not None:
             return
         backend = init_backend(
             self.compile_config, self.model_idx, self.model_tag, self.traced_files, self.inductor_compile_config
@@ -142,8 +148,8 @@ class MagiCompileState:
         # gets an extra ``.aot_compile`` attribute (eval_frame.py:880) that
         # delegates to ``torch._dynamo.aot_compile.aot_compile_fullgraph``
         # (aot_compile.py:108).
-        self._compiled_callable = torch.compile(
-            self._target_callable, fullgraph=True, dynamic=True, backend=backend, options=options
+        self.compiled_entry = torch.compile(
+            self.original_entry, fullgraph=True, dynamic=True, backend=backend, options=options
         )
 
     @property
@@ -158,7 +164,7 @@ class MagiCompileState:
         traced through (unknown before Dynamo runs).  On loading we verify
         traced-file checksums separately via ``_verify_source_unchanged``.
         """
-        hash_key = compute_hash([self._target_callable, self.model_idx, self.compile_config.hash, self.dynamic_arg_dims])
+        hash_key = compute_hash([self.original_entry, self.model_idx, self.compile_config.hash, self.dynamic_arg_dims])
         cache_dir = os.path.join(
             self.compile_config.cache_root_dir,
             "torch_aot_compile",
@@ -184,8 +190,8 @@ class MagiCompileState:
         from torch._dynamo.aot_compile import CompileArtifacts
 
         with open(aot_path, "rb") as f:
-            self._compile_artifacts = CompileArtifacts.deserialize(f.read())
-        self._aot_compiled_fn = self._compile_artifacts.compiled_function()
+            self.aot_compile_artifacts = CompileArtifacts.deserialize(f.read())
+        self.aot_compiled_fn = self.aot_compile_artifacts.compiled_function()
         magi_logger.info("AOT cache loaded successfully from %s", aot_path)
         return True
 
@@ -197,7 +203,7 @@ class MagiCompileState:
         aot_path = self.aot_compilation_path
 
         with open(aot_path, "wb") as f:
-            f.write(CompileArtifacts.serialize(self._compile_artifacts))
+            f.write(CompileArtifacts.serialize(self.aot_compile_artifacts))
         _save_source_checksum(self.aot_compilation_path, self.traced_files)
         magi_logger.info("AOT path: artifacts saved to %s", aot_path)
 
@@ -228,10 +234,10 @@ class MagiCompileState:
         self._aot_retry_count = 0
         for attempt in range(self._AOT_MAX_RETRIES):
             try:
-                self._aot_compiled_fn = self._compiled_callable.aot_compile((args, kwargs))
-                save_fn = self._aot_compiled_fn.save_compiled_function
+                self.aot_compiled_fn = self.compiled_entry.aot_compile((args, kwargs))
+                save_fn = self.aot_compiled_fn.save_compiled_function
                 idx = save_fn.__code__.co_freevars.index("self")
-                self._compile_artifacts = save_fn.__closure__[idx].cell_contents
+                self.aot_compile_artifacts = save_fn.__closure__[idx].cell_contents
                 return
             except TensorifyScalarRestartAnalysis:
                 if attempt >= self._AOT_MAX_RETRIES - 1:
@@ -243,11 +249,11 @@ class MagiCompileState:
                     attempt + 1,
                     self._AOT_MAX_RETRIES,
                 )
-                self._compiled_callable = None
+                self.compiled_entry = None
                 self._ensure_compiled()
 
     @contextmanager
-    def _capture_compiled_bytecode(self):
+    def _jit_capture_compiled_bytecode(self):
         """Register a Dynamo bytecode hook to capture compiled bytecode.
 
         Each time Dynamo completes compilation of a frame (e.g., the ``forward``
@@ -265,7 +271,7 @@ class MagiCompileState:
 
         def _bytecode_hook(old_code: CodeType, new_code: CodeType):
             """Hook to save the compiled bytecode for direct execution."""
-            if old_code is not self.original_code_object:
+            if old_code is not self.original_code_for_hook:
                 return
             frame = sys._getframe()
             while frame and frame.f_back:
@@ -277,13 +283,13 @@ class MagiCompileState:
             frame = frame.f_locals["frame"]
             assert frame.f_code == old_code
 
-            if isinstance(self.obj, torch.nn.Module):
-                if hasattr(frame.f_locals, "self") and frame.f_locals["self"] is not self.obj:
+            if self.target_method_name is not None:
+                if "self" in frame.f_locals and frame.f_locals["self"] is not self.obj:
                     return
 
             emit_after_dynamo_bytecode_transform()
             # Save the compiled bytecode
-            self.compiled_code = new_code
+            self.jit_compiled_code = new_code
 
         handle = torch._dynamo.convert_frame.register_bytecode_hook(_bytecode_hook)
         try:
@@ -293,60 +299,39 @@ class MagiCompileState:
 
     @contextmanager
     def dispatch_to_compiled_fwd(self, mode: Literal["jit", "aot"] = "jit"):
+        """Temporarily swap in compiled code and yield a callable invoker.
+
+        For JIT mode the original ``__code__`` is swapped with the compiled
+        bytecode and restored in ``finally``.  For AOT mode the pre-compiled
+        function is used directly with no cleanup needed.
         """
-        Context manager to dispatch to the compiled code.
+        dispatch_via_method = self.target_method_name is not None
 
-        For class-level decoration (obj is nn.Module):
-            Temporarily swaps the class's forward bytecode, yields None.
-            The caller invokes old_call(self, ...) which picks up the swapped code.
-
-        For function-level decoration (obj is Callable):
-            Temporarily swaps the target function's bytecode, yields the modified function.
-            The caller invokes the yielded function directly.
-
-        This way:
-        1. Dynamo guarantees that the compiled bytecode has exactly the same arguments,
-           cell variables, and free variables as the original code. Therefore we can
-           directly switch the code object in the function and call it.
-        2. In torch.nn.Module, `__call__` wraps `forward` with critical runtime logic
-           (hooks, FSDP mechanics, etc.). Switching bytecode ensures these are preserved.
-        """
         if mode == "jit":
-            assert self.compiled_code is not None
-            if isinstance(self.obj, torch.nn.Module):
-                self.obj.__class__.forward.__code__ = self.compiled_code
-                if hasattr(self.obj, "_magi_original_forward"):
-                    original_forward = self.obj.forward
-                    self.obj.forward = self.obj.__class__.forward.__get__(self.obj, self.obj.__class__)
-                    yield
-                    self.obj.forward = original_forward
-                else:
-                    yield
-                self.obj.__class__.forward.__code__ = self.original_code_object
+            assert self.jit_compiled_code is not None
+            if dispatch_via_method:
+                assert self.target_function is not None
+                original_code = self.target_function.__code__
+                self.target_function.__code__ = self.jit_compiled_code
+                try:
+                    yield self.target_function.__get__(self.obj, self.obj.__class__)
+                finally:
+                    self.target_function.__code__ = original_code
             else:
-                # Function/Method level
                 target = inspect.unwrap(self.obj)
-                if inspect.ismethod(target):
-                    # Bound method (e.g. model.forward)
-                    target.__func__.__code__ = self.compiled_code
-                    yield
-                    target.__func__.__code__ = self.original_code_object
-                elif inspect.isfunction(target) or hasattr(target, "__code__"):
-                    # Normal function or anything with __code__
-                    target.__code__ = self.compiled_code
-                    yield
-                    target.__code__ = self.original_code_object
-                else:
-                    raise AttributeError(f"Target {target} is neither a method nor a function with __code__")
+                original_code = target.__code__
+                target.__code__ = self.jit_compiled_code
+                try:
+                    yield target
+                finally:
+                    target.__code__ = original_code
+
         elif mode == "aot":
-            assert self._aot_compiled_fn is not None
-            if isinstance(self.obj, torch.nn.Module):
-                original_forward = self.obj.forward
-                self.obj.forward = lambda *args, **kwargs: self._aot_compiled_fn(self.obj, *args, **kwargs)
-                yield
-                self.obj.forward = original_forward
+            assert self.aot_compiled_fn is not None
+            if dispatch_via_method:
+                yield lambda *args, **kwargs: self.aot_compiled_fn(self.obj, *args, **kwargs)
             else:
-                # For functions, AOT returns the compiled function directly
-                yield self._aot_compiled_fn
+                yield self.aot_compiled_fn
+
         else:
             raise ValueError(f"Invalid mode: {mode}")

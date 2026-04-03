@@ -30,6 +30,7 @@ import torch.nn as nn
 
 from magi_compiler import magi_compile
 from magi_compiler.config import CompileMode
+from tests.model_definition import RawNonModulePointwiseFusionChain
 from tests.perf_tests import cuda_benchmark, print_perf_comparison
 from tests.perf_tests.utils import assert_speedup
 
@@ -190,3 +191,81 @@ def test_pointwise_method_decoration(pointwise_device, pointwise_input, pointwis
         extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})",
     )
     assert_speedup(magi_vs_eager, eager_result, magi_result, "method", SPEEDUP_VS_EAGER_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
+def test_pointwise_non_module_class_decoration_speedup(pointwise_device, pointwise_input):
+    @magi_compile(dynamic_arg_dims={"inp": 0})
+    class CompiledNonModulePointwise(RawNonModulePointwiseFusionChain):
+        def __call__(self, inp: torch.Tensor) -> torch.Tensor:
+            return super().__call__(inp)
+
+    eager_obj = RawNonModulePointwiseFusionChain()
+    compiled_obj = CompiledNonModulePointwise()
+
+    with torch.no_grad():
+        eager_result = cuda_benchmark(lambda: eager_obj(pointwise_input))
+        compiled_result = cuda_benchmark(lambda: compiled_obj(pointwise_input), compilation_warmup=3)
+
+    speedup, _ = print_perf_comparison(
+        "Pointwise non-module - class decoration",
+        eager_result,
+        compiled_result,
+        extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})",
+    )
+    assert_speedup(speedup, eager_result, compiled_result, "pointwise_non_module_class", SPEEDUP_VS_EAGER_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
+def test_pointwise_non_module_instance_decoration_speedup(pointwise_device, pointwise_input):
+    eager_obj = RawNonModulePointwiseFusionChain()
+    inst_obj = RawNonModulePointwiseFusionChain()
+    compiled_obj = magi_compile(inst_obj, dynamic_arg_dims={"inp": 0})
+
+    with torch.no_grad():
+        eager_result = cuda_benchmark(lambda: eager_obj(pointwise_input))
+        compiled_result = cuda_benchmark(lambda: compiled_obj(pointwise_input), compilation_warmup=3)
+
+    speedup, _ = print_perf_comparison(
+        "Pointwise non-module - instance decoration",
+        eager_result,
+        compiled_result,
+        extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})",
+    )
+    assert_speedup(speedup, eager_result, compiled_result, "pointwise_non_module_instance", SPEEDUP_VS_EAGER_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
+def test_pointwise_non_module_method_decoration_speedup(pointwise_device, pointwise_input):
+    eager_obj = RawNonModulePointwiseFusionChain()
+    mtd_obj = RawNonModulePointwiseFusionChain()
+    mtd_obj.step = magi_compile(mtd_obj.step, dynamic_arg_dims={"inp": 0})
+
+    with torch.no_grad():
+        eager_result = cuda_benchmark(lambda: eager_obj.step(pointwise_input))
+        compiled_result = cuda_benchmark(lambda: mtd_obj.step(pointwise_input), compilation_warmup=3)
+
+    speedup, _ = print_perf_comparison(
+        "Pointwise non-module - method decoration",
+        eager_result,
+        compiled_result,
+        extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})",
+    )
+    assert_speedup(speedup, eager_result, compiled_result, "pointwise_non_module_method", SPEEDUP_VS_EAGER_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
+def test_pointwise_non_module_eager_vs_module_eager_speed(pointwise_device, pointwise_input):
+    module_eager = PointwiseFusionChain().to(pointwise_device).eval()
+    non_module_eager = RawNonModulePointwiseFusionChain()
+
+    with torch.no_grad():
+        module_eager_result = cuda_benchmark(lambda: module_eager(pointwise_input))
+        non_module_eager_result = cuda_benchmark(lambda: non_module_eager(pointwise_input))
+
+    print_perf_comparison(
+        "Pointwise eager baseline check: module vs non-module",
+        module_eager_result,
+        non_module_eager_result,
+        extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})",
+    )

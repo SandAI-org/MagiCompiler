@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
+from typing import Self
 
 import torch
 import torch.nn as nn
@@ -175,6 +176,97 @@ def create_mlp_model_with_initial_params(config: MLPConfig, device: torch.device
     model = MLP(config).to(device)
     initial_params = [p.clone().detach() for p in model.parameters()]
     return model, initial_params
+
+
+class RawNonModuleMLP:
+    """Non-module MLP workload aligned with ``RawMLP`` math."""
+
+    def __init__(self, hidden_size: int, intermediate_size: int, device: torch.device, dtype: torch.dtype = torch.bfloat16):
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.device = device
+        self.dtype = dtype
+        self.eps = 1e-6
+
+        self.pre_norm_weight = torch.ones(hidden_size, device=device, dtype=torch.float32)
+        self.up_proj_weight = torch.randn(intermediate_size, hidden_size, device=device, dtype=dtype)
+        self.down_proj_weight = torch.randn(hidden_size, intermediate_size, device=device, dtype=dtype)
+
+    def copy_from(self, other: Self) -> None:
+        self.pre_norm_weight = other.pre_norm_weight.clone()
+        self.up_proj_weight = other.up_proj_weight.clone()
+        self.down_proj_weight = other.down_proj_weight.clone()
+
+    def _rms_norm(self, x: torch.Tensor) -> torch.Tensor:
+        input_dtype = x.dtype
+        variance = x.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        x = x.to(self.pre_norm_weight.dtype) * self.pre_norm_weight
+        return x.to(input_dtype)
+
+    def forward(self, inp: torch.Tensor) -> torch.Tensor:
+        x = self._rms_norm(inp).to(torch.bfloat16)
+        x = torch.nn.functional.linear(x, self.up_proj_weight).to(torch.float32)
+        x = torch.nn.functional.silu(x).to(torch.bfloat16)
+        x = torch.nn.functional.linear(x, self.down_proj_weight).to(torch.float32)
+        return x
+
+    def __call__(self, inp: torch.Tensor) -> torch.Tensor:
+        return self.forward(inp)
+
+    def step(self, inp: torch.Tensor) -> torch.Tensor:
+        return self.forward(inp)
+
+
+class RawNonModulePointwiseFusionChain:
+    """Non-module pointwise chain aligned with ``PointwiseFusionChain`` math."""
+
+    def copy_from(self, other: Self) -> None:
+        _ = other
+
+    def forward(self, inp: torch.Tensor) -> torch.Tensor:
+        x = inp
+        x = x * 0.5
+        x = x + 1.0
+        x = torch.relu(x)
+        x = x * x
+        x = x - 0.5
+        x = torch.sigmoid(x)
+        return x
+
+    def __call__(self, inp: torch.Tensor) -> torch.Tensor:
+        return self.forward(inp)
+
+    def step(self, inp: torch.Tensor) -> torch.Tensor:
+        return self.forward(inp)
+
+
+class RawNonModuleNormResidualActivation:
+    """Non-module norm+residual+activation workload aligned with module math."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.weight = torch.ones(hidden_size, dtype=torch.float32)
+
+    def copy_from(self, other: Self) -> None:
+        self.weight = other.weight.clone()
+
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        input_dtype = x.dtype
+        variance = x.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        x = x.to(self.weight.dtype) * self.weight.to(x.device)
+        return x.to(input_dtype)
+
+    def forward(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.silu(self._norm(x) + residual)
+
+    def __call__(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        return self.forward(x, residual)
+
+    def step(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        return self.forward(x, residual)
 
 
 @dataclass

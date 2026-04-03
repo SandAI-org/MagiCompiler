@@ -126,6 +126,7 @@ class CompilerManager:
             magi_logger.info("MagiCompiler's cache is disabled.")
             return
 
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         magi_logger.info("Using cache directory: %s for MagiCompiler", cache_dir)
         if self.cache_file_path.exists():
             # load the cache from the file
