@@ -31,7 +31,7 @@ import torch.nn.functional as F
 
 from magi_compiler import magi_compile
 from magi_compiler.config import CompileMode
-from tests.model_definition import RMSNorm
+from tests.model_definition import RawNonModuleNormResidualActivation, RMSNorm
 from tests.perf_tests import cuda_benchmark, print_perf_comparison
 from tests.perf_tests.utils import assert_speedup
 
@@ -199,3 +199,104 @@ def test_norm_residual_method_decoration(nra_device, nra_inputs, nra_baselines):
         extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})  dtype=bf16",
     )
     assert_speedup(magi_vs_eager, eager_result, magi_result, "method", SPEEDUP_VS_EAGER_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
+def test_norm_residual_non_module_class_decoration_speedup(nra_device, nra_inputs):
+    x, residual = nra_inputs
+
+    @magi_compile(dynamic_arg_dims={"x": 0, "residual": 0})
+    class CompiledNonModuleNRA(RawNonModuleNormResidualActivation):
+        def __call__(self, x: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+            return super().__call__(x, residual)
+
+    base = RawNonModuleNormResidualActivation(HIDDEN_SIZE)
+
+    eager_obj = RawNonModuleNormResidualActivation(HIDDEN_SIZE)
+    eager_obj.copy_from(base)
+
+    compiled_obj = CompiledNonModuleNRA(HIDDEN_SIZE)
+    compiled_obj.copy_from(base)
+
+    with torch.no_grad():
+        eager_result = cuda_benchmark(lambda: eager_obj(x, residual))
+        compiled_result = cuda_benchmark(lambda: compiled_obj(x, residual), compilation_warmup=3)
+
+    speedup, _ = print_perf_comparison(
+        "Norm+Residual non-module - class decoration",
+        eager_result,
+        compiled_result,
+        extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})  dtype=bf16",
+    )
+    assert_speedup(speedup, eager_result, compiled_result, "norm_residual_non_module_class", SPEEDUP_VS_EAGER_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
+def test_norm_residual_non_module_instance_decoration_speedup(nra_device, nra_inputs):
+    x, residual = nra_inputs
+
+    base = RawNonModuleNormResidualActivation(HIDDEN_SIZE)
+
+    eager_obj = RawNonModuleNormResidualActivation(HIDDEN_SIZE)
+    eager_obj.copy_from(base)
+
+    inst_obj = RawNonModuleNormResidualActivation(HIDDEN_SIZE)
+    inst_obj.copy_from(base)
+    compiled_obj = magi_compile(inst_obj, dynamic_arg_dims={"x": 0, "residual": 0})
+
+    with torch.no_grad():
+        eager_result = cuda_benchmark(lambda: eager_obj(x, residual))
+        compiled_result = cuda_benchmark(lambda: compiled_obj(x, residual), compilation_warmup=3)
+
+    speedup, _ = print_perf_comparison(
+        "Norm+Residual non-module - instance decoration",
+        eager_result,
+        compiled_result,
+        extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})  dtype=bf16",
+    )
+    assert_speedup(speedup, eager_result, compiled_result, "norm_residual_non_module_instance", SPEEDUP_VS_EAGER_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
+def test_norm_residual_non_module_method_decoration_speedup(nra_device, nra_inputs):
+    x, residual = nra_inputs
+
+    base = RawNonModuleNormResidualActivation(HIDDEN_SIZE)
+
+    eager_obj = RawNonModuleNormResidualActivation(HIDDEN_SIZE)
+    eager_obj.copy_from(base)
+
+    mtd_obj = RawNonModuleNormResidualActivation(HIDDEN_SIZE)
+    mtd_obj.copy_from(base)
+    mtd_obj.step = magi_compile(mtd_obj.step, dynamic_arg_dims={"x": 0, "residual": 0})
+
+    with torch.no_grad():
+        eager_result = cuda_benchmark(lambda: eager_obj.step(x, residual))
+        compiled_result = cuda_benchmark(lambda: mtd_obj.step(x, residual), compilation_warmup=3)
+
+    speedup, _ = print_perf_comparison(
+        "Norm+Residual non-module - method decoration",
+        eager_result,
+        compiled_result,
+        extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})  dtype=bf16",
+    )
+    assert_speedup(speedup, eager_result, compiled_result, "norm_residual_non_module_method", SPEEDUP_VS_EAGER_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
+def test_norm_residual_non_module_eager_vs_module_eager_speed(nra_device, nra_inputs):
+    x, residual = nra_inputs
+
+    module_eager = NormResidualActivation(HIDDEN_SIZE).to(nra_device).eval()
+    non_module_eager = RawNonModuleNormResidualActivation(HIDDEN_SIZE)
+
+    with torch.no_grad():
+        module_eager_result = cuda_benchmark(lambda: module_eager(x, residual))
+        non_module_eager_result = cuda_benchmark(lambda: non_module_eager(x, residual))
+
+    print_perf_comparison(
+        "Norm+Residual eager baseline check: module vs non-module",
+        module_eager_result,
+        non_module_eager_result,
+        extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})  dtype=bf16",
+    )

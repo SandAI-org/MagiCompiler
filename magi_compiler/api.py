@@ -16,39 +16,43 @@ import functools
 import inspect
 from typing import Callable, TypeVar
 
-from torch import nn
-
 from ._api import (
     _check_dynamic_arg_dims,
     _infer_dynamic_arg_dims,
+    _magi_compile_bound_method,
     _magi_compile_class,
     _magi_compile_function,
-    _magi_compile_instance,
 )
 from ._magi_register_custom_op import _magi_register_custom_op_impl
 from .config import CompileConfig
 
-_T = TypeVar("_T", bound=type[nn.Module])
+_T = TypeVar("_T", bound=type)
 _F = TypeVar("_F", bound=Callable)
-_M = TypeVar("_M", bound=nn.Module)
+_O = TypeVar("_O", bound=object)
 
 
 def magi_compile(
-    obj: _T | _M | _F | None = None,
+    obj: _T | _O | _F | None = None,
     *,
     model_tag: str | None = None,
     dynamic_arg_dims: dict[str, int | list[int]] | None = None,
     enable_if: Callable[[], bool] | None = None,
     config_patch: Callable[[CompileConfig], CompileConfig] | None = None,
-) -> _T | _M | _F | Callable[[_T | _M | _F], _T | _M | _F]:
+    method_name: str | None = None,
+) -> _T | _O | _F | Callable[[_T | _O | _F], _T | _O | _F]:
     """
-    Compile target objects (nn.Module classes, modules, functions, or methods).
+    Compile classes, instances, standalone functions, or bound methods.
+
+    Default compile target when no explicit method is passed:
+    - ``nn.Module``: compile ``forward``.
+    - Non-module callable class/instance: compile ``forward`` by default;
+      if missing, users must pass ``method_name`` explicitly.
 
     Supported target types
     ----------------------
-    1) Class (must be an `nn.Module` subclass):
-        - Affects all instances of the annotated class.
-        - Compilation dispatch enters via `__call__`, while compiled execution replaces `forward` logic.
+    1) Class:
+        - Hooks ``__init__`` so every new instance gets the default method compiled (same mechanism for
+          ``nn.Module`` and non-module callable classes).
         - Example:
             @magi_compile
             class MyModel(nn.Module):
@@ -61,16 +65,15 @@ def magi_compile(
             @magi_compile
             def my_func(x): return x
 
-    3) Instance (nn.Module):
-        - Compiles a single instance specifically.
-        - Avoids affecting other instances by creating an instance-specific subclass.
+    3) Instance:
+        - Compiles only that object’s default method (``forward`` by default, or
+          explicit ``method_name`` for non-module targets).
         - Example:
             model = MyModel()
             model = magi_compile(model)
 
-    4) Method (Bound/Unbound):
-        - Wraps a specific function attribute (e.g., `model.forward`).
-        - Enables focused compilation of specific object behaviors.
+    4) Bound method:
+        - Compiles that method on its ``__self__`` (works for ``nn.Module`` and plain objects).
         - Example:
             model = MyModel()
             model.forward = magi_compile(model.forward)
@@ -103,6 +106,9 @@ def magi_compile(
     - dynamic_arg_dims: Dictionary mapping argument names to dynamic dimensions (int or list[int]).
     - model_tag: Optional tag for caching path (defaults to class/function name).
     - enable_if: Callable returning bool; compilation happens only if this returns True.
+    - method_name: Optional explicit method for class/instance targets. If omitted,
+      ``forward`` is used by default; for non-module targets without ``forward``,
+      this argument is required.
 
     Notes
     -----
@@ -117,21 +123,45 @@ def magi_compile(
             dynamic_arg_dims=dynamic_arg_dims,
             enable_if=enable_if,
             config_patch=config_patch,
+            method_name=method_name,
         )
 
-    # 1. Determine target function for dynamic dim inference
-    if inspect.isclass(obj):
-        assert issubclass(obj, nn.Module), f"Expected nn.Module subclass, got {obj}"
-        target_func = obj.forward
-        context_name = f"forward method of {obj.__name__}"
-    elif isinstance(obj, nn.Module):
-        target_func = obj.forward
-        context_name = f"forward method of instance {obj.__class__.__name__}"
-    elif callable(obj):
-        target_func = obj
-        context_name = f"function/method {obj.__name__}"
-    else:
+    config_patch = config_patch or (lambda x: x)
+
+    is_bound_method = inspect.ismethod(obj)
+    is_function = inspect.isfunction(obj)
+    is_class = inspect.isclass(obj)
+    is_instance = callable(obj) and not any((is_class, is_function, is_bound_method))
+    if not any((is_class, is_instance, is_bound_method, is_function)):
         raise TypeError(f"Unsupported type for magi_compile: {type(obj)}")
+
+    if method_name is not None and (is_bound_method or is_function):
+        entry_name = "bound method" if is_bound_method else "function"
+        raise ValueError(f"method_name cannot be used when compiling a {entry_name} directly")
+
+    # 1. Determine target function for dynamic dim inference
+    owner_instance = obj.__self__ if is_bound_method else obj if is_instance else None
+    owner_class = obj if is_class else owner_instance.__class__ if is_bound_method else obj.__class__ if is_instance else None
+
+    if is_class or is_instance:
+        method_name = method_name or "forward"
+        target_func = getattr(owner_class, method_name, None)
+        context_name = f"{'class' if is_class else 'instance'} {owner_class.__name__}.{method_name}"
+    elif is_bound_method:
+        method_name = method_name or obj.__name__
+        target_func = obj
+        context_name = f"bound method {method_name}"
+    else:
+        method_name = None
+        target_func = obj
+        context_name = f"function {obj.__name__}"
+
+    if not callable(target_func):
+        if is_class and not method_name:
+            raise AssertionError(f"Class '{owner_class.__name__}' must have forward method or pass method_name explicitly.")
+        if is_instance and not method_name:
+            raise AssertionError(f"Instance '{owner_class.__name__}' must have forward method or pass method_name explicitly.")
+        raise TypeError(f"Target '{target_func.__name__}' is not callable for {type(obj)}")
 
     # 2. Infer dynamic dims
     inferred_dims = dynamic_arg_dims or _infer_dynamic_arg_dims(target_func, context_name)
@@ -141,13 +171,19 @@ def magi_compile(
 
     _check_dynamic_arg_dims(inferred_dims, target_func)
 
-    # 3. Logic based on type
-    if inspect.isclass(obj):
-        return _magi_compile_class(obj, inferred_dims, enable_if, config_patch, model_tag)
-    elif isinstance(obj, nn.Module):
-        return _magi_compile_instance(obj, inferred_dims, enable_if, config_patch, model_tag)
-    else:
+    # 3. Dispatch by entry kind (class / instance / bound method / bare function)
+
+    if is_class:
+        return _magi_compile_class(obj, inferred_dims, enable_if, config_patch, model_tag, method_name)
+    elif is_instance:
+        return _magi_compile_bound_method(obj, inferred_dims, enable_if, config_patch, model_tag, method_name)
+    elif is_bound_method:
+        _magi_compile_bound_method(owner_instance, inferred_dims, enable_if, config_patch, model_tag, method_name)
+        return getattr(owner_instance, method_name)
+    elif is_function:
         return _magi_compile_function(obj, inferred_dims, enable_if, config_patch, model_tag)
+
+    raise TypeError(f"Unsupported type for magi_compile: {type(obj)}")
 
 
 def magi_register_custom_op(

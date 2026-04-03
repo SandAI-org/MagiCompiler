@@ -26,7 +26,7 @@ import torch
 
 from magi_compiler import magi_compile
 from magi_compiler.config import CompileMode
-from tests.model_definition import MLPConfig, RawMLP
+from tests.model_definition import MLPConfig, RawMLP, RawNonModuleMLP
 from tests.perf_tests import cuda_benchmark, print_perf_comparison
 from tests.perf_tests.utils import assert_speedup
 
@@ -186,3 +186,97 @@ def test_mlp_method_decoration(mlp_device, mlp_input, mlp_baselines):
         extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})  intermediate={INTERMEDIATE_SIZE}  dtype=bf16",
     )
     assert_speedup(magi_vs_eager, eager_result, magi_result, "method", SPEEDUP_VS_EAGER_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
+def test_non_module_mlp_class_decoration_speedup(mlp_device, mlp_input):
+    base = RawNonModuleMLP(HIDDEN_SIZE, INTERMEDIATE_SIZE, mlp_device)
+
+    @magi_compile(dynamic_arg_dims={"inp": 0})
+    class CompiledNonModuleMLP(RawNonModuleMLP):
+        def __call__(self, inp: torch.Tensor) -> torch.Tensor:
+            return super().__call__(inp)
+
+    eager_obj = RawNonModuleMLP(HIDDEN_SIZE, INTERMEDIATE_SIZE, mlp_device)
+    eager_obj.copy_from(base)
+
+    compiled_obj = CompiledNonModuleMLP(HIDDEN_SIZE, INTERMEDIATE_SIZE, mlp_device)
+    compiled_obj.copy_from(base)
+
+    with torch.no_grad():
+        eager_result = cuda_benchmark(lambda: eager_obj(mlp_input))
+        compiled_result = cuda_benchmark(lambda: compiled_obj(mlp_input), compilation_warmup=3)
+
+    speedup, _ = print_perf_comparison(
+        "Non-module MLP - class decoration",
+        eager_result,
+        compiled_result,
+        extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})  intermediate={INTERMEDIATE_SIZE}  dtype=bf16",
+    )
+    assert_speedup(speedup, eager_result, compiled_result, "non_module_class", SPEEDUP_VS_EAGER_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
+def test_non_module_mlp_instance_decoration_speedup(mlp_device, mlp_input):
+    base = RawNonModuleMLP(HIDDEN_SIZE, INTERMEDIATE_SIZE, mlp_device)
+
+    eager_obj = RawNonModuleMLP(HIDDEN_SIZE, INTERMEDIATE_SIZE, mlp_device)
+    eager_obj.copy_from(base)
+
+    inst_obj = RawNonModuleMLP(HIDDEN_SIZE, INTERMEDIATE_SIZE, mlp_device)
+    inst_obj.copy_from(base)
+    compiled_obj = magi_compile(inst_obj, dynamic_arg_dims={"inp": 0})
+
+    with torch.no_grad():
+        eager_result = cuda_benchmark(lambda: eager_obj(mlp_input))
+        compiled_result = cuda_benchmark(lambda: compiled_obj(mlp_input), compilation_warmup=3)
+
+    speedup, _ = print_perf_comparison(
+        "Non-module MLP - instance decoration",
+        eager_result,
+        compiled_result,
+        extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})  intermediate={INTERMEDIATE_SIZE}  dtype=bf16",
+    )
+    assert_speedup(speedup, eager_result, compiled_result, "non_module_instance", SPEEDUP_VS_EAGER_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
+def test_non_module_mlp_method_decoration_speedup(mlp_device, mlp_input):
+    base = RawNonModuleMLP(HIDDEN_SIZE, INTERMEDIATE_SIZE, mlp_device)
+
+    eager_obj = RawNonModuleMLP(HIDDEN_SIZE, INTERMEDIATE_SIZE, mlp_device)
+    eager_obj.copy_from(base)
+
+    mtd_obj = RawNonModuleMLP(HIDDEN_SIZE, INTERMEDIATE_SIZE, mlp_device)
+    mtd_obj.copy_from(base)
+    mtd_obj.step = magi_compile(mtd_obj.step, dynamic_arg_dims={"inp": 0})
+
+    with torch.no_grad():
+        eager_result = cuda_benchmark(lambda: eager_obj.step(mlp_input))
+        compiled_result = cuda_benchmark(lambda: mtd_obj.step(mlp_input), compilation_warmup=3)
+
+    speedup, _ = print_perf_comparison(
+        "Non-module MLP - method decoration",
+        eager_result,
+        compiled_result,
+        extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})  intermediate={INTERMEDIATE_SIZE}  dtype=bf16",
+    )
+    assert_speedup(speedup, eager_result, compiled_result, "non_module_method", SPEEDUP_VS_EAGER_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
+def test_non_module_mlp_eager_vs_module_eager_speed(mlp_device, mlp_input):
+    config = _build_config()
+    module_eager = RawMLP(config).to(mlp_device).eval()
+
+    non_module = RawNonModuleMLP(HIDDEN_SIZE, INTERMEDIATE_SIZE, mlp_device)
+    with torch.no_grad():
+        module_eager_result = cuda_benchmark(lambda: module_eager(mlp_input))
+        non_module_eager_result = cuda_benchmark(lambda: non_module(mlp_input))
+
+    print_perf_comparison(
+        "MLP eager baseline check: module vs non-module",
+        module_eager_result,
+        non_module_eager_result,
+        extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})  intermediate={INTERMEDIATE_SIZE}  dtype=bf16",
+    )

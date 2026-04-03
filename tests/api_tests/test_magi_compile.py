@@ -18,7 +18,6 @@ Tests for @magi_compile decorator functionality.
 
 import shutil
 import tempfile
-import time
 from typing import Tuple
 from unittest.mock import MagicMock, patch
 
@@ -29,6 +28,7 @@ from torch.testing import assert_close
 
 from magi_compiler.api import magi_compile
 from magi_compiler.config import CompileConfig, CompileMode
+from tests.perf_tests import cuda_benchmark
 
 
 @pytest.fixture(autouse=True)
@@ -310,6 +310,68 @@ class TestCompilationCorrectness:
         _check(_sync(mtd_imp), "mtd_imp")
         _check(_sync(mtd_fact), "mtd_fact")
 
+        # 5. Non-nn.Module callable class / instance / method
+        class CallableModel:
+            def __init__(self, dim: int):
+                self.dim = dim
+                self.ln_weight = [torch.randn(dim) for _ in range(3)]
+                self.ln_bias = [torch.randn(dim) for _ in range(3)]
+                self.linear_weight = [torch.randn(dim, dim) for _ in range(3)]
+                self.linear_bias = [torch.randn(dim) for _ in range(3)]
+
+            def copy_from(self, other: "CallableModel"):
+                self.ln_weight = [w.clone() for w in other.ln_weight]
+                self.ln_bias = [b.clone() for b in other.ln_bias]
+                self.linear_weight = [w.clone() for w in other.linear_weight]
+                self.linear_bias = [b.clone() for b in other.linear_bias]
+
+            def _run_blocks(self, x: torch.Tensor) -> torch.Tensor:
+                for i in range(3):
+                    res = x
+                    x = torch.nn.functional.layer_norm(x, (self.dim,), self.ln_weight[i], self.ln_bias[i])
+                    x = torch.nn.functional.linear(x, self.linear_weight[i], self.linear_bias[i])
+                    x = torch.nn.functional.gelu(x)
+                    x = x + res
+                return x
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self._run_blocks(x)
+
+            def __call__(self, x: torch.Tensor) -> torch.Tensor:
+                return self.forward(x)
+
+            def step(self, x: torch.Tensor) -> torch.Tensor:
+                return self._run_blocks(x)
+
+        x_non_module = torch.randn(2, size)
+        native_callable = CallableModel(size)
+        native_callable_out = native_callable(x_non_module)
+
+        # class path (factory style)
+        CallableClsFact = compiler(CallableModel)
+        callable_cls_inst = CallableClsFact(size)
+        callable_cls_inst.copy_from(native_callable)
+
+        # instance path (factory style, returns compiled callable entry)
+        callable_inst_obj = CallableModel(size)
+        callable_inst_obj.copy_from(native_callable)
+        callable_inst_entry = compiler(callable_inst_obj)
+
+        # method path (bound method; dispatch decided by self type)
+        callable_mtd_inst = CallableModel(size)
+        callable_mtd_inst.copy_from(native_callable)
+        callable_mtd_inst.step = compiler(callable_mtd_inst.step)
+
+        assert_close(callable_cls_inst(x_non_module), native_callable_out, rtol=1e-3, atol=1e-3)
+        assert_close(callable_inst_entry(x_non_module), native_callable_out, rtol=1e-3, atol=1e-3)
+        assert_close(callable_mtd_inst.step(x_non_module), native_callable_out, rtol=1e-3, atol=1e-3)
+
+        x_non_module_2 = torch.randn(5, size)
+        native_callable_out_2 = native_callable(x_non_module_2)
+        assert_close(callable_cls_inst(x_non_module_2), native_callable_out_2, rtol=1e-3, atol=1e-3)
+        assert_close(callable_inst_entry(x_non_module_2), native_callable_out_2, rtol=1e-3, atol=1e-3)
+        assert_close(callable_mtd_inst.step(x_non_module_2), native_callable_out_2, rtol=1e-3, atol=1e-3)
+
     def test_nested_function_calls(self):
         """Test compilation of model with nested function calls."""
 
@@ -485,25 +547,28 @@ class TestPerformanceImprovementConsistency:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support for stable timing")
     def test_simple_model_timing_class_function_instance_method(self):
-        """Lightweight timing sanity: Class / Function / Instance / Method entrypoints."""
+        """Timing sanity on a heavier workload: Class / Function / Instance / Method entrypoints."""
 
         class SimpleModel(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.dim = 32
+                self.dim = 128
                 self.layers = nn.ModuleList([nn.Linear(self.dim, self.dim) for _ in range(4)])
+                self.norms = nn.ModuleList([nn.LayerNorm(self.dim) for _ in range(4)])
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
-                for layer in self.layers:
+                for i, layer in enumerate(self.layers):
                     res = x
+                    x = self.norms[i](x)
                     x = layer(x)
                     x = torch.nn.functional.gelu(x)
+                    x = layer(x)
                     x = x + res
                 return x
 
         device = torch.device("cuda:0")
-        seq_len = 16
-        test_input = torch.randn(seq_len, 32, device=device)
+        seq_len = 256
+        test_input = torch.randn(seq_len, 128, device=device)
 
         native = SimpleModel().to(device).eval()
 
@@ -529,24 +594,72 @@ class TestPerformanceImprovementConsistency:
         mtd_model.load_state_dict(native.state_dict())
         mtd_model.forward = magi_compile(mtd_model.forward, dynamic_arg_dims={"x": 0})
 
-        def _bench(callable_obj, label: str, warmup: int = 5, iters: int = 200) -> float:
-            with torch.no_grad():
-                for _ in range(warmup):
-                    callable_obj(test_input)
-            torch.cuda.synchronize()
-            start = time.perf_counter()
-            with torch.no_grad():
-                for _ in range(iters):
-                    callable_obj(test_input)
-            torch.cuda.synchronize()
-            elapsed = time.perf_counter() - start
-            print(f"{label}: {elapsed:.4f}s")
-            return elapsed
+        class NonModulePerf:
+            def __init__(self, dim: int):
+                self.dim = dim
+                self.ln_weight = [torch.randn(dim, device=device) for _ in range(4)]
+                self.ln_bias = [torch.randn(dim, device=device) for _ in range(4)]
+                self.linear_weight = [torch.randn(dim, dim, device=device) for _ in range(4)]
+                self.linear_bias = [torch.randn(dim, device=device) for _ in range(4)]
 
-        t_class = _bench(cls_model, "class")
-        t_func = _bench(func_entry, "function")
-        t_inst = _bench(inst_model, "instance")
-        t_mtd = _bench(mtd_model, "method")
+            def copy_from(self, other: "NonModulePerf"):
+                self.ln_weight = [w.clone() for w in other.ln_weight]
+                self.ln_bias = [b.clone() for b in other.ln_bias]
+                self.linear_weight = [w.clone() for w in other.linear_weight]
+                self.linear_bias = [b.clone() for b in other.linear_bias]
+
+            def _run(self, x: torch.Tensor) -> torch.Tensor:
+                for i in range(4):
+                    res = x
+                    x = torch.nn.functional.layer_norm(x, (self.dim,), self.ln_weight[i], self.ln_bias[i])
+                    x = torch.nn.functional.linear(x, self.linear_weight[i], self.linear_bias[i])
+                    x = torch.nn.functional.gelu(x)
+                    x = torch.nn.functional.linear(x, self.linear_weight[i], self.linear_bias[i])
+                    x = x + res
+                return x
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self._run(x)
+
+            def __call__(self, x: torch.Tensor) -> torch.Tensor:
+                return self.forward(x)
+
+            def step(self, x: torch.Tensor) -> torch.Tensor:
+                return self._run(x)
+
+        @magi_compile(dynamic_arg_dims={"x": 0})
+        class CompiledNonModulePerf(NonModulePerf):
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return super().forward(x)
+
+        non_module_native = NonModulePerf(128)
+
+        non_module_cls = CompiledNonModulePerf(128)
+        non_module_cls.copy_from(non_module_native)
+
+        non_module_inst_obj = NonModulePerf(128)
+        non_module_inst_obj.copy_from(non_module_native)
+        non_module_inst = magi_compile(non_module_inst_obj, dynamic_arg_dims={"x": 0})
+
+        non_module_mtd_obj = NonModulePerf(128)
+        non_module_mtd_obj.copy_from(non_module_native)
+        non_module_mtd_obj.step = magi_compile(non_module_mtd_obj.step, dynamic_arg_dims={"x": 0})
+
+        with torch.no_grad():
+            class_result = cuda_benchmark(lambda: cls_model(test_input), compilation_warmup=3)
+            func_result = cuda_benchmark(lambda: func_entry(test_input), compilation_warmup=3)
+            inst_result = cuda_benchmark(lambda: inst_model(test_input), compilation_warmup=3)
+            method_result = cuda_benchmark(lambda: mtd_model(test_input), compilation_warmup=3)
+
+        print(class_result.summary("class"))
+        print(func_result.summary("function"))
+        print(inst_result.summary("instance"))
+        print(method_result.summary("method"))
+
+        t_class = class_result.median / 1000.0
+        t_func = func_result.median / 1000.0
+        t_inst = inst_result.median / 1000.0
+        t_mtd = method_result.median / 1000.0
 
         compiled_times = [t_class, t_func, t_inst, t_mtd]
         max_compiled = max(compiled_times)
@@ -554,4 +667,26 @@ class TestPerformanceImprovementConsistency:
         assert max_compiled / min_compiled < 1.2, (
             "Magi entry timings diverged too much: "
             f"class={t_class:.4f}s, function={t_func:.4f}s, instance={t_inst:.4f}s, method={t_mtd:.4f}s"
+        )
+
+        # non-nn.Module callable class / instance / method timing sanity
+        with torch.no_grad():
+            non_module_class_result = cuda_benchmark(lambda: non_module_cls(test_input), compilation_warmup=3)
+            non_module_instance_result = cuda_benchmark(lambda: non_module_inst(test_input), compilation_warmup=3)
+            non_module_method_result = cuda_benchmark(lambda: non_module_mtd_obj.step(test_input), compilation_warmup=3)
+
+        print(non_module_class_result.summary("non_module_class"))
+        print(non_module_instance_result.summary("non_module_instance"))
+        print(non_module_method_result.summary("non_module_method"))
+
+        t_nm_class = non_module_class_result.median / 1000.0
+        t_nm_inst = non_module_instance_result.median / 1000.0
+        t_nm_mtd = non_module_method_result.median / 1000.0
+
+        nm_times = [t_nm_class, t_nm_inst, t_nm_mtd]
+        max_nm = max(nm_times)
+        min_nm = min(nm_times)
+        assert max_nm / min_nm < 1.2, (
+            "Non-module entry timings diverged too much: "
+            f"class={t_nm_class:.4f}s, instance={t_nm_inst:.4f}s, method={t_nm_mtd:.4f}s"
         )
