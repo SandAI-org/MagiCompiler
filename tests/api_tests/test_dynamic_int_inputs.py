@@ -151,8 +151,8 @@ class TestDynamicIntInputs:
         with torch.no_grad():
             compiled_out = model(x, modality)
 
-        assert model.block._magi_state_forward is not None
-        assert model.block._magi_state_forward.jit_compiled_code is not None
+        assert model.block._magi_state_for_forward is not None
+        assert model.block._magi_state_for_forward.jit_compiled_code is not None
         assert torch.allclose(
             eager_out, compiled_out, atol=TOLERANCE, rtol=TOLERANCE
         ), f"max diff = {(eager_out - compiled_out).abs().max().item()}"

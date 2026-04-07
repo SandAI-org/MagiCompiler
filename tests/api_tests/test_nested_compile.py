@@ -71,15 +71,15 @@ def assert_not_torch_compiled_or_disabled(module: nn.Module, msg: str = ""):
 
 
 def assert_magi_compiled(module: nn.Module, msg: str = ""):
-    assert hasattr(module, "_magi_state_forward"), f"Missing _magi_state_forward (MagiCompileState). {msg}"
-    state = module._magi_state_forward
-    assert state is not None, f"_magi_state_forward is None (compilation disabled). {msg}"
+    assert hasattr(module, "_magi_state_for_forward"), f"Missing _magi_state_for_forward (MagiCompileState). {msg}"
+    state = module._magi_state_for_forward
+    assert state is not None, f"_magi_state_for_forward is None (compilation disabled). {msg}"
     assert state.jit_compiled_code is not None, f"jit_compiled_code is None. {msg}"
 
 
 def assert_not_magi_compiled(module: nn.Module, msg: str = ""):
-    if hasattr(module, "_magi_state_forward") and module._magi_state_forward is not None:
-        assert module._magi_state_forward.jit_compiled_code is None, f"jit_compiled_code should be None. {msg}"
+    if hasattr(module, "_magi_state_for_forward") and module._magi_state_for_forward is not None:
+        assert module._magi_state_for_forward.jit_compiled_code is None, f"jit_compiled_code should be None. {msg}"
 
 
 def assert_torch_disabled(module: nn.Module, msg: str = ""):

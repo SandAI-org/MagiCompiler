@@ -77,12 +77,8 @@ def get_attr_name_for_wrapper_installed_flag() -> str:
     return "_magi_wrapper_installed"
 
 
-def get_attr_name_for_default_state() -> str:
-    return "_magi"
-
-
-def get_attr_name_for_method_state(method_name: str) -> str:
-    return f"_magi_state_{method_name}"
+def get_attr_name_for_state(entry_name: str) -> str:
+    return f"_magi_state_for_{entry_name}"
 
 
 def _run_orchestration(state: MagiCompileState, args, kwargs):
@@ -142,12 +138,11 @@ def _lazy_init_magi_state(
     enable_if: Callable[[], bool] | None,
     config_patch: Callable[[CompileConfig], CompileConfig],
     model_tag: str | None,
-    *,
     target_method_name: str | None = None,
     state_attr: str | None = None,
 ):
     """Lazily initialize MagiCompileState and attach it on ``state_attr``."""
-    state_attr = state_attr or get_attr_name_for_default_state()
+    state_attr = state_attr or get_attr_name_for_state("function")
     if getattr(state_holder, state_attr, None) is not None:
         return
 
@@ -223,7 +218,7 @@ def _magi_compile_bound_method(
     if not callable(getattr(instance, method_name, None)):
         raise AttributeError(f"{instance.__class__.__name__} instance has no callable method '{method_name}'")
 
-    state_attr = get_attr_name_for_method_state(method_name)
+    state_attr = get_attr_name_for_state(method_name)
     if getattr(instance, state_attr, None) is not None:
         return instance
 
@@ -235,14 +230,7 @@ def _magi_compile_bound_method(
 
         if state is None:
             _lazy_init_magi_state(
-                instance,
-                instance,
-                dynamic_arg_dims,
-                enable_if,
-                config_patch,
-                model_tag,
-                target_method_name=method_name,
-                state_attr=state_attr,
+                instance, instance, dynamic_arg_dims, enable_if, config_patch, model_tag, method_name, state_attr
             )
             state = getattr(instance, state_attr, None)
 
@@ -274,7 +262,7 @@ def _magi_compile_function(
     The returned wrapper initializes state on first invocation and then dispatches
     through ``_run_orchestration``.
     """
-    state_attr = get_attr_name_for_default_state()
+    state_attr = get_attr_name_for_state("function")
     if getattr(func, state_attr, None) is not None:
         return func
 
@@ -285,7 +273,7 @@ def _magi_compile_function(
     def wrapper(*args, **kwargs):
         state = getattr(wrapper, state_attr, None)
         if state is None:
-            _lazy_init_magi_state(wrapper, func, dynamic_arg_dims, enable_if, config_patch, model_tag, state_attr=state_attr)
+            _lazy_init_magi_state(wrapper, func, dynamic_arg_dims, enable_if, config_patch, model_tag, None, state_attr)
             state = getattr(wrapper, state_attr, None)
 
         if state is None or torch.compiler.is_compiling():
