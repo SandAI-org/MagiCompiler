@@ -14,4 +14,9 @@
 
 from .api import magi_compile, magi_register_custom_op
 
-__all__ = ["magi_compile", "magi_register_custom_op"]
+try:
+    from ._version import __version__
+except ModuleNotFoundError:
+    __version__ = "0.0.0+unknown"
+
+__all__ = ["magi_compile", "magi_register_custom_op", "__version__"]
