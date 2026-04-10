@@ -37,7 +37,7 @@ jobs:
                 git config --global https.proxy "${{ secrets.HTTPS_PROXY }}"
 
         -   name: Checkout base branch
-            uses: actions/checkout@v4
+            uses: actions/checkout@v6
             timeout-minutes: 5
             with:
                 ref: ${{ github.event.pull_request.base.sha }}
@@ -45,7 +45,7 @@ jobs:
                 persist-credentials: false
 
         -   name: Checkout PR head
-            uses: actions/checkout@v4
+            uses: actions/checkout@v6
             timeout-minutes: 5
             with:
                 ref: ${{ github.event.pull_request.head.sha }}
