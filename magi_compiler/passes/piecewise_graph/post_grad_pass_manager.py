@@ -22,6 +22,7 @@ from ...utils import magi_logger, set_env_var
 from ...utils.envs import MAGI_PATTERN_MATCH_DEBUG
 from ..pass_base import InductorPass, get_pass_context
 from .fix_functionalization import FixFunctionalizationPass
+from .fusion.matmul_epilogue_fusion import MatmulCustomEpilogueFusionPass
 from .post_cleanup import PostCleanupPass
 
 
@@ -81,6 +82,7 @@ class PostGradPassManager(CustomGraphPass):
         self.pass_config = pass_config
 
         # TODO: Register custom passes here (fusion, noop elimination, sequence parallelism, async TP, Ulysses overlap).
+        self.add(MatmulCustomEpilogueFusionPass())
 
         # needs a functional graph
         self.post_cleanup = PostCleanupPass()
