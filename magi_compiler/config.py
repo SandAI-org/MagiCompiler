@@ -258,15 +258,22 @@ def model_rank_dir_name(model_idx: int, model_tag: str | None) -> str:
     return f"model_{model_idx}_rank_{rank}"
 
 
-def debug_dump_path(cache_root_dir: str, model_idx: int, model_tag: str | None) -> Path:
+def debug_dump_path(cache_root_dir: str, model_idx: int, model_tag: str | None = None) -> Path:
     from datetime import datetime
 
     run_id = datetime.now().strftime("run_%Y%m%d_%H%M%S")
     return Path(cache_root_dir) / "magi_depyf" / run_id / model_rank_dir_name(model_idx, model_tag)
 
 
-def cache_dump_path(cache_root_dir: str, model_idx: int, model_tag: str | None) -> Path:
-    return Path(cache_root_dir) / "torch_compile_cache" / model_rank_dir_name(model_idx, model_tag)
+def cache_dump_path(cache_root_dir: str, \
+                    model_idx: int | None = None, model_tag: str | None = None) -> Path:
+    if not model_idx and not model_tag:
+        # Inductor cache path
+        return Path(cache_root_dir) / "inductor_cache"
+    else:
+        # Magi cache path
+        assert model_idx and model_tag, "model_idx, model_tag are required for magi_cache path"
+        return Path(cache_root_dir) / "magi_cache" / model_rank_dir_name(model_idx, model_tag)
 
 
 def inductor_compile_config_hash(inductor_compile_config: dict[str, Any]) -> str:

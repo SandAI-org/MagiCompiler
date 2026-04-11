@@ -416,14 +416,14 @@ def _compilation_context(state: MagiCompileState):
     from .magi_depyf.inspect import explain_compilation
 
     _debug_dump_path = debug_dump_path(state.compile_config.cache_root_dir, state.model_idx, state.model_tag)
-    _cache_dump_path = cache_dump_path(state.compile_config.cache_root_dir, state.model_idx, state.model_tag)
+    _inductor_cache_dump_path = cache_dump_path(state.compile_config.cache_root_dir)
 
     with (
         patch.object(torch._dynamo.config, "assume_static_by_default", False),
         patch.object(torch._dynamo.config, "enable_cpp_symbolic_shape_guards", False),
         patch.object(torch._dynamo.config, "force_nn_module_property_static_shapes", False),
         _hijack_inline_call_to_collect_traced_files(state),
-        patch.dict(os.environ, {"TORCHINDUCTOR_CACHE_DIR": (_cache_dump_path / "inductor_cache").as_posix()}),
+        patch.dict(os.environ, {"TORCHINDUCTOR_CACHE_DIR": (_inductor_cache_dump_path).as_posix()}),
         explain_compilation(_debug_dump_path.as_posix()),
     ):
         yield
