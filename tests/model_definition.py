@@ -244,10 +244,10 @@ class RawNonModulePointwiseFusionChain:
 class RawNonModuleNormResidualActivation:
     """Non-module norm+residual+activation workload aligned with module math."""
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
+    def __init__(self, hidden_size: int, eps: float = 1e-6, device: torch.device | str = "cuda"):
         self.hidden_size = hidden_size
         self.eps = eps
-        self.weight = torch.ones(hidden_size, dtype=torch.float32)
+        self.weight = torch.ones(hidden_size, dtype=torch.float32, device=device)
 
     def copy_from(self, other: Self) -> None:
         self.weight = other.weight.clone()
