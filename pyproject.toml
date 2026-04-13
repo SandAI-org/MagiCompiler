@@ -27,6 +27,7 @@ profile = "black"
 requires = [
     "setuptools>=61.0",
     "wheel",
+    "versioningit",
 ]
 build-backend = "setuptools.build_meta"
 
