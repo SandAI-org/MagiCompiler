@@ -41,7 +41,7 @@ def test_restart_analysis_cache_handle_marks_and_skips_artifact_load(tmp_path: P
     assert p2.returncode == 0, f"worker2 failed\nstdout:\n{p2.stdout}\nstderr:\n{p2.stderr}"
     assert "too many values to unpack" not in p2.stderr
 
-    cache_files = list(cache_root.rglob("magi_compile_cache.py"))
+    cache_files = list(cache_root.rglob("magi_cache_indices.py"))
     assert cache_files, "no cache file generated"
     any_marked = False
     for cache_file in cache_files:
