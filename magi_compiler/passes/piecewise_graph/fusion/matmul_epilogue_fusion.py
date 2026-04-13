@@ -21,10 +21,12 @@ from torch.fx.node import Node
 
 from magi_compiler.passes.pass_base import MagiInductorPass
 
+from .cute_kernel import _HAS_CUTLASS, matmul_cute_custom_epilogue
 from .triton_kernels import matmul_custom_epilogue
 
 _LIB = torch.library.Library("magi_epilogue", "DEF")
 _LIB.define("matmul_custom(Tensor A, Tensor B, Tensor[] extras, str epilogue_code, bool reduce_n_by_2) -> Tensor")
+_LIB.define("matmul_custom_cute(Tensor A, Tensor B, Tensor[] extras, str epilogue_code, bool reduce_n_by_2) -> Tensor")
 
 
 @torch.library.impl(_LIB, "matmul_custom", "CUDA")
@@ -32,16 +34,29 @@ def _matmul_custom_cuda(A, B, extras, epilogue_code, reduce_n_by_2):
     return matmul_custom_epilogue(A, B, extras, epilogue_code, reduce_n_by_2)
 
 
-@torch.library.register_fake("magi_epilogue::matmul_custom")
-def _matmul_custom_abstract(A, B, extras, epilogue_code, reduce_n_by_2):
+@torch.library.impl(_LIB, "matmul_custom_cute", "CUDA")
+def _matmul_custom_cute_cuda(A, B, extras, epilogue_code, reduce_n_by_2):
+    return matmul_cute_custom_epilogue(A, B, extras, epilogue_code, reduce_n_by_2)
+
+
+def _matmul_abstract_shape(A, B, reduce_n_by_2):
+    """Shared shape + stride logic for both torch.library fake impls."""
     N_out = B.shape[1] // 2 if reduce_n_by_2 else B.shape[1]
     # Mirror the 128-byte-aligned row stride used by the real kernel so that
     # Inductor's assert_size_stride matches what we actually return.
-    # Keep the logical shape as (M, N_out) — changing it would interfere with
-    # Inductor's own K-dimension padding for the downstream mm.
     align_elems = 128 // A.element_size()
     N_stride = (N_out + align_elems - 1) // align_elems * align_elems
     return A.new_empty_strided((A.shape[0], N_out), (N_stride, 1))
+
+
+@torch.library.register_fake("magi_epilogue::matmul_custom")
+def _matmul_custom_abstract(A, B, extras, epilogue_code, reduce_n_by_2):
+    return _matmul_abstract_shape(A, B, reduce_n_by_2)
+
+
+@torch.library.register_fake("magi_epilogue::matmul_custom_cute")
+def _matmul_custom_cute_abstract(A, B, extras, epilogue_code, reduce_n_by_2):
+    return _matmul_abstract_shape(A, B, reduce_n_by_2)
 
 
 # ── Triton expression templates ────────────────────────────────────────────────
@@ -179,13 +194,39 @@ class MatmulCustomEpilogueFusionPass(MagiInductorPass):
         fused = 0
         for node in list(graph.nodes):
             if node.op == "call_function" and node.target in (torch.ops.aten.mm.default, torch.ops.aten.mm):
-                fused += self._try_fuse_custom_chain(graph, node)
+                # Prefer the CuTe path on Hopper; fall back to Triton-only.
+                if _HAS_CUTLASS:
+                    fused += self._try_fuse_custom_chain_cute(graph, node)
+                else:
+                    fused += self._try_fuse_custom_chain(graph, node)
 
         if fused:
             graph.eliminate_dead_code()
         return fused > 0
 
-    def _try_fuse_custom_chain(self, graph: fx.Graph, mm_node: fx.Node) -> int:
+    def _try_fuse_custom_chain_cute(self, graph: fx.Graph, mm_node: fx.Node) -> int:
+        """Like ``_try_fuse_custom_chain`` but emits ``matmul_custom_cute``.
+
+        Uses ``HopperWgmmaGemmPersistentKernel`` for the GEMM and a separate
+        Triton kernel for the epilogue.  The epilogue code string is identical
+        to the one produced by ``_try_fuse_custom_chain`` so the two methods
+        share the same generation logic — only the dispatched op differs.
+        """
+        return self._try_fuse_custom_chain(graph, mm_node, op=torch.ops.magi_epilogue.matmul_custom_cute.default)
+
+    def _try_fuse_custom_chain(self, graph: fx.Graph, mm_node: fx.Node, *, op=None) -> int:
+        """Fuse a chain of elementwise ops following *mm_node* into a single kernel.
+
+        Parameters
+        ----------
+        op : callable, optional
+            The dispatch target to call in the fused graph node.  Defaults to
+            ``torch.ops.magi_epilogue.matmul_custom.default`` (pure Triton).
+            Pass ``torch.ops.magi_epilogue.matmul_custom_cute.default`` to use
+            the CuTe GEMM path instead.
+        """
+        if op is None:
+            op = torch.ops.magi_epilogue.matmul_custom.default
         A, B = mm_node.args
 
         fused_nodes = {mm_node: "acc"}
@@ -417,9 +458,7 @@ class MatmulCustomEpilogueFusionPass(MagiInductorPass):
             epilogue_code = f"# @static:{json.dumps(static_dims, separators=(',', ':'))}\n" + epilogue_code
 
         with graph.inserting_after(last_fused_node):
-            fused_node = graph.call_function(
-                torch.ops.magi_epilogue.matmul_custom.default, args=(A, B, extras, epilogue_code, is_swiglu)
-            )
+            fused_node = graph.call_function(op, args=(A, B, extras, epilogue_code, is_swiglu))
             if "val" in last_fused_node.meta:
                 val = last_fused_node.meta["val"]
                 # Propagate the 128-byte-aligned row stride so downstream
