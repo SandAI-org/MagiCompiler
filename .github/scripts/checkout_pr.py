@@ -16,7 +16,7 @@
 
 """Robust PR checkout for self-hosted runners.
 
-Strategy: git-fetch with retry → tarball fallback (synthetic git history).
+Strategy: tarball via GitHub API → git-fetch fallback.
 
 Env vars: REPO_URL, BASE_SHA, HEAD_SHA, GITHUB_TOKEN, GITHUB_REPOSITORY.
 """
@@ -184,10 +184,10 @@ def tarball_checkout() -> bool:
 def main() -> None:
     log(f"HEAD={HEAD_SHA}, BASE={BASE_SHA}")
 
-    if git_fetch_checkout():
-        log("git-fetch succeeded")
-    elif tarball_checkout():
-        log("tarball fallback succeeded")
+    if tarball_checkout():
+        log("tarball succeeded")
+    elif git_fetch_checkout():
+        log("git-fetch fallback succeeded")
     else:
         log("all methods failed")
         sys.exit(1)
