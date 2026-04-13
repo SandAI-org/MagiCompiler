@@ -78,7 +78,7 @@ class TestCudaGraphFullMode:
 
         compile_config = _create_compile_config(cache_dir, CudaGraphMode.FULL)
 
-        with patch("magi_compiler._api.get_compile_config", return_value=compile_config), patch(
+        with patch("magi_compiler.api.get_compile_config", return_value=compile_config), patch(
             "torch.distributed.get_rank", return_value=0
         ):
 
@@ -149,7 +149,7 @@ class TestCudaGraphPiecewiseMode:
 
         compile_config = _create_compile_config(cache_dir, CudaGraphMode.PIECEWISE)
 
-        with patch("magi_compiler._api.get_compile_config", return_value=compile_config), patch(
+        with patch("magi_compiler.api.get_compile_config", return_value=compile_config), patch(
             "torch.distributed.get_rank", return_value=0
         ):
 
@@ -227,7 +227,7 @@ class TestCudaGraphParameterHandling:
 
         compile_config = _create_compile_config(cache_dir, CudaGraphMode.FULL)
 
-        with patch("magi_compiler._api.get_compile_config", return_value=compile_config), patch(
+        with patch("magi_compiler.api.get_compile_config", return_value=compile_config), patch(
             "torch.distributed.get_rank", return_value=0
         ):
 

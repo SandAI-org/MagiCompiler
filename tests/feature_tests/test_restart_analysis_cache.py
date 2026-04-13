@@ -30,13 +30,14 @@ def test_restart_analysis_cache_handle_marks_and_skips_artifact_load(tmp_path: P
 
     env = os.environ.copy()
     env["MAGI_LOGGING_LEVEL"] = "info"
+    env["MAGI_COMPILE_CACHE_ROOT_DIR"] = str(cache_root)
 
-    cmd1 = [sys.executable, str(helper_path), "--cache-root", str(cache_root), "--output", str(out1)]
+    cmd1 = [sys.executable, str(helper_path), "--output", str(out1)]
     p1 = subprocess.run(cmd1, env=env, capture_output=True, text=True)
     assert p1.returncode == 0, f"worker1 failed\nstdout:\n{p1.stdout}\nstderr:\n{p1.stderr}"
     assert "standalone_compile raised RestartAnalysis" in p1.stderr
 
-    cmd2 = [sys.executable, str(helper_path), "--cache-root", str(cache_root), "--output", str(out2)]
+    cmd2 = [sys.executable, str(helper_path), "--output", str(out2)]
     p2 = subprocess.run(cmd2, env=env, capture_output=True, text=True)
     assert p2.returncode == 0, f"worker2 failed\nstdout:\n{p2.stdout}\nstderr:\n{p2.stderr}"
     assert "too many values to unpack" not in p2.stderr

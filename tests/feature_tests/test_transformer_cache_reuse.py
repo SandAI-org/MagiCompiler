@@ -27,61 +27,31 @@ def test_transformer_cache_reuse_across_processes(tmp_path: Path, run_mode: str)
 
     env = os.environ.copy()
     env["MAGI_LOGGING_LEVEL"] = "info"
+    env["MAGI_COMPILE_AOT"] = "true" if run_mode == "aot" else "false"
 
+    baseline_env = {**env, "MAGI_COMPILE_CACHE_ROOT_DIR": str(tmp_path / f"baseline_cache_{run_mode}")}
     baseline = subprocess.run(
-        [
-            sys.executable,
-            str(helper_path),
-            "--cache-root",
-            str(tmp_path / f"baseline_cache_{run_mode}"),
-            "--output",
-            str(baseline_out),
-            "--run-mode",
-            run_mode,
-            "--run-kind",
-            "baseline",
-        ],
+        [sys.executable, str(helper_path), "--output", str(baseline_out), "--run-kind", "baseline"],
         capture_output=True,
         text=True,
-        env=env,
+        env=baseline_env,
     )
     assert baseline.returncode == 0, f"baseline process failed (mode={run_mode})\n{baseline.stderr}"
 
+    cache_env = {**env, "MAGI_COMPILE_CACHE_ROOT_DIR": str(cache_root)}
     run1 = subprocess.run(
-        [
-            sys.executable,
-            str(helper_path),
-            "--cache-root",
-            str(cache_root),
-            "--output",
-            str(cache_out1),
-            "--run-mode",
-            run_mode,
-            "--run-kind",
-            "cache",
-        ],
+        [sys.executable, str(helper_path), "--output", str(cache_out1), "--run-kind", "cache"],
         capture_output=True,
         text=True,
-        env=env,
+        env=cache_env,
     )
     assert run1.returncode == 0, f"cache run1 failed (mode={run_mode})\n{run1.stderr}"
 
     run2 = subprocess.run(
-        [
-            sys.executable,
-            str(helper_path),
-            "--cache-root",
-            str(cache_root),
-            "--output",
-            str(cache_out2),
-            "--run-mode",
-            run_mode,
-            "--run-kind",
-            "cache",
-        ],
+        [sys.executable, str(helper_path), "--output", str(cache_out2), "--run-kind", "cache"],
         capture_output=True,
         text=True,
-        env=env,
+        env=cache_env,
     )
     assert run2.returncode == 0, f"cache run2 failed (mode={run_mode})\n{run2.stderr}"
 

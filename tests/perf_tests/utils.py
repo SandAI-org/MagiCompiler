@@ -14,6 +14,8 @@
 
 from tests.perf_tests import BenchmarkResult
 
+MAGI_VS_TORCH_THRESHOLD = 0.97
+
 
 def assert_speedup(
     magi_vs_eager: float, eager_result: BenchmarkResult, magi_result: BenchmarkResult, label: str, threshold: float
@@ -22,4 +24,18 @@ def assert_speedup(
         f"[{label}] magi_compile must achieve >= {threshold:.2f}x over eager. "
         f"Got {magi_vs_eager:.2f}x "
         f"(eager={eager_result.median:.3f}ms, magi={magi_result.median:.3f}ms)"
+    )
+
+
+def assert_magi_vs_torch(
+    magi_vs_torch: float,
+    torch_result: BenchmarkResult,
+    magi_result: BenchmarkResult,
+    label: str,
+    threshold: float = MAGI_VS_TORCH_THRESHOLD,
+) -> None:
+    assert magi_vs_torch >= threshold, (
+        f"[{label}] magi_compile must be >= {threshold:.2f}x of torch.compile. "
+        f"Got {magi_vs_torch:.2f}x "
+        f"(torch={torch_result.median:.3f}ms, magi={magi_result.median:.3f}ms)"
     )

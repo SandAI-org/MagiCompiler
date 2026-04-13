@@ -32,7 +32,7 @@ from magi_compiler import magi_compile
 from magi_compiler.config import CompileMode
 from tests.model_definition import RawNonModulePointwiseFusionChain
 from tests.perf_tests import cuda_benchmark, print_perf_comparison
-from tests.perf_tests.utils import assert_speedup
+from tests.perf_tests.utils import assert_magi_vs_torch, assert_speedup
 
 HIDDEN_SIZE = 4096
 NUM_TOKENS = 16384
@@ -68,7 +68,9 @@ def pointwise_baselines(pointwise_device, pointwise_input):
     """Eager and torch.compile baselines, benchmarked once for the whole module."""
     x = pointwise_input
     eager_model = PointwiseFusionChain().to(pointwise_device).eval()
-    torch_compiled = torch.compile(PointwiseFusionChain().to(pointwise_device).eval(), backend="inductor")
+    torch_compiled = torch.compile(
+        PointwiseFusionChain().to(pointwise_device).eval(), fullgraph=True, dynamic=True, backend="inductor"
+    )
     with torch.no_grad():
         eager_result = cuda_benchmark(lambda: eager_model(x))
         torch_result = cuda_benchmark(lambda: torch_compiled(x), compilation_warmup=3)
@@ -92,7 +94,7 @@ def test_pointwise_class_decoration(pointwise_device, pointwise_input, pointwise
     with torch.no_grad():
         magi_result = cuda_benchmark(lambda: magi_compiled(pointwise_input), compilation_warmup=3)
 
-    magi_vs_eager, _ = print_perf_comparison(
+    magi_vs_eager, magi_vs_torch = print_perf_comparison(
         "Pointwise - class decoration",
         eager_result,
         magi_result,
@@ -100,6 +102,7 @@ def test_pointwise_class_decoration(pointwise_device, pointwise_input, pointwise
         extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})",
     )
     assert_speedup(magi_vs_eager, eager_result, magi_result, "class", SPEEDUP_VS_EAGER_THRESHOLD)
+    assert_magi_vs_torch(magi_vs_torch, torch_result, magi_result, "class")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
@@ -113,7 +116,7 @@ def test_pointwise_instance_decoration(pointwise_device, pointwise_input, pointw
     with torch.no_grad():
         magi_result = cuda_benchmark(lambda: magi_compiled(pointwise_input), compilation_warmup=3)
 
-    magi_vs_eager, _ = print_perf_comparison(
+    magi_vs_eager, magi_vs_torch = print_perf_comparison(
         "Pointwise - instance decoration",
         eager_result,
         magi_result,
@@ -121,6 +124,7 @@ def test_pointwise_instance_decoration(pointwise_device, pointwise_input, pointw
         extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})",
     )
     assert_speedup(magi_vs_eager, eager_result, magi_result, "instance", SPEEDUP_VS_EAGER_THRESHOLD)
+    assert_magi_vs_torch(magi_vs_torch, torch_result, magi_result, "instance")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
@@ -138,7 +142,7 @@ def test_pointwise_instance_torch_compile_mode(pointwise_device, pointwise_input
     with torch.no_grad():
         magi_result = cuda_benchmark(lambda: magi_compiled(pointwise_input), compilation_warmup=3)
 
-    magi_vs_eager, _ = print_perf_comparison(
+    magi_vs_eager, magi_vs_torch = print_perf_comparison(
         "Pointwise - instance (TORCH_COMPILE mode)",
         eager_result,
         magi_result,
@@ -146,6 +150,7 @@ def test_pointwise_instance_torch_compile_mode(pointwise_device, pointwise_input
         extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})",
     )
     assert_speedup(magi_vs_eager, eager_result, magi_result, "instance_tc", SPEEDUP_VS_EAGER_THRESHOLD)
+    assert_magi_vs_torch(magi_vs_torch, torch_result, magi_result, "instance_tc")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
@@ -162,7 +167,7 @@ def test_pointwise_function_decoration(pointwise_device, pointwise_input, pointw
     with torch.no_grad():
         magi_result = cuda_benchmark(lambda: compiled_entry(pointwise_input), compilation_warmup=3)
 
-    magi_vs_eager, _ = print_perf_comparison(
+    magi_vs_eager, magi_vs_torch = print_perf_comparison(
         "Pointwise - function decoration",
         eager_result,
         magi_result,
@@ -170,6 +175,7 @@ def test_pointwise_function_decoration(pointwise_device, pointwise_input, pointw
         extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})",
     )
     assert_speedup(magi_vs_eager, eager_result, magi_result, "function", SPEEDUP_VS_EAGER_THRESHOLD)
+    assert_magi_vs_torch(magi_vs_torch, torch_result, magi_result, "function")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
@@ -183,7 +189,7 @@ def test_pointwise_method_decoration(pointwise_device, pointwise_input, pointwis
     with torch.no_grad():
         magi_result = cuda_benchmark(lambda: magi_compiled(pointwise_input), compilation_warmup=3)
 
-    magi_vs_eager, _ = print_perf_comparison(
+    magi_vs_eager, magi_vs_torch = print_perf_comparison(
         "Pointwise - method decoration",
         eager_result,
         magi_result,
@@ -191,6 +197,7 @@ def test_pointwise_method_decoration(pointwise_device, pointwise_input, pointwis
         extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})",
     )
     assert_speedup(magi_vs_eager, eager_result, magi_result, "method", SPEEDUP_VS_EAGER_THRESHOLD)
+    assert_magi_vs_torch(magi_vs_torch, torch_result, magi_result, "method")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
