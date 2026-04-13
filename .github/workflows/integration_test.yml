@@ -36,22 +36,40 @@ jobs:
                 git config --global http.proxy "${{ secrets.HTTP_PROXY }}"
                 git config --global https.proxy "${{ secrets.HTTPS_PROXY }}"
 
-        -   name: Checkout base branch
-            uses: actions/checkout@v6
-            timeout-minutes: 5
-            with:
-                ref: ${{ github.event.pull_request.base.sha }}
-                fetch-depth: 1
-                persist-credentials: false
+        -   name: Checkout PR head with retry
+            timeout-minutes: 10
+            run: |
+                set -euo pipefail
+                repo_url="https://github.com/${{ github.repository }}.git"
 
-        -   name: Checkout PR head
-            uses: actions/checkout@v6
-            timeout-minutes: 5
-            with:
-                ref: ${{ github.event.pull_request.head.sha }}
-                fetch-depth: 1
-                persist-credentials: false
-                clean: false
+                git init .
+                git remote add origin "$repo_url"
+
+                for attempt in $(seq 1 15); do
+                    echo "[checkout] attempt ${attempt}/15"
+                    if timeout 1m git fetch --no-tags --prune --depth=1 origin \
+                        "${{ github.event.pull_request.base.sha }}" \
+                        "${{ github.event.pull_request.head.sha }}"; then
+                        break
+                    fi
+
+                    if [ "$attempt" -eq 15 ]; then
+                        echo "[checkout] failed after 15 attempts"
+                        exit 1
+                    fi
+
+                    echo "[checkout] fetch timeout/failure, retry in 20s (per-attempt timeout: 1m)"
+                    sleep 20
+                done
+
+                git checkout --force "${{ github.event.pull_request.head.sha }}"
+                git clean -fdx
+                git reset --hard "${{ github.event.pull_request.head.sha }}"
+                git rev-parse "${{ github.event.pull_request.base.sha }}"
+                git rev-parse "${{ github.event.pull_request.head.sha }}"
+                git log -1 --oneline
+                git diff --name-only "${{ github.event.pull_request.base.sha }}"..."${{ github.event.pull_request.head.sha }}" | head -n 20
+                echo "[checkout] done"
 
         -   name: Check Chinese Characters
             run: python3 .github/workflows/check_chinese_chars.py
