@@ -17,8 +17,10 @@
 # Robust PR checkout for self-hosted runners.
 #
 # Strategy:
-#   1. Download HEAD tarball via GitHub API (fast, single-file HTTP)
-#   2. Fallback to git-fetch if API download fails
+#   1. Download HEAD & BASE tarballs via GitHub API  (fast, curl-based)
+#      Then synthesize a local git repo with two commits so that
+#      downstream steps (git diff, pre-commit, etc.) work normally.
+#   2. Fallback to traditional git-fetch if tarball download fails.
 #
 # Required env vars:
 #   REPO_URL     – https clone URL          (e.g. https://github.com/org/repo.git)
@@ -39,42 +41,91 @@ if [ -z "${GITHUB_REPOSITORY:-}" ]; then
     GITHUB_REPOSITORY=$(echo "$REPO_URL" | sed -E 's|.*github\.com/||; s|\.git$||')
 fi
 
-# ── Method 1: tarball via GitHub API ─────────────────────────────────
-download_tarball() {
-    local tarball_url="https://api.github.com/repos/${GITHUB_REPOSITORY}/tarball/${HEAD_SHA}"
-    local tarball="/tmp/checkout_${HEAD_SHA}.tar.gz"
+# ── Helper: download a tarball for a given SHA ───────────────────────
+download_sha_tarball() {
+    local sha="$1"
+    local dest="$2"
+    local tarball_url="https://api.github.com/repos/${GITHUB_REPOSITORY}/tarball/${sha}"
 
     for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
-        echo "[checkout] tarball download attempt ${attempt}/${MAX_ATTEMPTS}"
-        if curl -fsSL --retry 3 --retry-delay 2 \
+        echo "[checkout] tarball(${sha:0:8}) attempt ${attempt}/${MAX_ATTEMPTS}"
+        if curl -fsSL --retry 3 --retry-delay 2 --max-time 120 \
             -H "Authorization: Bearer ${GITHUB_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
-            -L "$tarball_url" -o "$tarball"; then
-
-            echo "[checkout] tarball downloaded, extracting..."
-            # tarball contains a top-level directory like org-repo-<sha>/
-            # strip it so files land in current directory
-            tar xzf "$tarball" --strip-components=1
-            rm -f "$tarball"
+            -L "$tarball_url" -o "$dest"; then
             return 0
         fi
-
         if [ "$attempt" -eq "$MAX_ATTEMPTS" ]; then
-            echo "[checkout] tarball download failed after ${MAX_ATTEMPTS} attempts"
             return 1
         fi
         sleep "$SLEEP_SECS"
     done
 }
 
+# ── Method 1: tarball + synthetic git history ────────────────────────
+tarball_checkout() {
+    local head_tar="/tmp/checkout_head_${HEAD_SHA}.tar.gz"
+    local base_tar="/tmp/checkout_base_${BASE_SHA}.tar.gz"
+
+    echo "[checkout] downloading HEAD tarball..."
+    if ! download_sha_tarball "$HEAD_SHA" "$head_tar"; then
+        echo "[checkout] HEAD tarball download failed"
+        return 1
+    fi
+
+    echo "[checkout] downloading BASE tarball..."
+    if ! download_sha_tarball "$BASE_SHA" "$base_tar"; then
+        echo "[checkout] BASE tarball download failed"
+        rm -f "$head_tar"
+        return 1
+    fi
+
+    # Clean working directory (keep .git if it exists, we'll reinit)
+    rm -rf .git
+    git init .
+    git config user.email "ci@sandai.org"
+    git config user.name "CI"
+
+    # Commit 1: BASE
+    echo "[checkout] extracting BASE tarball..."
+    tar xzf "$base_tar" --strip-components=1
+    rm -f "$base_tar"
+    git add -A
+    GIT_COMMITTER_DATE="2000-01-01T00:00:00Z" \
+    GIT_AUTHOR_DATE="2000-01-01T00:00:00Z" \
+    git commit --allow-empty -m "base ${BASE_SHA}"
+    # Tag the commit so we can reference it by the original SHA
+    git tag "sha-base"
+
+    # Commit 2: HEAD (clear everything, then extract head tarball)
+    git rm -rf . > /dev/null 2>&1 || true
+    echo "[checkout] extracting HEAD tarball..."
+    tar xzf "$head_tar" --strip-components=1
+    rm -f "$head_tar"
+    git add -A
+    GIT_COMMITTER_DATE="2000-01-02T00:00:00Z" \
+    GIT_AUTHOR_DATE="2000-01-02T00:00:00Z" \
+    git commit --allow-empty -m "head ${HEAD_SHA}"
+    git tag "sha-head"
+
+    # Create replace refs so that `git rev-parse <real-sha>` resolves
+    local base_local head_local
+    base_local=$(git rev-parse sha-base)
+    head_local=$(git rev-parse sha-head)
+    git replace "$BASE_SHA" "$base_local" 2>/dev/null || true
+    git replace "$HEAD_SHA" "$head_local" 2>/dev/null || true
+
+    echo "[checkout] synthetic git history created"
+    echo "[checkout]   BASE ${BASE_SHA} -> ${base_local}"
+    echo "[checkout]   HEAD ${HEAD_SHA} -> ${head_local}"
+    return 0
+}
+
 # ── Method 2: git fetch (fallback) ──────────────────────────────────
 git_fetch_fallback() {
-    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-        git remote set-url origin "$REPO_URL" 2>/dev/null || git remote add origin "$REPO_URL"
-    else
-        git init .
-        git remote add origin "$REPO_URL"
-    fi
+    rm -rf .git
+    git init .
+    git remote add origin "$REPO_URL"
 
     cleanup_git_locks() {
         rm -f .git/shallow.lock .git/index.lock .git/packed-refs.lock \
@@ -86,9 +137,11 @@ git_fetch_fallback() {
         echo "[checkout] git-fetch attempt ${attempt}/${MAX_ATTEMPTS}"
 
         if [ $((attempt % 2)) -eq 1 ]; then
+            echo "[checkout] mode=proxy strict(lowSpeed=100/10)"
             fetch_cmd=(timeout 2m git -c http.lowSpeedLimit=100 -c http.lowSpeedTime=10
                 fetch --no-tags --prune --depth=1 origin "$BASE_SHA" "$HEAD_SHA")
         else
+            echo "[checkout] mode=direct relaxed(lowSpeed=1/30)"
             fetch_cmd=(env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY
                 timeout 2m git -c http.proxy= -c https.proxy= -c http.lowSpeedLimit=1 -c http.lowSpeedTime=30
                 fetch --no-tags --prune --depth=1 origin "$BASE_SHA" "$HEAD_SHA")
@@ -115,11 +168,16 @@ git_fetch_fallback() {
 echo "[checkout] HEAD_SHA=${HEAD_SHA}"
 echo "[checkout] BASE_SHA=${BASE_SHA}"
 
-if download_tarball; then
+if tarball_checkout; then
     echo "[checkout] tarball checkout succeeded"
 else
     echo "[checkout] tarball failed, falling back to git-fetch"
     git_fetch_fallback
 fi
 
+echo "[checkout] verifying..."
+git rev-parse "$BASE_SHA"
+git rev-parse "$HEAD_SHA"
+git log --oneline --all | head -5
+git diff --stat "$BASE_SHA" "$HEAD_SHA" | tail -3
 echo "[checkout] done"
