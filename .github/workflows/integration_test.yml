@@ -103,7 +103,7 @@ jobs:
                 git rev-parse "${{ github.event.pull_request.base.sha }}"
                 git rev-parse "${{ github.event.pull_request.head.sha }}"
                 git log -1 --oneline
-                git diff --name-only "${{ github.event.pull_request.base.sha }}"..."${{ github.event.pull_request.head.sha }}" | head -n 20
+                git diff --name-only "${{ github.event.pull_request.base.sha }}".."${{ github.event.pull_request.head.sha }}" | head -n 20
                 echo "[checkout] done"
 
         -   name: Check Chinese Characters
