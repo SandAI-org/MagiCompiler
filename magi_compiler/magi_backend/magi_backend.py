@@ -483,7 +483,9 @@ class MagiBackend:
         )
 
         # Path: .../model_{idx}_{model_tag}_rank_{rank}/{hash}/
-        self.local_magi_cache_path: Path = cache_dump_path(self.compile_config.cache_root_dir, self.model_idx, self.model_tag) / hash_key
+        self.local_magi_cache_path: Path = (
+            cache_dump_path(self.compile_config.cache_root_dir, self.model_idx, self.model_tag) / hash_key
+        )
         self.local_magi_cache_path.mkdir(parents=True, exist_ok=True)
         self.compiler_manager.initialize_cache(self.local_magi_cache_path)
 
