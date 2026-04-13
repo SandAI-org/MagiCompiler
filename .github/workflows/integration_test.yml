@@ -51,9 +51,29 @@ jobs:
 
                 for attempt in $(seq 1 15); do
                     echo "[checkout] attempt ${attempt}/15"
-                    if timeout 1m git fetch --no-tags --prune --depth=1 origin \
-                        "${{ github.event.pull_request.base.sha }}" \
-                        "${{ github.event.pull_request.head.sha }}"; then
+
+                    if [ "$attempt" -le 8 ]; then
+                        echo "[checkout] mode=proxy strict(lowSpeed=100/10)"
+                        fetch_cmd=(
+                            timeout 1m
+                            git -c http.lowSpeedLimit=100 -c http.lowSpeedTime=10
+                            fetch --no-tags --prune --depth=1 origin
+                            "${{ github.event.pull_request.base.sha }}"
+                            "${{ github.event.pull_request.head.sha }}"
+                        )
+                    else
+                        echo "[checkout] mode=direct relaxed(lowSpeed=1/30)"
+                        fetch_cmd=(
+                            env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY
+                            timeout 1m
+                            git -c http.proxy= -c https.proxy= -c http.lowSpeedLimit=1 -c http.lowSpeedTime=30
+                            fetch --no-tags --prune --depth=1 origin
+                            "${{ github.event.pull_request.base.sha }}"
+                            "${{ github.event.pull_request.head.sha }}"
+                        )
+                    fi
+
+                    if "${fetch_cmd[@]}"; then
                         break
                     fi
 
@@ -62,7 +82,7 @@ jobs:
                         exit 1
                     fi
 
-                    echo "[checkout] fetch timeout/failure, retry in 20s (per-attempt timeout: 1m)"
+                    echo "[checkout] fetch timeout/failure, retry in 20s"
                     sleep 20
                 done
 
