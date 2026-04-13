@@ -266,12 +266,12 @@ def debug_dump_path(cache_root_dir: str, model_idx: int, model_tag: str | None =
 
 
 def cache_dump_path(cache_root_dir: str, model_idx: int | None = None, model_tag: str | None = None) -> Path:
-    if not model_idx and not model_tag:
+    if model_idx is None and model_tag is None:
         # Inductor cache path
         return Path(cache_root_dir) / "inductor_cache"
     else:
         # Magi cache path
-        assert model_idx and model_tag, "model_idx, model_tag are required for magi_cache path"
+        assert model_idx is not None and model_tag is not None, "model_idx, model_tag are required for magi_cache path"
         return Path(cache_root_dir) / "magi_cache" / model_rank_dir_name(model_idx, model_tag)
 
 
