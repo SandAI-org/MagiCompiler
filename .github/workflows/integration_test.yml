@@ -82,8 +82,8 @@ jobs:
                         exit 1
                     fi
 
-                    echo "[checkout] fetch timeout/failure, retry in 20s"
-                    sleep 20
+                    echo "[checkout] fetch timeout/failure, retry in 5s"
+                    sleep 5
                 done
 
                 git checkout --force "${{ github.event.pull_request.head.sha }}"
