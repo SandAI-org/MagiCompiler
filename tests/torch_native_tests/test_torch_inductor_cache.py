@@ -122,14 +122,10 @@ class TestTorchInductorCache:
         before = cache_snapshot()
         for _ in range(num_epochs):
             dummy_input = torch.randint(
-                0, model_config.vocab_size,
-                (max_batch_size, model_config.max_position_embeddings),
-                device=_device(),
+                0, model_config.vocab_size, (max_batch_size, model_config.max_position_embeddings), device=_device()
             )
             dummy_label = torch.randint(
-                0, model_config.vocab_size,
-                (max_batch_size, model_config.max_position_embeddings),
-                device=_device(),
+                0, model_config.vocab_size, (max_batch_size, model_config.max_position_embeddings), device=_device()
             )
 
             optimizer.zero_grad()
@@ -152,9 +148,7 @@ class TestTorchInductorCache:
         before = cache_snapshot()
         with torch.no_grad():
             dummy_input = torch.randint(
-                0, model_config.vocab_size,
-                (max_batch_size, model_config.max_position_embeddings),
-                device=_device(),
+                0, model_config.vocab_size, (max_batch_size, model_config.max_position_embeddings), device=_device()
             )
             model.forward(dummy_input)
         after = cache_snapshot()

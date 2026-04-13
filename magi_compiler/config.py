@@ -265,8 +265,7 @@ def debug_dump_path(cache_root_dir: str, model_idx: int, model_tag: str | None =
     return Path(cache_root_dir) / "magi_depyf" / run_id / model_rank_dir_name(model_idx, model_tag)
 
 
-def cache_dump_path(cache_root_dir: str, \
-                    model_idx: int | None = None, model_tag: str | None = None) -> Path:
+def cache_dump_path(cache_root_dir: str, model_idx: int | None = None, model_tag: str | None = None) -> Path:
     if not model_idx and not model_tag:
         # Inductor cache path
         return Path(cache_root_dir) / "inductor_cache"
