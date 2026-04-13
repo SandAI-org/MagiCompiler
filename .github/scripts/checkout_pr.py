@@ -31,7 +31,6 @@ import subprocess
 import sys
 import tarfile
 import time
-import urllib.request
 
 RETRIES = 10
 SLEEP = 5
@@ -115,17 +114,33 @@ def git_fetch_checkout() -> bool:
 
 def _download(sha: str, dest: str) -> bool:
     url = f"https://api.github.com/repos/{REPO}/tarball/{sha}"
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github+json"})
     for i in range(1, RETRIES + 1):
-        log(f"tarball({sha[:8]}) attempt {i}/{RETRIES}")
-        try:
-            with urllib.request.urlopen(req, timeout=120) as r, open(dest, "wb") as f:
-                shutil.copyfileobj(r, f)
+        via = "proxy" if i % 2 == 1 else "direct"
+        log(f"tarball({sha[:8]}) attempt {i}/{RETRIES} via {via}")
+        curl = [
+            "curl",
+            "-fSL",
+            "--retry",
+            "2",
+            "--retry-delay",
+            "3",
+            "--connect-timeout",
+            "15",
+            "--max-time",
+            "180",
+            "-H",
+            f"Authorization: Bearer {TOKEN}",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-o",
+            dest,
+            url,
+        ]
+        env = no_proxy_env() if via == "direct" else None
+        if subprocess.run(curl, check=False, env=env).returncode == 0:
             return True
-        except Exception as e:
-            log(f"  error: {e}")
-            if i < RETRIES:
-                time.sleep(SLEEP)
+        if i < RETRIES:
+            time.sleep(SLEEP)
     return False
 
 
