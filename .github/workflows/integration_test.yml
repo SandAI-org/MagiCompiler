@@ -49,7 +49,16 @@ jobs:
                     git remote add origin "$repo_url"
                 fi
 
+                cleanup_git_locks() {
+                    rm -f .git/shallow.lock \
+                          .git/index.lock \
+                          .git/packed-refs.lock \
+                          .git/FETCH_HEAD.lock \
+                          .git/config.lock
+                }
+
                 for attempt in $(seq 1 15); do
+                    cleanup_git_locks
                     echo "[checkout] attempt ${attempt}/15"
 
                     if [ "$attempt" -le 8 ]; then
@@ -82,10 +91,12 @@ jobs:
                         exit 1
                     fi
 
+                    cleanup_git_locks
                     echo "[checkout] fetch timeout/failure, retry in 5s"
                     sleep 5
                 done
 
+                cleanup_git_locks
                 git checkout --force "${{ github.event.pull_request.head.sha }}"
                 git clean -fdx
                 git reset --hard "${{ github.event.pull_request.head.sha }}"
