@@ -38,35 +38,35 @@ jobs:
 
         -   name: Checkout PR head with retry
             timeout-minutes: 10
+            env:
+                REPO_URL: https://github.com/${{ github.repository }}.git
+                GITHUB_REPOSITORY: ${{ github.repository }}
+                GITHUB_TOKEN: ${{ github.token }}
+                BASE_SHA: ${{ github.event.pull_request.base.sha }}
+                HEAD_SHA: ${{ github.event.pull_request.head.sha }}
             run: |
                 set -euo pipefail
 
-                script_path=".github/scripts/checkout_pr.sh"
-                api_url="https://api.github.com/repos/${{ github.repository }}/contents/${script_path}?ref=${{ github.event.pull_request.head.sha }}"
+                script_path=".github/scripts/checkout_pr.py"
+                api_url="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${script_path}?ref=${HEAD_SHA}"
 
                 mkdir -p .github/scripts
                 for attempt in $(seq 1 10); do
-                    echo "[checkout-bootstrap] download script attempt ${attempt}/10"
+                    echo "[bootstrap] download checkout script attempt ${attempt}/10"
                     if curl -fsSL \
-                        -H "Authorization: Bearer ${{ github.token }}" \
+                        -H "Authorization: Bearer ${GITHUB_TOKEN}" \
                         -H "Accept: application/vnd.github.raw" \
                         "$api_url" -o "$script_path"; then
                         break
                     fi
                     if [ "$attempt" -eq 10 ]; then
-                        echo "[checkout-bootstrap] failed to download checkout script"
+                        echo "[bootstrap] failed to download checkout script"
                         exit 1
                     fi
                     sleep 3
                 done
 
-                chmod +x "$script_path"
-                REPO_URL="https://github.com/${{ github.repository }}.git" \
-                GITHUB_REPOSITORY="${{ github.repository }}" \
-                GITHUB_TOKEN="${{ github.token }}" \
-                BASE_SHA="${{ github.event.pull_request.base.sha }}" \
-                HEAD_SHA="${{ github.event.pull_request.head.sha }}" \
-                bash "$script_path"
+                python3 "$script_path"
 
         -   name: Check Chinese Characters
             run: python3 .github/workflows/check_chinese_chars.py
