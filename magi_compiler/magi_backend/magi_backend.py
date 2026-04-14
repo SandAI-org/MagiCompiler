@@ -111,7 +111,7 @@ class CompilerManager:
         The organization of the cache directory is as follows:
         cache_dir=/path/to/magi_cache/model_{idx}[_{tag}]_rank_{rank}/hash_str/[prefix/]
         inside cache_dir, there will be:
-        - magi_cache_indices.py
+        - subgraph_indices.py
         - computation_graph.py
 
         for multiple prefixes, they can share the same base cache dir of
@@ -120,7 +120,7 @@ class CompilerManager:
         """
 
         self.cache_dir: Path = cache_dir
-        self.cache_file_path: Path = cache_dir / "magi_cache_indices.py"
+        self.cache_file_path: Path = cache_dir / "subgraph_indices.py"
 
         if self.disable_cache:
             magi_logger.info("MagiCompiler's cache is disabled.")
