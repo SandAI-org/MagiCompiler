@@ -63,7 +63,7 @@ class CompilerInterface:
     name: str
 
     @abstractmethod
-    def initialize_cache(self, cache_dir: Path, prefix: str = ""):
+    def initialize_cache(self, cache_dir: Path):
         """
         when the MagiCompiler process uses `cache_dir` as the cache directory,
         the compiler should initialize itself with the cache directory,

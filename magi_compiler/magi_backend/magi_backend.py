@@ -104,7 +104,7 @@ class CompilerManager:
             with pass_context(runtime_shape, graph_index):
                 yield
 
-    def initialize_cache(self, cache_dir: Path, prefix: str | None = None):
+    def initialize_cache(self, cache_dir: Path):
         """
         Initialize the cache directory for the compiler.
 
@@ -139,7 +139,7 @@ class CompilerManager:
                     cache_handle = CacheHandle(*handle)
                     self.cache[cache_entry] = cache_handle
 
-        self.compiler.initialize_cache(cache_dir=self.cache_dir, prefix=prefix)
+        self.compiler.initialize_cache(cache_dir=self.cache_dir)
 
     def save_to_file(self):
         if self.disable_cache:
