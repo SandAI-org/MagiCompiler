@@ -159,11 +159,8 @@ class InductorStandaloneAdaptor(CompilerInterface):
         factors: list[Any] = [CacheBase.get_system(), torch_key()]
         return compute_hash(factors)
 
-    def initialize_cache(self, cache_dir: Path, prefix: str | None = None):
-        if prefix:
-            self.cache_dir: Path = cache_dir / prefix
-        else:
-            self.cache_dir: Path = cache_dir
+    def initialize_cache(self, cache_dir: Path):
+        self.cache_dir: Path = cache_dir
 
     @observe_lifecycle("compiler_compile")
     def compile(

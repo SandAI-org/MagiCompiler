@@ -265,14 +265,12 @@ def debug_dump_path(cache_root_dir: str, model_idx: int, model_tag: str | None =
     return Path(cache_root_dir) / "magi_depyf" / run_id / model_rank_dir_name(model_idx, model_tag)
 
 
-def cache_dump_path(cache_root_dir: str, model_idx: int | None = None, model_tag: str | None = None) -> Path:
-    if model_idx is None and model_tag is None:
-        # Inductor cache path
-        return Path(cache_root_dir) / "inductor_cache"
-    else:
-        # Magi cache path
-        assert model_idx is not None and model_tag is not None, "model_idx, model_tag are required for magi_cache path"
-        return Path(cache_root_dir) / "magi_cache" / model_rank_dir_name(model_idx, model_tag)
+def magi_cache_dump_path(cache_root_dir: str, model_idx: int, model_tag: str | None = None) -> Path:
+    return Path(cache_root_dir) / "magi_cache" / model_rank_dir_name(model_idx, model_tag)
+
+
+def inductor_cache_dump_path(cache_root_dir: str, model_idx: int | None = None, model_tag: str | None = None) -> Path:
+    return Path(cache_root_dir) / "inductor_cache"
 
 
 def inductor_compile_config_hash(inductor_compile_config: dict[str, Any]) -> str:

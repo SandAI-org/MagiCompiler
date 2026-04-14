@@ -25,7 +25,7 @@ from torch import distributed as dist
 from torch import nn
 from torch._dynamo.symbolic_convert import InliningInstructionTranslator
 
-from magi_compiler.config import cache_dump_path, debug_dump_path
+from magi_compiler.config import debug_dump_path, inductor_cache_dump_path
 from magi_compiler.cuda.cudart import pin_memory_in_place
 from magi_compiler.magi_backend.magi_compiler_base import MagiCompileState
 from magi_compiler.utils import compilation_counter, envs, magi_logger
@@ -397,7 +397,7 @@ def _compilation_context(state: MagiCompileState):
     from .magi_depyf.inspect import explain_compilation
 
     _debug_dump_path = debug_dump_path(state.compile_config.cache_root_dir, state.model_idx, state.model_tag)
-    _inductor_cache_dump_path = cache_dump_path(state.compile_config.cache_root_dir)
+    _inductor_cache_dump_path = inductor_cache_dump_path(state.compile_config.cache_root_dir)
 
     with (
         _isolated_dynamo_config(),

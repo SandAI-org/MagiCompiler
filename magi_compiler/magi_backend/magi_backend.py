@@ -30,7 +30,7 @@ from torch._dispatch.python import enable_python_dispatcher
 from torch._guards import detect_fake_mode
 
 import magi_compiler.utils.envs as envs
-from magi_compiler.config import CompileConfig, CompileMode, CudaGraphMode, cache_dump_path, inductor_compile_config_hash
+from magi_compiler.config import CompileConfig, CompileMode, CudaGraphMode, inductor_compile_config_hash, magi_cache_dump_path
 from magi_compiler.magi_depyf.timeline import observe_lifecycle, observe_lifecycle_context
 from magi_compiler.offload.offload_warpper import OffloadWrapper
 from magi_compiler.passes import CustomJointGraphPartitionFn, FullGraphPassManager, PostGradPassManager, pass_context
@@ -484,7 +484,7 @@ class MagiBackend:
 
         # Path: .../model_{idx}_{model_tag}_rank_{rank}/{hash}/
         self.local_magi_cache_path: Path = (
-            cache_dump_path(self.compile_config.cache_root_dir, self.model_idx, self.model_tag) / hash_key
+            magi_cache_dump_path(self.compile_config.cache_root_dir, self.model_idx, self.model_tag) / hash_key
         )
         self.local_magi_cache_path.mkdir(parents=True, exist_ok=True)
         self.compiler_manager.initialize_cache(self.local_magi_cache_path)
