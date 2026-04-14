@@ -57,13 +57,11 @@ def test_autograd_cache_flag_and_cache_reuse(tmp_path: Path):
 
     env = os.environ.copy()
     env["MAGI_LOGGING_LEVEL"] = "info"
+    env["MAGI_COMPILE_CACHE_ROOT_DIR"] = str(cache_root)
 
     def _run(output: Path) -> subprocess.CompletedProcess:
         return subprocess.run(
-            [sys.executable, str(helper_path), "--cache-root", str(cache_root), "--output", str(output)],
-            env=env,
-            capture_output=True,
-            text=True,
+            [sys.executable, str(helper_path), "--output", str(output)], env=env, capture_output=True, text=True
         )
 
     # ── Run 1: warm cache ────────────────────────────────────────────────────

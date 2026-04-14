@@ -140,8 +140,6 @@ class MagiCompileState:
             options = options or {}
             # Drop all the guards in the AOT compile mode as bytecode hook is not used anymore.
             options["guard_filter_fn"] = lambda guards: [False for _ in guards]
-            assert hasattr(torch._dynamo.config, "enable_aot_compile"), "enable_aot_compile config not available"
-            torch._dynamo.config.enable_aot_compile = True
 
         # torch.compile returns a ``compile_wrapper`` closure defined in
         # torch/_dynamo/eval_frame.py.  When ``enable_aot_compile=True`` it

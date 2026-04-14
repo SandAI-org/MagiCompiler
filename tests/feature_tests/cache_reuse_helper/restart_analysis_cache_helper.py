@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 
 from magi_compiler import magi_compile, magi_register_custom_op
-from magi_compiler.config import CompileMode, get_compile_config
+from magi_compiler.config import get_compile_config
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
@@ -107,17 +107,12 @@ def _collect_new_run_dirs(cache_root: Path, before: set[str]) -> list[Path]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cache-root", required=True)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
-    cache_root = Path(args.cache_root)
-    run_dirs_before = {str(p) for p in cache_root.rglob("run_*") if p.is_dir()}
-
     config = get_compile_config()
-    config.compile_mode = CompileMode.MAGI_COMPILE
-    config.aot = False
-    config.cache_root_dir = args.cache_root
+    cache_root = Path(config.cache_root_dir)
+    run_dirs_before = {str(p) for p in cache_root.rglob("run_*") if p.is_dir()}
 
     torch._dynamo.reset()
     torch.manual_seed(2026)

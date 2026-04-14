@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 
 from magi_compiler import magi_compile, magi_register_custom_op
-from magi_compiler.config import CompileMode, get_compile_config
+from magi_compiler.config import get_compile_config
 
 DEVICE = "cuda"
 DTYPE = torch.float16
@@ -99,16 +99,11 @@ def make_input() -> torch.Tensor:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cache-root", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--run-mode", choices=["jit", "aot"], required=True)
     parser.add_argument("--run-kind", choices=["baseline", "cache"], required=True)
     args = parser.parse_args()
 
     config = get_compile_config()
-    config.compile_mode = CompileMode.MAGI_COMPILE
-    config.aot = args.run_mode == "aot"
-    config.cache_root_dir = args.cache_root
     config.splitting_ops = ["test::scaled_dot_product_attn_boundary"]
 
     torch._dynamo.reset()
@@ -122,7 +117,7 @@ def main() -> None:
         y = model(x)
 
     payload = {
-        "mode": args.run_mode,
+        "mode": "aot" if config.aot else "jit",
         "run_kind": args.run_kind,
         "shape": list(y.shape),
         "sum": float(y.float().sum().item()),

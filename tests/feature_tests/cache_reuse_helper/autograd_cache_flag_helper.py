@@ -49,7 +49,6 @@ import torch._inductor as _inductor_mod
 import torch.nn as nn
 
 from magi_compiler import magi_compile
-from magi_compiler.config import CompileMode, get_compile_config
 from magi_compiler.utils import compilation_counter
 
 DEVICE = "cuda"
@@ -89,14 +88,8 @@ class TrainingModel(nn.Module):
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cache-root", required=True)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
-
-    config = get_compile_config()
-    config.compile_mode = CompileMode.MAGI_COMPILE
-    config.aot = False
-    config.cache_root_dir = args.cache_root
 
     torch._dynamo.reset()
     torch.manual_seed(2026)

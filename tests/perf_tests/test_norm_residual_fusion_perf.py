@@ -33,7 +33,7 @@ from magi_compiler import magi_compile
 from magi_compiler.config import CompileMode
 from tests.model_definition import RawNonModuleNormResidualActivation, RMSNorm
 from tests.perf_tests import cuda_benchmark, print_perf_comparison
-from tests.perf_tests.utils import assert_speedup
+from tests.perf_tests.utils import assert_magi_vs_torch, assert_speedup
 
 HIDDEN_SIZE = 4096
 NUM_TOKENS = 16384
@@ -69,7 +69,9 @@ def nra_baselines(nra_device, nra_inputs):
     """Eager and torch.compile baselines, benchmarked once for the whole module."""
     x, residual = nra_inputs
     eager_model = NormResidualActivation(HIDDEN_SIZE).to(nra_device).eval()
-    torch_compiled = torch.compile(NormResidualActivation(HIDDEN_SIZE).to(nra_device).eval(), backend="inductor")
+    torch_compiled = torch.compile(
+        NormResidualActivation(HIDDEN_SIZE).to(nra_device).eval(), fullgraph=True, dynamic=True, backend="inductor"
+    )
     with torch.no_grad():
         eager_result = cuda_benchmark(lambda: eager_model(x, residual))
         torch_result = cuda_benchmark(lambda: torch_compiled(x, residual), compilation_warmup=3)
@@ -94,7 +96,7 @@ def test_norm_residual_class_decoration(nra_device, nra_inputs, nra_baselines):
     with torch.no_grad():
         magi_result = cuda_benchmark(lambda: magi_compiled(x, residual), compilation_warmup=3)
 
-    magi_vs_eager, _ = print_perf_comparison(
+    magi_vs_eager, magi_vs_torch = print_perf_comparison(
         "Norm+Residual+SiLU - class decoration",
         eager_result,
         magi_result,
@@ -102,6 +104,7 @@ def test_norm_residual_class_decoration(nra_device, nra_inputs, nra_baselines):
         extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})  dtype=bf16",
     )
     assert_speedup(magi_vs_eager, eager_result, magi_result, "class", SPEEDUP_VS_EAGER_THRESHOLD)
+    assert_magi_vs_torch(magi_vs_torch, torch_result, magi_result, "class")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
@@ -116,7 +119,7 @@ def test_norm_residual_instance_decoration(nra_device, nra_inputs, nra_baselines
     with torch.no_grad():
         magi_result = cuda_benchmark(lambda: magi_compiled(x, residual), compilation_warmup=3)
 
-    magi_vs_eager, _ = print_perf_comparison(
+    magi_vs_eager, magi_vs_torch = print_perf_comparison(
         "Norm+Residual+SiLU - instance decoration",
         eager_result,
         magi_result,
@@ -124,6 +127,7 @@ def test_norm_residual_instance_decoration(nra_device, nra_inputs, nra_baselines
         extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})  dtype=bf16",
     )
     assert_speedup(magi_vs_eager, eager_result, magi_result, "instance", SPEEDUP_VS_EAGER_THRESHOLD)
+    assert_magi_vs_torch(magi_vs_torch, torch_result, magi_result, "instance")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
@@ -144,7 +148,7 @@ def test_norm_residual_instance_torch_compile_mode(nra_device, nra_inputs, nra_b
     with torch.no_grad():
         magi_result = cuda_benchmark(lambda: magi_compiled(x, residual), compilation_warmup=3)
 
-    magi_vs_eager, _ = print_perf_comparison(
+    magi_vs_eager, magi_vs_torch = print_perf_comparison(
         "Norm+Residual+SiLU - instance (TORCH_COMPILE mode)",
         eager_result,
         magi_result,
@@ -152,6 +156,7 @@ def test_norm_residual_instance_torch_compile_mode(nra_device, nra_inputs, nra_b
         extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})  dtype=bf16",
     )
     assert_speedup(magi_vs_eager, eager_result, magi_result, "instance_tc", SPEEDUP_VS_EAGER_THRESHOLD)
+    assert_magi_vs_torch(magi_vs_torch, torch_result, magi_result, "instance_tc")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
@@ -169,7 +174,7 @@ def test_norm_residual_function_decoration(nra_device, nra_inputs, nra_baselines
     with torch.no_grad():
         magi_result = cuda_benchmark(lambda: compiled_entry(x, residual), compilation_warmup=3)
 
-    magi_vs_eager, _ = print_perf_comparison(
+    magi_vs_eager, magi_vs_torch = print_perf_comparison(
         "Norm+Residual+SiLU - function decoration",
         eager_result,
         magi_result,
@@ -177,6 +182,7 @@ def test_norm_residual_function_decoration(nra_device, nra_inputs, nra_baselines
         extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})  dtype=bf16",
     )
     assert_speedup(magi_vs_eager, eager_result, magi_result, "function", SPEEDUP_VS_EAGER_THRESHOLD)
+    assert_magi_vs_torch(magi_vs_torch, torch_result, magi_result, "function")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
@@ -191,7 +197,7 @@ def test_norm_residual_method_decoration(nra_device, nra_inputs, nra_baselines):
     with torch.no_grad():
         magi_result = cuda_benchmark(lambda: magi_compiled(x, residual), compilation_warmup=3)
 
-    magi_vs_eager, _ = print_perf_comparison(
+    magi_vs_eager, magi_vs_torch = print_perf_comparison(
         "Norm+Residual+SiLU - method decoration",
         eager_result,
         magi_result,
@@ -199,6 +205,7 @@ def test_norm_residual_method_decoration(nra_device, nra_inputs, nra_baselines):
         extra_info=f"shape=({NUM_TOKENS}, {HIDDEN_SIZE})  dtype=bf16",
     )
     assert_speedup(magi_vs_eager, eager_result, magi_result, "method", SPEEDUP_VS_EAGER_THRESHOLD)
+    assert_magi_vs_torch(magi_vs_torch, torch_result, magi_result, "method")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")

@@ -36,28 +36,44 @@ jobs:
                 git config --global http.proxy "${{ secrets.HTTP_PROXY }}"
                 git config --global https.proxy "${{ secrets.HTTPS_PROXY }}"
 
-        -   name: Checkout base branch
-            uses: actions/checkout@v4
-            timeout-minutes: 5
-            with:
-                ref: ${{ github.event.pull_request.base.sha }}
-                fetch-depth: 1
-                persist-credentials: false
+        -   name: Checkout PR head with retry
+            id: checkout
+            timeout-minutes: 10
+            env:
+                REPO_URL: https://github.com/${{ github.repository }}.git
+                GITHUB_REPOSITORY: ${{ github.repository }}
+                GITHUB_TOKEN: ${{ github.token }}
+                BASE_SHA: ${{ github.event.pull_request.base.sha }}
+                HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+            run: |
+                set -euo pipefail
 
-        -   name: Checkout PR head
-            uses: actions/checkout@v4
-            timeout-minutes: 5
-            with:
-                ref: ${{ github.event.pull_request.head.sha }}
-                fetch-depth: 1
-                persist-credentials: false
-                clean: false
+                script_path=".github/scripts/checkout_pr.py"
+                api_url="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${script_path}?ref=${HEAD_SHA}"
+
+                mkdir -p .github/scripts
+                for attempt in $(seq 1 10); do
+                    echo "[bootstrap] download checkout script attempt ${attempt}/10"
+                    if curl -fsSL \
+                        -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                        -H "Accept: application/vnd.github.raw" \
+                        "$api_url" -o "$script_path"; then
+                        break
+                    fi
+                    if [ "$attempt" -eq 10 ]; then
+                        echo "[bootstrap] failed to download checkout script"
+                        exit 1
+                    fi
+                    sleep 3
+                done
+
+                python3 "$script_path"
 
         -   name: Check Chinese Characters
             run: python3 .github/workflows/check_chinese_chars.py
             env:
-                BASE_REF: ${{ github.event.pull_request.base.sha }}
-                HEAD_REF: ${{ github.event.pull_request.head.sha }}
+                BASE_REF: ${{ steps.checkout.outputs.base_ref || github.event.pull_request.base.sha }}
+                HEAD_REF: ${{ steps.checkout.outputs.head_ref || github.event.pull_request.head.sha }}
 
         -   name: Check Code Style
             run: pre-commit run --show-diff-on-failure --color=always --all-files

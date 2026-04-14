@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import functools
 import inspect
 from typing import Callable, TypeVar
@@ -24,7 +25,7 @@ from ._api import (
     _magi_compile_function,
 )
 from ._magi_register_custom_op import _magi_register_custom_op_impl
-from .config import CompileConfig
+from .config import CompileConfig, CompileMode, get_compile_config
 
 _T = TypeVar("_T", bound=type)
 _F = TypeVar("_F", bound=Callable)
@@ -127,6 +128,10 @@ def magi_compile(
         )
 
     config_patch = config_patch or (lambda x: x)
+    conf = config_patch(copy.deepcopy(get_compile_config()))
+    enable = enable_if is None or enable_if()
+    if not enable or conf.compile_mode == CompileMode.NONE:
+        return obj
 
     is_bound_method = inspect.ismethod(obj)
     is_function = inspect.isfunction(obj)
@@ -171,17 +176,20 @@ def magi_compile(
 
     _check_dynamic_arg_dims(inferred_dims, target_func)
 
+    if model_tag is None:
+        model_tag = getattr(obj, "__name__", obj.__class__.__name__)
+
     # 3. Dispatch by entry kind (class / instance / bound method / bare function)
 
     if is_class:
-        return _magi_compile_class(obj, inferred_dims, enable_if, config_patch, model_tag, method_name)
+        return _magi_compile_class(obj, inferred_dims, conf, model_tag, method_name)
     elif is_instance:
-        return _magi_compile_bound_method(obj, inferred_dims, enable_if, config_patch, model_tag, method_name)
+        return _magi_compile_bound_method(obj, inferred_dims, conf, model_tag, method_name)
     elif is_bound_method:
-        _magi_compile_bound_method(owner_instance, inferred_dims, enable_if, config_patch, model_tag, method_name)
+        _magi_compile_bound_method(owner_instance, inferred_dims, conf, model_tag, method_name)
         return getattr(owner_instance, method_name)
     elif is_function:
-        return _magi_compile_function(obj, inferred_dims, enable_if, config_patch, model_tag)
+        return _magi_compile_function(obj, inferred_dims, conf, model_tag)
 
     raise TypeError(f"Unsupported type for magi_compile: {type(obj)}")
 
