@@ -27,7 +27,7 @@ from torch import nn
 from torch.testing import assert_close
 
 from magi_compiler.api import magi_compile
-from magi_compiler.config import CompileConfig, CompileMode
+from magi_compiler.config import CompileConfig
 from tests.perf_tests import cuda_benchmark
 
 
@@ -35,7 +35,7 @@ from tests.perf_tests import cuda_benchmark
 def compile_config_fixture():
     """Fixture to set up a clean compile configuration for each test."""
     cache_dir = tempfile.mkdtemp()
-    compile_config = CompileConfig(compile_mode=CompileMode.TORCH_COMPILE, cache_root_dir=cache_dir)
+    compile_config = CompileConfig(cache_root_dir=cache_dir)
 
     with patch("magi_compiler.config.get_compile_config") as mock_get_config, patch("torch.distributed.get_rank") as mock_rank:
         mock_get_config.return_value = compile_config
