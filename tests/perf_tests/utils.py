@@ -12,14 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+
+import torch
+
 from tests.perf_tests import BenchmarkResult
 
 MAGI_VS_TORCH_THRESHOLD = 0.97
+
+# Absolute speedup-vs-eager thresholds are calibrated on H100.
+# On other GPUs the operator mix (e.g. matmul vs memory-bound) may shift the
+# ratio significantly, so we only enforce magi ≈ torch.compile (parity check).
+_PERF_CALIBRATED_GPUS = ("H100",)
+
+
+@functools.cache
+def is_perf_calibrated_gpu() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    name = torch.cuda.get_device_name(0)
+    return any(kw in name for kw in _PERF_CALIBRATED_GPUS)
 
 
 def assert_speedup(
     magi_vs_eager: float, eager_result: BenchmarkResult, magi_result: BenchmarkResult, label: str, threshold: float
 ) -> None:
+    if not is_perf_calibrated_gpu():
+        return
     assert magi_vs_eager >= threshold, (
         f"[{label}] magi_compile must achieve >= {threshold:.2f}x over eager. "
         f"Got {magi_vs_eager:.2f}x "
