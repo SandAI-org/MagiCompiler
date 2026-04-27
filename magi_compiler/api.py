@@ -1,4 +1,4 @@
-# Copyright (c) 2025 SandAI. All Rights Reserved.
+# Copyright (c) 2026 SandAI. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 import copy
 import functools
 import inspect
-from typing import Callable, TypeVar
+from typing import Any, Callable, TypeVar
 
 from ._api import (
     _check_dynamic_arg_dims,
@@ -202,6 +202,7 @@ def magi_register_custom_op(
     backward_fn: Callable | None = None,
     is_compute_sensitive: bool = False,
     is_subgraph_boundary: bool = False,
+    extra_triton_kernels: list[Any] | tuple[Any, ...] | None = None,
 ):
     """
     A unified decorator to register a custom operator with PyTorch's library.
@@ -210,6 +211,153 @@ def magi_register_custom_op(
     - @torch.library.custom_op
     - @torch.library.register_fake
     - fn.register_autograd
+    - @torch.library.triton_op (auto-detected: see "Triton kernels" below)
+
+    plus two convenience layers on top:
+    - frozen-dataclass inputs (including arbitrarily nested dataclasses)
+      are transparently flattened into primitive parameters before being
+      handed to ``torch.library``, then reassembled at runtime so user code
+      sees the original signature; see "Frozen-dataclass inputs" below.
+    - autograd hooks expressed against the original signature keep
+      working when dataclass inputs are present: ``setup_context_fn`` and
+      ``backward_fn`` are bridged in/out of the flat parameter space
+      automatically; see "Autograd with dataclass inputs" below.
+
+    Triton kernels
+    --------------
+    If the decorated function (or any helper it calls) launches one or more
+    ``triton.jit`` kernels (with or without an explicit ``wrap_triton`` call),
+    the function is automatically registered via ``torch.library.triton_op``
+    instead of ``torch.library.custom_op``. Detected kernel references are
+    transparently rewritten to go through ``torch.library.wrap_triton`` at
+    runtime, so the user does not need to add ``wrap_triton(...)`` manually.
+    Already-wrapped kernels are detected and not re-wrapped (the rewrite is
+    idempotent), and the same op may launch any number of triton kernels:
+    Inductor will see all of them and may inline / fuse them.
+
+    This makes the kernels visible to ``torch.compile`` / Inductor (instead of
+    keeping the op opaque), enabling kernel inlining and fusion in the
+    generated graph. Falls back to plain ``custom_op`` if no kernels are
+    detected or if ``triton_op`` registration fails.
+
+    Detection is best-effort source introspection and recurses through helper
+    functions called from the decorated function (including helpers in other
+    modules and helpers reached via ``torch.ops.<ns>.<op>(...)`` calls). For
+    pathological cases (kernels stored on instance attributes, kernels behind
+    user-defined conditional wrappers, kernels constructed only at runtime,
+    etc.), pass ``extra_triton_kernels`` to provide the list explicitly.
+
+    Frozen-dataclass inputs
+    -----------------------
+    Any parameter typed as a ``@dataclass(frozen=True)`` is recursively
+    flattened into its individual leaf fields before being registered with
+    ``torch.library``. Nested dataclasses (dataclass-of-dataclass, to any
+    depth) are fully unwrapped using ``__`` as the join separator, e.g. an
+    outer ``cfg: OuterCfg`` whose ``OuterCfg.inner: InnerCfg(val: float)``
+    becomes a flat parameter named ``cfg__inner__val: float``. At call time
+    the user passes (and the body sees) the original dataclass instance; the
+    decorator handles the conversion in both directions.
+
+    Requirements:
+    - Each dataclass MUST be ``frozen=True``; the leaf field types must be
+      types accepted by ``torch.library.custom_op``. Supported field types
+      include:
+        * ``torch.Tensor``
+        * Scalars: ``int``, ``float``, ``bool``, ``str``
+        * Structured scalars: ``torch.dtype``, ``torch.device``
+        * Optional variants: ``Optional[Tensor]``, ``Optional[int]``, etc.,
+          as well as PEP 604 syntax (e.g. ``Tensor | None``).
+        * Lists of scalars/tensors: ``list[int]``, ``list[float]``,
+          ``list[bool]``, ``list[Tensor]``, ``list[Optional[Tensor]]``.
+          Note that PyTorch does **not** support ``list[Optional[int]]``
+          but it does support ``list[Optional[Tensor]]``. Similarly,
+          ``Optional[list[Tensor]]`` is **not** supported (use
+          ``list[Optional[Tensor]]`` instead).
+        * ``Literal[str, ...]`` and ``Enum`` containing only string values
+          are automatically supported by downgrading them to ``str`` at the
+          schema boundary (but your op body still receives the original string).
+    - Returning a dataclass from the op body is not supported; only
+      ``torch.Tensor`` / ``tuple[torch.Tensor, ...]`` returns are allowed.
+
+    Autograd with dataclass inputs
+    ------------------------------
+    ``setup_context_fn`` and ``backward_fn`` are written against the
+    *original* (dataclass-bearing) signature, not the flat one:
+    - ``setup_context_fn(ctx, inputs, output)`` receives ``inputs`` in the
+      same positional order as ``fn``'s signature, with each dataclass
+      argument reassembled back into its original instance.
+    - ``backward_fn(ctx, *grad_outputs)`` must return one grad per
+      *original* input (dataclass arguments count as one slot). For a
+      dataclass slot the user may return any of:
+        * ``None``                 -> equivalent to "no grad for any field"
+                                      (the bridge fills ``None`` into every
+                                      flat slot under that dataclass).
+        * a same-shape dataclass / namedtuple instance -> per-field grad,
+          ``None`` leaves are allowed and are spread to the corresponding
+          flat slots.
+        * a ``dict`` keyed by field name -> same as above but without
+          having to construct a new dataclass instance.
+      Returning the wrong number of top-level grads raises ``ValueError``.
+
+    Limitations and known caveats
+    -----------------------------
+    - Return type: only ``torch.Tensor`` / ``tuple[torch.Tensor, ...]`` /
+      ``list[torch.Tensor]`` / ``None`` are accepted by the underlying
+      ``torch.library`` schema. Returning a dataclass raises a clear
+      ``TypeError`` at registration time -- destructure the dataclass into a
+      tuple at the op boundary instead.
+    - Top-level tuple/dict: parameters typed as ``tuple[...]`` or
+      ``dict[...]`` are not supported by the schema and will raise a
+      ``TypeError``. Wrap them in a ``@dataclass(frozen=True)`` instead.
+    - Local nested types: a dataclass field annotated with a class defined
+      inside another function body, combined with
+      ``from __future__ import annotations``, cannot be resolved by
+      ``typing.get_type_hints`` and produces a clear ``TypeError`` pointing at
+      the offending field. Move the type to module scope to fix.
+    - Double backward: not supported automatically. ``backward_fn`` runs
+      under autograd but does not get its own backward registered. If you need
+      higher-order derivatives, either compute them manually inside
+      ``backward_fn`` (using ``torch.autograd.grad(..., create_graph=True)``
+      against differentiable building blocks), or split the op so the second
+      derivative comes from a separately registered op.
+    - vmap / functorch: there is no automatic ``vmap`` rule. Calling a
+      registered op under ``torch.vmap`` falls back to the default per-sample
+      loop. If you need a real batched implementation, register one with
+      ``torch.library.register_vmap`` against the *flat* inner op
+      (``op._magi_inner_op`` when dataclass inputs are present).
+    - Triton kernel imported inside the op body: ``import`` statements
+      executed at call time are not visible to source introspection. Either
+      hoist the import to module scope, or pass the kernel object explicitly
+      via ``extra_triton_kernels=``.
+    - Mixed wrapped/bare Triton kernels: If your op body uses both
+      ``wrap_triton(kernel)[grid]`` and bare ``kernel[grid]`` calls, avoid
+      using the same kernel function for both styles, or the automated wrapper
+      might double-wrap it. Standardize on one style (bare is recommended).
+    - dataclass field of type ``list[Dataclass]``: not supported. The flat
+      schema requires a static, finite leaf count; a runtime-sized list of
+      dataclass instances has no fixed shape. Restructure into parallel
+      ``list[Tensor]`` / ``list[int]`` fields, or split into per-element op
+      calls.
+    - Mixed-type tuple returns (e.g. ``tuple[Tensor, int]``): not
+      supported by the schema (only homogeneous ``tuple[Tensor, ...]`` /
+      ``list[Tensor]`` are accepted). Either return only the tensors, or
+      stash the scalar on ``ctx`` and recover it from the call site.
+    - Custom CUDA streams inside the op body (``with torch.cuda.stream(s):``):
+      not analysed. Inductor will treat the op as opaque w.r.t. the
+      alternate stream; do stream-overlap orchestration above the op
+      boundary, not inside it.
+    - 0-dim Tensor used as a scalar: works but goes through a Tensor
+      schema slot (not a ``Scalar`` slot), so the value enters the FX graph
+      as a tensor input and won't constant-fold. Pass an actual
+      ``int``/``float``/``bool`` if you want scalar semantics.
+    - CPU-only execution on the Triton path: a Triton-backed op only
+      registers a ``cuda`` kernel. Calling it on CPU tensors raises
+      ``"no kernel registered"`` from PyTorch; do CPU dispatch above the op
+      boundary.
+    - Decorating a function twice with magi_register_custom_op: the
+      second decoration receives the wrapper from the first, not the user's
+      original function, and produces a confusing schema error. Decorate at
+      most once per function object.
 
     Arguments:
         name: The fully qualified name of the operator (e.g., "namespace::op_name").
@@ -218,15 +366,26 @@ def magi_register_custom_op(
         infer_output_meta_fn: Specifies output tensor metadata (shape, dtype, device) for tracing.
             - None (default): Assumes each output has the same metadata as the corresponding
               input tensor (1st output matches 1st tensor input, 2nd matches 2nd, etc.).
+              On the triton path, when None is passed the decorated function itself is used as
+              the fake/meta implementation (must be make_fx-traceable, which it is once kernel
+              calls go through ``wrap_triton``).
             - list[str]: Parameter names whose metadata to use for outputs.
               E.g., ["weight", "bias"] means output[0] has same shape as `weight`,
               output[1] has same shape as `bias`.
-            - Callable: Custom function with same signature as the op, returns torch.empty_like()
-              tensors matching the expected output shapes.
+            - Callable: Custom function with same signature as the op (in the
+              *original* signature space, including dataclass arguments
+              -- the bridge handles flattening for you), returns
+              torch.empty_like() tensors matching the expected output shapes.
         setup_context_fn: Function to save tensors/values for backward.
-            Signature: setup_context_fn(ctx, inputs, output)
+            Signature: ``setup_context_fn(ctx, inputs, output)``. ``inputs``
+            mirrors the *original* signature: dataclass arguments are
+            reassembled into their original instances rather than exposed as
+            flat fields. Safe to use both with and without dataclass inputs.
         backward_fn: Function to compute gradients.
-            Signature: backward_fn(ctx, *grad_outputs) -> tuple of gradients
+            Signature: ``backward_fn(ctx, *grad_outputs) -> tuple of grads``.
+            Return one grad per *original* parameter (use ``None`` for
+            non-differentiable / non-tensor parameters). For dataclass
+            parameters see "Autograd with dataclass inputs" above.
         is_compute_sensitive: If True, marks this operator as compute-intensive (e.g., MatMul,
             Attention). During activation recomputation (rematerialization), outputs of
             compute-sensitive ops are prioritized for saving rather than recomputing,
@@ -235,6 +394,13 @@ def magi_register_custom_op(
             compilation. Each sub-graph between boundary operators is compiled independently
             by Inductor, enabling piecewise compilation and more flexible scheduling
             (e.g., for CPU offloading or overlapping computation with data transfer).
+        extra_triton_kernels: Optional explicit list of triton kernels (``triton.jit`` /
+            ``triton.autotune`` objects) referenced inside the decorated function. Use this
+            when automatic source-based detection fails to discover a kernel
+            (e.g., kernel stored on ``self``, kernel selected by a user-defined ``maybe_capture``
+            wrapper, etc.). Kernels listed here are merged with the auto-detected
+            ones and deduplicated by object identity, so it is safe (and harmless)
+            to also list a kernel that is statically detectable.
 
     Returns:
         The registered custom operator function.
@@ -281,6 +447,74 @@ def magi_register_custom_op(
         ... )
         ... def square(x: torch.Tensor) -> torch.Tensor:
         ...     return x * x
+
+        4. With a (nested) frozen dataclass argument (auto pytree-flattened):
+
+        >>> from dataclasses import dataclass
+        >>>
+        >>> @dataclass(frozen=True)
+        ... class NormCfg:
+        ...     eps: float
+        ...     affine: bool
+        ...
+        >>> @dataclass(frozen=True)
+        ... class AttnCfg:
+        ...     scale: float
+        ...     norm: NormCfg            # nested dataclass field
+        ...
+        >>> @magi_register_custom_op()
+        ... def my_attn(q: torch.Tensor, k: torch.Tensor, cfg: AttnCfg) -> torch.Tensor:
+        ...     out = (q @ k.transpose(-1, -2)) * cfg.scale
+        ...     return out / (out.std() + cfg.norm.eps)
+
+        Internally the registered op has flat parameters
+        ``q, k, cfg__scale, cfg__norm__eps, cfg__norm__affine``; users still
+        call ``my_attn(q, k, AttnCfg(scale=..., norm=NormCfg(...)))``.
+
+        5. Dataclass input + custom backward (signature is the original one):
+
+        >>> @dataclass(frozen=True)
+        ... class ScaleCfg:
+        ...     scale: float
+        ...
+        >>> def _setup(ctx, inputs, output):
+        ...     x, cfg = inputs                 # original signature view
+        ...     ctx.save_for_backward(x)
+        ...     ctx.scale = cfg.scale
+        ...
+        >>> def _bwd(ctx, grad_out):
+        ...     # one grad per ORIGINAL input; dataclass slot -> ``None``.
+        ...     return grad_out * ctx.scale, None
+        ...
+        >>> @magi_register_custom_op(
+        ...     setup_context_fn=_setup,
+        ...     backward_fn=_bwd,
+        ... )
+        ... def scale_op(x: torch.Tensor, cfg: ScaleCfg) -> torch.Tensor:
+        ...     return x * cfg.scale
+
+        6. Triton kernel inside the body, no manual ``wrap_triton`` needed:
+
+        >>> import triton
+        >>> import triton.language as tl
+        >>>
+        >>> @triton.jit
+        ... def cos_kernel(in_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
+        ...     pid = tl.program_id(axis=0)
+        ...     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        ...     mask = offsets < n
+        ...     x = tl.load(in_ptr + offsets, mask=mask)
+        ...     tl.store(out_ptr + offsets, tl.cos(x), mask=mask)
+        ...
+        >>> @magi_register_custom_op()
+        ... def my_cos(x: torch.Tensor) -> torch.Tensor:
+        ...     out = torch.empty_like(x)
+        ...     n = x.numel()
+        ...     # Plain ``kernel[grid](...)`` -- the decorator detects this and
+        ...     # registers ``my_cos`` as a triton_op so torch.compile can
+        ...     # inline ``cos_kernel``.
+        ...     cos_kernel[((n + 127) // 128,)](x, out, n, BLOCK_SIZE=128)
+        ...     return out
     """
     return _magi_register_custom_op_impl(
         name=name,
@@ -290,4 +524,5 @@ def magi_register_custom_op(
         backward_fn=backward_fn,
         is_compute_sensitive=is_compute_sensitive,
         is_subgraph_boundary=is_subgraph_boundary,
+        extra_triton_kernels=extra_triton_kernels,
     )

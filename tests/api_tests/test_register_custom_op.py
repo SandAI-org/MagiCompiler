@@ -1,4 +1,4 @@
-# Copyright (c) 2025 SandAI. All Rights Reserved.
+# Copyright (c) 2026 SandAI. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,17 +13,35 @@
 # limitations under the License.
 
 """
-Tests for @magi_register_custom_op decorator functionality.
+This test suite covers the plain ``@magi_register_custom_op`` path (without Triton kernels).
 
-This module tests:
-- Basic custom op registration (forward only)
-- Custom op with infer_output_meta_fn for torch.compile tracing
-- Custom op with autograd support (setup_context + backward)
-- Full custom op with all components
-- Multiple outputs support
-- Integration with magi_compile decorator
+Coverage Matrix & Sections:
+---------------------------
+SECTION 1: Core Registration & Meta Inference
+  - Basic usage & auto-generated namings
+  - Explicit / Identity / Param-name-based ``infer_output_meta_fn``
+  - Name duplicate rejection & missing-namespace rejection
+  - Compile & Subgraph boundary / Compute-sensitive markings
+
+SECTION 2: Type Support & Schema Bridging
+  - **Dataclass flattening**: Single, nested, Optional fields (``Optional[Tensor/scalar]``, PEP 604), List fields (``list[int/bool/Tensor/Optional[Tensor]]``).
+  - **Downgrades & Scrubs**: ``Literal[str]``, ``Enum``, ``list[int]=[0]`` defaults.
+  - **Unsupported Rejections**: Mutable dataclasses, Return dataclasses, Top-level ``tuple/dict``, Unresolvable local types.
+  - **Special Inputs/Outputs**: ``dtype/device`` fields, Top-level ``Optional[Tensor]``, Returning ``list[Tensor]``.
+
+SECTION 3: Autograd Bridge
+  - Standard setup/backward for plain and dataclass inputs
+  - Tuple multi-output backward
+  - Per-field ``None`` gradients
+  - Backward function calling another magi op
+
+SECTION 4: Compositions & Python Semantics
+  - Kwarg-only dataclass calls
+  - ``mutates_args`` mapping
+  - Nested magi op calls (an op calling another op)
 """
 
+import dataclasses
 import tempfile
 from unittest.mock import patch
 
@@ -33,7 +51,11 @@ from torch import nn
 from torch.testing import assert_close
 
 from magi_compiler.api import magi_compile, magi_register_custom_op
-from magi_compiler.config import CompileConfig
+from magi_compiler.config import CompileConfig, CompileMode
+
+# ============================================================================
+# SECTION 1: Core Registration & Meta Inference
+# ============================================================================
 
 
 class TestBasicRegistration:
@@ -56,7 +78,9 @@ class TestBasicRegistration:
         """Test custom op with multiple input tensors."""
 
         @magi_register_custom_op(name="test::multi_input_op", mutates_args=())
-        def _multi_input_op(a: torch.Tensor, b: torch.Tensor, scale: float) -> torch.Tensor:
+        def _multi_input_op(
+            a: torch.Tensor, b: torch.Tensor, scale: float
+        ) -> torch.Tensor:
             return (a + b) * scale
 
         a = torch.randn(4, 8)
@@ -74,13 +98,19 @@ class TestInferOutputMeta:
     def test_with_infer_output_meta(self):
         """Test that infer_output_meta_fn is correctly registered for tracing."""
 
-        def _scaled_add_infer_output_meta(x: torch.Tensor, y: torch.Tensor, scale: float) -> torch.Tensor:
+        def _scaled_add_infer_output_meta(
+            x: torch.Tensor, y: torch.Tensor, scale: float
+        ) -> torch.Tensor:
             return torch.empty_like(x)
 
         @magi_register_custom_op(
-            name="test::scaled_add_op", mutates_args=(), infer_output_meta_fn=_scaled_add_infer_output_meta
+            name="test::scaled_add_op",
+            mutates_args=(),
+            infer_output_meta_fn=_scaled_add_infer_output_meta,
         )
-        def _scaled_add_op(x: torch.Tensor, y: torch.Tensor, scale: float) -> torch.Tensor:
+        def _scaled_add_op(
+            x: torch.Tensor, y: torch.Tensor, scale: float
+        ) -> torch.Tensor:
             return (x + y) * scale
 
         x = torch.randn(4, 8)
@@ -94,11 +124,20 @@ class TestInferOutputMeta:
     def test_multiple_outputs_infer_meta(self):
         """Test infer_output_meta_fn with multiple outputs."""
 
-        def _split_op_infer_output_meta(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        def _split_op_infer_output_meta(
+            x: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             half_size = x.shape[-1] // 2
-            return (x.new_empty((*x.shape[:-1], half_size)), x.new_empty((*x.shape[:-1], half_size)))
+            return (
+                x.new_empty((*x.shape[:-1], half_size)),
+                x.new_empty((*x.shape[:-1], half_size)),
+            )
 
-        @magi_register_custom_op(name="test::split_op", mutates_args=(), infer_output_meta_fn=_split_op_infer_output_meta)
+        @magi_register_custom_op(
+            name="test::split_op",
+            mutates_args=(),
+            infer_output_meta_fn=_split_op_infer_output_meta,
+        )
         def _split_op(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             half_size = x.shape[-1] // 2
             # NOTE: Output cannot share the same memory with input
@@ -111,126 +150,6 @@ class TestInferOutputMeta:
         assert out2.shape == (4, 4)
         assert_close(out1, x[..., :4])
         assert_close(out2, x[..., 4:])
-
-
-class TestAutograd:
-    """Tests for custom op with autograd support."""
-
-    def test_with_autograd(self):
-        """Test custom op with setup_context and backward functions."""
-
-        def _square_infer_output_meta(x: torch.Tensor) -> torch.Tensor:
-            return torch.empty_like(x)
-
-        def _square_setup_context(ctx, inputs, output):
-            (x,) = inputs
-            ctx.save_for_backward(x)
-
-        def _square_backward(ctx, grad_output):
-            (x,) = ctx.saved_tensors
-            return grad_output * 2 * x
-
-        @magi_register_custom_op(
-            name="test::square_op",
-            mutates_args=(),
-            infer_output_meta_fn=_square_infer_output_meta,
-            setup_context_fn=_square_setup_context,
-            backward_fn=_square_backward,
-        )
-        def _square_op(x: torch.Tensor) -> torch.Tensor:
-            return x * x
-
-        x = torch.randn(4, 8, requires_grad=True)
-        output = _square_op(x)
-        loss = output.sum()
-        loss.backward()
-
-        # Gradient of x^2 is 2x
-        expected_grad = 2 * x
-        assert_close(x.grad, expected_grad)
-
-    def test_autograd_multiple_inputs(self):
-        """Test autograd with multiple input tensors."""
-
-        def _weighted_sum_infer_output_meta(a: torch.Tensor, b: torch.Tensor, weight: float) -> torch.Tensor:
-            return torch.empty_like(a)
-
-        def _weighted_sum_setup_context(ctx, inputs, output):
-            a, b, weight = inputs
-            ctx.save_for_backward(a, b)
-            ctx.weight = weight
-
-        def _weighted_sum_backward(ctx, grad_output):
-            a, b = ctx.saved_tensors
-            weight = ctx.weight
-            grad_a = grad_output * weight
-            grad_b = grad_output * (1 - weight)
-            return grad_a, grad_b, None  # None for non-tensor input
-
-        @magi_register_custom_op(
-            name="test::weighted_sum_op",
-            mutates_args=(),
-            infer_output_meta_fn=_weighted_sum_infer_output_meta,
-            setup_context_fn=_weighted_sum_setup_context,
-            backward_fn=_weighted_sum_backward,
-        )
-        def _weighted_sum_op(a: torch.Tensor, b: torch.Tensor, weight: float) -> torch.Tensor:
-            return a * weight + b * (1 - weight)
-
-        a = torch.randn(4, 8, requires_grad=True)
-        b = torch.randn(4, 8, requires_grad=True)
-        weight = 0.7
-
-        output = _weighted_sum_op(a, b, weight)
-        loss = output.sum()
-        loss.backward()
-
-        expected_grad_a = torch.ones_like(a) * weight
-        expected_grad_b = torch.ones_like(b) * (1 - weight)
-
-        assert_close(a.grad, expected_grad_a)
-        assert_close(b.grad, expected_grad_b)
-
-    def test_autograd_multiple_outputs(self):
-        """Test autograd with multiple output tensors."""
-
-        def _split_scale_infer_output_meta(x: torch.Tensor, scale: float) -> tuple[torch.Tensor, torch.Tensor]:
-            half = x.shape[-1] // 2
-            return (x.new_empty((*x.shape[:-1], half)), x.new_empty((*x.shape[:-1], half)))
-
-        def _split_scale_setup_context(ctx, inputs, output):
-            x, scale = inputs
-            ctx.save_for_backward(x)
-            ctx.scale = scale
-            ctx.half = x.shape[-1] // 2
-
-        def _split_scale_backward(ctx, grad_out1, grad_out2):
-            (x,) = ctx.saved_tensors
-            scale = ctx.scale
-            # Reconstruct gradient for x
-            grad_x = torch.cat([grad_out1 * scale, grad_out2 * scale], dim=-1)
-            return grad_x, None
-
-        @magi_register_custom_op(
-            name="test::split_scale_op",
-            mutates_args=(),
-            infer_output_meta_fn=_split_scale_infer_output_meta,
-            setup_context_fn=_split_scale_setup_context,
-            backward_fn=_split_scale_backward,
-        )
-        def _split_scale_op(x: torch.Tensor, scale: float) -> tuple[torch.Tensor, torch.Tensor]:
-            half = x.shape[-1] // 2
-            return x[..., :half] * scale, x[..., half:] * scale
-
-        x = torch.randn(4, 8, requires_grad=True)
-        scale = 2.0
-
-        out1, out2 = _split_scale_op(x, scale)
-        loss = out1.sum() + out2.sum()
-        loss.backward()
-
-        expected_grad = torch.ones_like(x) * scale
-        assert_close(x.grad, expected_grad)
 
 
 class TestAutoGeneratedName:
@@ -258,7 +177,9 @@ class TestAutoGeneratedName:
         """Test auto-generated name with multiple tensor outputs."""
 
         @magi_register_custom_op()
-        def _auto_name_multi_out_op(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        def _auto_name_multi_out_op(
+            a: torch.Tensor, b: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             return torch.clone(a + 1), torch.clone(b + 2)
 
         def fn(a, b):
@@ -284,7 +205,9 @@ class TestAutoGeneratedName:
             (x,) = ctx.saved_tensors
             return grad_output * 2 * x
 
-        @magi_register_custom_op(setup_context_fn=_auto_grad_setup_context, backward_fn=_auto_grad_backward)
+        @magi_register_custom_op(
+            setup_context_fn=_auto_grad_setup_context, backward_fn=_auto_grad_backward
+        )
         def _auto_name_square_op(x: torch.Tensor) -> torch.Tensor:
             return x * x
 
@@ -322,7 +245,9 @@ class TestDefaultIdentityMetaFn:
         """Test default meta function with multiple inputs but single tensor output."""
 
         @magi_register_custom_op(name="test::default_meta_multi_in")
-        def _default_meta_multi_in_op(a: torch.Tensor, b: torch.Tensor, scale: float) -> torch.Tensor:
+        def _default_meta_multi_in_op(
+            a: torch.Tensor, b: torch.Tensor, scale: float
+        ) -> torch.Tensor:
             return (a + b) * scale
 
         def fn(a, b, scale):
@@ -342,7 +267,9 @@ class TestDefaultIdentityMetaFn:
         """Test default meta function with multiple tensor outputs."""
 
         @magi_register_custom_op(name="test::default_meta_multi_out")
-        def _default_meta_multi_out_op(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        def _default_meta_multi_out_op(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             # Clone to avoid aliasing issues
             return torch.clone(x * 2), torch.clone(y * 3)
 
@@ -405,6 +332,26 @@ class TestDefaultIdentityMetaFn:
         assert_close(out2, y * scale + offset)
 
 
+@pytest.fixture()
+def magi_compile_config():
+    """Fixture to set up a clean compile configuration for magi_compile tests."""
+    compile_config = CompileConfig(
+        compile_mode=CompileMode.TORCH_COMPILE, cache_root_dir=tempfile.mkdtemp()
+    )
+
+    with (
+        patch("magi_compiler.api.get_compile_config") as mock_get_config,
+        patch("torch.distributed.get_rank") as mock_rank,
+    ):
+        mock_get_config.return_value = compile_config
+        mock_rank.return_value = 0
+        yield compile_config
+
+    import shutil
+
+    shutil.rmtree(compile_config.cache_root_dir, ignore_errors=True)
+
+
 class TestTorchCompileIntegration:
     """Tests for integration with torch.compile."""
 
@@ -414,7 +361,11 @@ class TestTorchCompileIntegration:
         def _double_infer_output_meta(x: torch.Tensor) -> torch.Tensor:
             return torch.empty_like(x)
 
-        @magi_register_custom_op(name="test::double_op", mutates_args=(), infer_output_meta_fn=_double_infer_output_meta)
+        @magi_register_custom_op(
+            name="test::double_op",
+            mutates_args=(),
+            infer_output_meta_fn=_double_infer_output_meta,
+        )
         def _double_op(x: torch.Tensor) -> torch.Tensor:
             return x * 2
 
@@ -469,21 +420,6 @@ class TestTorchCompileIntegration:
         assert_close(x.grad, expected_grad)
 
 
-@pytest.fixture()
-def magi_compile_config():
-    """Fixture to set up a clean compile configuration for magi_compile tests."""
-    compile_config = CompileConfig(cache_root_dir=tempfile.mkdtemp())
-
-    with patch("magi_compiler.api.get_compile_config") as mock_get_config, patch("torch.distributed.get_rank") as mock_rank:
-        mock_get_config.return_value = compile_config
-        mock_rank.return_value = 0
-        yield compile_config
-
-    import shutil
-
-    shutil.rmtree(compile_config.cache_root_dir, ignore_errors=True)
-
-
 class TestMagiCompileIntegration:
     """Tests for integration with magi_compile decorator."""
 
@@ -493,7 +429,11 @@ class TestMagiCompileIntegration:
         def _triple_infer_output_meta(x: torch.Tensor) -> torch.Tensor:
             return torch.empty_like(x)
 
-        @magi_register_custom_op(name="test::triple_op", mutates_args=(), infer_output_meta_fn=_triple_infer_output_meta)
+        @magi_register_custom_op(
+            name="test::triple_op",
+            mutates_args=(),
+            infer_output_meta_fn=_triple_infer_output_meta,
+        )
         def _triple_op(x: torch.Tensor) -> torch.Tensor:
             return x * 3
 
@@ -568,7 +508,9 @@ class TestMagiCompileIntegration:
             return torch.empty_like(x)
 
         @magi_register_custom_op(
-            name="test::relu_custom_op", mutates_args=(), infer_output_meta_fn=_relu_custom_infer_output_meta
+            name="test::relu_custom_op",
+            mutates_args=(),
+            infer_output_meta_fn=_relu_custom_infer_output_meta,
         )
         def _relu_custom_op(x: torch.Tensor) -> torch.Tensor:
             return torch.relu(x)
@@ -599,11 +541,19 @@ class TestMagiCompileIntegration:
         def _mul_two_infer_output_meta(x: torch.Tensor) -> torch.Tensor:
             return torch.empty_like(x)
 
-        @magi_register_custom_op(name="test::add_one_op", mutates_args=(), infer_output_meta_fn=_add_one_infer_output_meta)
+        @magi_register_custom_op(
+            name="test::add_one_op",
+            mutates_args=(),
+            infer_output_meta_fn=_add_one_infer_output_meta,
+        )
         def _add_one_op(x: torch.Tensor) -> torch.Tensor:
             return x + 1
 
-        @magi_register_custom_op(name="test::mul_two_op", mutates_args=(), infer_output_meta_fn=_mul_two_infer_output_meta)
+        @magi_register_custom_op(
+            name="test::mul_two_op",
+            mutates_args=(),
+            infer_output_meta_fn=_mul_two_infer_output_meta,
+        )
         def _mul_two_op(x: torch.Tensor) -> torch.Tensor:
             return x * 2
 
@@ -623,14 +573,25 @@ class TestMagiCompileIntegration:
         expected = (x + 1) * 2
         assert_close(output, expected)
 
-    def test_custom_op_multiple_outputs_in_magi_compiled_module(self, magi_compile_config):
+    def test_custom_op_multiple_outputs_in_magi_compiled_module(
+        self, magi_compile_config
+    ):
         """Test custom op with multiple outputs inside a magi_compile'd module."""
 
-        def _split_v2_infer_output_meta(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        def _split_v2_infer_output_meta(
+            x: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             half = x.shape[-1] // 2
-            return (x.new_empty((*x.shape[:-1], half)), x.new_empty((*x.shape[:-1], half)))
+            return (
+                x.new_empty((*x.shape[:-1], half)),
+                x.new_empty((*x.shape[:-1], half)),
+            )
 
-        @magi_register_custom_op(name="test::split_v2_op", mutates_args=(), infer_output_meta_fn=_split_v2_infer_output_meta)
+        @magi_register_custom_op(
+            name="test::split_v2_op",
+            mutates_args=(),
+            infer_output_meta_fn=_split_v2_infer_output_meta,
+        )
         def _split_v2_op(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             half = x.shape[-1] // 2
             return torch.clone(x[..., :half]), torch.clone(x[..., half:])
@@ -653,6 +614,1517 @@ class TestMagiCompileIntegration:
         assert out2.shape == (4, 4)
         assert_close(out1, x[..., :4] + 1)
         assert_close(out2, x[..., 4:] * 2)
+
+
+class TestDuplicateOpNameRejected:
+    """Re-registering the same ``namespace::op_name`` should raise a clear
+    error instead of letting ``torch.library`` complain about schema
+    fingerprints.
+    """
+
+    def test_duplicate_name_rejected(self):
+        @magi_register_custom_op(name="test::dup_name_first")
+        def _op_a(x: torch.Tensor) -> torch.Tensor:
+            return x + 1
+
+        with pytest.raises(RuntimeError, match="already"):
+
+            @magi_register_custom_op(name="test::dup_name_first")
+            def _op_b(x: torch.Tensor) -> torch.Tensor:
+                return x + 2
+
+
+class TestOpNameNamespaceRequired:
+    """``torch.library`` requires ``namespace::op_name``; a bare name causes a
+    confusing low-level error. We surface a clear, actionable message
+    pointing at the convention.
+    """
+
+    def test_missing_namespace_rejected(self):
+        with pytest.raises(ValueError, match="namespace"):
+
+            @magi_register_custom_op(name="missing_namespace_op")
+            def _op(x: torch.Tensor) -> torch.Tensor:
+                return x
+
+    def test_namespaced_name_accepted(self):
+        @magi_register_custom_op(name="test::ns_ok")
+        def _op(x: torch.Tensor) -> torch.Tensor:
+            return x + 1
+
+        assert_close(_op(torch.zeros(2)), torch.ones(2))
+
+
+@dataclasses.dataclass(frozen=True)
+class _CSCfg:
+    s: float
+
+
+class TestDataclassWithComputeSensitiveSmoke:
+    """Dataclass input + ``is_compute_sensitive=True`` should register cleanly
+    and the op name should land in ``custom_compute_sensitive_ops``.
+    """
+
+    def test_dataclass_compute_sensitive_smoke(self):
+        from magi_compiler.config import get_compile_config
+
+        @magi_register_custom_op(
+            name="test::dc_compute_sensitive",
+            is_compute_sensitive=True,
+        )
+        def _op(x: torch.Tensor, cfg: _CSCfg) -> torch.Tensor:
+            return x * cfg.s
+
+        out = _op(torch.ones(2), _CSCfg(s=2.0))
+        assert_close(out, torch.full((2,), 2.0))
+        assert (
+            "test::dc_compute_sensitive"
+            in get_compile_config().recompute_config.custom_compute_sensitive_ops
+        )
+
+
+# ============================================================================
+# SECTION 2: Type Support & Schema Bridging
+# ============================================================================
+
+
+class TestFrozenDataclassInput:
+    """Tests for frozen-dataclass input support via the auto pytree path."""
+
+    def test_forward_with_dataclass_only(self):
+        """Custom op whose only argument is a frozen dataclass."""
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _ScaleCfg:
+            scale: float
+            bias: float
+
+        @magi_register_custom_op(name="test::dc_only_op", mutates_args=())
+        def _dc_only_op(cfg: _ScaleCfg) -> torch.Tensor:
+            return torch.full((2, 3), cfg.scale + cfg.bias)
+
+        cfg = _ScaleCfg(scale=2.0, bias=1.0)
+        out = _dc_only_op(cfg)
+        assert_close(out, torch.full((2, 3), 3.0))
+
+    def test_forward_with_mixed_args(self):
+        """Custom op with mixed dataclass and tensor inputs."""
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _AttnCfg:
+            scale: float
+            causal: bool
+
+        @magi_register_custom_op(name="test::dc_mixed_op", mutates_args=())
+        def _dc_mixed_op(
+            q: torch.Tensor, k: torch.Tensor, cfg: _AttnCfg
+        ) -> torch.Tensor:
+            out = (q @ k.transpose(-1, -2)) * cfg.scale
+            if cfg.causal:
+                mask = torch.tril(torch.ones_like(out, dtype=torch.bool))
+                out = out.masked_fill(~mask, 0.0)
+            return out
+
+        q = torch.randn(2, 4, 8)
+        k = torch.randn(2, 4, 8)
+        cfg = _AttnCfg(scale=0.25, causal=False)
+        out = _dc_mixed_op(q, k, cfg)
+        expected = (q @ k.transpose(-1, -2)) * 0.25
+        assert_close(out, expected)
+
+        # Try positional + keyword call form to ensure outer wrapper handles both.
+        out_kw = _dc_mixed_op(q, k=k, cfg=cfg)
+        assert_close(out_kw, expected)
+
+    def test_forward_with_custom_meta_fn(self):
+        """Custom op with a user-provided meta function expressed in dataclass terms."""
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _ProjCfg:
+            out_dim: int
+
+        def _proj_meta(x: torch.Tensor, cfg: _ProjCfg) -> torch.Tensor:
+            return x.new_empty((*x.shape[:-1], cfg.out_dim))
+
+        @magi_register_custom_op(
+            name="test::dc_meta_op", mutates_args=(), infer_output_meta_fn=_proj_meta
+        )
+        def _dc_meta_op(x: torch.Tensor, cfg: _ProjCfg) -> torch.Tensor:
+            return x[..., : cfg.out_dim].clone()
+
+        x = torch.randn(2, 8)
+        cfg = _ProjCfg(out_dim=3)
+        out = _dc_meta_op(x, cfg)
+        assert out.shape == (2, 3)
+        assert_close(out, x[..., :3])
+
+
+class TestNestedDataclassInput:
+    """Tests for *recursively* flattened nested-dataclass inputs."""
+
+    def test_nested_dataclass_only(self):
+        """A single dataclass argument that itself contains a dataclass field."""
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _Inner:
+            scale: float
+            bias: float
+
+        @dataclass(frozen=True)
+        class _Outer:
+            inner: _Inner
+            offset: float
+
+        @magi_register_custom_op(name="test::nested_dc_only_op", mutates_args=())
+        def _nested_dc_only_op(cfg: _Outer) -> torch.Tensor:
+            return torch.full((2, 3), cfg.inner.scale * cfg.inner.bias + cfg.offset)
+
+        cfg = _Outer(inner=_Inner(scale=2.0, bias=3.0), offset=1.5)
+        out = _nested_dc_only_op(cfg)
+        assert_close(out, torch.full((2, 3), 7.5))
+
+        # The flat plan should fully expand the nested dataclass into leaves.
+        plan = _nested_dc_only_op._magi_flat_plan
+        assert plan[0][0] == "dataclass"
+        assert plan[0][1] == "cfg"
+        children = plan[0][3]
+        kinds = [c[0] for c in children]
+        assert (
+            "dataclass" in kinds
+        ), "inner dataclass field must remain a dataclass node"
+        # Find the leaf flat names.
+        flat_names: list[str] = []
+
+        def _collect(node):
+            if node[0] == "primitive":
+                flat_names.append(node[2])
+            else:
+                for child in node[3]:
+                    _collect(child)
+
+        _collect(plan[0])
+        assert "cfg__inner__scale" in flat_names
+        assert "cfg__inner__bias" in flat_names
+        assert "cfg__offset" in flat_names
+
+    def test_nested_dataclass_mixed_with_tensor(self):
+        """Tensor arg alongside a nested dataclass arg."""
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _NormCfg:
+            eps: float
+            affine: bool
+
+        @dataclass(frozen=True)
+        class _LayerCfg:
+            norm: _NormCfg
+            scale: float
+
+        @magi_register_custom_op(name="test::nested_dc_mixed_op", mutates_args=())
+        def _nested_dc_mixed_op(x: torch.Tensor, cfg: _LayerCfg) -> torch.Tensor:
+            y = x / (x.std() + cfg.norm.eps)
+            if cfg.norm.affine:
+                y = y * cfg.scale
+            return y
+
+        x = torch.randn(4, 8)
+        cfg = _LayerCfg(norm=_NormCfg(eps=1e-3, affine=True), scale=2.0)
+        out = _nested_dc_mixed_op(x, cfg)
+        expected = x / (x.std() + 1e-3) * 2.0
+        assert_close(out, expected)
+
+        # Keyword form too.
+        out_kw = _nested_dc_mixed_op(x=x, cfg=cfg)
+        assert_close(out_kw, expected)
+
+    def test_deeply_nested_dataclass(self):
+        """Three levels of nesting plus a sibling primitive at the top level."""
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _Leaf:
+            val: float
+
+        @dataclass(frozen=True)
+        class _Mid:
+            leaf: _Leaf
+            extra: int
+
+        @dataclass(frozen=True)
+        class _Root:
+            mid: _Mid
+            tag: float
+
+        @magi_register_custom_op(name="test::deep_nested_dc_op", mutates_args=())
+        def _deep_nested_dc_op(
+            x: torch.Tensor, cfg: _Root, alpha: float
+        ) -> torch.Tensor:
+            return x * cfg.mid.leaf.val + cfg.mid.extra + cfg.tag + alpha
+
+        x = torch.randn(2, 3)
+        cfg = _Root(mid=_Mid(leaf=_Leaf(val=2.0), extra=3), tag=0.5)
+        out = _deep_nested_dc_op(x, cfg, alpha=1.0)
+        assert_close(out, x * 2.0 + 3 + 0.5 + 1.0)
+
+    def test_nested_dataclass_with_meta_fn(self):
+        """User-supplied meta function expressed in nested-dataclass terms."""
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _ShapeCfg:
+            out_dim: int
+
+        @dataclass(frozen=True)
+        class _ProjCfg:
+            shape: _ShapeCfg
+            scale: float
+
+        def _proj_meta(x: torch.Tensor, cfg: _ProjCfg) -> torch.Tensor:
+            return x.new_empty((*x.shape[:-1], cfg.shape.out_dim))
+
+        @magi_register_custom_op(
+            name="test::nested_dc_meta_op",
+            mutates_args=(),
+            infer_output_meta_fn=_proj_meta,
+        )
+        def _nested_dc_meta_op(x: torch.Tensor, cfg: _ProjCfg) -> torch.Tensor:
+            return x[..., : cfg.shape.out_dim].clone() * cfg.scale
+
+        x = torch.randn(2, 8)
+        cfg = _ProjCfg(shape=_ShapeCfg(out_dim=3), scale=2.0)
+        out = _nested_dc_meta_op(x, cfg)
+        assert out.shape == (2, 3)
+        assert_close(out, x[..., :3] * 2.0)
+
+
+class TestDataclassOptionalFields:
+    """Frozen dataclass fields annotated with ``Optional[...]`` should flow
+    through the recursive flattener and be accepted by
+    ``torch.library.infer_schema`` as long as the underlying type is one of
+    the schema's known optional types.
+
+    Coverage matrix (verified against torch 2.9.1):
+
+    - ``Optional[Tensor]``            ✓
+    - ``Optional[int]``               ✓
+    - ``Optional[float]``             ✓
+    - ``Optional[bool]``              ✓
+    - ``Optional[str]``               ✓
+    - ``Optional[list[int]]``         ✓
+    - ``Tensor | None``  (PEP 604)    ✓
+    - ``Optional[list[Tensor]]``      ✗ (PyTorch limitation, see negative
+      test below; users should use ``list[Optional[Tensor]]`` instead)
+    """
+
+    def test_optional_scalar_and_tensor_fields(self):
+        from dataclasses import dataclass
+        from typing import Optional
+
+        @dataclass(frozen=True)
+        class _Cfg:
+            bias: Optional[torch.Tensor]
+            scale: Optional[float]
+            mode: Optional[str]
+            block_sizes: Optional[list[int]]
+            flag: Optional[bool]
+            count: Optional[int]
+
+        @magi_register_custom_op(name="test::dc_optional_mix")
+        def _op(x: torch.Tensor, cfg: _Cfg) -> torch.Tensor:
+            out = x.clone()
+            if cfg.bias is not None:
+                out = out + cfg.bias
+            if cfg.scale is not None:
+                out = out * cfg.scale
+            return out
+
+        x = torch.ones(3)
+        # All-None: just the identity transform.
+        out_all_none = _op(x, _Cfg(None, None, None, None, None, None))
+        assert_close(out_all_none, x)
+        # Some-None: bias + scale active, others ignored by the body.
+        cfg = _Cfg(
+            bias=torch.tensor([1.0, 2.0, 3.0]),
+            scale=2.0,
+            mode="a",
+            block_sizes=[4, 8],
+            flag=True,
+            count=7,
+        )
+        out_some = _op(x, cfg)
+        assert_close(out_some, torch.tensor([4.0, 6.0, 8.0]))
+
+    def test_pep604_optional_tensor_field(self):
+        """The ``X | None`` PEP 604 syntax should be equivalent to
+        ``Optional[X]`` for dataclass fields."""
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _Cfg:
+            bias: torch.Tensor | None
+
+        @magi_register_custom_op(name="test::dc_pep604_optional")
+        def _op(x: torch.Tensor, cfg: _Cfg) -> torch.Tensor:
+            return x.clone() if cfg.bias is None else x + cfg.bias
+
+        x = torch.ones(2)
+        assert_close(_op(x, _Cfg(bias=None)), x)
+        assert_close(
+            _op(x, _Cfg(bias=torch.tensor([10.0, 20.0]))),
+            torch.tensor([11.0, 21.0]),
+        )
+
+    def test_optional_list_of_tensors_unsupported_by_torch_library(self):
+        """Sanity-pin a known-broken case so a future torch upgrade that
+        relaxes ``infer_schema`` flips this from xfail to pass.
+
+        ``Optional[list[Tensor]]`` is NOT in the torch.library schema's
+        accepted-type set (although ``list[Optional[Tensor]]`` is). The
+        magi flattener doesn't try to rewrite the user's annotation, so we
+        let the underlying ValueError propagate."""
+        from dataclasses import dataclass
+        from typing import Optional
+
+        @dataclass(frozen=True)
+        class _Cfg:
+            biases: Optional[list[torch.Tensor]]
+
+        with pytest.raises(ValueError, match="unsupported type"):
+
+            @magi_register_custom_op(name="test::dc_optional_list_tensor")
+            def _op(x: torch.Tensor, cfg: _Cfg) -> torch.Tensor:
+                return x
+
+
+class TestDataclassListFields:
+    """Frozen dataclass fields annotated with ``list[...]`` flow through the
+    flattener and are accepted by ``torch.library.infer_schema`` for the
+    schema's supported scalar/tensor element types.
+
+    Coverage matrix (verified against torch 2.9.1):
+
+    - ``list[Tensor]``                  ✓
+    - ``list[int]``                     ✓
+    - ``list[float]``                   ✓
+    - ``list[bool]``                    ✓
+    - ``list[Optional[Tensor]]``        ✓
+    """
+
+    def test_list_of_tensors_and_scalars_in_dataclass(self):
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _Cfg:
+            biases: list[torch.Tensor]
+            scales: list[float]
+            block_sizes: list[int]
+            flags: list[bool]
+
+        @magi_register_custom_op(name="test::dc_list_mix")
+        def _op(x: torch.Tensor, cfg: _Cfg) -> torch.Tensor:
+            out = x.clone()
+            for b in cfg.biases:
+                out = out + b
+            out = out * float(sum(cfg.scales))
+            # ``flags`` and ``block_sizes`` are accepted on the schema side
+            # even though the body here doesn't depend on them.
+            assert all(isinstance(s, int) for s in cfg.block_sizes)
+            assert all(isinstance(f, bool) for f in cfg.flags)
+            return out
+
+        x = torch.ones(3)
+        cfg = _Cfg(
+            biases=[torch.tensor([1.0, 2.0, 3.0]), torch.tensor([10.0, 20.0, 30.0])],
+            scales=[2.0, 0.5],
+            block_sizes=[4, 8],
+            flags=[True, False],
+        )
+        out = _op(x, cfg)
+        # (1 + 1 + 10) * 2.5 = 30, (1 + 2 + 20) * 2.5 = 57.5, ...
+        assert_close(out, torch.tensor([30.0, 57.5, 85.0]))
+
+    def test_list_of_optional_tensors_in_dataclass(self):
+        """``list[Optional[Tensor]]`` is on the schema's supported list (in
+        contrast to the rejected ``Optional[list[Tensor]]``)."""
+        from dataclasses import dataclass
+        from typing import Optional
+
+        @dataclass(frozen=True)
+        class _Cfg:
+            maybe_biases: list[Optional[torch.Tensor]]
+
+        @magi_register_custom_op(name="test::dc_list_optional_tensor")
+        def _op(x: torch.Tensor, cfg: _Cfg) -> torch.Tensor:
+            out = x.clone()
+            for b in cfg.maybe_biases:
+                if b is not None:
+                    out = out + b
+            return out
+
+        x = torch.ones(2)
+        out = _op(
+            x,
+            _Cfg(maybe_biases=[None, torch.tensor([10.0, 20.0]), None]),
+        )
+        assert_close(out, torch.tensor([11.0, 21.0]))
+
+    def test_empty_list_field(self):
+        """An empty ``list[Tensor]`` value should round-trip through the
+        flattener and run the body normally."""
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _Cfg:
+            biases: list[torch.Tensor]
+
+        @magi_register_custom_op(name="test::dc_empty_list")
+        def _op(x: torch.Tensor, cfg: _Cfg) -> torch.Tensor:
+            out = x.clone()
+            for b in cfg.biases:
+                out = out + b
+            return out
+
+        x = torch.ones(3)
+        assert_close(_op(x, _Cfg(biases=[])), x)
+
+
+class TestDataclassFieldDefaults:
+    """Dataclass field ``default`` / ``default_factory`` values should
+    propagate to the flat ``inspect.Signature`` so that calling the op
+    without those fields works (and ``torch.library.infer_schema`` records
+    them as optional)."""
+
+    def test_dataclass_field_default_carried_into_signature(self):
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _Cfg:
+            scale: float = 2.0
+
+        @magi_register_custom_op(name="test::dc_field_default_scale")
+        def _op(x: torch.Tensor, cfg: _Cfg) -> torch.Tensor:
+            return x * cfg.scale
+
+        x = torch.ones(3)
+        # User constructs the dataclass with the default value implicitly.
+        assert_close(_op(x, _Cfg()), torch.full((3,), 2.0))
+        # And the override path still works.
+        assert_close(_op(x, _Cfg(scale=10.0)), torch.full((3,), 10.0))
+
+    def test_dataclass_field_default_factory_for_list(self):
+        from dataclasses import dataclass, field
+
+        @dataclass(frozen=True)
+        class _Cfg:
+            block_sizes: list[int] = field(default_factory=lambda: [4, 8])
+
+        @magi_register_custom_op(name="test::dc_field_default_factory")
+        def _op(x: torch.Tensor, cfg: _Cfg) -> torch.Tensor:
+            return x * float(sum(cfg.block_sizes))
+
+        x = torch.ones(2)
+        assert_close(_op(x, _Cfg()), torch.full((2,), 12.0))
+        assert_close(_op(x, _Cfg(block_sizes=[1, 2, 3])), torch.full((2,), 6.0))
+
+    def test_nested_dataclass_with_default(self):
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _Inner:
+            val: float = 3.0
+
+        @dataclass(frozen=True)
+        class _Outer:
+            inner: _Inner = _Inner()
+            scale: float = 1.0
+
+        @magi_register_custom_op(name="test::dc_nested_default")
+        def _op(x: torch.Tensor, cfg: _Outer) -> torch.Tensor:
+            return x * cfg.inner.val * cfg.scale
+
+        x = torch.ones(2)
+        assert_close(_op(x, _Outer()), torch.full((2,), 3.0))
+        assert_close(
+            _op(x, _Outer(inner=_Inner(val=5.0), scale=2.0)),
+            torch.full((2,), 10.0),
+        )
+
+
+class TestDataclassUnsupportedContainerFields:
+    """``tuple[...]`` and ``dict[...]`` dataclass field annotations are not
+    accepted by ``torch.library.infer_schema`` (only ``list[...]`` is). We
+    reject them at registration time with an actionable hint pointing to the
+    field name and suggested fix."""
+
+    def test_tuple_field_rejected_with_hint(self):
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _Cfg:
+            qkv: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+        with pytest.raises(TypeError, match=r"list\[\.\.\.\]"):
+
+            @magi_register_custom_op(name="test::dc_tuple_field")
+            def _op(x: torch.Tensor, cfg: _Cfg) -> torch.Tensor:
+                return x
+
+    def test_dict_field_rejected_with_hint(self):
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _Cfg:
+            weight_by_name: dict[str, torch.Tensor]
+
+        with pytest.raises(TypeError, match="dict-typed"):
+
+            @magi_register_custom_op(name="test::dc_dict_field")
+            def _op(x: torch.Tensor, cfg: _Cfg) -> torch.Tensor:
+                return x
+
+
+class TestMutableDataclassRejected:
+    """``magi_register_custom_op`` only supports ``@dataclass(frozen=True)``.
+
+    A non-frozen dataclass passed as an op input would otherwise produce a
+    confusing ``ValueError: Unsupported type annotation X. It is not a type``
+    deep inside ``torch.library.infer_schema``. We surface a clear error
+    pointing at the fix.
+    """
+
+    def test_top_level_mutable_dataclass_rejected(self):
+        from dataclasses import dataclass
+
+        @dataclass  # NOTE: missing frozen=True
+        class _MutableCfg:
+            scale: float
+
+        with pytest.raises(TypeError, match="frozen=True"):
+
+            @magi_register_custom_op(name="test::mutable_dc_top")
+            def _op(x: torch.Tensor, cfg: _MutableCfg) -> torch.Tensor:
+                return x * cfg.scale
+
+    def test_nested_mutable_dataclass_rejected(self):
+        """Inner non-frozen dataclass nested inside an outer frozen one is
+        also detected; the error names the offending field."""
+        from dataclasses import dataclass
+
+        @dataclass  # NOT frozen
+        class _MutableInner:
+            val: float
+
+        @dataclass(frozen=True)
+        class _OuterCfg:
+            inner: _MutableInner
+
+        with pytest.raises(TypeError, match="_MutableInner"):
+
+            @magi_register_custom_op(name="test::mutable_dc_nested")
+            def _op(x: torch.Tensor, cfg: _OuterCfg) -> torch.Tensor:
+                return x * cfg.inner.val
+
+    def test_frozen_dataclass_still_works(self):
+        """Sanity: the rejection path doesn't break the supported case."""
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _OkCfg:
+            scale: float
+
+        @magi_register_custom_op(name="test::frozen_dc_ok")
+        def _op(x: torch.Tensor, cfg: _OkCfg) -> torch.Tensor:
+            return x * cfg.scale
+
+        out = _op(torch.ones(4), _OkCfg(scale=3.0))
+        assert_close(out, torch.full((4,), 3.0))
+
+
+class TestDataclassReturnRejected:
+    """``torch.library`` cannot model dataclass returns; we should refuse with
+    an actionable error instead of letting ``infer_schema`` raise an opaque
+    ``ValueError`` from the depths.
+    """
+
+    def test_dataclass_return_rejected(self):
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _Out:
+            a: torch.Tensor
+
+        with pytest.raises(TypeError, match="dataclass"):
+
+            @magi_register_custom_op(name="test::dc_return")
+            def _op(x: torch.Tensor) -> _Out:
+                return _Out(a=x.clone())
+
+    def test_tensor_return_still_works(self):
+        @magi_register_custom_op(name="test::tensor_return_ok")
+        def _op(x: torch.Tensor) -> torch.Tensor:
+            return x + 1
+
+        out = _op(torch.zeros(3))
+        assert_close(out, torch.ones(3))
+
+
+class TestDataclassUnresolvableLocalField:
+    """A dataclass field annotated with a class defined inside another
+    function (a "local class") under ``from __future__ import annotations``
+    cannot be resolved by ``typing.get_type_hints``. We surface a clear
+    error pointing at the fix instead of a confusing schema error.
+    """
+
+    def test_unresolvable_local_field_rejected(self):
+        # We synthesize the failure by hand-constructing a frozen dataclass
+        # whose field type is a *string* that doesn't resolve in any visible
+        # namespace. This mirrors what ``from __future__ import annotations``
+        # produces for a local class.
+        import dataclasses
+
+        @dataclasses.dataclass(frozen=True)
+        class _OuterCfg:
+            inner: "_DefinitelyNotInScope"  # noqa: F821
+
+        with pytest.raises(TypeError, match="unresolved string annotation"):
+
+            @magi_register_custom_op(name="test::dc_unresolvable_local")
+            def _op(x: torch.Tensor, cfg: _OuterCfg) -> torch.Tensor:
+                return x
+
+
+@dataclasses.dataclass(frozen=True)
+class _OptScalarCfg:
+    softcap: float | None = None
+    causal: bool | None = None
+
+
+class TestDataclassOptionalScalarFields:
+    """Common attention/cfg pattern: dataclass field is ``Optional[scalar]``
+    with a ``None`` default. Verify forward across explicit-None and
+    explicit-value calls.
+    """
+
+    def test_optional_scalar_defaults_and_overrides(self):
+        @magi_register_custom_op(name="test::dc_opt_scalar")
+        def _op(x: torch.Tensor, cfg: _OptScalarCfg) -> torch.Tensor:
+            y = x.clone()
+            if cfg.softcap is not None:
+                y = torch.tanh(y / cfg.softcap) * cfg.softcap
+            if cfg.causal is True:
+                y = y * 0.5
+            return y
+
+        x = torch.randn(4)
+        assert_close(_op(x, _OptScalarCfg()), x)
+        out = _op(x, _OptScalarCfg(softcap=2.0, causal=True))
+        expected = torch.tanh(x / 2.0) * 2.0 * 0.5
+        assert_close(out, expected)
+
+
+@dataclasses.dataclass(frozen=True)
+class _DtypeCfg:
+    out_dtype: torch.dtype = torch.float16
+    out_device: torch.device | None = None
+
+
+class TestDataclassDtypeDeviceFields:
+    """``torch.dtype`` / ``torch.device`` are the canonical schema-supported
+    "structured scalar" types. Make sure they survive the dataclass-flatten
+    round-trip with sensible defaults.
+    """
+
+    def test_dtype_device_round_trip(self):
+        @magi_register_custom_op(name="test::dc_dtype_device")
+        def _op(x: torch.Tensor, cfg: _DtypeCfg) -> torch.Tensor:
+            return x.to(dtype=cfg.out_dtype)
+
+        x = torch.randn(4)
+        out = _op(x, _DtypeCfg(out_dtype=torch.bfloat16))
+        assert out.dtype == torch.bfloat16
+
+
+class TestTopLevelTupleDictRejected:
+    """Top-level parameters of type ``tuple[T, ...]`` / ``dict[K, V]`` are
+    rejected with the same actionable message as dataclass fields.
+    """
+
+    def test_top_level_tuple_rejected(self):
+        with pytest.raises(TypeError, match="tuple"):
+
+            @magi_register_custom_op(name="test::top_tuple")
+            def _op(xs: tuple[torch.Tensor, ...]) -> torch.Tensor:
+                return xs[0]
+
+    def test_top_level_dict_rejected(self):
+        with pytest.raises(TypeError, match="dict"):
+
+            @magi_register_custom_op(name="test::top_dict")
+            def _op(xs: dict[str, torch.Tensor]) -> torch.Tensor:
+                return next(iter(xs.values()))
+
+
+class TestLiteralAndEnumDowngrade:
+    """``Literal[str, ...]`` and string-valued ``Enum`` annotations are
+    auto-downgraded to ``str`` at the schema boundary; the op body still
+    receives the raw string. Numeric/heterogeneous Literals are rejected
+    with a clear error.
+    """
+
+    def test_literal_str_downgraded(self):
+        from typing import Literal
+
+        @magi_register_custom_op(name="test::literal_str")
+        def _op(x: torch.Tensor, mode: Literal["a", "b"]) -> torch.Tensor:
+            return x * (2.0 if mode == "a" else 3.0)
+
+        x = torch.ones(3)
+        assert_close(_op(x, "a"), torch.full((3,), 2.0))
+        assert_close(_op(x, "b"), torch.full((3,), 3.0))
+
+    def test_string_enum_downgraded(self):
+        import enum
+
+        class _Mode(enum.Enum):
+            A = "a"
+            B = "b"
+
+        @magi_register_custom_op(name="test::enum_str")
+        def _op(x: torch.Tensor, mode: _Mode) -> torch.Tensor:
+            return x * (2.0 if mode == "a" else 3.0)
+
+        # Note: caller passes the raw string value (the schema sees ``str``).
+        x = torch.ones(3)
+        assert_close(_op(x, "a"), torch.full((3,), 2.0))
+
+    def test_int_literal_rejected(self):
+        from typing import Literal
+
+        with pytest.raises(TypeError, match="Literal"):
+
+            @magi_register_custom_op(name="test::literal_int")
+            def _op(x: torch.Tensor, k: Literal[1, 2]) -> torch.Tensor:
+                return x
+
+    def test_int_valued_enum_rejected(self):
+        import enum
+
+        class _IntMode(enum.Enum):
+            A = 1
+            B = 2
+
+        with pytest.raises(TypeError, match="Enum"):
+
+            @magi_register_custom_op(name="test::enum_int")
+            def _op(x: torch.Tensor, mode: _IntMode) -> torch.Tensor:
+                return x
+
+
+class TestTopLevelOptionalTensor:
+    """``Optional[Tensor]`` / ``Tensor | None`` is the most common attention /
+    bias / mask pattern. Verify both annotation flavours, with and without
+    a ``None`` default, and across forward + autograd paths.
+    """
+
+    def test_optional_tensor_default_none(self):
+        @magi_register_custom_op(name="test::opt_tensor_default")
+        def _op(x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+            return x.clone() if bias is None else x + bias
+
+        x = torch.randn(3, 4)
+        b = torch.randn(3, 4)
+        assert_close(_op(x), x)
+        assert_close(_op(x, b), x + b)
+
+    def test_optional_tensor_no_default_explicit_none(self):
+        @magi_register_custom_op(name="test::opt_tensor_explicit")
+        def _op(x: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+            return x.clone() if bias is None else x + bias
+
+        x = torch.randn(3, 4)
+        assert_close(_op(x, None), x)
+
+
+class TestReturnListTensor:
+    """``list[Tensor]`` is the canonical return shape for split / chunk /
+    expert-output ops. Validate forward and that a user-supplied
+    ``infer_output_meta_fn`` is required for tracing.
+    """
+
+    def test_list_tensor_return_runtime(self):
+        def meta(x, n):
+            return [torch.empty_like(x.chunk(n, dim=0)[0]) for _ in range(n)]
+
+        @magi_register_custom_op(
+            name="test::list_tensor_return",
+            infer_output_meta_fn=meta,
+        )
+        def _op(x: torch.Tensor, n: int) -> list[torch.Tensor]:
+            # ``.chunk`` returns views that alias ``x``; clone each chunk so
+            # the op doesn't violate torch.library's no-aliasing invariant
+            # for outputs.
+            return [c.clone() for c in x.chunk(n, dim=0)]
+
+        x = torch.randn(8, 4)
+        out = _op(x, 4)
+        assert isinstance(out, list)
+        assert len(out) == 4
+        assert all(o.shape == (2, 4) for o in out)
+
+
+class TestTopLevelListIntDefault:
+    """A top-level parameter typed ``list[int]`` with a non-None default
+    should not crash registration (the previous behavior was to forward the
+    list literal to ``infer_schema``, which rejects it).
+    """
+
+    def test_list_int_default_does_not_crash(self):
+        @magi_register_custom_op(name="test::list_int_default")
+        def _op(x: torch.Tensor, dims: list[int] = [0]) -> torch.Tensor:
+            return x.sum(dim=dims, keepdim=True)
+
+        x = torch.randn(3, 4)
+        # Caller still has to supply the list explicitly because the schema
+        # default was scrubbed; that's the documented price of using a list
+        # default with torch.library.
+        out = _op(x, [0])
+        assert out.shape == (1, 4)
+
+
+# ============================================================================
+# SECTION 3: Autograd Bridge
+# ============================================================================
+
+
+class TestAutograd:
+    """Tests for custom op with autograd support."""
+
+    def test_with_autograd(self):
+        """Test custom op with setup_context and backward functions."""
+
+        def _square_infer_output_meta(x: torch.Tensor) -> torch.Tensor:
+            return torch.empty_like(x)
+
+        def _square_setup_context(ctx, inputs, output):
+            (x,) = inputs
+            ctx.save_for_backward(x)
+
+        def _square_backward(ctx, grad_output):
+            (x,) = ctx.saved_tensors
+            return grad_output * 2 * x
+
+        @magi_register_custom_op(
+            name="test::square_op",
+            mutates_args=(),
+            infer_output_meta_fn=_square_infer_output_meta,
+            setup_context_fn=_square_setup_context,
+            backward_fn=_square_backward,
+        )
+        def _square_op(x: torch.Tensor) -> torch.Tensor:
+            return x * x
+
+        x = torch.randn(4, 8, requires_grad=True)
+        output = _square_op(x)
+        loss = output.sum()
+        loss.backward()
+
+        # Gradient of x^2 is 2x
+        expected_grad = 2 * x
+        assert_close(x.grad, expected_grad)
+
+    def test_autograd_multiple_inputs(self):
+        """Test autograd with multiple input tensors."""
+
+        def _weighted_sum_infer_output_meta(
+            a: torch.Tensor, b: torch.Tensor, weight: float
+        ) -> torch.Tensor:
+            return torch.empty_like(a)
+
+        def _weighted_sum_setup_context(ctx, inputs, output):
+            a, b, weight = inputs
+            ctx.save_for_backward(a, b)
+            ctx.weight = weight
+
+        def _weighted_sum_backward(ctx, grad_output):
+            a, b = ctx.saved_tensors
+            weight = ctx.weight
+            grad_a = grad_output * weight
+            grad_b = grad_output * (1 - weight)
+            return grad_a, grad_b, None  # None for non-tensor input
+
+        @magi_register_custom_op(
+            name="test::weighted_sum_op",
+            mutates_args=(),
+            infer_output_meta_fn=_weighted_sum_infer_output_meta,
+            setup_context_fn=_weighted_sum_setup_context,
+            backward_fn=_weighted_sum_backward,
+        )
+        def _weighted_sum_op(
+            a: torch.Tensor, b: torch.Tensor, weight: float
+        ) -> torch.Tensor:
+            return a * weight + b * (1 - weight)
+
+        a = torch.randn(4, 8, requires_grad=True)
+        b = torch.randn(4, 8, requires_grad=True)
+        weight = 0.7
+
+        output = _weighted_sum_op(a, b, weight)
+        loss = output.sum()
+        loss.backward()
+
+        expected_grad_a = torch.ones_like(a) * weight
+        expected_grad_b = torch.ones_like(b) * (1 - weight)
+
+        assert_close(a.grad, expected_grad_a)
+        assert_close(b.grad, expected_grad_b)
+
+    def test_autograd_multiple_outputs(self):
+        """Test autograd with multiple output tensors."""
+
+        def _split_scale_infer_output_meta(
+            x: torch.Tensor, scale: float
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            half = x.shape[-1] // 2
+            return (
+                x.new_empty((*x.shape[:-1], half)),
+                x.new_empty((*x.shape[:-1], half)),
+            )
+
+        def _split_scale_setup_context(ctx, inputs, output):
+            x, scale = inputs
+            ctx.save_for_backward(x)
+            ctx.scale = scale
+            ctx.half = x.shape[-1] // 2
+
+        def _split_scale_backward(ctx, grad_out1, grad_out2):
+            (x,) = ctx.saved_tensors
+            scale = ctx.scale
+            # Reconstruct gradient for x
+            grad_x = torch.cat([grad_out1 * scale, grad_out2 * scale], dim=-1)
+            return grad_x, None
+
+        @magi_register_custom_op(
+            name="test::split_scale_op",
+            mutates_args=(),
+            infer_output_meta_fn=_split_scale_infer_output_meta,
+            setup_context_fn=_split_scale_setup_context,
+            backward_fn=_split_scale_backward,
+        )
+        def _split_scale_op(
+            x: torch.Tensor, scale: float
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            half = x.shape[-1] // 2
+            return x[..., :half] * scale, x[..., half:] * scale
+
+        x = torch.randn(4, 8, requires_grad=True)
+        scale = 2.0
+
+        out1, out2 = _split_scale_op(x, scale)
+        loss = out1.sum() + out2.sum()
+        loss.backward()
+
+        expected_grad = torch.ones_like(x) * scale
+        assert_close(x.grad, expected_grad)
+
+
+class TestDataclassInputWithBackward:
+    """``backward_fn`` is bridged so users can write it in the ORIGINAL
+    (dataclass-bearing) signature even though the registered op underneath
+    is flat. These tests pin every shape of bridging we promise.
+    """
+
+    def test_backward_with_tensor_and_dataclass_input(self):
+        """``backward`` returns ``(grad_x, None)`` against the original sig."""
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _ScaleCfg:
+            scale: float
+
+        def _setup(ctx, inputs, output):
+            x, cfg = inputs  # NOTE: original-signature view, not flat
+            assert isinstance(cfg, _ScaleCfg)
+            ctx.save_for_backward(x)
+            ctx.scale = cfg.scale
+
+        def _bwd(ctx, grad_out):
+            (_x,) = ctx.saved_tensors
+            return grad_out * ctx.scale, None
+
+        @magi_register_custom_op(
+            name="test::dc_bwd_basic",
+            mutates_args=(),
+            setup_context_fn=_setup,
+            backward_fn=_bwd,
+        )
+        def _op(x: torch.Tensor, cfg: _ScaleCfg) -> torch.Tensor:
+            return x * cfg.scale
+
+        x = torch.randn(4, 8, requires_grad=True)
+        cfg = _ScaleCfg(scale=3.0)
+        y = _op(x, cfg)
+        assert_close(y, x * 3.0)
+        (gx,) = torch.autograd.grad(y.sum(), x)
+        assert_close(gx, torch.full_like(x, 3.0))
+
+    def test_backward_returning_bare_grad_is_allowed(self):
+        """Single-input convenience: returning a bare tensor instead of a
+        1-tuple should still work, mirroring stock PyTorch behaviour."""
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _Cfg:
+            alpha: float
+
+        def _setup(ctx, inputs, output):
+            (cfg,) = inputs
+            ctx.alpha = cfg.alpha
+
+        def _bwd(ctx, grad_out):
+            # Op has zero tensor inputs; nothing to backprop into. Returning
+            # ``None`` (or even a bare value) for the lone non-tensor input
+            # must be accepted by the bridge.
+            return None
+
+        @magi_register_custom_op(
+            name="test::dc_bwd_bare_grad",
+            mutates_args=(),
+            setup_context_fn=_setup,
+            backward_fn=_bwd,
+        )
+        def _op(cfg: _Cfg) -> torch.Tensor:
+            return torch.full((2, 3), cfg.alpha)
+
+        out = _op(_Cfg(alpha=1.5))
+        assert_close(out, torch.full((2, 3), 1.5))
+
+    def test_backward_with_per_field_grads(self):
+        """If the user wants to express grads at field granularity, returning
+        a same-shape dataclass (or a dict) for the dataclass slot must be
+        spread to the underlying flat slots. The bridge accepts ``None``
+        leaves to stand in for non-differentiable fields."""
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _Cfg:
+            scale: float
+            offset: float
+
+        def _setup(ctx, inputs, output):
+            x, cfg = inputs
+            ctx.save_for_backward(x)
+            ctx.scale = cfg.scale
+
+        def _bwd(ctx, grad_out):
+            # Express the dataclass grad as a same-shape dataclass with
+            # ``None`` leaves; the bridge must spread these to flat slots.
+            return grad_out * ctx.scale, _Cfg(scale=None, offset=None)
+
+        @magi_register_custom_op(
+            name="test::dc_bwd_per_field",
+            mutates_args=(),
+            setup_context_fn=_setup,
+            backward_fn=_bwd,
+        )
+        def _op(x: torch.Tensor, cfg: _Cfg) -> torch.Tensor:
+            return x * cfg.scale + cfg.offset
+
+        x = torch.randn(3, requires_grad=True)
+        y = _op(x, _Cfg(scale=2.0, offset=0.5))
+        (gx,) = torch.autograd.grad(y.sum(), x)
+        assert_close(gx, torch.full_like(x, 2.0))
+
+    def test_backward_with_dict_shaped_dc_grad(self):
+        """The bridge should also accept a plain ``dict`` for the dataclass
+        slot (handy when the user does not want to construct another instance)."""
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _Cfg:
+            scale: float
+
+        def _setup(ctx, inputs, output):
+            x, cfg = inputs
+            ctx.save_for_backward(x)
+            ctx.scale = cfg.scale
+
+        def _bwd(ctx, grad_out):
+            return grad_out * ctx.scale, {"scale": None}
+
+        @magi_register_custom_op(
+            name="test::dc_bwd_dict_grad",
+            mutates_args=(),
+            setup_context_fn=_setup,
+            backward_fn=_bwd,
+        )
+        def _op(x: torch.Tensor, cfg: _Cfg) -> torch.Tensor:
+            return x * cfg.scale
+
+        x = torch.randn(5, requires_grad=True)
+        y = _op(x, _Cfg(scale=4.0))
+        (gx,) = torch.autograd.grad(y.sum(), x)
+        assert_close(gx, torch.full_like(x, 4.0))
+
+    def test_backward_with_nested_dataclass(self):
+        """Backward bridging must descend through nested dataclasses (the
+        flat slot count for a nested dc with ``None`` grad equals the total
+        number of leaf fields)."""
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _Inner:
+            scale: float
+            bias: float
+
+        @dataclass(frozen=True)
+        class _Outer:
+            inner: _Inner
+            tag: float
+
+        def _setup(ctx, inputs, output):
+            x, cfg = inputs
+            assert isinstance(cfg, _Outer) and isinstance(cfg.inner, _Inner)
+            ctx.save_for_backward(x)
+            ctx.scale = cfg.inner.scale
+
+        def _bwd(ctx, grad_out):
+            return grad_out * ctx.scale, None  # whole nested dc => None
+
+        @magi_register_custom_op(
+            name="test::dc_bwd_nested",
+            mutates_args=(),
+            setup_context_fn=_setup,
+            backward_fn=_bwd,
+        )
+        def _op(x: torch.Tensor, cfg: _Outer) -> torch.Tensor:
+            return x * cfg.inner.scale + cfg.inner.bias + cfg.tag
+
+        x = torch.randn(2, 4, requires_grad=True)
+        cfg = _Outer(inner=_Inner(scale=1.5, bias=0.25), tag=0.0)
+        y = _op(x, cfg)
+        (gx,) = torch.autograd.grad(y.sum(), x)
+        assert_close(gx, torch.full_like(x, 1.5))
+
+    def test_backward_two_tensor_inputs_around_dataclass(self):
+        """Two tensor inputs sandwiching a dataclass: both gradients must
+        land in the right flat slots."""
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _Cfg:
+            alpha: float
+            beta: float
+
+        def _setup(ctx, inputs, output):
+            a, cfg, b = inputs
+            ctx.save_for_backward(a, b)
+            ctx.alpha = cfg.alpha
+            ctx.beta = cfg.beta
+
+        def _bwd(ctx, grad_out):
+            a, b = ctx.saved_tensors
+            return grad_out * ctx.alpha, None, grad_out * ctx.beta
+
+        @magi_register_custom_op(
+            name="test::dc_bwd_sandwich",
+            mutates_args=(),
+            setup_context_fn=_setup,
+            backward_fn=_bwd,
+        )
+        def _op(a: torch.Tensor, cfg: _Cfg, b: torch.Tensor) -> torch.Tensor:
+            return a * cfg.alpha + b * cfg.beta
+
+        a = torch.randn(4, requires_grad=True)
+        b = torch.randn(4, requires_grad=True)
+        cfg = _Cfg(alpha=2.0, beta=-3.0)
+        y = _op(a, cfg, b)
+        ga, gb = torch.autograd.grad(y.sum(), [a, b])
+        assert_close(ga, torch.full_like(a, 2.0))
+        assert_close(gb, torch.full_like(b, -3.0))
+
+    def test_backward_wrong_grad_count_raises(self):
+        """If ``backward_fn`` returns the wrong number of grads (relative to
+        the ORIGINAL signature), the user gets a clear error rather than an
+        opaque autograd shape mismatch."""
+        from dataclasses import dataclass
+
+        @dataclass(frozen=True)
+        class _Cfg:
+            scale: float
+
+        def _setup(ctx, inputs, output):
+            x, cfg = inputs
+            ctx.save_for_backward(x)
+
+        def _bad_bwd(ctx, grad_out):
+            return (grad_out,)  # missing the dataclass slot
+
+        @magi_register_custom_op(
+            name="test::dc_bwd_wrong_count",
+            mutates_args=(),
+            setup_context_fn=_setup,
+            backward_fn=_bad_bwd,
+        )
+        def _op(x: torch.Tensor, cfg: _Cfg) -> torch.Tensor:
+            return x * cfg.scale
+
+        x = torch.randn(3, requires_grad=True)
+        y = _op(x, _Cfg(scale=2.0))
+        with pytest.raises(ValueError, match=r"backward_fn returned 1 grad"):
+            torch.autograd.grad(y.sum(), x)
+
+
+@dataclasses.dataclass(frozen=True)
+class _BwTupleCfg:
+    s: float
+
+
+class TestTupleOutputBackward:
+    """``backward_fn`` with ``tuple`` outputs and a dataclass input."""
+
+    def test_two_output_backward_with_dataclass(self):
+        def setup(ctx, inputs, output):
+            x, _cfg = inputs
+            ctx.save_for_backward(x)
+            ctx.s = _cfg.s
+
+        def bwd(ctx, gy0, gy1):
+            (x,) = ctx.saved_tensors
+            # d(out0)/dx = s, d(out1)/dx = 1
+            return gy0 * ctx.s + gy1, None
+
+        @magi_register_custom_op(
+            name="test::tuple_bwd_dc",
+            setup_context_fn=setup,
+            backward_fn=bwd,
+        )
+        def _op(x: torch.Tensor, cfg: _BwTupleCfg) -> tuple[torch.Tensor, torch.Tensor]:
+            return x * cfg.s, x.clone()
+
+        x = torch.randn(4, requires_grad=True)
+        y0, y1 = _op(x, _BwTupleCfg(s=3.0))
+        (y0.sum() + 2.0 * y1.sum()).backward()
+        assert x.grad is not None
+        # gy0 = 1, gy1 = 2 -> grad = 1*3 + 2 = 5
+        assert torch.allclose(x.grad, torch.full_like(x, 5.0))
+
+
+class TestPerFieldNoneGrad:
+    """The autograd bridge supports returning a partially-None grad for a
+    dataclass input (i.e. some Tensor fields differentiable, others not).
+    """
+
+    def test_partial_none_grad_for_dataclass(self):
+        @dataclasses.dataclass(frozen=True)
+        class _Cfg:
+            w: torch.Tensor
+            b: torch.Tensor  # we'll mark this non-differentiable
+
+        def setup(ctx, inputs, output):
+            x, cfg = inputs
+            ctx.save_for_backward(x, cfg.w)
+
+        def bwd(ctx, gy):
+            x, w = ctx.saved_tensors
+            # x: gx = gy * w; cfg.w: gw = gy * x; cfg.b: None.
+            return gy * w, {"w": gy * x, "b": None}
+
+        @magi_register_custom_op(
+            name="test::partial_none_grad",
+            setup_context_fn=setup,
+            backward_fn=bwd,
+        )
+        def _op(x: torch.Tensor, cfg: _Cfg) -> torch.Tensor:
+            return x * cfg.w + cfg.b
+
+        x = torch.randn(4, requires_grad=True)
+        w = torch.randn(4, requires_grad=True)
+        b = torch.randn(4, requires_grad=False)
+        cfg = _Cfg(w=w, b=b)
+        out = _op(x, cfg)
+        out.sum().backward()
+        assert torch.allclose(x.grad, w)
+        assert torch.allclose(w.grad, x)
+        # b did not require grad; nothing to assert beyond "no exception".
+
+
+class TestBackwardCallsAnotherOp:
+    """``backward_fn`` is allowed to call other registered ops to compute the
+    gradient. This is the FlashAttention-style "forward op + backward op"
+    decomposition. Verify the gradient is correct end-to-end.
+    """
+
+    def test_backward_dispatches_to_another_op(self):
+        @magi_register_custom_op(name="test::matmul_grad_helper")
+        def matmul_grad_x(gy: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            return gy @ w.t()
+
+        def setup(ctx, inputs, output):
+            x, w = inputs
+            ctx.save_for_backward(x, w)
+
+        def bwd(ctx, gy):
+            x, w = ctx.saved_tensors
+            return matmul_grad_x(gy, w), x.t() @ gy
+
+        @magi_register_custom_op(
+            name="test::matmul_with_op_bwd",
+            setup_context_fn=setup,
+            backward_fn=bwd,
+        )
+        def matmul(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            return x @ w
+
+        x = torch.randn(3, 4, requires_grad=True)
+        w = torch.randn(4, 5, requires_grad=True)
+        out = matmul(x, w)
+        out.sum().backward()
+        gy = torch.ones_like(out)
+        assert torch.allclose(x.grad, gy @ w.t())
+        assert torch.allclose(w.grad, x.t() @ gy)
+
+
+# ============================================================================
+# SECTION 4: Compositions & Python Semantics
+# ============================================================================
+
+
+@dataclasses.dataclass(frozen=True)
+class _KwCfg:
+    s: float
+
+
+class TestKwargOnlyDataclass:
+    """``cfg`` passed as a kwarg-only argument should still be flattened and
+    routed correctly through the dataclass-aware bridge.
+    """
+
+    def test_kwarg_only_dataclass_call(self):
+        @magi_register_custom_op(name="test::kwonly_dc")
+        def _op(x: torch.Tensor, *, cfg: _KwCfg) -> torch.Tensor:
+            return x * cfg.s
+
+        x = torch.randn(2, 3)
+        out = _op(x, cfg=_KwCfg(s=4.0))
+        assert_close(out, x * 4.0)
+
+    def test_kwarg_only_dataclass_with_backward(self):
+        def setup(ctx, inputs, output):
+            x, cfg = inputs
+            ctx.s = cfg.s
+
+        def bwd(ctx, gy):
+            return gy * ctx.s, None
+
+        @magi_register_custom_op(
+            name="test::kwonly_dc_bwd",
+            setup_context_fn=setup,
+            backward_fn=bwd,
+        )
+        def _op(x: torch.Tensor, *, cfg: _KwCfg) -> torch.Tensor:
+            return x * cfg.s
+
+        x = torch.randn(3, requires_grad=True)
+        out = _op(x, cfg=_KwCfg(s=2.5))
+        out.sum().backward()
+        assert torch.allclose(x.grad, torch.full_like(x, 2.5))
+
+
+@dataclasses.dataclass(frozen=True)
+class _MutCfg:
+    a: torch.Tensor
+    b: torch.Tensor
+
+
+class TestMutatesArgsOnDataclass:
+    """``mutates_args=('cfg',)`` on a dataclass parameter should expand to the
+    flat leaf names automatically; an unknown name should raise.
+    """
+
+    def test_mutates_args_dataclass_expands(self):
+        # We don't actually mutate (frozen dataclass) -- we just check the
+        # registration succeeds, which it would not if the name failed to
+        # expand to flat tensor leaves.
+        @magi_register_custom_op(
+            name="test::mutates_dc_expand",
+            mutates_args=("cfg",),
+        )
+        def _op(x: torch.Tensor, cfg: _MutCfg) -> torch.Tensor:
+            cfg.a.add_(x)  # in-place on a tensor field
+            cfg.b.add_(x)
+            return cfg.a + cfg.b
+
+        x = torch.ones(3)
+        cfg = _MutCfg(a=torch.zeros(3), b=torch.zeros(3))
+        out = _op(x, cfg)
+        assert_close(out, torch.full((3,), 2.0))
+
+    def test_mutates_args_unknown_name_rejected(self):
+        with pytest.raises(ValueError, match="does not match"):
+
+            @magi_register_custom_op(
+                name="test::mutates_dc_unknown",
+                mutates_args=("does_not_exist",),
+            )
+            def _op(x: torch.Tensor, cfg: _MutCfg) -> torch.Tensor:
+                return x
+
+    def test_mutates_args_flat_name_passthrough(self):
+        """Users may also use the flat name (``cfg__a``) directly."""
+
+        @magi_register_custom_op(
+            name="test::mutates_dc_flat",
+            mutates_args=("cfg__a",),
+        )
+        def _op(x: torch.Tensor, cfg: _MutCfg) -> torch.Tensor:
+            cfg.a.add_(x)
+            return cfg.a + cfg.b
+
+        x = torch.ones(3)
+        cfg = _MutCfg(a=torch.zeros(3), b=torch.zeros(3))
+        out = _op(x, cfg)
+        assert_close(out, torch.ones(3))
+
+
+class TestNestedMagiOpCall:
+    """Calling one ``@magi_register_custom_op``-registered op from inside
+    another is the bread-and-butter compositional pattern (e.g. a fused
+    attention op that internally calls a registered softmax). Verify both
+    plain-input and dataclass-input compositions.
+    """
+
+    def test_plain_op_inside_plain_op(self):
+        @magi_register_custom_op(name="test::nested_inner_plain")
+        def inner(x: torch.Tensor) -> torch.Tensor:
+            return x * 2
+
+        @magi_register_custom_op(name="test::nested_outer_plain")
+        def outer(x: torch.Tensor) -> torch.Tensor:
+            return inner(x) + 1
+
+        x = torch.randn(4)
+        assert_close(outer(x), x * 2 + 1)
+
+    def test_dataclass_op_inside_plain_op(self):
+        @dataclasses.dataclass(frozen=True)
+        class _Cfg:
+            s: float
+
+        @magi_register_custom_op(name="test::nested_inner_dc")
+        def inner(x: torch.Tensor, cfg: _Cfg) -> torch.Tensor:
+            return x * cfg.s
+
+        @magi_register_custom_op(name="test::nested_outer_calls_dc")
+        def outer(x: torch.Tensor) -> torch.Tensor:
+            return inner(x, _Cfg(s=3.0)) + 1
+
+        x = torch.randn(4)
+        assert_close(outer(x), x * 3.0 + 1)
 
 
 if __name__ == "__main__":
