@@ -53,9 +53,7 @@ tl = pytest.importorskip("triton.language")
 
 from magi_compiler.api import magi_register_custom_op  # noqa: E402
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="triton kernels require CUDA"
-)
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="triton kernels require CUDA")
 
 
 # ---------------------------------------------------------------------------
@@ -97,10 +95,7 @@ def _add_kernel(a_ptr, b_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_SIZE": 128}, num_warps=4),
-        triton.Config({"BLOCK_SIZE": 256}, num_warps=4),
-    ],
+    configs=[triton.Config({"BLOCK_SIZE": 128}, num_warps=4), triton.Config({"BLOCK_SIZE": 256}, num_warps=4)],
     key=["n_elements"],
 )
 @triton.jit
@@ -209,15 +204,10 @@ def _heuristics_top_kernel(in_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr
     tl.store(out_ptr + offsets, x, mask=mask)
 
 
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=4)],
-    key=["n_elements"],
-)
+@triton.autotune(configs=[triton.Config({}, num_warps=4)], key=["n_elements"])
 @triton.heuristics({"BLOCK_SIZE": lambda args: 128})
 @triton.jit
-def _autotune_then_heuristics_kernel(
-    in_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr
-):
+def _autotune_then_heuristics_kernel(in_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(axis=0)
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -324,14 +314,9 @@ class TestMultiLevelNesting:
         assert_close(fn(x), torch.cos(x), atol=1e-5, rtol=1e-5)
 
     def test_introspection_walks_all_levels(self):
-        from torch._higher_order_ops.triton_kernel_wrap import (
-            TraceableTritonKernelWrapper,
-        )
+        from torch._higher_order_ops.triton_kernel_wrap import TraceableTritonKernelWrapper
 
-        from magi_compiler._triton_introspect import (
-            get_inner_triton_kernels,
-            rewrite_fn_with_wrap_triton,
-        )
+        from magi_compiler._triton_introspect import get_inner_triton_kernels, rewrite_fn_with_wrap_triton
 
         def fn(x):
             return _dispatch_launcher(x)
@@ -342,9 +327,7 @@ class TestMultiLevelNesting:
         rewritten = rewrite_fn_with_wrap_triton(fn, kernels)
         rebuilt_dispatch = rewritten.__globals__["_dispatch_launcher"]
         rebuilt_inner = rebuilt_dispatch.__globals__["_inner_launcher"]
-        assert isinstance(
-            rebuilt_inner.__globals__["_cos_kernel"], TraceableTritonKernelWrapper
-        )
+        assert isinstance(rebuilt_inner.__globals__["_cos_kernel"], TraceableTritonKernelWrapper)
 
 
 # Third-party "thin wrapper" pattern: some libraries return objects with a
@@ -386,10 +369,7 @@ class TestNnModuleSelfKernel:
             def _build_fn(self):
                 kernel = self._kernel
 
-                @magi_register_custom_op(
-                    name=f"magi_test::module_self_kernel_{id(self)}",
-                    extra_triton_kernels=[kernel],
-                )
+                @magi_register_custom_op(name=f"magi_test::module_self_kernel_{id(self)}", extra_triton_kernels=[kernel])
                 def op(x: torch.Tensor) -> torch.Tensor:
                     out = torch.empty_like(x)
                     n = x.numel()
@@ -468,9 +448,7 @@ class TestThirdPartyThinWrapper:
 
 class TestTrueCrossModuleLauncher:
     def test_external_neg_launcher(self):
-        from tests.api_tests._triton_external_helpers import (
-            external_neg_launcher,
-        )
+        from tests.api_tests._triton_external_helpers import external_neg_launcher
 
         @magi_register_custom_op(name="magi_test::true_cross_module_neg")
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -480,18 +458,10 @@ class TestTrueCrossModuleLauncher:
         assert_close(fn(x), -x, atol=1e-5, rtol=1e-5)
 
     def test_rewrite_descends_into_other_module(self):
-        from torch._higher_order_ops.triton_kernel_wrap import (
-            TraceableTritonKernelWrapper,
-        )
+        from torch._higher_order_ops.triton_kernel_wrap import TraceableTritonKernelWrapper
 
-        from magi_compiler._triton_introspect import (
-            get_inner_triton_kernels,
-            rewrite_fn_with_wrap_triton,
-        )
-        from tests.api_tests._triton_external_helpers import (
-            external_double_kernel,
-            external_double_launcher,
-        )
+        from magi_compiler._triton_introspect import get_inner_triton_kernels, rewrite_fn_with_wrap_triton
+        from tests.api_tests._triton_external_helpers import external_double_kernel, external_double_launcher
 
         def fn(x):
             # Bare Name call so the introspector can follow it across modules
@@ -514,19 +484,13 @@ class TestTrueCrossModuleLauncher:
                 contents = cell.cell_contents
             except ValueError:
                 continue
-            if callable(contents) and getattr(contents, "__name__", None) == (
-                "external_double_launcher"
-            ):
+            if callable(contents) and getattr(contents, "__name__", None) == ("external_double_launcher"):
                 rebuilt_launcher = contents
                 break
         assert rebuilt_launcher is not None, (
-            "expected rewrite_fn_with_wrap_triton to keep the launcher in "
-            "the rewritten function's closure"
+            "expected rewrite_fn_with_wrap_triton to keep the launcher in " "the rewritten function's closure"
         )
-        assert isinstance(
-            rebuilt_launcher.__globals__["external_double_kernel"],
-            TraceableTritonKernelWrapper,
-        ), (
+        assert isinstance(rebuilt_launcher.__globals__["external_double_kernel"], TraceableTritonKernelWrapper), (
             "rewrite_fn_with_wrap_triton should rebuild cross-module helpers "
             "so the kernel reference inside them is wrap_triton-aware."
         )
@@ -536,8 +500,7 @@ class TestTrueCrossModuleLauncher:
         from tests.api_tests import _triton_external_helpers as ext_mod
 
         assert not isinstance(
-            ext_mod.external_double_launcher.__globals__["external_double_kernel"],
-            TraceableTritonKernelWrapper,
+            ext_mod.external_double_launcher.__globals__["external_double_kernel"], TraceableTritonKernelWrapper
         ), (
             "rewrite_fn_with_wrap_triton must not mutate the helper's home "
             "module globals (other unrelated callers would be affected)."
@@ -590,9 +553,7 @@ class TestWrapTritonIdempotent:
     def test_rewrite_does_not_double_wrap(self):
         """Direct unit test: passing the already-wrapped kernel back through
         ``rewrite_fn_with_wrap_triton`` must not produce a double wrapper."""
-        from torch._higher_order_ops.triton_kernel_wrap import (
-            TraceableTritonKernelWrapper,
-        )
+        from torch._higher_order_ops.triton_kernel_wrap import TraceableTritonKernelWrapper
         from torch.library import wrap_triton
 
         from magi_compiler._triton_introspect import rewrite_fn_with_wrap_triton
@@ -638,10 +599,7 @@ class TestExtraTritonKernels:
         kernels_holder = type("KH", (), {})()
         kernels_holder.k = _cos_kernel
 
-        @magi_register_custom_op(
-            name="magi_test::cos_via_extra",
-            extra_triton_kernels=[_cos_kernel],
-        )
+        @magi_register_custom_op(name="magi_test::cos_via_extra", extra_triton_kernels=[_cos_kernel])
         def fn(x: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             n = x.numel()
@@ -666,9 +624,7 @@ class TestExtraTritonKernelsDedup:
             _cos_kernel[_grid_1d(n)](x, out, n, BLOCK_SIZE=128)
             return out
 
-        resolved_all, resolved_bare, _user_wrapped_ids = _resolve_triton_kernels(
-            fn, [_cos_kernel]
-        )
+        resolved_all, resolved_bare, _user_wrapped_ids = _resolve_triton_kernels(fn, [_cos_kernel])
         # Should appear exactly once even though it's both passed explicitly
         # and discovered by introspection.
         assert resolved_all.count(_cos_kernel) == 1
@@ -677,18 +633,13 @@ class TestExtraTritonKernelsDedup:
         assert len(resolved_bare) == 1
 
         rewritten = rewrite_fn_with_wrap_triton(fn, resolved_bare)
-        from torch._higher_order_ops.triton_kernel_wrap import (
-            TraceableTritonKernelWrapper,
-        )
+        from torch._higher_order_ops.triton_kernel_wrap import TraceableTritonKernelWrapper
 
         wrapped = rewritten.__globals__["_cos_kernel"]
         assert isinstance(wrapped, TraceableTritonKernelWrapper)
 
     def test_dedup_e2e(self):
-        @magi_register_custom_op(
-            name="magi_test::dedup_cos",
-            extra_triton_kernels=[_cos_kernel],
-        )
+        @magi_register_custom_op(name="magi_test::dedup_cos", extra_triton_kernels=[_cos_kernel])
         def fn(x: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             n = x.numel()
@@ -717,10 +668,7 @@ class TestExtraTritonKernelsForStaticOrClassmethod:
     """
 
     def test_staticmethod_selected_kernel(self):
-        @magi_register_custom_op(
-            name="magi_test::sm_kernel",
-            extra_triton_kernels=[_scale_kernel],
-        )
+        @magi_register_custom_op(name="magi_test::sm_kernel", extra_triton_kernels=[_scale_kernel])
         def myop(x: torch.Tensor) -> torch.Tensor:
             kernel = _KernelHolder.get_static()
             out = torch.empty_like(x)
@@ -733,10 +681,7 @@ class TestExtraTritonKernelsForStaticOrClassmethod:
         assert_close(out, x * 2.0)
 
     def test_classmethod_selected_kernel(self):
-        @magi_register_custom_op(
-            name="magi_test::cm_kernel",
-            extra_triton_kernels=[_scale_kernel],
-        )
+        @magi_register_custom_op(name="magi_test::cm_kernel", extra_triton_kernels=[_scale_kernel])
         def myop(x: torch.Tensor) -> torch.Tensor:
             kernel = _KernelHolder.get_class()
             out = torch.empty_like(x)
@@ -760,10 +705,7 @@ class TestExtraTritonKernelsForRuntimeImport:
         # function still call it). Simulate the runtime-import case by stuffing
         # the kernel into a local ``import``-like alias derived from globals,
         # so source introspection cannot statically resolve it.
-        @magi_register_custom_op(
-            name="magi_test::runtime_import_kernel",
-            extra_triton_kernels=[_cos_kernel],
-        )
+        @magi_register_custom_op(name="magi_test::runtime_import_kernel", extra_triton_kernels=[_cos_kernel])
         def myop(x: torch.Tensor) -> torch.Tensor:
             module_globals = globals()
             # Indirect lookup hides the kernel from static introspection of
@@ -818,14 +760,9 @@ class TestIntrospection:
         assert _add_kernel in kernels
 
     def test_rewrite_replaces_kernel_with_wrap_triton(self):
-        from torch._higher_order_ops.triton_kernel_wrap import (
-            TraceableTritonKernelWrapper,
-        )
+        from torch._higher_order_ops.triton_kernel_wrap import TraceableTritonKernelWrapper
 
-        from magi_compiler._triton_introspect import (
-            get_inner_triton_kernels,
-            rewrite_fn_with_wrap_triton,
-        )
+        from magi_compiler._triton_introspect import get_inner_triton_kernels, rewrite_fn_with_wrap_triton
 
         def fn(x):
             out = torch.empty_like(x)
@@ -838,23 +775,16 @@ class TestIntrospection:
 
         # _cos_kernel name in the rewritten globals should now point to a
         # TraceableTritonKernelWrapper, not the bare JITFunction.
-        assert isinstance(
-            rewritten.__globals__["_cos_kernel"], TraceableTritonKernelWrapper
-        )
+        assert isinstance(rewritten.__globals__["_cos_kernel"], TraceableTritonKernelWrapper)
         # Originals untouched.
         from triton.runtime.jit import JITFunction
 
         assert isinstance(_cos_kernel, JITFunction)
 
     def test_rewrite_propagates_through_helpers(self):
-        from torch._higher_order_ops.triton_kernel_wrap import (
-            TraceableTritonKernelWrapper,
-        )
+        from torch._higher_order_ops.triton_kernel_wrap import TraceableTritonKernelWrapper
 
-        from magi_compiler._triton_introspect import (
-            get_inner_triton_kernels,
-            rewrite_fn_with_wrap_triton,
-        )
+        from magi_compiler._triton_introspect import get_inner_triton_kernels, rewrite_fn_with_wrap_triton
 
         def fn(a, b):
             return _add_launcher(a, b)
@@ -863,9 +793,7 @@ class TestIntrospection:
         rewritten = rewrite_fn_with_wrap_triton(fn, kernels)
 
         rebuilt_launcher = rewritten.__globals__["_add_launcher"]
-        assert isinstance(
-            rebuilt_launcher.__globals__["_add_kernel"], TraceableTritonKernelWrapper
-        )
+        assert isinstance(rebuilt_launcher.__globals__["_add_kernel"], TraceableTritonKernelWrapper)
 
 
 # Multi-level nesting: fn -> dispatch -> launcher -> kernel.
@@ -875,10 +803,7 @@ class TestIntrospection:
 
 class TestInferOutputMetaOverride:
     def test_meta_list_form(self):
-        @magi_register_custom_op(
-            name="magi_test::triton_meta_list",
-            infer_output_meta_fn=["x"],
-        )
+        @magi_register_custom_op(name="magi_test::triton_meta_list", infer_output_meta_fn=["x"])
         def fn(x: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             n = x.numel()
@@ -898,10 +823,7 @@ class TestInferOutputMetaOverride:
             called["count"] += 1
             return torch.empty_like(x)
 
-        @magi_register_custom_op(
-            name="magi_test::triton_meta_callable",
-            infer_output_meta_fn=custom_meta,
-        )
+        @magi_register_custom_op(name="magi_test::triton_meta_callable", infer_output_meta_fn=custom_meta)
         def fn(x: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             n = x.numel()
@@ -963,9 +885,7 @@ class TestTritonOpRegistryAssertion:
         def fn(x: torch.Tensor) -> torch.Tensor:
             return x * 2 + 1
 
-        assert not self._was_registered_as_triton_op(
-            "magi_test::registry_pure_python"
-        ), (
+        assert not self._was_registered_as_triton_op("magi_test::registry_pure_python"), (
             "magi_test::registry_pure_python has no triton kernels; it should "
             "have fallen back to the custom_op path and remain opaque to "
             "make_fx."
@@ -1006,16 +926,11 @@ class TestMultipleAutotuneKernelsSameOp:
         # Build a *second* autotuned kernel locally so we can be sure both
         # kernel objects appear in the op's call graph.
         @triton.autotune(
-            configs=[
-                triton.Config({"BLOCK_SIZE": 128}, num_warps=4),
-                triton.Config({"BLOCK_SIZE": 256}, num_warps=4),
-            ],
+            configs=[triton.Config({"BLOCK_SIZE": 128}, num_warps=4), triton.Config({"BLOCK_SIZE": 256}, num_warps=4)],
             key=["n_elements"],
         )
         @triton.jit
-        def _autotuned_sin_kernel(
-            in_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr
-        ):
+        def _autotuned_sin_kernel(in_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(axis=0)
             block_start = pid * BLOCK_SIZE
             offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -1023,10 +938,7 @@ class TestMultipleAutotuneKernelsSameOp:
             x = tl.load(in_ptr + offsets, mask=mask)
             tl.store(out_ptr + offsets, tl.sin(x), mask=mask)
 
-        @magi_register_custom_op(
-            name="magi_test::two_autotune_kernels",
-            extra_triton_kernels=[_autotuned_sin_kernel],
-        )
+        @magi_register_custom_op(name="magi_test::two_autotune_kernels", extra_triton_kernels=[_autotuned_sin_kernel])
         def myop(x: torch.Tensor) -> torch.Tensor:
             n = x.numel()
             mid = torch.empty_like(x)
@@ -1068,10 +980,7 @@ class TestHeuristicsRejection:
         involved)."""
         with pytest.raises(RuntimeError, match="triton.heuristics"):
 
-            @magi_register_custom_op(
-                name="magi_test::heuristics_extra",
-                extra_triton_kernels=[_heuristics_top_kernel],
-            )
+            @magi_register_custom_op(name="magi_test::heuristics_extra", extra_triton_kernels=[_heuristics_top_kernel])
             def myop(x: torch.Tensor) -> torch.Tensor:
                 # Body doesn't reference the kernel at all; rejection comes
                 # purely from the extra_triton_kernels list.
@@ -1108,11 +1017,7 @@ class TestTritonWithAutograd:
             # d/dx cos(x) = -sin(x)
             return grad_out * (-torch.sin(x))
 
-        @magi_register_custom_op(
-            name="magi_test::triton_cos_grad",
-            setup_context_fn=setup_ctx,
-            backward_fn=backward,
-        )
+        @magi_register_custom_op(name="magi_test::triton_cos_grad", setup_context_fn=setup_ctx, backward_fn=backward)
         def mycos(x: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
             n = x.numel()
@@ -1154,11 +1059,8 @@ class TestDataclassWithTritonKernel:
 
         # The dataclass-aware path registers an *inner* op under the requested
         # name. That inner op should still be a triton_op.
-        assert TestTritonOpRegistryAssertion._was_registered_as_triton_op(
-            "magi_test::dc_cos"
-        ), (
-            "dataclass+triton path should still register the inner op as a "
-            "triton_op so Inductor can see through it."
+        assert TestTritonOpRegistryAssertion._was_registered_as_triton_op("magi_test::dc_cos"), (
+            "dataclass+triton path should still register the inner op as a " "triton_op so Inductor can see through it."
         )
 
 
@@ -1180,15 +1082,11 @@ class TestNestedDataclassWithTritonKernel:
             out = torch.empty_like(x)
             n = x.numel()
             _cos_kernel[_grid_1d(n)](x, tmp, n, BLOCK_SIZE=cfg.kernel.block_size)
-            _scale_kernel[_grid_1d(n)](
-                tmp, out, n, cfg.scale, BLOCK_SIZE=cfg.kernel.block_size
-            )
+            _scale_kernel[_grid_1d(n)](tmp, out, n, cfg.scale, BLOCK_SIZE=cfg.kernel.block_size)
             return out + cfg.kernel.extra_offset
 
         x = torch.randn(1024, device="cuda")
-        cfg = _DcOuterCfg(
-            kernel=_DcKernelCfg(block_size=128, extra_offset=0.5), scale=2.5
-        )
+        cfg = _DcOuterCfg(kernel=_DcKernelCfg(block_size=128, extra_offset=0.5), scale=2.5)
         out = fn(x, cfg)
         expected = torch.cos(x) * 2.5 + 0.5
         assert_close(out, expected, atol=1e-5, rtol=1e-5)
@@ -1207,16 +1105,10 @@ class TestNestedDataclassWithTritonKernel:
                     _collect(child)
 
         _collect(cfg_node)
-        assert {
-            "cfg__kernel__block_size",
-            "cfg__kernel__extra_offset",
-            "cfg__scale",
-        }.issubset(flat_names)
+        assert {"cfg__kernel__block_size", "cfg__kernel__extra_offset", "cfg__scale"}.issubset(flat_names)
 
         # And: the registered op should still go through triton_op.
-        assert TestTritonOpRegistryAssertion._was_registered_as_triton_op(
-            "magi_test::nested_dc_cos_scale"
-        ), (
+        assert TestTritonOpRegistryAssertion._was_registered_as_triton_op("magi_test::nested_dc_cos_scale"), (
             "nested-dataclass + triton path should still register the inner "
             "op as a triton_op so Inductor can see through it."
         )
@@ -1228,10 +1120,7 @@ class TestNestedDataclassWithTritonKernel:
         def _meta(x: torch.Tensor, cfg: _DcProjCfg) -> torch.Tensor:
             return x.new_empty((*x.shape[:-1], cfg.shape.out_dim))
 
-        @magi_register_custom_op(
-            name="magi_test::nested_dc_cos_proj",
-            infer_output_meta_fn=_meta,
-        )
+        @magi_register_custom_op(name="magi_test::nested_dc_cos_proj", infer_output_meta_fn=_meta)
         def fn(x: torch.Tensor, cfg: _DcProjCfg) -> torch.Tensor:
             sliced = x[..., : cfg.shape.out_dim].contiguous()
             out = torch.empty_like(sliced)
@@ -1268,11 +1157,7 @@ class TestDataclassWithTritonKernelAndBackward:
             (x,) = ctx.saved_tensors
             return grad_out * (-torch.sin(x)), None
 
-        @magi_register_custom_op(
-            name="magi_test::dc_cos_grad",
-            setup_context_fn=_setup,
-            backward_fn=_bwd,
-        )
+        @magi_register_custom_op(name="magi_test::dc_cos_grad", setup_context_fn=_setup, backward_fn=_bwd)
         def mycos(x: torch.Tensor, cfg: _DcCosCfg) -> torch.Tensor:
             out = torch.empty_like(x)
             n = x.numel()
@@ -1287,9 +1172,7 @@ class TestDataclassWithTritonKernelAndBackward:
 
         # Sanity: this op should still have gone through the triton_op path
         # (the dataclass-aware path registers an inner op under ``op_name``).
-        assert TestTritonOpRegistryAssertion._was_registered_as_triton_op(
-            "magi_test::dc_cos_grad"
-        )
+        assert TestTritonOpRegistryAssertion._was_registered_as_triton_op("magi_test::dc_cos_grad")
 
     def test_triton_nested_dc_backward(self):
         """Nested dataclass + triton + backward. The bridge must spread the
@@ -1308,25 +1191,17 @@ class TestDataclassWithTritonKernelAndBackward:
             # d/dx (cos(x) * scale + offset) = -sin(x) * scale
             return grad_out * (-torch.sin(x)) * ctx.scale, None
 
-        @magi_register_custom_op(
-            name="magi_test::nested_dc_cos_grad",
-            setup_context_fn=_setup,
-            backward_fn=_bwd,
-        )
+        @magi_register_custom_op(name="magi_test::nested_dc_cos_grad", setup_context_fn=_setup, backward_fn=_bwd)
         def fn(x: torch.Tensor, cfg: _DcOuterCfg) -> torch.Tensor:
             tmp = torch.empty_like(x)
             out = torch.empty_like(x)
             n = x.numel()
             _cos_kernel[_grid_1d(n)](x, tmp, n, BLOCK_SIZE=cfg.kernel.block_size)
-            _scale_kernel[_grid_1d(n)](
-                tmp, out, n, cfg.scale, BLOCK_SIZE=cfg.kernel.block_size
-            )
+            _scale_kernel[_grid_1d(n)](tmp, out, n, cfg.scale, BLOCK_SIZE=cfg.kernel.block_size)
             return out + cfg.kernel.extra_offset
 
         x = torch.randn(1024, device="cuda", requires_grad=True)
-        cfg = _DcOuterCfg(
-            kernel=_DcKernelCfg(block_size=128, extra_offset=0.5), scale=2.5
-        )
+        cfg = _DcOuterCfg(kernel=_DcKernelCfg(block_size=128, extra_offset=0.5), scale=2.5)
         out = fn(x, cfg)
         out.sum().backward()
         expected = -torch.sin(x.detach()) * 2.5
@@ -1343,16 +1218,9 @@ class TestDataclassWithTritonKernelAndBackward:
 
         def _bwd(ctx, grad_out):
             (x,) = ctx.saved_tensors
-            return (
-                grad_out * (-torch.sin(x)),
-                _DcCosCfg(block_size=None),
-            )
+            return (grad_out * (-torch.sin(x)), _DcCosCfg(block_size=None))
 
-        @magi_register_custom_op(
-            name="magi_test::dc_cos_per_field_grad",
-            setup_context_fn=_setup,
-            backward_fn=_bwd,
-        )
+        @magi_register_custom_op(name="magi_test::dc_cos_per_field_grad", setup_context_fn=_setup, backward_fn=_bwd)
         def mycos(x: torch.Tensor, cfg: _DcCosCfg) -> torch.Tensor:
             out = torch.empty_like(x)
             n = x.numel()
@@ -1381,11 +1249,7 @@ class TestDataclassWithTritonKernelAndBackward:
             # _DcCosCfg(block_size=None) instance.
             return grad_out * (-torch.sin(x)), {"block_size": None}
 
-        @magi_register_custom_op(
-            name="magi_test::dc_cos_dict_grad",
-            setup_context_fn=_setup,
-            backward_fn=_bwd,
-        )
+        @magi_register_custom_op(name="magi_test::dc_cos_dict_grad", setup_context_fn=_setup, backward_fn=_bwd)
         def mycos(x: torch.Tensor, cfg: _DcCosCfg) -> torch.Tensor:
             out = torch.empty_like(x)
             n = x.numel()
@@ -1412,10 +1276,7 @@ class TestDataclassTritonComputeSensitiveSmoke:
     def test_dataclass_triton_compute_sensitive(self):
         from magi_compiler.config import get_compile_config
 
-        @magi_register_custom_op(
-            name="magi_test::dc_triton_cs",
-            is_compute_sensitive=True,
-        )
+        @magi_register_custom_op(name="magi_test::dc_triton_cs", is_compute_sensitive=True)
         def myop(x: torch.Tensor, cfg: _DcCosCfg) -> torch.Tensor:
             out = torch.empty_like(x)
             n = x.numel()
@@ -1425,10 +1286,7 @@ class TestDataclassTritonComputeSensitiveSmoke:
         x = torch.randn(256, device="cuda")
         out = myop(x, _DcCosCfg(block_size=128))
         assert_close(out, torch.cos(x))
-        assert (
-            "magi_test::dc_triton_cs"
-            in get_compile_config().recompute_config.custom_compute_sensitive_ops
-        )
+        assert "magi_test::dc_triton_cs" in get_compile_config().recompute_config.custom_compute_sensitive_ops
 
 
 class TestInductorSeesTritonKernel:
@@ -1468,10 +1326,7 @@ class TestInductorSeesTritonKernel:
         assert_close(out, torch.cos(x), atol=1e-5, rtol=1e-5)
 
         joined = "\n".join(captured_graphs)
-        assert (
-            "triton_kernel_wrapper_functional" in joined
-            or "triton_kernel_wrapper_mutation" in joined
-        ), (
+        assert "triton_kernel_wrapper_functional" in joined or "triton_kernel_wrapper_mutation" in joined, (
             "AOT graph did not decompose magi_test::inductor_visible_cos "
             "into the triton_kernel_wrapper HOP; Inductor will treat it "
             "as opaque. Captured AOT graph:\n" + joined

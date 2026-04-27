@@ -59,9 +59,7 @@ __all__ = [
 # ==============================================================================
 
 
-def _find_triton_kernels_impl(
-    fn: Callable[..., Any], only_bare: bool = False
-) -> list[object]:
+def _find_triton_kernels_impl(fn: Callable[..., Any], only_bare: bool = False) -> list[object]:
     """Shared driver for :func:`get_inner_triton_kernels` and
     :func:`get_bare_triton_kernels`.
 
@@ -75,11 +73,7 @@ def _find_triton_kernels_impl(
     # prevent infinite recursion
     MAX_RECURSION_DEPTH = 5
 
-    def find_triton_kernels(
-        fn: Callable[..., Any],
-        visited_fns: set[int] | None = None,
-        depth: int = 0,
-    ) -> list[object]:
+    def find_triton_kernels(fn: Callable[..., Any], visited_fns: set[int] | None = None, depth: int = 0) -> list[object]:
         try:
             from triton.runtime.autotuner import Autotuner
             from triton.runtime.jit import JITFunction
@@ -98,10 +92,7 @@ def _find_triton_kernels_impl(
         if fn_id in visited_fns:
             return []
         if depth > MAX_RECURSION_DEPTH:
-            logger.debug(
-                "reached max recursion depth (%s) in find_triton_kernels",
-                MAX_RECURSION_DEPTH,
-            )
+            logger.debug("reached max recursion depth (%s) in find_triton_kernels", MAX_RECURSION_DEPTH)
             return []
 
         visited_fns.add(fn_id)
@@ -166,9 +157,7 @@ def _find_triton_kernels_impl(
                             and attr.value.value.value.id == "torch"
                             and attr.value.value.attr == "ops"
                         ):
-                            self.called_functions.append(
-                                f"{attr.value.attr}::{attr.attr}"
-                            )
+                            self.called_functions.append(f"{attr.value.attr}::{attr.attr}")
                 # Catch capture_triton, wrap_triton that's been
                 # imported directly
                 elif isinstance(node.func, ast.Name):
@@ -186,9 +175,7 @@ def _find_triton_kernels_impl(
                 # value is a plain Name (the most common pattern); subscripted
                 # attributes (e.g. ``self.kernel[grid](...)``) need the
                 # ``extra_triton_kernels`` escape hatch.
-                if isinstance(node.func, ast.Subscript) and isinstance(
-                    node.func.value, ast.Name
-                ):
+                if isinstance(node.func, ast.Subscript) and isinstance(node.func.value, ast.Name):
                     self.bare_kernel_names.append(node.func.value.id)
 
                 self.generic_visit(node)
@@ -279,11 +266,7 @@ def _find_triton_kernels_impl(
                         except ValueError:
                             unwrapped = obj
                         if hasattr(unwrapped, "__code__"):
-                            nested = find_triton_kernels(
-                                unwrapped,
-                                visited_fns,
-                                depth + 1,
-                            )
+                            nested = find_triton_kernels(unwrapped, visited_fns, depth + 1)
                             if nested:
                                 results.extend(nested)
                                 continue
@@ -292,9 +275,7 @@ def _find_triton_kernels_impl(
                     # trace through local assignments
                     for rhs_expr in assignments[name]:
                         referenced = extract_names_from_expr(rhs_expr)
-                        traced = resolve_names_to_kernels(
-                            referenced, namespace, assignments, visited
-                        )
+                        traced = resolve_names_to_kernels(referenced, namespace, assignments, visited)
                         results.extend(traced)
                 else:
                     logger.debug("%s not found in namespace or assignments", name)
@@ -308,16 +289,12 @@ def _find_triton_kernels_impl(
         if only_bare:
             names_to_resolve: list[str] = list(collector.bare_kernel_names)
         else:
-            names_to_resolve = list(collector.bare_kernel_names) + list(
-                collector.wrapped_kernel_names
-            )
+            names_to_resolve = list(collector.bare_kernel_names) + list(collector.wrapped_kernel_names)
             for expr in collector.return_exprs:
                 names_to_resolve.extend(extract_names_from_expr(expr))
 
         for name in names_to_resolve:
-            traced_objects = resolve_names_to_kernels(
-                [name], all_names, collector.assignments
-            )
+            traced_objects = resolve_names_to_kernels([name], all_names, collector.assignments)
             for obj in traced_objects:
                 obj_id = id(obj)
                 if obj_id not in seen_ids:
@@ -352,9 +329,7 @@ def _find_triton_kernels_impl(
                         seen_ids.add(kernel_id)
                         resolved.append(kernel)
             except Exception:
-                logger.debug(
-                    "failed to analyze called function %s", func_name, exc_info=True
-                )
+                logger.debug("failed to analyze called function %s", func_name, exc_info=True)
 
         return resolved
 
@@ -432,9 +407,7 @@ def _find_user_wrapped_kernels_impl(fn: Callable[..., Any]) -> list[object]:
         obj = namespace.get(n)
         if obj is None:
             continue
-        resolved = (
-            obj if isinstance(obj, kernel_types) else _resolve_kernel(obj, kernel_types)
-        )
+        resolved = obj if isinstance(obj, kernel_types) else _resolve_kernel(obj, kernel_types)
         if resolved is None:
             continue
         if id(resolved) in seen:
@@ -616,9 +589,7 @@ def _is_user_helper(obj: object) -> bool:
 
 
 def rewrite_fn_with_wrap_triton(
-    fn: Callable[..., Any],
-    kernels: list[object],
-    excluded_kernel_ids: Optional[set[int]] = None,
+    fn: Callable[..., Any], kernels: list[object], excluded_kernel_ids: Optional[set[int]] = None
 ) -> Callable[..., Any]:
     """
     Return a copy of ``fn`` whose globals / closures are shadowed so that every
@@ -772,21 +743,11 @@ def rewrite_fn_with_wrap_triton(
                         new_cells.append(types.CellType(_rebuild(contents)))
                         continue
                     except Exception:
-                        logger.debug(
-                            "failed to rebuild closure helper %s",
-                            getattr(contents, "__name__", "?"),
-                            exc_info=True,
-                        )
+                        logger.debug("failed to rebuild closure helper %s", getattr(contents, "__name__", "?"), exc_info=True)
                 new_cells.append(cell)
             new_closure = tuple(new_cells)
 
-        new_fn = types.FunctionType(
-            f.__code__,
-            new_globals,
-            f.__name__,
-            f.__defaults__,
-            new_closure,
-        )
+        new_fn = types.FunctionType(f.__code__, new_globals, f.__name__, f.__defaults__, new_closure)
         # Preserve introspectable metadata so that downstream tooling
         # (infer_schema, register_fake, etc.) continues to work.
         try:

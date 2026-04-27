@@ -98,8 +98,7 @@ def _assert_op_name_namespaced(op_name: str) -> None:
 
 
 _LITERAL_STRING_DOWNGRADE_HINT = (
-    "Use ``str`` and validate the value inside the op body, e.g. "
-    "``assert mode in ('a', 'b')``."
+    "Use ``str`` and validate the value inside the op body, e.g. " "``assert mode in ('a', 'b')``."
 )
 
 
@@ -439,14 +438,7 @@ def _resolve_dataclass_field_types(cls: type) -> dict[str, Any]:
         return {f.name: f.type for f in dataclasses.fields(cls)}
 
 
-_SCHEMA_DEFAULT_TYPES: tuple[type, ...] = (
-    int,
-    float,
-    bool,
-    str,
-    torch.device,
-    torch.dtype,
-)
+_SCHEMA_DEFAULT_TYPES: tuple[type, ...] = (int, float, bool, str, torch.device, torch.dtype)
 
 
 def _schema_compatible_param_default(default: Any) -> Any:
@@ -491,9 +483,7 @@ def _schema_compatible_default(f: "dataclasses.Field") -> Any:
     return inspect.Parameter.empty
 
 
-def _build_dataclass_subplan(
-    cls: type, attr_name: str, flat_prefix: str
-) -> tuple[tuple, list[inspect.Parameter]]:
+def _build_dataclass_subplan(cls: type, attr_name: str, flat_prefix: str) -> tuple[tuple, list[inspect.Parameter]]:
     """Recursively build a (sub-)plan and the corresponding flat parameters
     for one frozen-dataclass-typed value.
 
@@ -530,18 +520,12 @@ def _build_dataclass_subplan(
             )
         _assert_not_mutable_dataclass(f_type, where=f"field {cls.__name__}.{f.name}")
         if _is_frozen_dataclass(f_type):
-            sub_node, sub_params = _build_dataclass_subplan(
-                f_type, attr_name=f.name, flat_prefix=child_flat_name
-            )
+            sub_node, sub_params = _build_dataclass_subplan(f_type, attr_name=f.name, flat_prefix=child_flat_name)
             children.append(sub_node)
             flat_params.extend(sub_params)
         else:
-            _assert_not_unsupported_container(
-                f_type, where=f"field {cls.__name__}.{f.name}"
-            )
-            f_type = _maybe_downgrade_literal_or_enum(
-                f_type, where=f"field {cls.__name__}.{f.name}"
-            )
+            _assert_not_unsupported_container(f_type, where=f"field {cls.__name__}.{f.name}")
+            f_type = _maybe_downgrade_literal_or_enum(f_type, where=f"field {cls.__name__}.{f.name}")
             children.append(("primitive", f.name, child_flat_name, None))
             # Carry the dataclass field's default (or default_factory product)
             # over to the flat parameter so torch.library.infer_schema records
@@ -602,16 +586,12 @@ def _build_flat_signature(fn: Callable):
         annotation = resolved.get(name, param.annotation)
         _assert_not_mutable_dataclass(annotation, where=f"parameter {name!r}")
         if _is_frozen_dataclass(annotation):
-            node, sub_params = _build_dataclass_subplan(
-                annotation, attr_name=name, flat_prefix=name
-            )
+            node, sub_params = _build_dataclass_subplan(annotation, attr_name=name, flat_prefix=name)
             plan.append(node)
             flat_params.extend(sub_params)
         else:
             _assert_not_unsupported_container(annotation, where=f"parameter {name!r}")
-            annotation = _maybe_downgrade_literal_or_enum(
-                annotation, where=f"parameter {name!r}"
-            )
+            annotation = _maybe_downgrade_literal_or_enum(annotation, where=f"parameter {name!r}")
             new_param = param.replace(
                 kind=inspect.Parameter.POSITIONAL_OR_KEYWORD,
                 annotation=annotation,
@@ -655,9 +635,7 @@ def _make_flat_signature_wrapper(fn: Callable, flat_sig: inspect.Signature) -> C
 
     _wrapped.__signature__ = flat_sig
     flat_annotations = {
-        p.name: p.annotation
-        for p in flat_sig.parameters.values()
-        if p.annotation is not inspect.Parameter.empty
+        p.name: p.annotation for p in flat_sig.parameters.values() if p.annotation is not inspect.Parameter.empty
     }
     if flat_sig.return_annotation is not inspect.Signature.empty:
         flat_annotations["return"] = flat_sig.return_annotation
@@ -718,9 +696,7 @@ def _flatten_value_into(node: tuple, value: Any, out: list) -> None:
         _flatten_value_into(child, getattr(value, field_name), out)
 
 
-def _flatten_call_args(
-    plan: list[tuple], user_sig: inspect.Signature, args: tuple, kwargs: dict
-) -> list:
+def _flatten_call_args(plan: list[tuple], user_sig: inspect.Signature, args: tuple, kwargs: dict) -> list:
     """
     Flatten a user-side call (which may pass nested dataclass instances) into
     a positional list. The order matches the flat signature produced by
@@ -798,10 +774,7 @@ def _collect_tensor_leaf_flat_names(node: tuple) -> list[str]:
     return out
 
 
-def _expand_mutates_args(
-    mutates_args: tuple[str, ...] | list[str],
-    plan: list[tuple],
-) -> tuple[str, ...]:
+def _expand_mutates_args(mutates_args: tuple[str, ...] | list[str], plan: list[tuple]) -> tuple[str, ...]:
     """Translate ``mutates_args`` from the *original* parameter space to the
     *flat* parameter space.
 
@@ -913,8 +886,7 @@ def _assert_wrap_triton_compatible(kernels: list[Any]) -> None:
 
 
 def _resolve_triton_kernels(
-    fn: Callable,
-    extra_triton_kernels: list[Any] | tuple[Any, ...] | None,
+    fn: Callable, extra_triton_kernels: list[Any] | tuple[Any, ...] | None
 ) -> tuple[list[Any], list[Any], set[int]]:
     """Best-effort: collect triton kernels referenced inside ``fn``.
 
@@ -981,9 +953,7 @@ def _resolve_triton_kernels(
     except Exception:
         logger.debug("get_referenced_heuristics_kernels(%r) failed", fn, exc_info=True)
         referenced_heuristics = []
-    _assert_wrap_triton_compatible(
-        list(extra_triton_kernels or ()) + list(referenced_heuristics)
-    )
+    _assert_wrap_triton_compatible(list(extra_triton_kernels or ()) + list(referenced_heuristics))
     try:
         user_wrapped = get_user_wrapped_triton_kernels(fn)
     except Exception:
@@ -1064,16 +1034,12 @@ def _register_op(
         except ImportError:
             triton_op = None  # type: ignore[assignment]
             logger.warning(
-                "torch.library.triton_op not available; falling back to "
-                "torch.library.custom_op for op %s",
-                op_name,
+                "torch.library.triton_op not available; falling back to " "torch.library.custom_op for op %s", op_name
             )
 
         if triton_op is not None:
             try:
-                fn_for_register = rewrite_fn_with_wrap_triton(
-                    fn, bare_triton_kernels, excluded_kernel_ids=excluded_kernel_ids
-                )
+                fn_for_register = rewrite_fn_with_wrap_triton(fn, bare_triton_kernels, excluded_kernel_ids=excluded_kernel_ids)
                 # ``rewrite_fn_with_wrap_triton`` builds a fresh
                 # ``types.FunctionType`` from ``fn.__code__``; if ``fn`` is a
                 # thin signature-rewriting wrapper (e.g. for Literal /
@@ -1087,16 +1053,9 @@ def _register_op(
                         for p in signature_override.parameters.values()
                         if p.annotation is not inspect.Parameter.empty
                     }
-                    if (
-                        signature_override.return_annotation
-                        is not inspect.Signature.empty
-                    ):
-                        fn_for_register.__annotations__["return"] = (
-                            signature_override.return_annotation
-                        )
-                registered_op = triton_op(op_name, mutates_args=mutates_args)(
-                    fn_for_register
-                )
+                    if signature_override.return_annotation is not inspect.Signature.empty:
+                        fn_for_register.__annotations__["return"] = signature_override.return_annotation
+                registered_op = triton_op(op_name, mutates_args=mutates_args)(fn_for_register)
                 # ``triton_op`` already registers ``fn`` as the fake/meta
                 # implementation. Only override when the user explicitly
                 # supplied an ``infer_output_meta_fn``.
@@ -1133,9 +1092,7 @@ def _magi_register_custom_op_impl(
         _assert_op_name_namespaced(op_name)
         _assert_op_name_unused(op_name)
         if is_compute_sensitive:
-            get_compile_config().recompute_config.custom_compute_sensitive_ops.append(
-                op_name
-            )
+            get_compile_config().recompute_config.custom_compute_sensitive_ops.append(op_name)
         if is_subgraph_boundary:
             get_compile_config().splitting_ops.append(op_name)
 
@@ -1153,9 +1110,7 @@ def _magi_register_custom_op_impl(
             # schema sees the cleaned-up version. Otherwise we register ``fn``
             # directly to preserve the original zero-overhead path.
             sig_was_rewritten = _signatures_differ(flat_sig, user_sig)
-            fn_for_register = (
-                _make_flat_signature_wrapper(fn, flat_sig) if sig_was_rewritten else fn
-            )
+            fn_for_register = _make_flat_signature_wrapper(fn, flat_sig) if sig_was_rewritten else fn
 
             # Step 1: Build the meta/fake function (used either as a
             # register_fake override on the triton path, or as the regular
@@ -1165,9 +1120,7 @@ def _magi_register_custom_op_impl(
                 meta_fn = _create_identity_meta_fn(meta_target)
                 user_supplied_meta = False
             elif isinstance(infer_output_meta_fn, list):
-                meta_fn = _create_meta_fn_from_param_names(
-                    meta_target, infer_output_meta_fn
-                )
+                meta_fn = _create_meta_fn_from_param_names(meta_target, infer_output_meta_fn)
                 user_supplied_meta = True
             else:
                 meta_fn = infer_output_meta_fn
@@ -1175,9 +1128,7 @@ def _magi_register_custom_op_impl(
 
             # Step 2: Detect inner triton kernels and register the op via
             # triton_op (if any kernels are present) or custom_op (otherwise).
-            triton_kernels, bare_triton_kernels, user_wrapped_ids = (
-                _resolve_triton_kernels(fn, extra_triton_kernels)
-            )
+            triton_kernels, bare_triton_kernels, user_wrapped_ids = _resolve_triton_kernels(fn, extra_triton_kernels)
             registered_op = _register_op(
                 op_name=op_name,
                 fn=fn_for_register,
@@ -1192,9 +1143,7 @@ def _magi_register_custom_op_impl(
 
             # Step 3: Register autograd if backward_fn is provided
             if backward_fn is not None:
-                registered_op.register_autograd(
-                    backward_fn, setup_context=setup_context_fn
-                )
+                registered_op.register_autograd(backward_fn, setup_context=setup_context_fn)
 
             _REGISTERED_OP_NAMES.add(op_name)
             return registered_op
@@ -1212,13 +1161,9 @@ def _magi_register_custom_op_impl(
         # Detect triton kernels referenced from the original (dataclass-typed)
         # fn. If any are present, route ``inner_fn`` through a wrap_triton-aware
         # copy of ``fn`` so the eventual triton_op registration captures them.
-        triton_kernels, bare_triton_kernels, user_wrapped_ids = _resolve_triton_kernels(
-            fn, extra_triton_kernels
-        )
+        triton_kernels, bare_triton_kernels, user_wrapped_ids = _resolve_triton_kernels(fn, extra_triton_kernels)
         fn_for_inner = (
-            rewrite_fn_with_wrap_triton(
-                fn, bare_triton_kernels, excluded_kernel_ids=user_wrapped_ids
-            )
+            rewrite_fn_with_wrap_triton(fn, bare_triton_kernels, excluded_kernel_ids=user_wrapped_ids)
             if bare_triton_kernels
             else fn
         )
@@ -1243,9 +1188,7 @@ def _magi_register_custom_op_impl(
         # tool reading ``__annotations__`` directly (e.g. ``get_type_hints``)
         # also sees the primitive types torch.library expects.
         flat_annotations = {
-            p.name: p.annotation
-            for p in flat_sig.parameters.values()
-            if p.annotation is not inspect.Parameter.empty
+            p.name: p.annotation for p in flat_sig.parameters.values() if p.annotation is not inspect.Parameter.empty
         }
         if flat_sig.return_annotation is not inspect.Signature.empty:
             flat_annotations["return"] = flat_sig.return_annotation
@@ -1303,9 +1246,7 @@ def _magi_register_custom_op_impl(
                 # ``inputs`` is the flat positional tuple in the order of
                 # ``flat_sig``. Reassemble it into the user's original
                 # (possibly nested-dataclass-bearing) shape.
-                flat_kwargs = {
-                    p.name: v for p, v in zip(flat_sig.parameters.values(), inputs)
-                }
+                flat_kwargs = {p.name: v for p, v in zip(flat_sig.parameters.values(), inputs)}
                 user_kwargs = _reassemble_user_kwargs(plan, flat_kwargs)
                 # Preserve original positional order so users can do
                 # ``x, cfg = inputs`` exactly like in the no-dataclass case.
@@ -1320,9 +1261,7 @@ def _magi_register_custom_op_impl(
                     user_grads = (user_grads,)
                 return tuple(_flatten_user_grads(plan, user_grads))
 
-            registered_op.register_autograd(
-                _bridged_backward, setup_context=_bridged_setup_context
-            )
+            registered_op.register_autograd(_bridged_backward, setup_context=_bridged_setup_context)
 
         # Outer wrapper preserves the original (dataclass-aware) signature for
         # users while routing through the registered (flat) op underneath.

@@ -41,9 +41,7 @@ except ImportError:  # pragma: no cover
 if HAS_TRITON:
 
     @triton.jit
-    def external_neg_kernel(
-        in_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr
-    ):
+    def external_neg_kernel(in_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(axis=0)
         offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
@@ -51,9 +49,7 @@ if HAS_TRITON:
         tl.store(out_ptr + offsets, -x, mask=mask)
 
     @triton.jit
-    def external_double_kernel(
-        in_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr
-    ):
+    def external_double_kernel(in_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(axis=0)
         offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
