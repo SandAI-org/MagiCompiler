@@ -368,6 +368,54 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                 fake_args.append(t)
         return fake_args
 
+    @staticmethod
+    def _restride_outputs(target: str, output: Any, output_strides: list | None) -> Any:
+        """Update FakeTensor output strides to match what Inductor will produce.
+
+        ``standalone_compile`` may change the memory layout of a subgraph's
+        outputs (e.g. mm output padding, kernel fusion).  The downstream
+        subgraph will be compiled with the FakeTensor strides that flow out of
+        this method, so they **must** reflect Inductor's actual output layout.
+
+        ``output_strides`` comes from Inductor's ``set_tracing_context_output_strides``
+        which evaluates symbolic stride expressions to concrete ints.  When the
+        FakeTensor already has a symbolic stride (e.g. ``5120*s93``), replacing it
+        with a concrete value (e.g. ``20244480``) would specialize that dimension
+        and break dynamic-shape compilation for other sequence lengths.  We only
+        apply restride for dimensions where *both* sides are statically known
+        (concrete ints) and differ.
+        """
+        if not output_strides:
+            return output
+
+        outputs: list[Any]
+        is_tuple = isinstance(output, (tuple, list))
+        outputs = list(output) if is_tuple else [output]
+
+        for i, strides in enumerate(output_strides):
+            if strides is None or i >= len(outputs):
+                continue
+            t = outputs[i]
+            if not isinstance(t, torch.Tensor) or t.dim() == 0:
+                continue
+
+            old_strides = t.stride()
+            new_strides = list(old_strides)
+            changed = False
+            for d, (old_s, new_s) in enumerate(zip(old_strides, strides)):
+                if isinstance(old_s, torch.SymInt) or isinstance(new_s, torch.SymInt):
+                    continue
+                if old_s != new_s:
+                    new_strides[d] = new_s
+                    changed = True
+
+            if not changed:
+                continue
+            magi_logger.info("Restriding output %d of '%s': %s -> %s", i, target, tuple(old_strides), tuple(new_strides))
+            outputs[i] = t.as_strided(t.shape, new_strides)
+
+        return type(output)(outputs) if is_tuple else outputs[0]
+
     def call_module(
         self, target: torch.fx.node.Target, args: tuple[torch.fx.node.Argument, ...], kwargs: dict[str, Any]
     ) -> Any:
@@ -389,6 +437,9 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
             num_graphs=len(self.compile_submod_names),
             runtime_shape=None,
         )
+
+        output_strides = getattr(self.compiler_manager.compiler, "_last_output_strides", None)
+        output = self._restride_outputs(target, output, output_strides)
 
         piecewise_backend = PiecewiseBackend(
             submod,

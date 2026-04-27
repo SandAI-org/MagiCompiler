@@ -127,6 +127,46 @@ def _read_generated_code_expected_arity(path: str) -> int | None:
         return None
 
 
+def _intercept_inductor_output_strides() -> tuple[contextlib.AbstractContextManager, list[tuple[int, ...] | None]]:
+    """Create a context manager that captures the output strides Inductor
+    reports during ``standalone_compile``.
+
+    ``standalone_compile`` creates its own ``TracingContext`` that is destroyed
+    when its ``with`` block exits, so the strides it writes are lost.  We
+    intercept ``set_tracing_context_output_strides`` to capture them.
+
+    Returns ``(context_manager, captured_list)``; the caller should enter the
+    context manager around the ``standalone_compile`` call, then read
+    ``captured_list`` afterwards.
+    """
+    import torch._inductor.output_code as output_code_mod
+    import torch._inductor.utils as inductor_utils
+
+    original_fn = inductor_utils.set_tracing_context_output_strides
+    captured: list[tuple[int, ...] | None] = []
+
+    def _hook(example_inputs, compiled_graph):
+        original_fn(example_inputs, compiled_graph)
+        ctx = torch._guards.TracingContext.try_get()
+        if ctx is not None and ctx.output_strides is not None:
+            captured.extend(ctx.output_strides)
+
+    @contextlib.contextmanager
+    def _ctx():
+        inductor_utils.set_tracing_context_output_strides = _hook
+        original_ref = getattr(output_code_mod, "set_tracing_context_output_strides", None)
+        if original_ref is not None:
+            output_code_mod.set_tracing_context_output_strides = _hook
+        try:
+            yield
+        finally:
+            inductor_utils.set_tracing_context_output_strides = original_fn
+            if original_ref is not None:
+                output_code_mod.set_tracing_context_output_strides = original_fn
+
+    return _ctx(), captured
+
+
 class CompilerInterface:
     """
     The interface for a compiler that can be used by MagiCompiler.
@@ -223,6 +263,7 @@ class InductorStandaloneAdaptor(CompilerInterface):
 
         self.compile_config: CompileConfig = compile_config
         self._restart_analysis_counts: dict[str, int] = {}
+        self._last_output_strides: list[tuple[int, ...] | None] | None = None
 
     @property
     def hash(self) -> str:
@@ -277,9 +318,10 @@ class InductorStandaloneAdaptor(CompilerInterface):
             if dynamic_shapes == "from_tracing_context"
             else contextlib.nullcontext()
         )
+        stride_ctx, captured_strides = _intercept_inductor_output_strides()
 
         try:
-            with scope_asserts, functorch_config.patch(autograd_cache_allow_custom_autograd_functions=True):
+            with scope_asserts, functorch_config.patch(autograd_cache_allow_custom_autograd_functions=True), stride_ctx:
                 compiled_graph = standalone_compile(
                     graph, example_inputs, dynamic_shapes=dynamic_shapes, options={"config_patches": current_config}
                 )
@@ -297,6 +339,8 @@ class InductorStandaloneAdaptor(CompilerInterface):
                 len(example_inputs),
             )
             raise
+
+        self._last_output_strides = captured_strides if captured_strides else None
 
         # Step3: Save the compiled artifact
         # autograd_cache_allow_custom_autograd_functions=True is required above so that
