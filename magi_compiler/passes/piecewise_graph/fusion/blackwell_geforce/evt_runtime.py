@@ -1,0 +1,583 @@
+# Copyright (c) 2026 SandAI. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Runtime side of the EVT fusion: torch.library op + JIT loader + dispatch.
+
+This file owns:
+  * The ``magi_epilogue::matmul_custom_evt`` torch.library op + fake impl.
+  * A process-level cache mapping IR JSON → compiled cpp_extension module.
+  * Dispatch to one of two backends:
+      - ``kind == "evt"``         → JIT-compiled CUTLASS Sm80EVT kernel.
+      - ``kind == "swiglu7_dual"`` → vendored DualGemm one-stage kernel.
+
+The kernel build directory uses the IR cache key as its name so re-runs and
+multi-process Inductor compile workers all hit the same on-disk cache.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import threading
+from typing import Optional
+
+import torch
+
+from magi_compiler.config import get_compile_config
+
+from .evt_codegen import render_evt_cu
+from .evt_ir import Accum, AuxLoad, ColBroadcast, Compute, RowBroadcast, Store
+
+# ── torch.library op definition ───────────────────────────────────────────────
+# Reuse the existing ``magi_epilogue`` library so all our custom matmul ops
+# live under one namespace. Defining a fresh op here is harmless even if
+# ``matmul_epilogue_fusion.py`` has already initialised the library.
+_LIB = torch.library.Library("magi_epilogue", "FRAGMENT")
+_LIB.define(
+    "matmul_custom_evt(Tensor A, Tensor B, Tensor[] extras, str ir_json," " str kind, int n_out, int out_dtype_id) -> Tensor"
+)
+
+
+# ── Output-dtype encoding (must round-trip through torch.library int args) ────
+_OUT_DTYPE_ID = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}
+_ID_TO_DTYPE = {v: k for k, v in _OUT_DTYPE_ID.items()}
+_DTYPE_TO_STR = {torch.bfloat16: "bfloat16", torch.float16: "float16", torch.float32: "float32"}
+
+
+def out_dtype_id(dt: torch.dtype) -> int:
+    """Encode a torch.dtype as a small int for inclusion in op args."""
+    if dt not in _OUT_DTYPE_ID:
+        raise ValueError(f"Unsupported EVT output dtype {dt}")
+    return _OUT_DTYPE_ID[dt]
+
+
+def out_dtype_from_id(i: int) -> torch.dtype:
+    return _ID_TO_DTYPE[i]
+
+
+# ── M-bucket dispatch ─────────────────────────────────────────────────────────
+# Three coarse buckets matching the tile-candidate sets in
+# ``evt_codegen._TILE_CANDIDATES_5090``:
+#   small  — M ≤ 256       (decode / single-token)
+#   medium — 256 < M ≤ 2048 (mid-size prefill)
+#   large  — M > 2048       (large prefill / batched)
+# Each bucket compiles a distinct .cu module containing its own tile-candidate
+# vector; the per-module C++ runner then autotunes the actual best (TileShape,
+# WarpShape, NumStages) tuple at first call per (M, N, K) and caches the
+# winning index inside the module — so the Python side only pays one extra
+# cache key dimension.
+_M_BUCKET_BOUNDARIES = (256, 2048)
+
+
+def _m_bucket(M: int) -> str:
+    if M <= _M_BUCKET_BOUNDARIES[0]:
+        return "small"
+    if M <= _M_BUCKET_BOUNDARIES[1]:
+        return "medium"
+    return "large"
+
+
+# ── Output row-stride helper ──────────────────────────────────────────────────
+# CUTLASS Sm80EVT and the swiglu7 DualGemm both require D's row stride to be a
+# multiple of AlignmentC * sizeof(ElementC) = 4 * sizeof(bf16) = 8 bytes (i.e.
+# 4 elements for bf16/fp16, 2 elements for fp32). When n_out already meets this
+# requirement we return a *contiguous* (M, n_out) tensor — avoids an extra D2D
+# scratch copy on the hot path. Only when n_out fails the alignment do we fall
+# back to padding the row stride.
+#
+# Earlier this padded everything to 128 bytes (matching the Triton path's
+# convention) but on shapes like N_out=13652 the resulting non-contig D forced
+# a kernel-into-scratch + scratch-into-D copy worth ~5% of the kernel runtime
+# at (M=7697, N=27304, K=5120) — which fully accounted for the perf gap users
+# saw between the standalone benchmark (no scratch) and the real model.
+#
+# Pre-computed alignment per dtype to avoid the ~2–5 μs cost of
+# ``torch.empty([], dtype=dt).element_size()`` per op invocation. Hit count on
+# this lookup is 2× per fused op (runtime impl + fake impl), so on a model with
+# 100 fused-op calls per forward this shaves ~1 ms off the dispatch overhead.
+_ALIGN_BY_DTYPE: dict = {
+    torch.bfloat16: 4,  # 8 bytes / 2 = 4 elements
+    torch.float16: 4,
+    torch.float32: 2,  # 8 bytes / 4 = 2 elements
+}
+
+
+def _aligned_n_stride(n_out: int, dt: torch.dtype) -> int:
+    align = _ALIGN_BY_DTYPE.get(dt)
+    if align is None:  # rare: a dtype we haven't pre-tabulated
+        align = max(1, 8 // torch.empty([], dtype=dt).element_size())
+    return (n_out + align - 1) // align * align
+
+
+# ── Compile cache + per-key build lock ────────────────────────────────────────
+_MODULE_CACHE: dict = {}  # cache_key (sha256 str) → loaded cpp_extension module
+# Hot-path fast cache — avoids ``json.dumps + sha256`` (~10–30 μs/call) when
+# the module has already been compiled. Keyed by the 4-tuple of (Python-)
+# hashable inputs that uniquely determine the rendered .cu, since equality on
+# the tuple is sufficient (no need to canonicalise twice). Populated on the
+# slow path inside ``_compile_evt_module``.
+_MODULE_FAST_CACHE: dict = {}  # (ir_json, a_dtype, b_dtype, b_layout) → module
+_MODULE_LOCKS: dict = {}  # cache_key → threading.Lock
+_MODULE_LOCKS_GLOBAL = threading.Lock()
+_SWIGLU7_LOCK = threading.Lock()  # serialises insertions into _SWIGLU7_FAST_CACHE
+
+
+# ── D output-buffer cache ────────────────────────────────────────────────────
+# Keyed by (M, n_out, n_stride, out_dtype, device_idx). Mirrors the same
+# cache pattern in ``sm120_triton_kernel.py:_buf_cache`` — which has been
+# shipping in this codebase for the Triton path. Reusing D across calls
+# avoids the per-call ``torch.empty`` overhead (~5–15 μs of Python work +
+# allocator metadata) and the (rare) scratch slice; on hot paths with
+# millisecond-scale kernels this is a measurable but small win.
+#
+# Correctness contract — same as the Triton path: this is a single-stream
+# inference cache. The previous call's D consumer must already have read it
+# before the next call lands. Inductor-generated ``call(...)`` functions
+# satisfy this because they execute serially on the default CUDA stream and
+# the returned tensor is consumed before the next op-level dispatch.
+#
+# To opt out (e.g. when bench-scripting with overlapping streams), set the
+# env var ``MAGI_EVT_DISABLE_D_CACHE=1``.
+_D_BUF_CACHE: dict = {}
+_D_CACHE_DISABLED: bool = os.environ.get("MAGI_EVT_DISABLE_D_CACHE", "0") not in ("0", "", "false", "False")
+
+
+def _get_or_alloc_D(M: int, n_out: int, out_dtype: torch.dtype, device: torch.device) -> "torch.Tensor":
+    """Return a (possibly cached) (M, n_out) output buffer.
+
+    The buffer is contiguous when ``n_stride == n_out`` (the fast path); when
+    ``n_out`` is mis-aligned we keep the padded ``[:, :n_out]`` slice so the
+    fake impl's stride matches at runtime.
+    """
+    # Fast path: cache key first, recompute n_stride only on miss. The cache
+    # is keyed by (M, n_out, dtype, device_idx); two distinct (n_out, dtype)
+    # always have the same alignment, so we don't need n_stride in the key.
+    idx = device.index or 0  # index is None for default device → falsy → 0
+    key = (M, n_out, out_dtype, idx)
+    cached = _D_BUF_CACHE.get(key)
+    if cached is not None and not _D_CACHE_DISABLED:
+        return cached
+    n_stride = _aligned_n_stride(n_out, out_dtype)
+    if n_stride == n_out:
+        D = torch.empty((M, n_out), device=device, dtype=out_dtype)
+    else:
+        D = torch.empty((M, n_stride), device=device, dtype=out_dtype)[:, :n_out]
+    if not _D_CACHE_DISABLED:
+        # Single-entry cache: evict everything else, then install the new one.
+        # We can't iterate-and-delete on the live dict (RuntimeError under any
+        # workload that puts >1 entry in the cache — e.g. CP=4 sees multiple
+        # per-rank shapes during warmup, while a single-card run often reuses
+        # one shape and never tripped the bug).
+        _D_BUF_CACHE.clear()
+        _D_BUF_CACHE[key] = D
+    return D
+
+
+def _cutlass_root() -> str:
+    return os.environ.get("MAGI_CUTLASS_ROOT", "/root/cutlass")
+
+
+def _evt_build_dir(key: str) -> str:
+    cache_root = get_compile_config().cache_root_dir
+    return os.path.join(cache_root, "evt_kernels", key)
+
+
+def _per_key_lock(key: str) -> threading.Lock:
+    """Return the per-key build lock; coalesces concurrent compile requests."""
+    with _MODULE_LOCKS_GLOBAL:
+        lock = _MODULE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _MODULE_LOCKS[key] = lock
+        return lock
+
+
+def _compile_evt_module(
+    ir_json: str,
+    a_dtype: torch.dtype,
+    b_dtype: torch.dtype,
+    b_layout: str = "row",
+    m_bucket: str = "medium",
+    N: int = 0,
+    K: int = 0,
+):
+    """Render + JIT-compile the EVT kernel for ``ir_json``. Process-level cached.
+
+    Cache key: (IR, A dtype, B dtype, b_layout, m_bucket, N, K). Each distinct
+    weight (N, K) lowers to its own .cu — even though the .cu source is
+    identical (N/K stay runtime variables), splitting the modules gives every
+    (N, K) its own runner instance with isolated `best_idx_`. This avoids
+    cross-(N, K) autotune contamination and matches the user's per-(N, K)
+    cache layout: e.g. two distinct (N, K) × two M-buckets ⇒ 4 .cu modules.
+    """
+    # Hot-path fast cache: skip ``json.dumps + sha256`` (~10–30 μs each) on
+    # subsequent calls with the same inputs.
+    fast_key = (ir_json, a_dtype, b_dtype, b_layout, m_bucket, N, K)
+    cached = _MODULE_FAST_CACHE.get(fast_key)
+    if cached is not None:
+        return cached
+
+    if b_layout not in ("row", "col"):
+        raise ValueError(f"b_layout must be 'row' or 'col', got {b_layout!r}")
+    a_str = _DTYPE_TO_STR[a_dtype]
+    b_str = _DTYPE_TO_STR[b_dtype]
+    extended = json.dumps(
+        {
+            "ir": ir_json,
+            "a": a_str,
+            "b": b_str,
+            "b_layout": b_layout,
+            "m_bucket": m_bucket,
+            "N": int(N),
+            "K": int(K),
+            "version": 3,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    key = hashlib.sha256(extended).hexdigest()
+
+    cached = _MODULE_CACHE.get(key)
+    if cached is not None:
+        _MODULE_FAST_CACHE[fast_key] = cached
+        return cached
+
+    lock = _per_key_lock(key)
+    with lock:
+        cached = _MODULE_CACHE.get(key)
+        if cached is not None:
+            _MODULE_FAST_CACHE[fast_key] = cached
+            return cached
+
+        # Re-hydrate the IR tree from JSON for codegen.
+        ir = _ir_from_json(ir_json)
+        src = render_evt_cu(ir, a_str, b_str, cache_key_str=key, b_layout=b_layout, m_bucket=m_bucket)
+
+        build_dir = _evt_build_dir(key)
+        os.makedirs(build_dir, exist_ok=True)
+        src_path = os.path.join(build_dir, "evt.cu")
+        # Write atomically (tmp + rename) so concurrent processes don't see a
+        # half-written file. Use a process-specific tmp name to avoid races
+        # across multiple rank processes generating the same kernel.
+        tmp_path = f"{src_path}.{os.getpid()}.tmp"
+        with open(tmp_path, "w") as f:
+            f.write(src)
+        os.replace(tmp_path, src_path)
+
+        cutlass_root = _cutlass_root()
+        from torch.utils.cpp_extension import load
+
+        # cpp_extension.load uses its own file lock under build_directory, so
+        # multi-process races resolve to a single nvcc invocation.
+        module = load(
+            name=f"magi_evt_{key[:12]}",
+            sources=[src_path],
+            extra_include_paths=[
+                os.path.join(cutlass_root, "include"),
+                os.path.join(cutlass_root, "tools", "util", "include"),
+            ],
+            extra_cflags=["-O3", "-std=c++17"],
+            extra_cuda_cflags=["-std=c++17", "-O3", "--expt-relaxed-constexpr", "-gencode=arch=compute_120,code=sm_120"],
+            build_directory=build_dir,
+            verbose=False,
+        )
+        _MODULE_CACHE[key] = module
+        _MODULE_FAST_CACHE[fast_key] = module
+        return module
+
+
+# ── IR (de)serialisation ─────────────────────────────────────────────────────
+
+
+def to_ir_json(node) -> str:
+    from .evt_ir import to_canonical_json
+
+    return to_canonical_json(node)
+
+
+def _ir_from_json(s: str):
+    """Inverse of ``to_canonical_json``. Used only to drive codegen at compile
+    time — the FX pass holds the original Python objects and never round-trips
+    its own IR through JSON in a hot loop."""
+    d = json.loads(s)
+    return _node_from_dict(d)
+
+
+def _node_from_dict(d):
+    kind = d["kind"]
+    if kind == "accum":
+        return Accum()
+    if kind == "row_bcast":
+        return RowBroadcast(input_idx=d["input_idx"], dtype=d["dtype"])
+    if kind == "col_bcast":
+        return ColBroadcast(input_idx=d["input_idx"], dtype=d["dtype"])
+    if kind == "aux_load":
+        return AuxLoad(input_idx=d["input_idx"], dtype=d["dtype"])
+    if kind == "compute":
+        scalar = d.get("scalar")
+        scalar_val: Optional[float] = float(scalar) if scalar is not None else None
+        return Compute(op=d["op"], children=tuple(_node_from_dict(c) for c in d["children"]), scalar=scalar_val)
+    if kind == "store":
+        return Store(child=_node_from_dict(d["child"]), out_dtype=d["out_dtype"])
+    raise ValueError(f"Unknown IR kind {kind!r}")
+
+
+# ── swiglu7 dual-gemm extension loader ────────────────────────────────────────
+# Per-(m_bucket, N, K) cache. The .cu source is identical across keys (N/K stay
+# runtime variables); we still build separate modules so each runner instance
+# hosts exactly one (N, K), giving every weight shape its own isolated
+# best_idx_. Two distinct (N, K) × two M-buckets ⇒ 4 modules.
+_SWIGLU7_FAST_CACHE: dict = {}  # (m_bucket, N, K) → loaded module
+_SWIGLU7_BUILD_LOCKS: dict = {}  # (m_bucket, N, K) → threading.Lock
+
+
+def _compile_swiglu7_dual(m_bucket: str, N: int, K: int):
+    """Lazy-load a per-(bucket, N, K) instance of the vendored DualGemm kernel.
+
+    Parameters
+    ----------
+    m_bucket : "small" | "medium" | "large"
+        Bucket of the activation M dim — included in the cache key so e.g.
+        small-M (decode) can autotune to a different best tile than large-M
+        (prefill) for the same (N, K).
+    N, K : int
+        Static weight shape from B (the underlying (N, K) row-major tensor).
+        Distinct (N, K) get distinct modules so their autotune state is
+        independent.
+    """
+    fast_key = (m_bucket, int(N), int(K))
+    cached = _SWIGLU7_FAST_CACHE.get(fast_key)
+    if cached is not None:
+        return cached
+
+    with _SWIGLU7_LOCK:
+        lock = _SWIGLU7_BUILD_LOCKS.get(fast_key)
+        if lock is None:
+            lock = threading.Lock()
+            _SWIGLU7_BUILD_LOCKS[fast_key] = lock
+    with lock:
+        cached = _SWIGLU7_FAST_CACHE.get(fast_key)
+        if cached is not None:
+            return cached
+
+        cutlass_root = _cutlass_root()
+        here = os.path.dirname(os.path.abspath(__file__))
+        src = os.path.join(here, "cutlass_kernels", "swiglu7_epi_one_stage.cu")
+        if not os.path.exists(src):
+            raise FileNotFoundError(f"vendored swiglu7 source not found: {src}")
+        cache_root = get_compile_config().cache_root_dir
+        # Build dir embeds (bucket, N, K) so distinct keys get their own
+        # build artefacts. cpp_extension uses the dir as the cache identity.
+        build_tag = f"{m_bucket}_N{N}_K{K}"
+        build_dir = os.path.join(cache_root, "evt_kernels", f"swiglu7_dual_{build_tag}")
+        os.makedirs(build_dir, exist_ok=True)
+        from torch.utils.cpp_extension import load
+
+        module = load(
+            name=f"magi_swiglu7_dual_{build_tag}",
+            sources=[src],
+            extra_include_paths=[
+                os.path.join(cutlass_root, "include"),
+                os.path.join(cutlass_root, "tools", "util", "include"),
+                os.path.join(cutlass_root, "examples"),
+                os.path.join(here, "cutlass_kernels"),
+            ],
+            extra_cflags=["-O3", "-std=c++17"],
+            extra_cuda_cflags=["-std=c++17", "-O3", "--expt-relaxed-constexpr", "-gencode=arch=compute_120,code=sm_120"],
+            build_directory=build_dir,
+            verbose=False,
+        )
+        _SWIGLU7_FAST_CACHE[fast_key] = module
+        return module
+
+
+# ── torch.library backend impls ───────────────────────────────────────────────
+
+
+# Single-entry scratch cache for the rare mis-aligned-N path. Same greedy
+# eviction policy as ``_D_BUF_CACHE`` — bounded memory across many shapes
+# (e.g. CP=4 sees several per-rank M values during warmup; we don't want a
+# scratch buffer for every one).
+_SCRATCH_CACHE: dict = {}
+
+
+def _get_or_alloc_scratch(M: int, n_out: int, out_dtype: torch.dtype, device: torch.device) -> "torch.Tensor":
+    if _D_CACHE_DISABLED:
+        return torch.empty((M, n_out), device=device, dtype=out_dtype)
+    idx = device.index or 0
+    key = (M, n_out, out_dtype, idx)
+    cached = _SCRATCH_CACHE.get(key)
+    if cached is not None:
+        return cached
+    s = torch.empty((M, n_out), device=device, dtype=out_dtype)
+    # Greedy eviction: one shape at a time.
+    _SCRATCH_CACHE.clear()
+    _SCRATCH_CACHE[key] = s
+    return s
+
+
+# ── Dispatch fast-cache ──────────────────────────────────────────────────────
+# Hot-path bottleneck reduction: collapse the four-step
+#   out_dtype_from_id → _m_bucket → _compile_* → mod.attr-lookup
+# chain into a single dict.get() returning a pre-bound callable plus the
+# small amount of immutable metadata the kernel-launch site needs.
+#
+# Key shape: (kind, ir_json, A.dtype, B.dtype, N, K, m_bucket, out_dtype).
+# Most of these are static per FX-emit site (kind / ir_json / dtypes / N / K)
+# — only m_bucket varies with M. So the cache reaches steady state after the
+# first time each (site, bucket) is seen.
+#
+# Each entry holds:
+#   * kernel_call : pre-bound mod.evt_matmul_out / swiglu7_dual_matmul_out
+#   * is_evt      : True for evt_row/evt_col (need extras list), False for swiglu7
+#   * out_dtype   : torch.dtype to pass to D allocation
+class _DispatchEntry:
+    __slots__ = ("kernel_call", "is_evt", "out_dtype")
+
+    def __init__(self, kernel_call, is_evt, out_dtype):
+        self.kernel_call = kernel_call
+        self.is_evt = is_evt
+        self.out_dtype = out_dtype
+
+
+_DISPATCH_CACHE: dict = {}
+
+
+def _resolve_dispatch(kind, ir_json, a_dtype, b_dtype, N_w, K_w, m_bucket, out_dtype):
+    """Slow-path resolver — compiles the .cu module (cache miss) and binds
+    the kernel callable. Cached by (kind, ir_json, A_dt, B_dt, N, K, bucket,
+    out_dtype) so each FX site × bucket only pays this once."""
+    if kind == "swiglu7_dual":
+        mod = _compile_swiglu7_dual(m_bucket, N_w, K_w)
+        return _DispatchEntry(mod.swiglu7_dual_matmul_out, False, out_dtype)
+    if kind == "evt_row" or kind == "evt":
+        b_layout = "row"
+    elif kind == "evt_col":
+        b_layout = "col"
+    else:
+        raise ValueError(f"Unknown EVT kind {kind!r}")
+    mod = _compile_evt_module(ir_json, a_dtype, b_dtype, b_layout=b_layout, m_bucket=m_bucket, N=N_w, K=K_w)
+    return _DispatchEntry(mod.evt_matmul_out, True, out_dtype)
+
+
+@torch.library.impl(_LIB, "matmul_custom_evt", "CUDA")
+def _matmul_custom_evt_cuda(A, B, extras, ir_json, kind, n_out, out_dtype_id_):
+    """Runtime entry point for the EVT-fused matmul op.
+
+    Hot path is heavily inlined to keep per-call Python overhead under ~2 μs:
+    one dict.get() resolves the kernel callable + metadata, then we allocate D
+    (with a single-entry greedy cache) and call straight into the C++ kernel.
+
+    Layout contract — the FX pass owns this; do not rewrite operands here:
+      * ``kind == "evt_row"`` : B is contiguous (K, N) row-major.
+      * ``kind == "evt_col"`` : B is the underlying (N, K) row-major weight; the
+        kernel was rendered with ``LayoutB = ColumnMajor`` so it reads (K, N)
+        from the same bytes via stride (1, K).
+      * ``kind == "swiglu7_dual"`` : B is the underlying (N, K) row-major weight
+        (the FX pass already replaced the ``permute([1,0])`` view with its
+        operand). The DualGemm kernel reads it as ColumnMajor + ldB=2K.
+
+    Calling ``.contiguous()`` on B here would silently break the col / swiglu7
+    paths by materialising a (K, N) row-major copy that no longer matches the
+    LayoutB the kernel was compiled with — every B value would be wrong.
+    """
+    # ── Step 1: resolve dispatch entry (one dict lookup on the fast path) ──
+    # B.size(0)/size(1) are slightly faster than .shape[0]/[1] (avoid Python
+    # tuple construction). For all 3 kinds B's leading dim ≠ K — the launcher
+    # / runner derives N internally from b_layout, but for the dispatch cache
+    # key we just need a stable per-site discriminator, so passing the raw
+    # B.size pair is enough.
+    B_size0 = B.size(0)
+    B_size1 = B.size(1)
+    M = A.size(0)
+    # Inline _m_bucket: avoid the ~300 ns function call.
+    if M <= 256:
+        m_bucket = "small"
+    elif M <= 2048:
+        m_bucket = "medium"
+    else:
+        m_bucket = "large"
+    # Inline out_dtype_from_id: skip the function call frame.
+    out_dtype = _ID_TO_DTYPE[out_dtype_id_]
+    # B's (N, K) interpretation depends on kind. For evt_row B is (K, N),
+    # for evt_col / swiglu7_dual B is the underlying (N, K). Either way we
+    # only need (B_size0, B_size1) to disambiguate distinct weights — the
+    # resolver re-computes N/K correctly for compilation.
+    a_dtype = A.dtype
+    b_dtype_ = B.dtype
+    fast_key = (kind, ir_json, a_dtype, b_dtype_, B_size0, B_size1, m_bucket, out_dtype)
+    entry = _DISPATCH_CACHE.get(fast_key)
+    if entry is None:
+        # Map B sizes to (N_w, K_w) in the layout the compile path expects.
+        if kind == "evt_row":
+            K_w, N_w = B_size0, B_size1
+        else:
+            # evt_col / swiglu7_dual: B is (N, K) underlying weight.
+            N_w, K_w = B_size0, B_size1
+        entry = _resolve_dispatch(kind, ir_json, a_dtype, b_dtype_, N_w, K_w, m_bucket, out_dtype)
+        _DISPATCH_CACHE[fast_key] = entry
+
+    # ── Step 2: alloc / fetch D (greedy single-entry cache, inlined) ──
+    # D matches the fake impl's shape. CUTLASS launchers require D contiguous;
+    # when n_out happens to be mis-aligned the row stride is padded and we
+    # route through a scratch buffer.
+    if _D_CACHE_DISABLED:
+        n_stride = _aligned_n_stride(n_out, out_dtype)
+        if n_stride == n_out:
+            D = torch.empty((M, n_out), device=A.device, dtype=out_dtype)
+        else:
+            D = torch.empty((M, n_stride), device=A.device, dtype=out_dtype)[:, :n_out]
+    else:
+        dev_idx = A.device.index or 0
+        d_key = (M, n_out, out_dtype, dev_idx)
+        D = _D_BUF_CACHE.get(d_key)
+        if D is None:
+            n_stride = _aligned_n_stride(n_out, out_dtype)
+            if n_stride == n_out:
+                D = torch.empty((M, n_out), device=A.device, dtype=out_dtype)
+            else:
+                D = torch.empty((M, n_stride), device=A.device, dtype=out_dtype)[:, :n_out]
+            _D_BUF_CACHE.clear()
+            _D_BUF_CACHE[d_key] = D
+
+    # ── Step 3: dispatch — pre-bound callable, single C++ trampoline ──
+    # `D.stride(0) != n_out` is the only branch we take per call to decide
+    # whether we need the scratch route. Cheap C++ attribute compare.
+    needs_scratch = D.stride(0) != n_out
+    kernel_call = entry.kernel_call
+
+    if entry.is_evt:
+        if needs_scratch:
+            scratch = _get_or_alloc_scratch(M, n_out, out_dtype, A.device)
+            kernel_call(A, B, extras, scratch)
+            D.copy_(scratch)
+            return D
+        kernel_call(A, B, extras, D)
+        return D
+
+    # swiglu7_dual: extras is always [] here (FX pass guarantees).
+    if needs_scratch:
+        scratch = _get_or_alloc_scratch(M, n_out, out_dtype, A.device)
+        kernel_call(A, B, scratch)
+        D.copy_(scratch)
+        return D
+    kernel_call(A, B, D)
+    return D
+
+
+@torch.library.register_fake("magi_epilogue::matmul_custom_evt")
+def _matmul_custom_evt_fake(A, B, extras, ir_json, kind, n_out, out_dtype_id_):
+    out_dtype = out_dtype_from_id(out_dtype_id_)
+    n_stride = _aligned_n_stride(n_out, out_dtype)
+    return A.new_empty_strided((A.shape[0], n_out), (n_stride, 1), dtype=out_dtype)

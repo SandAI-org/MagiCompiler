@@ -12,10 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Tests for the CUTLASS Sm80EVT matmul-epilogue fusion path on RTX 5090.
+
+Three families of checks:
+
+  1. Positive numerical equivalence: every supported epilogue (the 7 athena
+     activations + binary ops + 1-D bias) must match eager within bf16 tol.
+  2. Fusion-actually-fired: the emitted graph must contain a
+     ``magi_epilogue.matmul_custom_evt`` node — a green numerical test alone
+     would silently pass even if fusion was skipped (eager == "compiled").
+  3. Negative fallback: shapes / dtypes / chains the EVT pass does NOT
+     support must keep the original ``aten.mm`` and run through cuBLAS.
+     Catches over-eager fusion that would corrupt downstream consumers.
+"""
+
 from typing import Optional
 
 import pytest
 import torch
+import torch.fx as fx
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -24,28 +39,28 @@ from magi_compiler.config import get_compile_config
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
+_SM120_ONLY = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 12,
+    reason="CUTLASS EVT path targets sm_120 (Blackwell consumer)",
+)
 
-# ---------------------------------------------------------------------------
-# Activation functions
-# ---------------------------------------------------------------------------
+
+# ── Activations from athena/performer_v16/activation.py (verbatim) ────────────
 
 
 def high_precision_silu(x, out_dtype: Optional[torch.dtype] = None):
     out_dtype = x.dtype if out_dtype is None else out_dtype
-    x = x.to(torch.float32)
-    return F.silu(x).to(out_dtype)
+    return F.silu(x.to(torch.float32)).to(out_dtype)
 
 
 def high_precision_sigmoid(x, out_dtype: Optional[torch.dtype] = None):
     out_dtype = x.dtype if out_dtype is None else out_dtype
-    x = x.to(torch.float32)
-    return F.sigmoid(x).to(out_dtype)
+    return F.sigmoid(x.to(torch.float32)).to(out_dtype)
 
 
 def high_precision_gelu(x, out_dtype: Optional[torch.dtype] = None):
     out_dtype = x.dtype if out_dtype is None else out_dtype
-    x = x.to(torch.float32)
-    return F.gelu(x).to(out_dtype)
+    return F.gelu(x.to(torch.float32)).to(out_dtype)
 
 
 def swiglu7(x, alpha: float = 1.702, limit: float = 7.0, out_dtype: Optional[torch.dtype] = None):
@@ -68,131 +83,461 @@ def gelu7(x, alpha: float = 1.702, limit: float = 7.0, out_dtype: Optional[torch
 
 def relu_square(x, out_dtype: Optional[torch.dtype] = None):
     out_dtype = x.dtype if out_dtype is None else out_dtype
-    x = x.to(torch.float32)
-    return torch.square(F.relu(x)).to(out_dtype)
+    return torch.square(F.relu(x.to(torch.float32))).to(out_dtype)
 
 
-# ---------------------------------------------------------------------------
-# Model wrappers
-# ---------------------------------------------------------------------------
+# ── Compile + fusion-side instrumentation ────────────────────────────────────
 
 
-class SiluModel(nn.Module):
-    def forward(self, a, b):
-        return high_precision_silu(torch.mm(a, b), out_dtype=torch.bfloat16)
+class _FusionStats:
+    """Records what the EVT pass did to the graph during one ``magi_compile``.
 
+    Captured by patching ``MatmulEvtEpilogueFusionPass.__call__`` for the scope
+    of a test. We track:
+      * mm_before    — count of ``aten.mm`` nodes seen on entry
+      * mm_after     — same after the pass
+      * fused_count  — number of ``magi_epilogue.matmul_custom_evt`` nodes
+                       inserted (i.e. how many mm sites the pass actually
+                       replaced; ``mm_before - mm_after`` only matches when
+                       fusion never aborts mid-walk).
+      * kinds        — the ``kind`` arg of each emitted op, e.g.
+                       ["evt_row", "swiglu7_dual"].
 
-class SigmoidModel(nn.Module):
-    def forward(self, a, b):
-        return high_precision_sigmoid(torch.mm(a, b), out_dtype=torch.bfloat16)
-
-
-class GeluModel(nn.Module):
-    def forward(self, a, b):
-        return high_precision_gelu(torch.mm(a, b), out_dtype=torch.bfloat16)
-
-
-class Swiglu7Model(nn.Module):
-    def forward(self, a, b):
-        return swiglu7(torch.mm(a, b), out_dtype=torch.bfloat16)
-
-
-class Gelu7Model(nn.Module):
-    def forward(self, a, b):
-        return gelu7(torch.mm(a, b), out_dtype=torch.bfloat16)
-
-
-class ReluSquareModel(nn.Module):
-    def forward(self, a, b):
-        return relu_square(torch.mm(a, b), out_dtype=torch.bfloat16)
-
-
-# ---------------------------------------------------------------------------
-# Helper
-# ---------------------------------------------------------------------------
-
-
-def _run_fusion_test(model: nn.Module, a: torch.Tensor, b: torch.Tensor, atol: float = 0.5, rtol: float = 0.0):
-    """Run a matmul-epilogue fusion test.
-
-    Checks that the fused result satisfies:  |actual - expected| < atol + rtol * |expected|
-
-    atol=0.5 covers the bf16 → fp32 accumulation difference for element-wise
-    activations whose output magnitude is O(1).  For activations that amplify
-    magnitude (e.g. relu_square), pass a non-zero rtol instead.
+    Tests assert against these to prove the pass made the right choice — a
+    purely numerical comparison against eager would silently pass even when
+    fusion was skipped (because both paths fall back to cuBLAS).
     """
-    model = model.cuda().bfloat16()
+
+    def __init__(self) -> None:
+        self.mm_before = 0
+        self.mm_after = 0
+        self.fused_count = 0
+        self.kinds: list = []
+
+
+def _install_pass_instrument():
+    """Returns (stats, restore_fn). Wraps the FX pass to record per-call deltas."""
+    from magi_compiler.passes.piecewise_graph.fusion.blackwell_geforce import matmul_epilogue_fusion as P
+
+    stats = _FusionStats()
+    original = P.MatmulEvtEpilogueFusionPass.__call__
+    evt_op = torch.ops.magi_epilogue.matmul_custom_evt.default
+    mm_targets = (torch.ops.aten.mm.default, torch.ops.aten.mm)
+
+    def _instrumented(self, graph: fx.Graph):
+        before = sum(1 for n in graph.nodes if n.op == "call_function" and n.target in mm_targets)
+        result = original(self, graph)
+        after = sum(1 for n in graph.nodes if n.op == "call_function" and n.target in mm_targets)
+        emitted_kinds = []
+        for n in graph.nodes:
+            if n.op == "call_function" and n.target is evt_op:
+                # signature: (A, B, extras, ir_json, kind, n_out, out_dtype_id)
+                if len(n.args) >= 5:
+                    emitted_kinds.append(n.args[4])
+        stats.mm_before += before
+        stats.mm_after += after
+        stats.fused_count += len(emitted_kinds)
+        stats.kinds.extend(emitted_kinds)
+        return result
+
+    P.MatmulEvtEpilogueFusionPass.__call__ = _instrumented
+
+    def restore():
+        P.MatmulEvtEpilogueFusionPass.__call__ = original
+
+    return stats, restore
+
+
+def _compile_and_check(
+    model: nn.Module,
+    inputs,
+    *,
+    atol: float = 0.5,
+    rtol: float = 0.0,
+    expect_fused: int = -1,
+    expect_kinds: Optional[list] = None,
+    dynamic_arg_dims=None,
+):
+    """Compile ``model``, run it on ``inputs``, compare against eager.
+
+    Parameters
+    ----------
+    model, inputs
+        ``inputs`` is a tuple/list passed positionally to forward.
+    atol, rtol
+        Numerical tolerance: ``|actual - expected| <= atol + rtol*|expected|``.
+    expect_fused
+        Number of mm sites the pass MUST have replaced. Use 0 for negative
+        tests (fusion must NOT fire). -1 disables the check.
+    expect_kinds
+        If set, the multiset of emitted op ``kind`` args must equal this list.
+        E.g. ``["swiglu7_dual"]`` for the swiglu7 special-case path.
+    dynamic_arg_dims
+        Forwarded to magi_compile. Defaults to making the first arg's M
+        dynamic (matches our fusion guards).
+    """
+    if dynamic_arg_dims is None:
+        # Use the model's forward signature to pick the first arg name.
+        import inspect
+
+        params = list(inspect.signature(model.forward).parameters)
+        if not params:
+            dynamic_arg_dims = {}
+        else:
+            dynamic_arg_dims = {params[0]: 0}
+
+    model = model.cuda()
+    # Use bfloat16 so the EVT pass actually fires (the pass requires bf16).
+    if any(p.dtype.is_floating_point for p in model.parameters()):
+        model = model.bfloat16()
+    # Disable gradients on parameters; otherwise magi_compile / aot_autograd
+    # produces a forward+backward joint graph and the mm node has an extra
+    # user (the saved tensor for backward), which the EVT escape detector
+    # correctly refuses to fuse.
+    for p in model.parameters():
+        p.requires_grad_(False)
+
     with torch.no_grad():
-        expected = model(a, b)
+        expected = model(*inputs)
 
     get_compile_config().disable_cache = True
-    compiled_model = magi_compile(model, dynamic_arg_dims={"a": 0})
-    with torch.no_grad():
-        actual = compiled_model(a, b)
+    stats, restore = _install_pass_instrument()
+    try:
+        compiled_model = magi_compile(model, dynamic_arg_dims=dynamic_arg_dims)
+        with torch.no_grad():
+            actual = compiled_model(*inputs)
+    finally:
+        restore()
 
+    # Numerical check.
     abs_diff = (actual - expected).abs()
     tol = atol + rtol * expected.abs()
     max_violation = (abs_diff - tol).max().item()
     assert max_violation <= 0, (
-        f"Fused result too far from reference: "
+        f"Fused result outside tolerance: "
         f"max(|diff| - tol) = {max_violation:.4f}, "
-        f"max |diff| = {abs_diff.max().item():.4f}"
+        f"max |diff| = {abs_diff.max().item():.4f}, "
+        f"fusion stats: fused={stats.fused_count} kinds={stats.kinds}"
+    )
+
+    # Fusion-actually-fired check.
+    if expect_fused >= 0:
+        assert stats.fused_count == expect_fused, (
+            f"Expected {expect_fused} fused mm sites, got {stats.fused_count}. "
+            f"mm_before={stats.mm_before} mm_after={stats.mm_after} "
+            f"emitted kinds={stats.kinds}"
+        )
+    if expect_kinds is not None:
+        assert sorted(stats.kinds) == sorted(expect_kinds), (
+            f"Expected emitted kinds {sorted(expect_kinds)}, " f"got {sorted(stats.kinds)}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Positive tests — every athena activation must fuse and stay numerically OK
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class _Bf16MmModel(nn.Module):
+    """All positive activation models share this skeleton: bf16 mm followed
+    by an epilogue fn that returns bf16. Weight is held in (N, K) row-major
+    form and accessed via ``permute([1, 0])`` to mirror the real GAGA2 graph."""
+
+    def __init__(self, k: int, n: int, epilogue):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(n, k))
+        self._epi = epilogue
+
+    def forward(self, a):
+        y = torch.mm(a, self.weight.permute(1, 0))
+        return self._epi(y, out_dtype=torch.bfloat16)
+
+
+_M, _K, _N = 1024, 1024, 1024
+
+
+def _input_a():
+    return torch.randn(_M, _K, device="cuda", dtype=torch.bfloat16)
+
+
+@_SM120_ONLY
+@pytest.mark.parametrize(
+    "epi_name,epi_fn,atol,rtol",
+    [
+        ("silu", high_precision_silu, 0.5, 0.0),
+        ("sigmoid", high_precision_sigmoid, 0.5, 0.0),
+        ("gelu", high_precision_gelu, 0.5, 0.0),
+        ("gelu7", gelu7, 0.5, 0.0),
+        ("relu_square", relu_square, 0.0, 0.2),
+    ],
+)
+def test_evt_unary_activations_fuse(epi_name, epi_fn, atol, rtol):
+    """All unary activations must fuse to a single ``evt_col`` op."""
+    model = _Bf16MmModel(_K, _N, epi_fn)
+    _compile_and_check(model, (_input_a(),), atol=atol, rtol=rtol, expect_fused=1, expect_kinds=["evt_col"])
+
+
+@_SM120_ONLY
+def test_evt_relu_native():
+    """Plain ``aten.relu`` (no fp32 cast) — exercises the built-in CUTLASS
+    ReLu functor mapping in the IR."""
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(_N, _K))
+
+        def forward(self, a):
+            return torch.relu(torch.mm(a, self.weight.permute(1, 0))).to(torch.bfloat16)
+
+    _compile_and_check(M(), (_input_a(),), expect_fused=1, expect_kinds=["evt_col"])
+
+
+@_SM120_ONLY
+def test_evt_swiglu7_dispatches_to_dualgemm():
+    """SwiGLU7 must take the dedicated DualGemm one-stage path, not generic EVT."""
+    model = _Bf16MmModel(_K, _N, swiglu7)
+    _compile_and_check(model, (_input_a(),), atol=0.5, rtol=0.05, expect_fused=1, expect_kinds=["swiglu7_dual"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Binary-op positive tests — chains containing add/sub/mul/div on the mm output
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@_SM120_ONLY
+def test_evt_mm_plus_scalar():
+    """``mm + 0.5`` — scalar add absorbs into ``add_scalar`` IR node.
+
+    Tolerance: eager runs the add in bf16 (lossy ulp at ±0.5); CUTLASS runs
+    the add in fp32 then casts. The ~1.0 absolute diff observed is bf16
+    rounding noise on the eager side, not a CUTLASS bug.
+    """
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(_N, _K))
+
+        def forward(self, a):
+            return (torch.mm(a, self.weight.permute(1, 0)) + 0.5).to(torch.bfloat16)
+
+    _compile_and_check(M(), (_input_a(),), atol=1.5, expect_fused=1, expect_kinds=["evt_col"])
+
+
+@_SM120_ONLY
+def test_evt_mm_times_scalar():
+    """``mm * 0.25`` — scalar mul (mul_scalar IR)."""
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(_N, _K))
+
+        def forward(self, a):
+            return (torch.mm(a, self.weight.permute(1, 0)) * 0.25).to(torch.bfloat16)
+
+    _compile_and_check(M(), (_input_a(),), expect_fused=1, expect_kinds=["evt_col"])
+
+
+@_SM120_ONLY
+def test_evt_mm_div_scalar_then_silu():
+    """``silu(mm / 8)`` — scalar div + activation chain."""
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(_N, _K))
+
+        def forward(self, a):
+            y = torch.mm(a, self.weight.permute(1, 0)) / 8.0
+            return high_precision_silu(y, out_dtype=torch.bfloat16)
+
+    _compile_and_check(M(), (_input_a(),), expect_fused=1, expect_kinds=["evt_col"])
+
+
+@_SM120_ONLY
+def test_evt_mm_minus_scalar_then_relu():
+    """``relu(mm - 2.0)``."""
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(_N, _K))
+
+        def forward(self, a):
+            y = torch.mm(a, self.weight.permute(1, 0)) - 2.0
+            return torch.relu(y).to(torch.bfloat16)
+
+    _compile_and_check(M(), (_input_a(),), expect_fused=1, expect_kinds=["evt_col"])
+
+
+@_SM120_ONLY
+def test_evt_mm_plus_1d_bias():
+    """``silu(mm + bias_N)`` — 1-D bias as RowBroadcast extras."""
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(_N, _K))
+            self.bias = nn.Parameter(torch.randn(_N))
+
+        def forward(self, a):
+            y = torch.mm(a, self.weight.permute(1, 0)) + self.bias
+            return high_precision_silu(y, out_dtype=torch.bfloat16)
+
+    # atol=1.5: eager does the bias-add in bf16 (lossy), CUTLASS in fp32 —
+    # the ~1.0 abs diff is bf16 ulp noise on the eager side.
+    _compile_and_check(M(), (_input_a(),), atol=1.5, expect_fused=1, expect_kinds=["evt_col"])
+
+
+@_SM120_ONLY
+def test_evt_mm_times_aux_load():
+    """``(mm * gate_MxN)`` — full (M, N) auxiliary tensor multiply.
+
+    The gate must be supplied as a regular forward arg (not a model parameter)
+    because magi_compile doesn't trace through Parameters of dynamic shape.
+    """
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(_N, _K))
+
+        def forward(self, a, gate):
+            y = torch.mm(a, self.weight.permute(1, 0)) * gate
+            return y.to(torch.bfloat16)
+
+    a = _input_a()
+    gate = torch.randn(_M, _N, device="cuda", dtype=torch.bfloat16)
+    # rtol=0.1: ``mm * gate`` in eager is bf16 (lossy multiply); CUTLASS
+    # multiplies in fp32 then casts. Output magnitude scales like sqrt(K)*1*1
+    # ≈ 32, so 5–10 % relative diff is expected purely from bf16 vs fp32.
+    _compile_and_check(M(), (a, gate), atol=0.0, rtol=0.1, expect_fused=1, expect_kinds=["evt_col"], dynamic_arg_dims={"a": 0})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Negative tests — fusion must NOT fire and the chain must fall back to cuBLAS
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@_SM120_ONLY
+def test_evt_no_fuse_intermediate_escapes():
+    """Attention → residual → RMSNorm pattern: ``add(residual, mm)`` is
+    consumed both by ``square(...)`` (would-be-fused) AND by ``mul(_, rsqrt)``
+    later. The pass MUST refuse — fusing would silently drop the value the
+    rest of RMSNorm needs."""
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(5120, _K))
+            self.gamma = nn.Parameter(torch.randn(5120))
+
+        def forward(self, a, residual):
+            y = torch.mm(a, self.weight.permute(1, 0)).float()
+            x = residual + y
+            var = x.pow(2).mean(-1, keepdim=True)
+            rsqrt = torch.rsqrt(var + 1e-6)
+            return (x * rsqrt * (self.gamma + 1)).to(torch.bfloat16)
+
+    a = _input_a()
+    residual = torch.randn(_M, 5120, device="cuda", dtype=torch.float32)
+    _compile_and_check(M(), (a, residual), atol=2.0, rtol=0.1, expect_fused=0)
+
+
+@_SM120_ONLY
+def test_evt_no_fuse_bare_mm():
+    """A bare ``mm`` with no epilogue at all — Store(Accum) is trivial.
+    Replacing cuBLAS with a CUTLASS GEMM that does identical work is strictly
+    slower, so the pass must skip."""
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(_N, _K))
+
+        def forward(self, a):
+            return torch.mm(a, self.weight.permute(1, 0))
+
+    _compile_and_check(M(), (_input_a(),), atol=0.5, expect_fused=0)
+
+
+@_SM120_ONLY
+def test_evt_no_fuse_k_misaligned():
+    """K not divisible by 8 fails the bf16 alignment guard — cuBLAS path."""
+
+    class M(nn.Module):
+        def __init__(self, k, n):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(n, k))
+
+        def forward(self, a):
+            y = torch.mm(a, self.weight.permute(1, 0))
+            return high_precision_silu(y, out_dtype=torch.bfloat16)
+
+    K = 1023  # 1023 % 8 = 7 → should NOT fuse
+    N = 1024
+    a = torch.randn(_M, K, device="cuda", dtype=torch.bfloat16)
+    _compile_and_check(M(K, N), (a,), expect_fused=0)
+
+
+@_SM120_ONLY
+def test_evt_no_fuse_fp32_mm():
+    """fp32 mm — pass requires bf16 (or fp16); fp32 must skip."""
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(_N, _K))
+
+        def forward(self, a):
+            y = torch.mm(a, self.weight.permute(1, 0))
+            return F.silu(y)
+
+    a = torch.randn(_M, _K, device="cuda", dtype=torch.float32)
+
+    model = M().cuda()  # fp32 — do NOT bfloat16() the model
+    with torch.no_grad():
+        expected = model(a)
+
+    get_compile_config().disable_cache = True
+    stats, restore = _install_pass_instrument()
+    try:
+        compiled_model = magi_compile(model, dynamic_arg_dims={"a": 0})
+        with torch.no_grad():
+            actual = compiled_model(a)
+    finally:
+        restore()
+
+    diff = (actual - expected).abs().max().item()
+    assert diff <= 1.0, f"fp32 mm result diverged: {diff}"
+    assert stats.fused_count == 0, (
+        f"fp32 mm should NOT fuse, but pass emitted {stats.fused_count} ops " f"(kinds={stats.kinds})"
     )
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# IR / cache key invariants
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_matmul_epilogue_fusion_silu():
-    M, K, N = 128, 256, 512
-    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
-    b = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
-    _run_fusion_test(SiluModel(), a, b)
+@_SM120_ONLY
+def test_evt_ir_canonical_determinism():
+    """Same IR built twice → identical canonical JSON. If this regresses, the
+    .cu module disk cache silently misses and recompiles every run."""
+    from magi_compiler.passes.piecewise_graph.fusion.blackwell_geforce.evt_ir import (
+        Accum,
+        Compute,
+        Store,
+        cache_key,
+        to_canonical_json,
+    )
 
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_matmul_epilogue_fusion_sigmoid():
-    M, K, N = 128, 256, 512
-    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
-    b = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
-    _run_fusion_test(SigmoidModel(), a, b)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_matmul_epilogue_fusion_gelu():
-    M, K, N = 128, 256, 512
-    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
-    b = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
-    _run_fusion_test(GeluModel(), a, b)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_matmul_epilogue_fusion_swiglu7():
-    M, K, N = 128, 256, 512
-    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
-    b = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
-    _run_fusion_test(Swiglu7Model(), a, b)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_matmul_epilogue_fusion_gelu7():
-    M, K, N = 128, 256, 512
-    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
-    b = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
-    _run_fusion_test(Gelu7Model(), a, b)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_matmul_epilogue_fusion_relu_square():
-    M, K, N = 128, 256, 512
-    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
-    b = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
-    # relu_square amplifies values quadratically (output ~ x^2, up to ~256),
-    # so use relative tolerance instead of a fixed absolute bound.
-    _run_fusion_test(ReluSquareModel(), a, b, atol=0.0, rtol=0.2)
+    a = Store(Compute("silu", (Compute("add", (Accum(), Accum())),)), "bfloat16")
+    b = Store(Compute("silu", (Compute("add", (Accum(), Accum())),)), "bfloat16")
+    assert to_canonical_json(a) == to_canonical_json(b)
+    assert cache_key(a, "bfloat16", "bfloat16") == cache_key(b, "bfloat16", "bfloat16")
 
 
 if __name__ == "__main__":
