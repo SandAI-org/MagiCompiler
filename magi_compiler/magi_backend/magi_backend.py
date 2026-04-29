@@ -591,7 +591,7 @@ class MagiBackend:
 
         # Step 5: visualize the split graph
         if envs.MAGI_ENABLE_FX_GRAPH_VIZ:
-            # save_fx_graph_visualization(split_gm.graph, sub_dir="after_split", filename="split_gm_root")
+            save_fx_graph_visualization(split_gm.graph, sub_dir="after_split", filename="split_gm_root")
             for item in piecewise_graphs:
                 save_fx_graph_visualization(item.graph.graph, sub_dir="after_split", filename=item.submod_name)
 

@@ -37,6 +37,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.fx as fx
 
+from magi_compiler.cuda.device import device_capability_major
 from magi_compiler.passes.pass_base import MagiInductorPass
 
 from . import evt_runtime  # ensures torch.library op + fake impl are registered
@@ -189,11 +190,7 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
     def __init__(self, allow_extras: bool = True) -> None:
         # On non-sm120 we degrade to a no-op; the manager wires us only on
         # sm120 anyway, but defending against misuse is cheap.
-        try:
-            cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
-        except Exception:
-            cap = (0, 0)
-        self._enabled = cap[0] >= 12
+        self._enabled = device_capability_major() >= 12
         self.allow_extras = allow_extras
 
     def __call__(self, graph: fx.Graph) -> bool:

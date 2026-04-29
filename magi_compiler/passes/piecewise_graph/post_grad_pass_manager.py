@@ -18,24 +18,13 @@ from torch import fx as fx
 from torch._inductor.custom_graph_pass import CustomGraphPass
 
 from ...config import PassConfig
+from ...cuda.device import device_capability_major
 from ...utils import magi_logger, set_env_var
 from ...utils.envs import MAGI_PATTERN_MATCH_DEBUG
 from ..pass_base import InductorPass, get_pass_context
 from .fix_functionalization import FixFunctionalizationPass
 from .fusion.blackwell_geforce.matmul_epilogue_fusion import MatmulEvtEpilogueFusionPass
 from .post_cleanup import PostCleanupPass
-
-
-def _device_capability_major() -> int:
-    """Return the CUDA major capability, or 0 when CUDA is unavailable."""
-    try:
-        import torch as _torch
-
-        if _torch.cuda.is_available():
-            return _torch.cuda.get_device_capability()[0]
-    except Exception:
-        pass
-    return 0
 
 
 def with_pattern_match_debug(fn):
@@ -94,7 +83,11 @@ class PostGradPassManager(CustomGraphPass):
         self.pass_config = pass_config
 
         # Matmul + epilogue fusion. On sm_120 (Blackwell consumer / RTX 5090)
-        if _device_capability_major() >= 12:
+        # we lower fused chains to a CUTLASS Sm80EVT kernel. Toggled via
+        # PassConfig.enable_mm_epilogue_fusion (default True). The device
+        # check is independent — even with the flag on, non-sm_120 hosts
+        # don't register the pass since its FX walker would just no-op.
+        if pass_config.enable_mm_epilogue_fusion and device_capability_major() >= 12:
             self.add(MatmulEvtEpilogueFusionPass())
 
         # needs a functional graph

@@ -64,6 +64,16 @@ class PassConfig(BaseModel):
     # TODO: Add sequence parallelism pass and async TP pass.
     # TODO: Add Ulysses overlap pass.
     enable_sage_attn: bool = Field(False, description="Whether to replace flash attention with sage attention.")
+    enable_mm_epilogue_fusion: bool = Field(
+        True,
+        description=(
+            "Whether to enable the matmul + elementwise epilogue fusion pass. "
+            "On RTX 5090 (sm_120) this lowers fused chains to a CUTLASS Sm80EVT "
+            "kernel via the blackwell_geforce.MatmulEvtEpilogueFusionPass. The "
+            "pass is a no-op on older architectures regardless of this flag, "
+            "but the flag still controls whether it is registered at all."
+        ),
+    )
 
     @property
     def hash(self) -> str:
