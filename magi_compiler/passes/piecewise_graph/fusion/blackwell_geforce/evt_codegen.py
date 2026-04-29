@@ -22,8 +22,9 @@ The output is a single self-contained file that:
   4. Exposes ``evt_matmul_out`` via PYBIND11.
 
 We use CUTLASS 2.x ``Sm80EVT`` running backward-compat on sm_120; this matches
-``/root/cutlass/examples/99_evt_demo/heavy_epi_torch_ext.cu`` which has been
-verified to deliver +5..+12 % vs the Triton TMA path on RTX 5090 bf16.
+``$MAGI_CUTLASS_ROOT/examples/99_evt_demo/heavy_epi_torch_ext.cu`` (default
+``/opt/cutlass/...``) which has been verified to deliver +5..+12 % vs the
+Triton TMA path on RTX 5090 bf16.
 """
 
 from __future__ import annotations

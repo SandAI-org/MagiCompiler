@@ -616,7 +616,13 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         if w_shape is None or len(w_shape) != 2 or w_stride is None:
             return False
         N, K = w_shape
-        if not (_is_static_int(N) and N % 2 == 0):
+        # N % 8 ensures (a) the gate/linear interleaved split is valid (N
+        # even) AND (b) n_out = N // 2 satisfies CUTLASS AlignmentC = 4
+        # for bf16. This lets the runtime allocate D as a true-contiguous
+        # (M, n_out) tensor with no padded stride / scratch path. Real
+        # GAGA2 has N=27304 (% 8 == 0). Smaller misaligned N falls back
+        # to torch.compile's default mm + python silu chain.
+        if not (_is_static_int(N) and N % 8 == 0):
             return False
         if w_stride != (K, 1):
             return False  # not contiguous (N, K) — abort

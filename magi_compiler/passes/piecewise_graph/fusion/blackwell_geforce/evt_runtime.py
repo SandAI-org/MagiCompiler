@@ -67,60 +67,6 @@ def out_dtype_from_id(i: int) -> torch.dtype:
     return _ID_TO_DTYPE[i]
 
 
-# ── M-bucket dispatch ─────────────────────────────────────────────────────────
-# Three coarse buckets matching the tile-candidate sets in
-# ``evt_codegen._TILE_CANDIDATES_5090``:
-#   small  — M ≤ 256       (decode / single-token)
-#   medium — 256 < M ≤ 2048 (mid-size prefill)
-#   large  — M > 2048       (large prefill / batched)
-# Each bucket compiles a distinct .cu module containing its own tile-candidate
-# vector; the per-module C++ runner then autotunes the actual best (TileShape,
-# WarpShape, NumStages) tuple at first call per (M, N, K) and caches the
-# winning index inside the module — so the Python side only pays one extra
-# cache key dimension.
-_M_BUCKET_BOUNDARIES = (256, 2048)
-
-
-def _m_bucket(M: int) -> str:
-    if M <= _M_BUCKET_BOUNDARIES[0]:
-        return "small"
-    if M <= _M_BUCKET_BOUNDARIES[1]:
-        return "medium"
-    return "large"
-
-
-# ── Output row-stride helper ──────────────────────────────────────────────────
-# CUTLASS Sm80EVT and the swiglu7 DualGemm both require D's row stride to be a
-# multiple of AlignmentC * sizeof(ElementC) = 4 * sizeof(bf16) = 8 bytes (i.e.
-# 4 elements for bf16/fp16, 2 elements for fp32). When n_out already meets this
-# requirement we return a *contiguous* (M, n_out) tensor — avoids an extra D2D
-# scratch copy on the hot path. Only when n_out fails the alignment do we fall
-# back to padding the row stride.
-#
-# Earlier this padded everything to 128 bytes (matching the Triton path's
-# convention) but on shapes like N_out=13652 the resulting non-contig D forced
-# a kernel-into-scratch + scratch-into-D copy worth ~5% of the kernel runtime
-# at (M=7697, N=27304, K=5120) — which fully accounted for the perf gap users
-# saw between the standalone benchmark (no scratch) and the real model.
-#
-# Pre-computed alignment per dtype to avoid the ~2–5 μs cost of
-# ``torch.empty([], dtype=dt).element_size()`` per op invocation. Hit count on
-# this lookup is 2× per fused op (runtime impl + fake impl), so on a model with
-# 100 fused-op calls per forward this shaves ~1 ms off the dispatch overhead.
-_ALIGN_BY_DTYPE: dict = {
-    torch.bfloat16: 4,  # 8 bytes / 2 = 4 elements
-    torch.float16: 4,
-    torch.float32: 2,  # 8 bytes / 4 = 2 elements
-}
-
-
-def _aligned_n_stride(n_out: int, dt: torch.dtype) -> int:
-    align = _ALIGN_BY_DTYPE.get(dt)
-    if align is None:  # rare: a dtype we haven't pre-tabulated
-        align = max(1, 8 // torch.empty([], dtype=dt).element_size())
-    return (n_out + align - 1) // align * align
-
-
 # ── Compile cache + per-key build lock ────────────────────────────────────────
 _MODULE_CACHE: dict = {}  # cache_key (sha256 str) → loaded cpp_extension module
 # Hot-path fast cache — avoids ``json.dumps + sha256`` (~10–30 μs/call) when
@@ -135,18 +81,16 @@ _SWIGLU7_LOCK = threading.Lock()  # serialises insertions into _SWIGLU7_FAST_CAC
 
 
 # ── D output-buffer cache ────────────────────────────────────────────────────
-# Keyed by (M, n_out, n_stride, out_dtype, device_idx). Mirrors the same
-# cache pattern in ``sm120_triton_kernel.py:_buf_cache`` — which has been
-# shipping in this codebase for the Triton path. Reusing D across calls
-# avoids the per-call ``torch.empty`` overhead (~5–15 μs of Python work +
-# allocator metadata) and the (rare) scratch slice; on hot paths with
-# millisecond-scale kernels this is a measurable but small win.
+# Single-entry greedy cache, keyed by (M, n_out, dtype, device_idx). The hot
+# path in ``_matmul_custom_evt_cuda`` reads/writes this dict directly (the
+# resolver was inlined for ~1 μs/call savings), so this module only owns the
+# storage and a disable switch.
 #
-# Correctness contract — same as the Triton path: this is a single-stream
-# inference cache. The previous call's D consumer must already have read it
-# before the next call lands. Inductor-generated ``call(...)`` functions
-# satisfy this because they execute serially on the default CUDA stream and
-# the returned tensor is consumed before the next op-level dispatch.
+# FX-pass guards (K % 8 == 0; generic N % 4 == 0; swiglu7 N % 8 == 0) ensure
+# n_out is always a multiple of CUTLASS's AlignmentC = 4 elements, so D is
+# always allocated as a true-contiguous ``torch.empty((M, n_out), dtype)`` —
+# no padded stride / scratch buffer route exists. Anything that violates the
+# guards is rejected upstream and falls back to torch.compile's default mm.
 #
 # To opt out (e.g. when bench-scripting with overlapping streams), set the
 # env var ``MAGI_EVT_DISABLE_D_CACHE=1``.
@@ -154,39 +98,10 @@ _D_BUF_CACHE: dict = {}
 _D_CACHE_DISABLED: bool = os.environ.get("MAGI_EVT_DISABLE_D_CACHE", "0") not in ("0", "", "false", "False")
 
 
-def _get_or_alloc_D(M: int, n_out: int, out_dtype: torch.dtype, device: torch.device) -> "torch.Tensor":
-    """Return a (possibly cached) (M, n_out) output buffer.
-
-    The buffer is contiguous when ``n_stride == n_out`` (the fast path); when
-    ``n_out`` is mis-aligned we keep the padded ``[:, :n_out]`` slice so the
-    fake impl's stride matches at runtime.
-    """
-    # Fast path: cache key first, recompute n_stride only on miss. The cache
-    # is keyed by (M, n_out, dtype, device_idx); two distinct (n_out, dtype)
-    # always have the same alignment, so we don't need n_stride in the key.
-    idx = device.index or 0  # index is None for default device → falsy → 0
-    key = (M, n_out, out_dtype, idx)
-    cached = _D_BUF_CACHE.get(key)
-    if cached is not None and not _D_CACHE_DISABLED:
-        return cached
-    n_stride = _aligned_n_stride(n_out, out_dtype)
-    if n_stride == n_out:
-        D = torch.empty((M, n_out), device=device, dtype=out_dtype)
-    else:
-        D = torch.empty((M, n_stride), device=device, dtype=out_dtype)[:, :n_out]
-    if not _D_CACHE_DISABLED:
-        # Single-entry cache: evict everything else, then install the new one.
-        # We can't iterate-and-delete on the live dict (RuntimeError under any
-        # workload that puts >1 entry in the cache — e.g. CP=4 sees multiple
-        # per-rank shapes during warmup, while a single-card run often reuses
-        # one shape and never tripped the bug).
-        _D_BUF_CACHE.clear()
-        _D_BUF_CACHE[key] = D
-    return D
-
-
 def _cutlass_root() -> str:
-    return os.environ.get("MAGI_CUTLASS_ROOT", "/root/cutlass")
+    # Default install location is /opt/cutlass (Dockerfile clones the source
+    # tree there). Override with MAGI_CUTLASS_ROOT for ad-hoc dev checkouts.
+    return os.environ.get("MAGI_CUTLASS_ROOT", "/opt/cutlass")
 
 
 def _evt_build_dir(key: str) -> str:
@@ -405,28 +320,6 @@ def _compile_swiglu7_dual(m_bucket: str, N: int, K: int):
 # ── torch.library backend impls ───────────────────────────────────────────────
 
 
-# Single-entry scratch cache for the rare mis-aligned-N path. Same greedy
-# eviction policy as ``_D_BUF_CACHE`` — bounded memory across many shapes
-# (e.g. CP=4 sees several per-rank M values during warmup; we don't want a
-# scratch buffer for every one).
-_SCRATCH_CACHE: dict = {}
-
-
-def _get_or_alloc_scratch(M: int, n_out: int, out_dtype: torch.dtype, device: torch.device) -> "torch.Tensor":
-    if _D_CACHE_DISABLED:
-        return torch.empty((M, n_out), device=device, dtype=out_dtype)
-    idx = device.index or 0
-    key = (M, n_out, out_dtype, idx)
-    cached = _SCRATCH_CACHE.get(key)
-    if cached is not None:
-        return cached
-    s = torch.empty((M, n_out), device=device, dtype=out_dtype)
-    # Greedy eviction: one shape at a time.
-    _SCRATCH_CACHE.clear()
-    _SCRATCH_CACHE[key] = s
-    return s
-
-
 # ── Dispatch fast-cache ──────────────────────────────────────────────────────
 # Hot-path bottleneck reduction: collapse the four-step
 #   out_dtype_from_id → _m_bucket → _compile_* → mod.attr-lookup
@@ -529,55 +422,36 @@ def _matmul_custom_evt_cuda(A, B, extras, ir_json, kind, n_out, out_dtype_id_):
         _DISPATCH_CACHE[fast_key] = entry
 
     # ── Step 2: alloc / fetch D (greedy single-entry cache, inlined) ──
-    # D matches the fake impl's shape. CUTLASS launchers require D contiguous;
-    # when n_out happens to be mis-aligned the row stride is padded and we
-    # route through a scratch buffer.
+    # FX pass guards (K % 8 == 0; generic N % 4 == 0; swiglu7 N % 8 == 0)
+    # ensure n_out is a multiple of CUTLASS AlignmentC = 4 for every dtype,
+    # so a plain ``torch.empty((M, n_out), dtype)`` is already CUTLASS-
+    # contiguous — no padded stride / scratch buffer route is required.
+    # Anything that violates the guards is rejected upstream and falls back
+    # to torch.compile's default mm.
     if _D_CACHE_DISABLED:
-        n_stride = _aligned_n_stride(n_out, out_dtype)
-        if n_stride == n_out:
-            D = torch.empty((M, n_out), device=A.device, dtype=out_dtype)
-        else:
-            D = torch.empty((M, n_stride), device=A.device, dtype=out_dtype)[:, :n_out]
+        D = torch.empty((M, n_out), device=A.device, dtype=out_dtype)
     else:
         dev_idx = A.device.index or 0
         d_key = (M, n_out, out_dtype, dev_idx)
         D = _D_BUF_CACHE.get(d_key)
         if D is None:
-            n_stride = _aligned_n_stride(n_out, out_dtype)
-            if n_stride == n_out:
-                D = torch.empty((M, n_out), device=A.device, dtype=out_dtype)
-            else:
-                D = torch.empty((M, n_stride), device=A.device, dtype=out_dtype)[:, :n_out]
+            D = torch.empty((M, n_out), device=A.device, dtype=out_dtype)
             _D_BUF_CACHE.clear()
             _D_BUF_CACHE[d_key] = D
 
     # ── Step 3: dispatch — pre-bound callable, single C++ trampoline ──
-    # `D.stride(0) != n_out` is the only branch we take per call to decide
-    # whether we need the scratch route. Cheap C++ attribute compare.
-    needs_scratch = D.stride(0) != n_out
     kernel_call = entry.kernel_call
-
     if entry.is_evt:
-        if needs_scratch:
-            scratch = _get_or_alloc_scratch(M, n_out, out_dtype, A.device)
-            kernel_call(A, B, extras, scratch)
-            D.copy_(scratch)
-            return D
         kernel_call(A, B, extras, D)
-        return D
-
-    # swiglu7_dual: extras is always [] here (FX pass guarantees).
-    if needs_scratch:
-        scratch = _get_or_alloc_scratch(M, n_out, out_dtype, A.device)
-        kernel_call(A, B, scratch)
-        D.copy_(scratch)
-        return D
-    kernel_call(A, B, D)
+    else:
+        # swiglu7_dual: extras is always [] here (FX pass guarantees).
+        kernel_call(A, B, D)
     return D
 
 
 @torch.library.register_fake("magi_epilogue::matmul_custom_evt")
 def _matmul_custom_evt_fake(A, B, extras, ir_json, kind, n_out, out_dtype_id_):
     out_dtype = out_dtype_from_id(out_dtype_id_)
-    n_stride = _aligned_n_stride(n_out, out_dtype)
-    return A.new_empty_strided((A.shape[0], n_out), (n_stride, 1), dtype=out_dtype)
+    # Contiguous (M, n_out) — see _D_BUF_CACHE comment for why padding is
+    # never needed under the FX-pass alignment guards.
+    return A.new_empty((A.shape[0], n_out), dtype=out_dtype)
