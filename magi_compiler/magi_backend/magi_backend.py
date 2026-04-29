@@ -605,9 +605,6 @@ class MagiBackend:
 
         self._init_cache()
 
-        # if envs.MAGI_ENABLE_FX_GRAPH_VIZ:
-        #     save_fx_graph_visualization(graph, sub_dir="before_split", filename="gm_root")
-
         self.full_graph_pass_manager(graph)
 
         split_gm, piecewise_graphs = self._split_graph(graph)
