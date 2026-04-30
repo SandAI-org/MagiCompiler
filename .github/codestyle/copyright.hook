@@ -43,7 +43,7 @@ def _get_comment_mark(path):
     if lang_type.search(path) is not None:
         return "#"
 
-    lang_type=re.compile(r"\.(h|c|hpp|cc|cpp|cu|go|cuh|proto)$")
+    lang_type=re.compile(r"\.(h|c|hpp|hxx|cc|cpp|cxx|cu|go|cuh|proto)$")
     if lang_type.search(path) is not None:
         return "//"
 
