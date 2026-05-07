@@ -65,11 +65,11 @@ using LayoutB0 = cutlass::layout::ColumnMajor;   // strided ldB = 2K view
 using LayoutB1 = cutlass::layout::ColumnMajor;   // strided ldB = 2K view
 using LayoutC  = cutlass::layout::RowMajor;
 
-constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;  // = 8
-constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;  // = 8
-// Output vector width = 4 (bf16, 8 bytes) so any N_out divisible by 4 is OK
-// — N=27304 → N_out=13652 is 4-aligned but not 8-aligned.
-constexpr int EpilogueVecCount = 4;
+constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;  // = 8 for bf16
+constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;  // = 8 for bf16
+// Uniform 128-bit alignment: D's row stride (ldd) is host-padded to a
+// multiple of 8 bf16 elements (16 bytes), so 8-wide stores are always safe.
+constexpr int EpilogueVecCount = 128 / cutlass::sizeof_bits<ElementC>::value;  // = 8 for bf16
 
 using ArchTag          = cutlass::arch::Sm80;
 using OperatorClass    = cutlass::arch::OpClassTensorOp;
@@ -121,7 +121,8 @@ struct Sw7Args {
   int K;
   void* ptr_A;
   void* ptr_B;    // (N, K) row-major weight; gate/linear interleaved
-  void* ptr_D;    // (M, N_out)
+  void* ptr_D;    // (M, N_out) — strided view of an (M, ldd) padded buffer
+  int64_t ldd;    // D's row stride in elements; >= N_out, multiple of EpilogueVecCount
 };
 
 class Sw7Concept {
@@ -152,7 +153,7 @@ class Sw7Impl : public Sw7Concept {
     int64_t const ldB_strided = static_cast<int64_t>(2) * K;
     LayoutB0 layoutB_gate(ldB_strided);
     LayoutB1 layoutB_linear(ldB_strided);
-    LayoutC  layoutC(static_cast<int64_t>(N_out));
+    LayoutC  layoutC(a.ldd);
 
     using TensorRefA  = cutlass::TensorRef<ElementA const, LayoutA>;
     using TensorRefB0 = cutlass::TensorRef<ElementB const, LayoutB0>;
@@ -262,8 +263,8 @@ class Sw7AutoTuneRunner {
                 "all inputs must be bf16");
     TORCH_CHECK(A.dim() == 2 && B.dim() == 2 && D.dim() == 2, "A, B, D must be 2D");
     TORCH_CHECK(A.size(1) == B.size(1), "K mismatch (A.size(1) vs B.size(1))");
-    TORCH_CHECK(A.is_contiguous() && B.is_contiguous() && D.is_contiguous(),
-                "A, B, D must be contiguous");
+    TORCH_CHECK(A.is_contiguous() && B.is_contiguous(),
+                "A, B must be contiguous");
 
     int const M = static_cast<int>(A.size(0));
     int const K = static_cast<int>(A.size(1));
@@ -272,12 +273,17 @@ class Sw7AutoTuneRunner {
     int const N_out = N / 2;
     TORCH_CHECK(D.size(0) == M && D.size(1) == N_out,
                 "D must be (M, N/2) = (", M, ",", N_out, ")");
+    // D may be a strided view of a host-padded (M, ldd) buffer.
+    TORCH_CHECK(D.stride(1) == 1, "D innermost stride must be 1; got ", D.stride(1));
+    TORCH_CHECK(D.stride(0) >= N_out,
+                "D row stride must be >= N_out; got stride(0)=", D.stride(0), ", N_out=", N_out);
 
     Sw7Args ea;
     ea.M = M; ea.N_out = N_out; ea.K = K;
     ea.ptr_A = A.data_ptr<at::BFloat16>();
     ea.ptr_B = B.data_ptr<at::BFloat16>();
     ea.ptr_D = D.data_ptr<at::BFloat16>();
+    ea.ldd = static_cast<int64_t>(D.stride(0));
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.device().index()).stream();
 

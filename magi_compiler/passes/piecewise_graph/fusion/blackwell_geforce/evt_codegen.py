@@ -409,9 +409,10 @@ using LayoutC = cutlass::layout::RowMajor;
 
 constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
 constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
-// AlignmentC = 4 instead of 8 so any N-divisible-by-4 output works (e.g. odd
-// half-N values like 13652 from N=27304). Aligned tails still vectorise.
-constexpr int AlignmentC = 4;
+// Uniform 128-bit alignment for A, B, and D. The host pads D's row stride
+// (ldd) up to AlignmentC element boundaries when n_out doesn't naturally
+// divide it; the runtime passes the padded stride via EvtArgs.ldd.
+constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
 
 using ArchTag          = cutlass::arch::Sm80;
 using OperatorClass    = cutlass::arch::OpClassTensorOp;
@@ -473,6 +474,9 @@ struct EvtArgs {{
   void* ptr_A;
   void* ptr_B;
   void* ptr_D;
+  // Row stride of D in elements. Equals N when D is contiguous; > N when
+  // the host padded D up to AlignmentC. Threaded into LayoutC at runtime.
+  int64_t ldd;
   // Extras pointers, in IR-leaf order.
   std::vector<void*> ptr_extras;
 }};
@@ -502,11 +506,14 @@ class EvtImpl : public EvtConcept {{
     int const N = a.N;
     int const K = a.K;
     int64_t const MN = static_cast<int64_t>(M) * static_cast<int64_t>(N);
+    // ldd = D's row stride in elements; padded by host to satisfy AlignmentC.
+    int64_t const ldd = a.ldd;
+    int64_t const stride_d_total = static_cast<int64_t>(M) * ldd;
 
     typename EvtRoot::Arguments callback_args{{
 {args_tree}
         ,
-        {{ptrD, {{int64_t(N), _1{{}}, MN}}}}
+        {{ptrD, {{ldd, _1{{}}, stride_d_total}}}}
     }};
 
     cutlass::gemm::GemmCoord problem{{M, N, K}};
@@ -577,9 +584,9 @@ class EvtAutoTuneRunner {{
     TORCH_CHECK(A.scalar_type() == {a_at_dtype}, "A must be {a_dtype}");
     TORCH_CHECK(B.scalar_type() == {b_at_dtype}, "B must be {b_dtype}");
     TORCH_CHECK(D.scalar_type() == {c_at_dtype}, "D must be {c_dtype}");
-    TORCH_CHECK(A.dim() == 2 && B.dim() == 2, "A, B must be 2D");
-    TORCH_CHECK(A.is_contiguous() && B.is_contiguous() && D.is_contiguous(),
-                "A, B, D must be contiguous (row-major)");
+    TORCH_CHECK(A.dim() == 2 && B.dim() == 2 && D.dim() == 2, "A, B, D must be 2D");
+    TORCH_CHECK(A.is_contiguous() && B.is_contiguous(),
+                "A, B must be contiguous (row-major)");
 
     int const M = static_cast<int>(A.size(0));
     int const K = static_cast<int>(A.size(1));
@@ -587,6 +594,11 @@ class EvtAutoTuneRunner {{
 
     TORCH_CHECK(D.size(0) == M && D.size(1) == N,
                 "D must be (M, N); got ", D.sizes());
+    // D may be a strided view of a host-padded (M, n_padded) buffer: inner
+    // stride must be 1, row stride (ldd) must be >= N.
+    TORCH_CHECK(D.stride(1) == 1, "D innermost stride must be 1; got ", D.stride(1));
+    TORCH_CHECK(D.stride(0) >= N,
+                "D row stride must be >= N; got stride(0)=", D.stride(0), ", N=", N);
     TORCH_CHECK(extras.size() == {n_extras}, "expected {n_extras} extra tensors, got ", extras.size());
 
 {extras_validation}
@@ -596,6 +608,7 @@ class EvtAutoTuneRunner {{
     ea.ptr_A = A.data_ptr<{a_at_cpp}>();
     ea.ptr_B = B.data_ptr<{b_at_cpp}>();
     ea.ptr_D = D.data_ptr<{c_at_cpp}>();
+    ea.ldd = static_cast<int64_t>(D.stride(0));
     ea.ptr_extras.reserve({n_extras});
 {extras_ptrs}
 

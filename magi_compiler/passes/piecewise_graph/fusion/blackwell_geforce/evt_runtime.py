@@ -67,6 +67,35 @@ def out_dtype_from_id(i: int) -> torch.dtype:
     return _ID_TO_DTYPE[i]
 
 
+def _aligned_n_stride(n_out: int, dtype: torch.dtype) -> int:
+    """Round n_out up to a 128-byte (one L2 cache line) element count.
+
+    The CUTLASS-side requirement is only ``ldd % AlignmentC == 0`` where
+    ``AlignmentC = 128 / sizeof_bits<ElementC>`` (= 8 elements for bf16),
+    i.e. a 16-byte boundary. We over-align here to 128 bytes — a full L2
+    cache line — for two reasons:
+
+      1. Every row starts on a cache-line boundary, so the contiguous block
+         of cp.async / ld.global issued by the next op (typically a cuBLAS
+         GEMM that consumes our strided D) sees clean cache-line packing.
+      2. cuBLAS's GEMM heuristic picks a different (and on RTX 5090 measurably
+         slower) kernel for "awkward" lda values that are not 128-byte
+         multiples. Bumping the pad from one vector store (16 B) to one
+         cache line (128 B) costs at most 63 extra elements per row — under
+         a hundred KB even at large M — and recovers the cuBLAS kernel
+         heuristic's first-class path.
+
+    Bytes-based formula keeps this dtype-agnostic:
+      bf16 / fp16 → 64 element pad boundary
+      fp32        → 32 element pad boundary
+      fp8         → 128 element pad boundary
+    """
+    align_bytes = 128
+    align = max(1, align_bytes // dtype.itemsize)
+    n = int(n_out)
+    return ((n + align - 1) // align) * align
+
+
 # ── Compile cache + per-key build lock ────────────────────────────────────────
 _MODULE_CACHE: dict = {}  # cache_key (sha256 str) → loaded cpp_extension module
 # Hot-path fast cache — avoids ``json.dumps + sha256`` (~10–30 μs/call) when
@@ -81,16 +110,20 @@ _SWIGLU7_LOCK = threading.Lock()  # serialises insertions into _SWIGLU7_FAST_CAC
 
 
 # ── D output-buffer cache ────────────────────────────────────────────────────
-# Single-entry greedy cache, keyed by (M, n_out, dtype, device_idx). The hot
+# Single-entry greedy cache, keyed by (M, n_pad, dtype, device_idx). The hot
 # path in ``_matmul_custom_evt_cuda`` reads/writes this dict directly (the
 # resolver was inlined for ~1 μs/call savings), so this module only owns the
 # storage and a disable switch.
 #
-# FX-pass guards (K % 8 == 0; generic N % 4 == 0; swiglu7 N % 8 == 0) ensure
-# n_out is always a multiple of CUTLASS's AlignmentC = 4 elements, so D is
-# always allocated as a true-contiguous ``torch.empty((M, n_out), dtype)`` —
-# no padded stride / scratch buffer route exists. Anything that violates the
-# guards is rejected upstream and falls back to torch.compile's default mm.
+# Every D allocation is sized ``(M, n_pad)`` where
+# ``n_pad = _aligned_n_stride(n_out, dtype)`` rounds n_out up to a full L2
+# cache line (128 B) — over-aligned vs. CUTLASS's vector-store requirement
+# of one 16 B boundary, so that downstream cuBLAS GEMMs that consume our
+# strided D land on the heuristic's first-class kernel. The op returns the
+# strided view ``D_pad[:, :n_out]`` (stride(0) == n_pad, stride(1) == 1) so
+# downstream Inductor sees a (M, n_out) tensor whose row stride is the
+# padded one. Two distinct n_out values that round to the same n_pad share
+# the same buffer.
 #
 # To opt out (e.g. when bench-scripting with overlapping streams), set the
 # env var ``MAGI_EVT_DISABLE_D_CACHE=1``.
@@ -421,23 +454,25 @@ def _matmul_custom_evt_cuda(A, B, extras, ir_json, kind, n_out, out_dtype_id_):
         entry = _resolve_dispatch(kind, ir_json, a_dtype, b_dtype_, N_w, K_w, m_bucket, out_dtype)
         _DISPATCH_CACHE[fast_key] = entry
 
-    # ── Step 2: alloc / fetch D (greedy single-entry cache, inlined) ──
-    # FX pass guards (K % 8 == 0; generic N % 4 == 0; swiglu7 N % 8 == 0)
-    # ensure n_out is a multiple of CUTLASS AlignmentC = 4 for every dtype,
-    # so a plain ``torch.empty((M, n_out), dtype)`` is already CUTLASS-
-    # contiguous — no padded stride / scratch buffer route is required.
-    # Anything that violates the guards is rejected upstream and falls back
-    # to torch.compile's default mm.
+    # ── Step 2: alloc / fetch padded D (greedy single-entry cache, inlined) ──
+    # Allocate D padded to AlignmentC element boundaries on the row stride.
+    # The CUTLASS kernel only writes the first n_out columns; the rest of
+    # each padded row is left untouched. The slice D_pad[:, :n_out] is what
+    # we hand to the kernel and what we return — a strided view whose
+    # stride(0) == n_pad. Cache key is on n_pad (not n_out) since that's the
+    # actual buffer size; two n_out values that pad to the same n_pad share.
+    n_pad = _aligned_n_stride(n_out, out_dtype)
     if _D_CACHE_DISABLED:
-        D = torch.empty((M, n_out), device=A.device, dtype=out_dtype)
+        D_pad = torch.empty((M, n_pad), device=A.device, dtype=out_dtype)
     else:
         dev_idx = A.device.index or 0
-        d_key = (M, n_out, out_dtype, dev_idx)
-        D = _D_BUF_CACHE.get(d_key)
-        if D is None:
-            D = torch.empty((M, n_out), device=A.device, dtype=out_dtype)
+        d_key = (M, n_pad, out_dtype, dev_idx)
+        D_pad = _D_BUF_CACHE.get(d_key)
+        if D_pad is None:
+            D_pad = torch.empty((M, n_pad), device=A.device, dtype=out_dtype)
             _D_BUF_CACHE.clear()
-            _D_BUF_CACHE[d_key] = D
+            _D_BUF_CACHE[d_key] = D_pad
+    D = D_pad[:, :n_out] if n_pad != n_out else D_pad
 
     # ── Step 3: dispatch — pre-bound callable, single C++ trampoline ──
     kernel_call = entry.kernel_call
@@ -452,6 +487,8 @@ def _matmul_custom_evt_cuda(A, B, extras, ir_json, kind, n_out, out_dtype_id_):
 @torch.library.register_fake("magi_epilogue::matmul_custom_evt")
 def _matmul_custom_evt_fake(A, B, extras, ir_json, kind, n_out, out_dtype_id_):
     out_dtype = out_dtype_from_id(out_dtype_id_)
-    # Contiguous (M, n_out) — see _D_BUF_CACHE comment for why padding is
-    # never needed under the FX-pass alignment guards.
-    return A.new_empty((A.shape[0], n_out), dtype=out_dtype)
+    # Strided (M, n_out) view of an (M, n_pad) buffer — must match the
+    # stride layout the CUDA impl actually returns, otherwise Inductor's
+    # downstream view metadata desyncs from the real tensor.
+    n_pad = _aligned_n_stride(n_out, out_dtype)
+    return A.new_empty_strided((A.shape[0], n_out), (n_pad, 1), dtype=out_dtype)

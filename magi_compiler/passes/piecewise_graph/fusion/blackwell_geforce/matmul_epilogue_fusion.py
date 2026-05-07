@@ -219,16 +219,18 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         b_dtype = _val_dtype(B)
         if a_dtype not in (torch.bfloat16, torch.float16) or a_dtype != b_dtype:
             return False
-        # Alignment gates — bf16/fp16 require K % 8.
+        # Alignment gates — A is RowMajor (M, K) so ldA = K must be a 128-bit
+        # multiple (= 8 for bf16/fp16). B's N-side gate is path-specific and
+        # checked after b_layout is resolved (only evt_row needs N-aligned ldB).
+        # D's N is unconstrained here: the runtime allocates a padded buffer
+        # and returns a strided view, so any n_out divides into AlignmentC.
         a_shape = _val_shape(A)
         b_shape = _val_shape(B)
         if a_shape is None or b_shape is None or len(a_shape) != 2 or len(b_shape) != 2:
             return False
         K = a_shape[1]
-        N = b_shape[1]
-        if _is_static_int(K) and (K % 8 != 0):
-            return False
-        if _is_static_int(N) and (N % 4 != 0):
+        align_a = max(1, 128 // (a_dtype.itemsize * 8))
+        if _is_static_int(K) and (K % align_a != 0):
             return False
 
         # node_to_ir: each fused fx.Node → its IR subtree. mm_node maps to Accum.
@@ -478,6 +480,15 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         if b_layout is None:
             return False
 
+        # Path-specific B-side alignment gate. evt_row: B is (K, N) row-major,
+        # ldB = N, so N must be a 128-bit multiple. evt_col: B is (N, K) row-
+        # major (read as (K, N) col-major), ldB = K, already covered by the
+        # entry K-gate. D's N stays unconstrained — runtime pads.
+        if b_layout == "row":
+            align_b = max(1, 128 // (b_dtype.itemsize * 8))
+            if _is_static_int(n_dim) and (n_dim % align_b != 0):
+                return False
+
         # Determine output dtype from the last fused node's FakeTensor metadata.
         out_dt = _val_dtype(last_node) or torch.bfloat16
         if out_dt not in _DTYPE_TO_STR:
@@ -500,18 +511,18 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
                 torch.ops.magi_epilogue.matmul_custom_evt.default,
                 args=(A, b_underlying, extras_nodes, ir_json, kind, n_out, out_dt_id),
             )
-        # Propagate FakeTensor meta so downstream Inductor checks pass.
-        try:
-            val_last = last_node.meta.get("val")
-            if val_last is not None:
-                # Propagate but with 128B-aligned stride matching what the
-                # CUDA impl actually returns.
-                new_val = val_last.new_empty_strided(
-                    val_last.shape, (evt_runtime._aligned_n_stride(int(val_last.shape[-1]), val_last.dtype), 1)
-                )
-                new_node.meta["val"] = new_val
-        except Exception:
-            pass
+        # Propagate FakeTensor meta with 128-bit-aligned row stride matching
+        # what the CUDA impl actually returns. Narrow the exception to the
+        # int(SymInt) cast for dynamic-N graphs — meta propagation is best-
+        # effort there; the runtime still returns a correct strided tensor.
+        val_last = last_node.meta.get("val")
+        if val_last is not None:
+            try:
+                n_pad = evt_runtime._aligned_n_stride(int(val_last.shape[-1]), val_last.dtype)
+            except (TypeError, ValueError):
+                n_pad = None
+            if n_pad is not None:
+                new_node.meta["val"] = val_last.new_empty_strided(val_last.shape, (n_pad, 1))
 
         last_node.replace_all_uses_with(new_node)
         for n in reversed(walk_seen):
@@ -613,13 +624,12 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         if w_shape is None or len(w_shape) != 2 or w_stride is None:
             return False
         N, K = w_shape
-        # N % 8 ensures (a) the gate/linear interleaved split is valid (N
-        # even) AND (b) n_out = N // 2 satisfies CUTLASS AlignmentC = 4
-        # for bf16. This lets the runtime allocate D as a true-contiguous
-        # (M, n_out) tensor with no padded stride / scratch path. Real
-        # GAGA2 has N=27304 (% 8 == 0). Smaller misaligned N falls back
-        # to torch.compile's default mm + python silu chain.
-        if not (_is_static_int(N) and N % 8 == 0):
+        # N must be even (gate/linear interleaved split). The output
+        # n_out = N // 2 is padded by the runtime to AlignmentC, so no
+        # further N divisibility is needed. K-side alignment (ldB = 2K
+        # for the strided gate/linear views) is already covered by the
+        # entry K-gate in _try_fuse_evt.
+        if not (_is_static_int(N) and N % 2 == 0):
             return False
         if w_stride != (K, 1):
             return False  # not contiguous (N, K) — abort
@@ -697,15 +707,16 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
                 torch.ops.magi_epilogue.matmul_custom_evt.default,
                 args=(mm_node.args[0], weight_node, [], "", "swiglu7_dual", n_out, out_dt_id),
             )
-        try:
-            val_last = last_chain_node.meta.get("val")
-            if val_last is not None:
-                new_val = val_last.new_empty_strided(
-                    val_last.shape, (evt_runtime._aligned_n_stride(int(val_last.shape[-1]), val_last.dtype), 1)
-                )
-                new_node.meta["val"] = new_val
-        except Exception:
-            pass
+        # Propagate FakeTensor meta with 128-bit-aligned row stride matching
+        # what the CUDA impl actually returns.
+        val_last = last_chain_node.meta.get("val")
+        if val_last is not None:
+            try:
+                n_pad = evt_runtime._aligned_n_stride(int(val_last.shape[-1]), val_last.dtype)
+            except (TypeError, ValueError):
+                n_pad = None
+            if n_pad is not None:
+                new_node.meta["val"] = val_last.new_empty_strided(val_last.shape, (n_pad, 1))
 
         last_chain_node.replace_all_uses_with(new_node)
         for n in reversed(chain_nodes):
