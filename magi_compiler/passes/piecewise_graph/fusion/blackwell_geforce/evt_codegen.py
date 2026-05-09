@@ -41,28 +41,21 @@ _DTYPE_TO_CUTLASS = {"bfloat16": "cutlass::bfloat16_t", "float16": "cutlass::hal
 _DTYPE_TO_AT = {"bfloat16": "at::kBFloat16", "float16": "at::kHalf", "float32": "at::kFloat"}
 
 
-# ── Per-M-bucket tile candidate sets, hand-tuned for RTX 5090 (sm_120) ──────
-# Hardware constraints driving these choices:
-#   * 170 SMs — the optimal grid size is some multiple of 170; small tiles
-#     keep more CTAs in flight when M is short.
-#   * 100 KB SMEM / SM — per-stage SMEM = (BM + BN) * BK * 2 (bf16). With
-#     stages=4 and (128,128,32) we land at 128 KB which exceeds budget; we
-#     prefer stages=3 in that case. (128,128,32)*4 = 128KB, (128,256,32)*3=144KB,
-#     (256,128,32)*3=144KB are still over budget but CUTLASS auto-shrinks
-#     stages on Sm80 if SMEM doesn't fit. We rely on can_implement / init to
-#     reject illegal combos at autotune time.
-#   * Decode-style M (≤256) loses parallelism on big tiles — 1 wave covers
-#     just a handful of N tiles. Need small BM.
-#   * Prefill-style M (>2048) has plenty of parallelism — bigger tiles win
-#     because they amortise loads better.
-#
+# ── Per-arch / per-M-bucket tile candidate sets ─────────────────────────────
 # Each tuple is (BM, BN, BK, WM, WN, WK, NumStages, label).
 # WarpShape is conventionally TileShape / (2, 2) along (M, N), keeping 4 warps.
 # We include WK == BK to match Sm80 TensorOp's default warp tiling.
-_TILE_CANDIDATES_5090: dict = {
+#
+# Per-arch set is selected by the runtime; unknown arch falls back to "sm120"
+# (the most conservative SMEM budget — works on Ada / Blackwell GeForce).
+
+# RTX 5090 (sm_120): 170 SMs, 100 KB SMEM / SM.
+# Per-stage SMEM = (BM + BN) * BK * 2 (bf16). Above ~96 KB total CUTLASS
+# auto-shrinks stages or `can_implement` rejects, so we keep tile×stages
+# inside that envelope.
+_TILE_CANDIDATES_SM120: dict = {
     # ── small (decode / single-token) ────────────────────────────────────────
-    # M ≤ 256: low parallelism along M. Use small BM to launch more CTAs along N.
-    # All candidates have BM*BN ≤ 16384 to keep occupancy high on 170 SMs.
+    # M ≤ 256: low parallelism along M. Small BM launches more CTAs along N.
     "small": [
         (64, 64, 32, 32, 32, 32, 4, "T<64,64,32>_S4"),
         (64, 64, 64, 32, 32, 64, 3, "T<64,64,64>_S3"),
@@ -74,7 +67,6 @@ _TILE_CANDIDATES_5090: dict = {
         (128, 64, 32, 64, 32, 32, 4, "T<128,64,32>_S4"),
     ],
     # ── medium (256 < M ≤ 2048) ──────────────────────────────────────────────
-    # Standard CUTLASS bf16 sweet spot. Mix BM=128/256 with BN=64/128/256.
     "medium": [
         (128, 128, 32, 64, 64, 32, 3, "T<128,128,32>_S3"),
         (128, 128, 32, 64, 64, 32, 4, "T<128,128,32>_S4"),
@@ -85,8 +77,6 @@ _TILE_CANDIDATES_5090: dict = {
         (64, 128, 64, 32, 64, 64, 4, "T<64,128,64>_S4"),
     ],
     # ── large (M > 2048) ─────────────────────────────────────────────────────
-    # Plenty of parallelism — bigger tiles for better arith density. SMEM
-    # budget on 5090 (100 KB) restricts (256,128) and (128,256) to stages=3.
     "large": [
         (128, 256, 32, 64, 64, 32, 3, "T<128,256,32>_S3"),
         (256, 128, 32, 64, 64, 32, 3, "T<256,128,32>_S3"),
@@ -97,10 +87,66 @@ _TILE_CANDIDATES_5090: dict = {
     ],
 }
 
+# H100 (sm_90): 132 SMs, 228 KB SMEM / SM, HBM3 ~3.35 TB/s, ~989 TF bf16.
+# Compared to sm_120: 2.28× SMEM headroom + 6× compute ⇒ favour bigger tiles
+# to amortise loads. Fewer SMs ⇒ optimal grid wave is multiples of 132 (vs 170).
+# We're still on Sm80 mainloop (CUTLASS 2.x, no TMA / wgmma) — all sizes here
+# fit in cp.async-based smem budget.
+#
+#   per-stage SMEM (single GEMM) = (BM + BN) * BK * 2
+#   budget cap ~200 KB to leave headroom for reg spill / aux smem
+_TILE_CANDIDATES_SM90: dict = {
+    # ── small (decode) ───────────────────────────────────────────────────────
+    # H100 needs more CTAs spread across 132 SMs at small M; mix BM=64/128.
+    "small": [
+        (64, 64, 64, 32, 32, 64, 4, "T<64,64,64>_S4"),  # 64 KB
+        (64, 128, 64, 32, 64, 64, 3, "T<64,128,64>_S3"),  # 72 KB
+        (64, 128, 64, 32, 64, 64, 4, "T<64,128,64>_S4"),  # 96 KB
+        (64, 256, 64, 32, 64, 64, 3, "T<64,256,64>_S3"),  # 120 KB
+        (128, 64, 64, 64, 32, 64, 4, "T<128,64,64>_S4"),  # 96 KB
+        (128, 64, 64, 64, 32, 64, 5, "T<128,64,64>_S5"),  # 120 KB
+        (128, 128, 32, 64, 64, 32, 4, "T<128,128,32>_S4"),  # 64 KB
+        (128, 128, 64, 64, 64, 64, 3, "T<128,128,64>_S3"),  # 96 KB
+    ],
+    # ── medium (256 < M ≤ 2048) ──────────────────────────────────────────────
+    # Sweet spot for prefill on H100 — bigger BK to feed the bigger tensor cores.
+    "medium": [
+        (128, 128, 64, 64, 64, 64, 3, "T<128,128,64>_S3"),  # 96 KB
+        (128, 128, 64, 64, 64, 64, 4, "T<128,128,64>_S4"),  # 128 KB
+        (128, 128, 64, 64, 64, 64, 5, "T<128,128,64>_S5"),  # 160 KB
+        (128, 256, 64, 64, 64, 64, 3, "T<128,256,64>_S3"),  # 144 KB
+        (256, 128, 64, 64, 64, 64, 3, "T<256,128,64>_S3"),  # 144 KB
+        (256, 128, 32, 64, 64, 32, 4, "T<256,128,32>_S4"),  # 96 KB
+        (128, 256, 32, 64, 64, 32, 4, "T<128,256,32>_S4"),  # 96 KB
+        (256, 256, 32, 64, 64, 32, 3, "T<256,256,32>_S3"),  # 96 KB
+    ],
+    # ── large (M > 2048) ─────────────────────────────────────────────────────
+    # Big tiles to maximise arithmetic density; 132 SMs need fewer CTAs.
+    "large": [
+        (128, 256, 64, 64, 64, 64, 3, "T<128,256,64>_S3"),  # 144 KB
+        (128, 256, 64, 64, 64, 64, 4, "T<128,256,64>_S4"),  # 192 KB
+        (256, 128, 64, 64, 64, 64, 3, "T<256,128,64>_S3"),  # 144 KB
+        (256, 128, 64, 64, 64, 64, 4, "T<256,128,64>_S4"),  # 192 KB
+        (256, 256, 32, 64, 64, 32, 3, "T<256,256,32>_S3"),  # 96 KB
+        (256, 256, 64, 64, 64, 64, 3, "T<256,256,64>_S3"),  # 192 KB
+        (128, 128, 64, 64, 64, 64, 4, "T<128,128,64>_S4"),  # 128 KB
+    ],
+}
 
-def _emit_tile_candidates(m_bucket: str) -> str:
-    """Emit C++ EVT_TILE_CANDIDATE(...) statements for a given M bucket."""
-    candidates = _TILE_CANDIDATES_5090.get(m_bucket, _TILE_CANDIDATES_5090["medium"])
+# arch tag → per-bucket dict. Runtime maps device compute capability to a tag.
+_TILE_CANDIDATES: dict = {"sm120": _TILE_CANDIDATES_SM120, "sm90": _TILE_CANDIDATES_SM90}
+
+# Backward-compat alias: some external callers still reference this name.
+_TILE_CANDIDATES_5090 = _TILE_CANDIDATES_SM120
+
+
+def _emit_tile_candidates(m_bucket: str, arch: str = "sm120") -> str:
+    """Emit C++ EVT_TILE_CANDIDATE(...) statements for a given (arch, M bucket).
+
+    Unknown arch falls back to ``sm120`` (conservative SMEM budget).
+    """
+    arch_table = _TILE_CANDIDATES.get(arch, _TILE_CANDIDATES["sm120"])
+    candidates = arch_table.get(m_bucket, arch_table["medium"])
     lines = []
     for bm, bn, bk, wm, wn, wk, stages, label in candidates:
         lines.append(f'    EVT_TILE_CANDIDATE({bm}, {bn}, {bk}, {wm}, {wn}, {wk}, ' f'{stages}, "{label}");')
@@ -407,12 +453,17 @@ using LayoutA = cutlass::layout::RowMajor;
 using LayoutB = cutlass::layout::{b_layout};
 using LayoutC = cutlass::layout::RowMajor;
 
-constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
-constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
-// Uniform 128-bit alignment for A, B, and D. The host pads D's row stride
-// (ldd) up to AlignmentC element boundaries when n_out doesn't naturally
-// divide it; the runtime passes the padded stride via EvtArgs.ldd.
-constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+// AlignmentA / AlignmentB / AlignmentC are baked from the (greedy) bit-width
+// chosen at runtime to match the actual K, N, and ldd divisibility — 128
+// bits when shapes allow vector loads, 64 bits as a fallback for shapes that
+// only meet 8-byte alignment (e.g. K = 12 for bf16). For C the host already
+// over-pads D's row stride to a full cache line (see ``_aligned_n_stride``
+// in evt_runtime.py), so AlignmentC = 128 is almost always achievable —
+// keeping it tunable lets a smaller-padding mode drop to 64 without a
+// CUTLASS template rebuild from scratch.
+constexpr int AlignmentA = {alignment_a_bits} / cutlass::sizeof_bits<ElementA>::value;
+constexpr int AlignmentB = {alignment_b_bits} / cutlass::sizeof_bits<ElementB>::value;
+constexpr int AlignmentC = {alignment_c_bits} / cutlass::sizeof_bits<ElementC>::value;
 
 using ArchTag          = cutlass::arch::Sm80;
 using OperatorClass    = cutlass::arch::OpClassTensorOp;
@@ -474,8 +525,13 @@ struct EvtArgs {{
   void* ptr_A;
   void* ptr_B;
   void* ptr_D;
-  // Row stride of D in elements. Equals N when D is contiguous; > N when
-  // the host padded D up to AlignmentC. Threaded into LayoutC at runtime.
+  // Row strides of A, B, D in elements. lda/ldb default to the contiguous
+  // case (lda = K, ldb = stride_b_expr) when the host doesn't override; the
+  // launcher always sets them explicitly from the at::Tensor strides so that
+  // Inductor reinterpret_tensor inputs with non-contiguous strides still
+  // index correctly.
+  int64_t lda;
+  int64_t ldb;
   int64_t ldd;
   // Extras pointers, in IR-leaf order.
   std::vector<void*> ptr_extras;
@@ -517,6 +573,8 @@ class EvtImpl : public EvtConcept {{
     }};
 
     cutlass::gemm::GemmCoord problem{{M, N, K}};
+    int64_t const lda = a.lda;
+    int64_t const ldb = a.ldb;
     typename GemmType::Arguments args(
         cutlass::gemm::GemmUniversalMode::kGemm,
         problem,
@@ -524,11 +582,11 @@ class EvtImpl : public EvtConcept {{
         callback_args,
         ptrA, ptrB,
         /*ptr_C=*/nullptr, /*ptr_D=*/nullptr,
-        /*batch_stride_A=*/static_cast<int64_t>(M) * K,
-        /*batch_stride_B=*/static_cast<int64_t>(N) * K,
+        /*batch_stride_A=*/static_cast<int64_t>(M) * lda,
+        /*batch_stride_B=*/static_cast<int64_t>(N) * ldb,
         /*batch_stride_C=*/0, /*batch_stride_D=*/0,
-        /*stride_a=*/static_cast<int64_t>(K),
-        /*stride_b=*/static_cast<int64_t>({stride_b_expr}),
+        /*stride_a=*/lda,
+        /*stride_b=*/ldb,
         /*stride_c=*/0, /*stride_d=*/0);
     return args;
   }}
@@ -585,8 +643,18 @@ class EvtAutoTuneRunner {{
     TORCH_CHECK(B.scalar_type() == {b_at_dtype}, "B must be {b_dtype}");
     TORCH_CHECK(D.scalar_type() == {c_at_dtype}, "D must be {c_dtype}");
     TORCH_CHECK(A.dim() == 2 && B.dim() == 2 && D.dim() == 2, "A, B, D must be 2D");
-    TORCH_CHECK(A.is_contiguous() && B.is_contiguous(),
-                "A, B must be contiguous (row-major)");
+    // A is always row-major (M, K), so its innermost (K) stride must be 1.
+    // We don't require A.is_contiguous() because Inductor often hands us a
+    // reinterpret_tensor that has the right strides but trips that check.
+    TORCH_CHECK(A.stride(1) == 1, "A innermost stride must be 1; got ", A.stride(1));
+    TORCH_CHECK(A.stride(0) >= A.size(1),
+                "A row stride must be >= K; got stride(0)=", A.stride(0), ", K=", A.size(1));
+    // B's stride contract depends on b_layout (substituted at codegen time):
+    //   row: B is (K, N) row-major          → B.stride(1) == 1, B.stride(0) >= N
+    //   col: B is the underlying (N, K)     → B.stride(1) == 1, B.stride(0) >= K
+    //        row-major weight read as
+    //        ColumnMajor (K, N) by CUTLASS
+    {b_stride_check}
 
     int const M = static_cast<int>(A.size(0));
     int const K = static_cast<int>(A.size(1));
@@ -608,6 +676,11 @@ class EvtAutoTuneRunner {{
     ea.ptr_A = A.data_ptr<{a_at_cpp}>();
     ea.ptr_B = B.data_ptr<{b_at_cpp}>();
     ea.ptr_D = D.data_ptr<{c_at_cpp}>();
+    // Real strides from the at::Tensor — handles Inductor reinterpret_tensor
+    // cases where lda > K or ldb > size(1). Both stride(0) values are in
+    // elements since stride(1) == 1 was just validated above.
+    ea.lda = static_cast<int64_t>(A.stride(0));
+    ea.ldb = static_cast<int64_t>(B.stride(0));
     ea.ldd = static_cast<int64_t>(D.stride(0));
     ea.ptr_extras.reserve({n_extras});
 {extras_ptrs}
@@ -711,8 +784,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
 """
 
 
+_VALID_ALIGN_BITS = (128, 64)
+
+
 def render_evt_cu(
-    ir: Store, a_dtype: str, b_dtype: str, cache_key_str: str = "", b_layout: str = "row", m_bucket: str = "medium"
+    ir: Store,
+    a_dtype: str,
+    b_dtype: str,
+    cache_key_str: str = "",
+    b_layout: str = "row",
+    m_bucket: str = "medium",
+    alignment_a_bits: int = 128,
+    alignment_b_bits: int = 128,
+    alignment_c_bits: int = 128,
+    arch: str = "sm120",
 ) -> str:
     """Render a complete .cu source for the given EVT IR.
 
@@ -731,18 +816,40 @@ def render_evt_cu(
         weight (== column-major (K, N)); LayoutB = ColumnMajor; ldB = K. Use
         ``"col"`` when the FX graph passes ``permute([1,0])(weight)`` as B.
     m_bucket : "small" | "medium" | "large"
-        Picks a tile-candidate set tuned for RTX 5090 (sm_120) at the given M
-        regime. The runner inside the rendered .cu autotunes across all
+        Picks a tile-candidate set tuned for the chosen ``arch`` at the given
+        M regime. The runner inside the rendered .cu autotunes across all
         candidates in that bucket on the first call per (M, N, K) shape and
         caches the winner.
+    alignment_a_bits, alignment_b_bits, alignment_c_bits : int
+        Bit-width baked into ``constexpr int AlignmentA / AlignmentB /
+        AlignmentC``. Must be one of ``(128, 64)``. The runtime greedy-picks
+        the largest width that divides the actual K (A), N or K (B), and
+        ldd (C); 64-bit is the fallback that admits shapes the strict
+        128-bit gate previously rejected. For C the host normally over-pads
+        D's row stride to satisfy 128 bits, so 128 is almost always picked,
+        but the parameter is exposed so a smaller-pad mode can drop to 64
+        without rebuilding the codegen template.
+    arch : str
+        Compute-capability tag (``"sm90"`` for H100, ``"sm120"`` for RTX 5090).
+        Selects which per-bucket tile candidate set to inline. Unknown values
+        fall back to ``"sm120"``.
     """
     if b_layout not in ("row", "col"):
         raise ValueError(f"b_layout must be 'row' or 'col', got {b_layout!r}")
-    if m_bucket not in _TILE_CANDIDATES_5090:
-        raise ValueError(f"unknown m_bucket {m_bucket!r}; " f"expected one of {list(_TILE_CANDIDATES_5090)}")
+    if m_bucket not in _TILE_CANDIDATES_SM120:
+        raise ValueError(f"unknown m_bucket {m_bucket!r}; " f"expected one of {list(_TILE_CANDIDATES_SM120)}")
+    if (
+        alignment_a_bits not in _VALID_ALIGN_BITS
+        or alignment_b_bits not in _VALID_ALIGN_BITS
+        or alignment_c_bits not in _VALID_ALIGN_BITS
+    ):
+        raise ValueError(
+            f"alignment_*_bits must be one of {_VALID_ALIGN_BITS}; "
+            f"got A={alignment_a_bits}, B={alignment_b_bits}, C={alignment_c_bits}"
+        )
     if not isinstance(ir, Store):
         raise TypeError("render_evt_cu expects a Store node as root")
-    tile_candidate_block = _emit_tile_candidates(m_bucket)
+    tile_candidate_block = _emit_tile_candidates(m_bucket, arch)
 
     a_elem = _DTYPE_TO_CUTLASS[a_dtype]
     b_elem = _DTYPE_TO_CUTLASS[b_dtype]
@@ -824,11 +931,29 @@ def render_evt_cu(
         # B is (K, N) row-major contiguous: K from B.size(0), N from B.size(1), ldB = N.
         n_dim_expr = "B.size(1)"
         stride_b_expr = "N"
+        # Row-major B: innermost (N) stride is 1, row stride (ldB) is at least N.
+        # Don't require B.is_contiguous() — Inductor may hand us a
+        # reinterpret_tensor with the right strides but the wrong storage_offset
+        # / sizes-vs-stride relationship that fails the strict check.
+        b_stride_check = (
+            'TORCH_CHECK(B.stride(1) == 1, "B innermost stride must be 1; got ", B.stride(1));\n'
+            '    TORCH_CHECK(B.stride(0) >= B.size(1),\n'
+            '                "B row stride must be >= N; got stride(0)=", B.stride(0), ", N=", B.size(1));'
+        )
     else:
         # B is the underlying (N, K) row-major weight (we read the same
         # bytes via ColumnMajor (K, N)): N from B.size(0), K from B.size(1), ldB = K.
         n_dim_expr = "B.size(0)"
         stride_b_expr = "K"
+        # ColumnMajor read: B is the underlying (N, K) row-major weight, so on
+        # the Tensor side innermost (K) stride is still 1; the col-major view
+        # is virtual (CUTLASS reads the same bytes with stride (1, K)).
+        # Required: B.stride(1) == 1, B.stride(0) >= K.
+        b_stride_check = (
+            'TORCH_CHECK(B.stride(1) == 1, "B innermost stride must be 1; got ", B.stride(1));\n'
+            '    TORCH_CHECK(B.stride(0) >= B.size(1),\n'
+            '                "B row stride must be >= K; got stride(0)=", B.stride(0), ", K=", B.size(1));'
+        )
 
     preamble = _KERNEL_PREAMBLE.format(
         cache_key=cache_key_str,
@@ -839,6 +964,9 @@ def render_evt_cu(
         typedef_block=typedef_block,
         evt_root_name=evt_root,
         b_layout=cutlass_b_layout,
+        alignment_a_bits=alignment_a_bits,
+        alignment_b_bits=alignment_b_bits,
+        alignment_c_bits=alignment_c_bits,
         # EvtImpl::make_args uses args_tree + stride_b_expr; same values as
         # the launcher (per-IR / per-layout, not per-tile-config).
         args_tree=args_tree,
@@ -861,6 +989,7 @@ def render_evt_cu(
         extras_ptrs=extras_ptrs,
         n_dim_expr=n_dim_expr,
         stride_b_expr=stride_b_expr,
+        b_stride_check=b_stride_check,
         tile_candidate_block=tile_candidate_block,
     )
     return preamble + launcher

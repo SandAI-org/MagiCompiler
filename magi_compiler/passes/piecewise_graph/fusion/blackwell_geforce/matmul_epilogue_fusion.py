@@ -117,6 +117,31 @@ def _is_static_int(x) -> bool:
     return type(x) is int
 
 
+# Greedy alignment: try 128-bit first, fall back to 64-bit. CUTLASS only needs
+# the leading dim divisible by AlignmentX, so picking the largest power-of-2
+# that fits gets us vectorised loads when shapes allow but doesn't lock out
+# 64-bit-only shapes (e.g. K=12 for bf16 → 4-elem-aligned).
+_GREEDY_ALIGN_BITS = (128, 64)
+
+
+def _largest_pow2_align_bits(n, dtype: torch.dtype) -> Optional[int]:
+    """Return the largest bit-width in (128, 64) that divides ``n * itemsize_bits``.
+
+    For dynamic ``n`` (SymInt) we conservatively return the smallest candidate
+    (64) — runtime is the authoritative gate; we just need to admit the fusion
+    here. Returns None when even the smallest candidate doesn't fit, in which
+    case the caller must abort fusion.
+    """
+    if not _is_static_int(n):
+        return _GREEDY_ALIGN_BITS[-1]
+    n_int = int(n)
+    for bits in _GREEDY_ALIGN_BITS:
+        align_elems = max(1, bits // (dtype.itemsize * 8))
+        if n_int % align_elems == 0:
+            return bits
+    return None
+
+
 def _is_transpose_node(n) -> bool:
     """True iff ``n`` is a 2-D transpose (aten.t / transpose(0,1) / permute([1,0]))."""
     if not isinstance(n, fx.Node) or n.op != "call_function":
@@ -219,18 +244,19 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         b_dtype = _val_dtype(B)
         if a_dtype not in (torch.bfloat16, torch.float16) or a_dtype != b_dtype:
             return False
-        # Alignment gates — A is RowMajor (M, K) so ldA = K must be a 128-bit
-        # multiple (= 8 for bf16/fp16). B's N-side gate is path-specific and
-        # checked after b_layout is resolved (only evt_row needs N-aligned ldB).
-        # D's N is unconstrained here: the runtime allocates a padded buffer
-        # and returns a strided view, so any n_out divides into AlignmentC.
+        # Alignment gates — A is RowMajor (M, K) so ldA = K must divide
+        # AlignmentA. We greedy-pick AlignmentA at runtime (128 → 64 bits),
+        # so the FX gate only refuses K not even 64-bit-aligned (= K%4 for
+        # bf16/fp16). B's N-side gate is path-specific and checked after
+        # b_layout is resolved. D's N is unconstrained here: the runtime
+        # allocates a padded buffer and returns a strided view, so any n_out
+        # divides into AlignmentC.
         a_shape = _val_shape(A)
         b_shape = _val_shape(B)
         if a_shape is None or b_shape is None or len(a_shape) != 2 or len(b_shape) != 2:
             return False
         K = a_shape[1]
-        align_a = max(1, 128 // (a_dtype.itemsize * 8))
-        if _is_static_int(K) and (K % align_a != 0):
+        if _largest_pow2_align_bits(K, a_dtype) is None:
             return False
 
         # node_to_ir: each fused fx.Node → its IR subtree. mm_node maps to Accum.
@@ -481,18 +507,31 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
             return False
 
         # Path-specific B-side alignment gate. evt_row: B is (K, N) row-major,
-        # ldB = N, so N must be a 128-bit multiple. evt_col: B is (N, K) row-
-        # major (read as (K, N) col-major), ldB = K, already covered by the
-        # entry K-gate. D's N stays unconstrained — runtime pads.
+        # ldB = N — must divide AlignmentB. We greedy-pick (128 → 64 bits) at
+        # runtime, so the FX gate only refuses N not even 64-bit-aligned.
+        # evt_col: B is (N, K) row-major (read as (K, N) col-major), ldB = K,
+        # already covered by the entry K-gate. D's N stays unconstrained —
+        # runtime pads.
         if b_layout == "row":
-            align_b = max(1, 128 // (b_dtype.itemsize * 8))
-            if _is_static_int(n_dim) and (n_dim % align_b != 0):
+            if _largest_pow2_align_bits(n_dim, b_dtype) is None:
                 return False
 
         # Determine output dtype from the last fused node's FakeTensor metadata.
         out_dt = _val_dtype(last_node) or torch.bfloat16
         if out_dt not in _DTYPE_TO_STR:
             return False
+
+        # Output-side (D) alignment gate. The runtime allocates D as
+        # (M, n_pad) where n_pad = _aligned_n_stride(n_out, out_dt) and the
+        # CUTLASS AlignmentC is greedy-picked from that ldd at compile time
+        # (128 → 64 bits). The FX gate only refuses if even the smallest
+        # candidate (64 bits) can't divide n_pad — that catches future
+        # configurations where the host padding is reduced or disabled.
+        # SymInt n_dim defers to the runtime gate (returns the small candidate).
+        if _is_static_int(n_dim):
+            n_pad_static = evt_runtime._aligned_n_stride(int(n_dim), out_dt)
+            if _largest_pow2_align_bits(n_pad_static, out_dt) is None:
+                return False
 
         ir_root = Store(child=last_ir, out_dtype=_DTYPE_TO_STR[out_dt])
         if is_trivial(ir_root):
@@ -626,15 +665,18 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         N, K = w_shape
         # N must be even (gate/linear interleaved split). The output
         # n_out = N // 2 is padded by the runtime to AlignmentC, so no
-        # further N divisibility is needed. K-side alignment (ldB = 2K
-        # for the strided gate/linear views) is already covered by the
-        # entry K-gate in _try_fuse_evt.
+        # further N divisibility is needed. K-side alignment is the same
+        # greedy 128 → 64 bit gate as the EVT path: the vendored .cu now
+        # accepts AlignmentA / AlignmentB via -D macros (see
+        # ``_compile_swiglu7_dual``), so K only needs to divide 64 bits.
         if not (_is_static_int(N) and N % 2 == 0):
             return False
         if w_stride != (K, 1):
             return False  # not contiguous (N, K) — abort
         a_dtype = _val_dtype(mm_node.args[0])
         if a_dtype != torch.bfloat16 or _val_dtype(weight_node) != torch.bfloat16:
+            return False
+        if _largest_pow2_align_bits(K, a_dtype) is None:
             return False
 
         # We walk the chain in source order and collect every node belonging to
@@ -689,6 +731,14 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
             return False
         if not _is_static_int(out_shape[1]) or out_shape[1] != N // 2:
             # The swiglu7 output's last dim must be N/2.
+            return False
+
+        # Output-side (D) alignment gate. Same logic as the EVT path —
+        # require that the host-padded ldd satisfies at least the 64-bit
+        # AlignmentC fallback (it always does under the current cache-line
+        # padding, but the gate future-proofs against a smaller-pad mode).
+        n_pad_static = evt_runtime._aligned_n_stride(int(N) // 2, out_dt)
+        if _largest_pow2_align_bits(n_pad_static, out_dt) is None:
             return False
 
         # No escape: every chain node's external uses must funnel through the

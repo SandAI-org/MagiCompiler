@@ -19,7 +19,7 @@ from ...magi_depyf.timeline import emit_pass_lifecycle
 from ..pass_base import MagiInductorPass
 
 
-class RemoveUselessOpsPass(MagiInductorPass):
+class EliminateIdentityViewCastPass(MagiInductorPass):
     """
     Remove useless convert, view, reshape operations.
     When their input already has the target type and shape, these operations are redundant.

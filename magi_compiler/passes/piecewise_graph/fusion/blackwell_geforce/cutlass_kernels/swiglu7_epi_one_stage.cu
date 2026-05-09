@@ -65,11 +65,29 @@ using LayoutB0 = cutlass::layout::ColumnMajor;   // strided ldB = 2K view
 using LayoutB1 = cutlass::layout::ColumnMajor;   // strided ldB = 2K view
 using LayoutC  = cutlass::layout::RowMajor;
 
-constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;  // = 8 for bf16
-constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;  // = 8 for bf16
-// Uniform 128-bit alignment: D's row stride (ldd) is host-padded to a
-// multiple of 8 bf16 elements (16 bytes), so 8-wide stores are always safe.
-constexpr int EpilogueVecCount = 128 / cutlass::sizeof_bits<ElementC>::value;  // = 8 for bf16
+// AlignmentA / AlignmentB / AlignmentC are picked greedily on the Python side
+// (128 → 64 bits) and passed in via -D at JIT time, so weights/activations
+// whose K only divides 64 bits (e.g. K = 12 for bf16) still fuse onto this
+// kernel instead of falling back to cuBLAS. AlignmentC normally stays at 128
+// because the host pads D's row stride to a full cache line, but exposing it
+// keeps the parity with A/B and lets a smaller-pad mode drop to 64 without
+// editing this file. Defaults preserve the prior 128-bit behaviour for
+// callers that don't override.
+#ifndef MAGI_SWIGLU7_ALIGN_A_BITS
+#define MAGI_SWIGLU7_ALIGN_A_BITS 128
+#endif
+#ifndef MAGI_SWIGLU7_ALIGN_B_BITS
+#define MAGI_SWIGLU7_ALIGN_B_BITS 128
+#endif
+#ifndef MAGI_SWIGLU7_ALIGN_C_BITS
+#define MAGI_SWIGLU7_ALIGN_C_BITS 128
+#endif
+constexpr int AlignmentA = MAGI_SWIGLU7_ALIGN_A_BITS / cutlass::sizeof_bits<ElementA>::value;
+constexpr int AlignmentB = MAGI_SWIGLU7_ALIGN_B_BITS / cutlass::sizeof_bits<ElementB>::value;
+// Output vector store width = ldd's alignment expressed in elements. Host-side
+// padding (see _aligned_n_stride in evt_runtime.py) normally guarantees 128
+// bits / 8 elements for bf16 — kept tunable here for parity with A/B.
+constexpr int EpilogueVecCount = MAGI_SWIGLU7_ALIGN_C_BITS / cutlass::sizeof_bits<ElementC>::value;
 
 using ArchTag          = cutlass::arch::Sm80;
 using OperatorClass    = cutlass::arch::OpClassTensorOp;
@@ -220,39 +238,69 @@ class Sw7Impl : public Sw7Concept {
           cutlass::gemm::GemmShape<wa_m, wa_n, wa_k>,                           \
           stages>>>(label))
 
+// MAGI_TARGET_ARCH is set by the host compile pipeline to the device's
+// numeric compute capability (e.g. 90 for sm_90, 120 for sm_120). Default to
+// sm_120 if unset so existing source-only consumers keep building.
+#ifndef MAGI_TARGET_ARCH
+#define MAGI_TARGET_ARCH 120
+#endif
+
 class Sw7AutoTuneRunner {
  public:
   Sw7AutoTuneRunner() {
-    // Tile candidates for RTX 5090 (sm_120, 100 KB SMEM/SM, 170 SMs).
-    //
     // SMEM cost for DualGemm = (BM + 2*BN) * BK * 2B * stages because both
-    // B operands live in smem simultaneously. Budget cap ~96 KB.
+    // B operands live in smem simultaneously.
     //
     // Bucket of M doesn't drive a separate .cu here — DualGemm compiles
     // fast enough that one runner with all candidates handles every M, and
     // the per-shape cache picks the best for whatever M it sees.
 
-    // ── Small / decode-friendly tiles ────────────────────────────────────────
+#if MAGI_TARGET_ARCH >= 90 && MAGI_TARGET_ARCH < 100
+    // ── H100 / Hopper (sm_90): 132 SMs, 228 KB SMEM/SM, HBM3 ~3.35 TB/s ──
+    // 2.28× SMEM headroom + 6× compute vs sm_120 ⇒ favour bigger tiles +
+    // larger BK to amortise loads. Budget cap ~200 KB to leave room for
+    // register spill / scratch. Still on Sm80 mainloop (no TMA / wgmma).
+
+    // Decode / small M
+    SW7_TILE(64,  64, 64, 32, 32, 64, 4, "T<64,64,64>_S4");      // 96 KB
+    SW7_TILE(64, 128, 64, 32, 64, 64, 3, "T<64,128,64>_S3");     // 120 KB
+    SW7_TILE(128, 64, 64, 64, 32, 64, 4, "T<128,64,64>_S4");     // 128 KB
+    SW7_TILE(128, 128, 32, 64, 64, 32, 4, "T<128,128,32>_S4");   // 96 KB
+
+    // Medium M
+    SW7_TILE(128, 128, 64, 64, 64, 64, 3, "T<128,128,64>_S3");   // 144 KB
+    SW7_TILE(256,  64, 32, 64, 32, 32, 4, "T<256,64,32>_S4");    // 96 KB
+    SW7_TILE(256,  64, 64, 64, 32, 64, 3, "T<256,64,64>_S3");    // 144 KB
+    SW7_TILE(256, 128, 32, 64, 64, 32, 4, "T<256,128,32>_S4");   // 128 KB
+
+    // Large prefill M
+    SW7_TILE(256, 128, 64, 64, 64, 64, 3, "T<256,128,64>_S3");   // 192 KB
+    SW7_TILE(128, 256, 32, 64, 64, 32, 4, "T<128,256,32>_S4");   // 160 KB
+
+#else
+    // ── RTX 5090 / Blackwell GeForce (sm_120) and fallback ──
+    // 170 SMs, 100 KB SMEM/SM. Budget cap ~96 KB.
+
+    // Small / decode-friendly tiles
     SW7_TILE(64,  64, 32, 32, 32, 32, 4, "T<64,64,32>_S4");      // 36 KB
     SW7_TILE(64,  64, 64, 32, 32, 64, 3, "T<64,64,64>_S3");      // 72 KB
     SW7_TILE(64, 128, 32, 32, 64, 32, 3, "T<64,128,32>_S3");     // 60 KB
     SW7_TILE(64, 128, 32, 32, 64, 32, 4, "T<64,128,32>_S4");     // 80 KB
 
-    // ── Medium tiles (CUTLASS bf16 reference defaults) ──────────────────────
-    SW7_TILE(128,  64, 32, 64, 32, 32, 3, "T<128,64,32>_S3");    // 48 KB  (original default)
+    // Medium tiles (CUTLASS bf16 reference defaults)
+    SW7_TILE(128,  64, 32, 64, 32, 32, 3, "T<128,64,32>_S3");    // 48 KB
     SW7_TILE(128,  64, 32, 64, 32, 32, 4, "T<128,64,32>_S4");    // 64 KB
     SW7_TILE(128,  64, 64, 64, 32, 64, 3, "T<128,64,64>_S3");    // 96 KB
     SW7_TILE(128, 128, 32, 64, 64, 32, 3, "T<128,128,32>_S3");   // 72 KB
     SW7_TILE(128, 128, 32, 64, 64, 32, 4, "T<128,128,32>_S4");   // 96 KB
 
-    // ── Large prefill tiles ─────────────────────────────────────────────────
+    // Large prefill tiles
     SW7_TILE(256,  64, 32, 64, 32, 32, 3, "T<256,64,32>_S3");    // 72 KB
-    // (256, 128, 32) needs stages>=3 (DualGemm requires multistage). With
-    // stages=3 SMEM = (256 + 256) * 32 * 2 * 3 = 96 KB — exactly at budget,
-    // tends to fail with SMEM allocation errors at runtime. Omitted.
-
+    // (256, 128, 32)*3 = 96 KB exact-budget, prone to SMEM alloc fail; omitted.
     // (128, 256, 32)*3 = 120 KB > 96 — omitted.
-    // (64, 256, 32)*3  = 108 KB > 96 — omitted.
+    // (64,  256, 32)*3 = 108 KB > 96 — omitted.
+
+#endif
   }
 
   void operator()(at::Tensor A, at::Tensor B, at::Tensor D) {
@@ -263,8 +311,18 @@ class Sw7AutoTuneRunner {
                 "all inputs must be bf16");
     TORCH_CHECK(A.dim() == 2 && B.dim() == 2 && D.dim() == 2, "A, B, D must be 2D");
     TORCH_CHECK(A.size(1) == B.size(1), "K mismatch (A.size(1) vs B.size(1))");
-    TORCH_CHECK(A.is_contiguous() && B.is_contiguous(),
-                "A, B must be contiguous");
+    // Stride-based contiguity instead of A.is_contiguous() / B.is_contiguous():
+    // Inductor's reinterpret_tensor often hands us a tensor with the right
+    // strides but tripped is_contiguous() (e.g. bigger storage than sizes
+    // would imply). The kernel only cares that A's innermost is K-stride 1
+    // and B's innermost is K-stride 1 (B is the (N, K) row-major weight,
+    // CUTLASS reads it via ColumnMajor + ldB=2K).
+    TORCH_CHECK(A.stride(1) == 1, "A innermost stride must be 1; got ", A.stride(1));
+    TORCH_CHECK(A.stride(0) >= A.size(1),
+                "A row stride must be >= K; got stride(0)=", A.stride(0), ", K=", A.size(1));
+    TORCH_CHECK(B.stride(1) == 1, "B innermost stride must be 1; got ", B.stride(1));
+    TORCH_CHECK(B.stride(0) >= B.size(1),
+                "B row stride must be >= K; got stride(0)=", B.stride(0), ", K=", B.size(1));
 
     int const M = static_cast<int>(A.size(0));
     int const K = static_cast<int>(A.size(1));

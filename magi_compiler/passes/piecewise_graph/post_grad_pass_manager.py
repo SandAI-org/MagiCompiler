@@ -18,7 +18,6 @@ from torch import fx as fx
 from torch._inductor.custom_graph_pass import CustomGraphPass
 
 from ...config import PassConfig
-from ...cuda.device import device_capability_major
 from ...utils import magi_logger, set_env_var
 from ...utils.envs import MAGI_PATTERN_MATCH_DEBUG
 from ..pass_base import InductorPass, get_pass_context
@@ -87,7 +86,7 @@ class PostGradPassManager(CustomGraphPass):
         # PassConfig.enable_mm_epilogue_fusion (default True). The device
         # check is independent — even with the flag on, non-sm_120 hosts
         # don't register the pass since its FX walker would just no-op.
-        if pass_config.enable_mm_epilogue_fusion and device_capability_major() >= 12:
+        if pass_config.enable_mm_epilogue_fusion:
             self.add(MatmulEvtEpilogueFusionPass())
 
         # needs a functional graph

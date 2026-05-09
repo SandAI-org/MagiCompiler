@@ -67,6 +67,26 @@ def out_dtype_from_id(i: int) -> torch.dtype:
     return _ID_TO_DTYPE[i]
 
 
+# ── Greedy AlignmentA / AlignmentB picker (matches FX-side gate) ────────────
+# CUTLASS only requires the leading dim divides AlignmentX. We pick the
+# largest power-of-2 in (128, 64) bits that fits the actual K (or N), giving
+# us 128-bit vector loads when shapes allow but admitting 64-bit-aligned
+# shapes (e.g. K = 12 for bf16 → 4 elems, 64 bits) that the strict 128-bit
+# gate previously rejected. The FX pass admits the fusion any time at least
+# 64 bits fits; the runtime then picks the actual width per call (cache-keyed
+# on (N, K) so each shape gets its own compiled kernel).
+_GREEDY_ALIGN_BITS_RT = (128, 64)
+
+
+def _runtime_align_bits(dim: int, dtype: torch.dtype) -> int:
+    n_int = int(dim)
+    for bits in _GREEDY_ALIGN_BITS_RT:
+        align_elems = max(1, bits // (dtype.itemsize * 8))
+        if n_int % align_elems == 0:
+            return bits
+    raise ValueError(f"dim={n_int} not even {_GREEDY_ALIGN_BITS_RT[-1]}-bit-aligned for dtype={dtype}")
+
+
 def _aligned_n_stride(n_out: int, dtype: torch.dtype) -> int:
     """Round n_out up to a 128-byte (one L2 cache line) element count.
 
@@ -137,9 +157,46 @@ def _cutlass_root() -> str:
     return os.environ.get("MAGI_CUTLASS_ROOT", "/opt/cutlass")
 
 
+def _device_gencode_flags() -> list[str]:
+    """Return nvcc -gencode flags matching the current CUDA device.
+
+    Hardcoding ``sm_120`` (Blackwell GeForce) breaks any other arch — the
+    nvcc output has no compatible SASS, kernel launch returns
+    ``cudaErrorInvalidDeviceFunction``, and CUTLASS surfaces it as
+    ``Status::kErrorInternal``. Detect the live device's compute capability
+    and emit a matching gencode plus a forward-compat PTX so future arches
+    can JIT.
+
+    Override with ``MAGI_EVT_GENCODE`` (semicolon-separated nvcc args) for
+    ad-hoc multi-arch builds.
+    """
+    override = os.environ.get("MAGI_EVT_GENCODE")
+    if override:
+        return [a for a in override.split(";") if a]
+    cap = torch.cuda.get_device_capability()
+    arch = f"{cap[0]}{cap[1]}"  # "90" for H100, "120" for RTX 5090, "80" for A100
+    return [
+        f"-gencode=arch=compute_{arch},code=sm_{arch}",
+        # Embed PTX of the same arch so a slightly newer driver / different
+        # minor revision JITs cleanly without rebuilding.
+        f"-gencode=arch=compute_{arch},code=compute_{arch}",
+    ]
+
+
+def _device_arch_tag() -> str:
+    """Short tag for the live device's compute capability (e.g. ``sm90``).
+
+    Folded into build_dir / module name so binaries compiled for a different
+    arch (e.g. running the same source tree on an H100 after using it on a
+    Blackwell box) don't get reused.
+    """
+    cap = torch.cuda.get_device_capability()
+    return f"sm{cap[0]}{cap[1]}"
+
+
 def _evt_build_dir(key: str) -> str:
     cache_root = get_compile_config().cache_root_dir
-    return os.path.join(cache_root, "evt_kernels", key)
+    return os.path.join(cache_root, "evt_kernels", _device_arch_tag(), key)
 
 
 def _per_key_lock(key: str) -> threading.Lock:
@@ -160,19 +217,41 @@ def _compile_evt_module(
     m_bucket: str = "medium",
     N: int = 0,
     K: int = 0,
+    alignment_a_bits: int = 128,
+    alignment_b_bits: int = 128,
+    alignment_c_bits: int = 128,
 ):
     """Render + JIT-compile the EVT kernel for ``ir_json``. Process-level cached.
 
-    Cache key: (IR, A dtype, B dtype, b_layout, m_bucket, N, K). Each distinct
-    weight (N, K) lowers to its own .cu — even though the .cu source is
-    identical (N/K stay runtime variables), splitting the modules gives every
-    (N, K) its own runner instance with isolated `best_idx_`. This avoids
-    cross-(N, K) autotune contamination and matches the user's per-(N, K)
-    cache layout: e.g. two distinct (N, K) × two M-buckets ⇒ 4 .cu modules.
+    Cache key: (IR, A dtype, B dtype, b_layout, m_bucket, N, K, alignA, alignB,
+    alignC, arch). Each distinct weight (N, K) lowers to its own .cu — even
+    though the .cu source is identical (N/K stay runtime variables), splitting
+    the modules gives every (N, K) its own runner instance with isolated
+    `best_idx_`. ``alignment_*_bits`` are derived from runtime K (A), N or K
+    (B), and ldd (C) via greedy 128 → 64 bit selection and baked into the
+    rendered .cu via constexpr; including them in the key keeps two shapes
+    that pick different alignments from sharing a .so.
     """
+    # arch determines which per-bucket tile candidate set the codegen inlines.
+    # Different arches must lower to different .cu files, so it goes into both
+    # the fast key and the SHA key.
+    arch = _device_arch_tag()
+
     # Hot-path fast cache: skip ``json.dumps + sha256`` (~10–30 μs each) on
     # subsequent calls with the same inputs.
-    fast_key = (ir_json, a_dtype, b_dtype, b_layout, m_bucket, N, K)
+    fast_key = (
+        ir_json,
+        a_dtype,
+        b_dtype,
+        b_layout,
+        m_bucket,
+        N,
+        K,
+        alignment_a_bits,
+        alignment_b_bits,
+        alignment_c_bits,
+        arch,
+    )
     cached = _MODULE_FAST_CACHE.get(fast_key)
     if cached is not None:
         return cached
@@ -190,7 +269,11 @@ def _compile_evt_module(
             "m_bucket": m_bucket,
             "N": int(N),
             "K": int(K),
-            "version": 3,
+            "alignA_bits": int(alignment_a_bits),
+            "alignB_bits": int(alignment_b_bits),
+            "alignC_bits": int(alignment_c_bits),
+            "arch": arch,
+            "version": 6,
         },
         sort_keys=True,
     ).encode("utf-8")
@@ -210,7 +293,18 @@ def _compile_evt_module(
 
         # Re-hydrate the IR tree from JSON for codegen.
         ir = _ir_from_json(ir_json)
-        src = render_evt_cu(ir, a_str, b_str, cache_key_str=key, b_layout=b_layout, m_bucket=m_bucket)
+        src = render_evt_cu(
+            ir,
+            a_str,
+            b_str,
+            cache_key_str=key,
+            b_layout=b_layout,
+            m_bucket=m_bucket,
+            alignment_a_bits=alignment_a_bits,
+            alignment_b_bits=alignment_b_bits,
+            alignment_c_bits=alignment_c_bits,
+            arch=arch,
+        )
 
         build_dir = _evt_build_dir(key)
         os.makedirs(build_dir, exist_ok=True)
@@ -236,7 +330,7 @@ def _compile_evt_module(
                 os.path.join(cutlass_root, "tools", "util", "include"),
             ],
             extra_cflags=["-O3", "-std=c++17"],
-            extra_cuda_cflags=["-std=c++17", "-O3", "--expt-relaxed-constexpr", "-gencode=arch=compute_120,code=sm_120"],
+            extra_cuda_cflags=["-std=c++17", "-O3", "--expt-relaxed-constexpr"] + _device_gencode_flags(),
             build_directory=build_dir,
             verbose=False,
         )
@@ -290,8 +384,10 @@ _SWIGLU7_FAST_CACHE: dict = {}  # (m_bucket, N, K) → loaded module
 _SWIGLU7_BUILD_LOCKS: dict = {}  # (m_bucket, N, K) → threading.Lock
 
 
-def _compile_swiglu7_dual(m_bucket: str, N: int, K: int):
-    """Lazy-load a per-(bucket, N, K) instance of the vendored DualGemm kernel.
+def _compile_swiglu7_dual(
+    m_bucket: str, N: int, K: int, alignment_a_bits: int = 128, alignment_b_bits: int = 128, alignment_c_bits: int = 128
+):
+    """Lazy-load a per-(bucket, N, K, align) instance of the vendored DualGemm kernel.
 
     Parameters
     ----------
@@ -303,8 +399,18 @@ def _compile_swiglu7_dual(m_bucket: str, N: int, K: int):
         Static weight shape from B (the underlying (N, K) row-major tensor).
         Distinct (N, K) get distinct modules so their autotune state is
         independent.
+    alignment_a_bits, alignment_b_bits, alignment_c_bits : int
+        Alignment width baked into the .cu via -DMAGI_SWIGLU7_ALIGN_*_BITS at
+        nvcc time. Greedy-picked from the actual K (A/B) and ldd (C):
+        128 → 64 bits. K-aligned shapes get vectorised loads, K = 12-style
+        shapes still fuse at 64. ``alignment_c_bits`` gates the epilogue
+        store width (``EpilogueVecCount``); host padding normally satisfies
+        128 but the parameter is exposed for parity with A/B.
+        Distinct widths get distinct .so files since the change is at
+        constexpr level and recompilation is the only way to thread it
+        through the DualGemm template.
     """
-    fast_key = (m_bucket, int(N), int(K))
+    fast_key = (m_bucket, int(N), int(K), int(alignment_a_bits), int(alignment_b_bits), int(alignment_c_bits))
     cached = _SWIGLU7_FAST_CACHE.get(fast_key)
     if cached is not None:
         return cached
@@ -325,10 +431,13 @@ def _compile_swiglu7_dual(m_bucket: str, N: int, K: int):
         if not os.path.exists(src):
             raise FileNotFoundError(f"vendored swiglu7 source not found: {src}")
         cache_root = get_compile_config().cache_root_dir
-        # Build dir embeds (bucket, N, K) so distinct keys get their own
-        # build artefacts. cpp_extension uses the dir as the cache identity.
-        build_tag = f"{m_bucket}_N{N}_K{K}"
-        build_dir = os.path.join(cache_root, "evt_kernels", f"swiglu7_dual_{build_tag}")
+        # Build dir embeds (arch, bucket, N, K, align) so distinct keys get
+        # their own build artefacts. cpp_extension uses the dir as the cache
+        # identity, and a stale binary from a different arch must NOT be
+        # reused (CUDA driver would refuse to load and CUTLASS surfaces it
+        # as Status::kErrorInternal).
+        build_tag = f"{m_bucket}_N{N}_K{K}" f"_aA{alignment_a_bits}_aB{alignment_b_bits}_aC{alignment_c_bits}"
+        build_dir = os.path.join(cache_root, "evt_kernels", _device_arch_tag(), f"swiglu7_dual_{build_tag}")
         os.makedirs(build_dir, exist_ok=True)
         from torch.utils.cpp_extension import load
 
@@ -342,7 +451,18 @@ def _compile_swiglu7_dual(m_bucket: str, N: int, K: int):
                 os.path.join(here, "cutlass_kernels"),
             ],
             extra_cflags=["-O3", "-std=c++17"],
-            extra_cuda_cflags=["-std=c++17", "-O3", "--expt-relaxed-constexpr", "-gencode=arch=compute_120,code=sm_120"],
+            extra_cuda_cflags=[
+                "-std=c++17",
+                "-O3",
+                "--expt-relaxed-constexpr",
+                *_device_gencode_flags(),
+                # Numeric tag (e.g. 90 for sm_90, 120 for sm_120) so the .cu
+                # can #if-pick the right SW7_TILE candidate block per arch.
+                f"-DMAGI_TARGET_ARCH={_device_arch_tag()[2:]}",
+                f"-DMAGI_SWIGLU7_ALIGN_A_BITS={int(alignment_a_bits)}",
+                f"-DMAGI_SWIGLU7_ALIGN_B_BITS={int(alignment_b_bits)}",
+                f"-DMAGI_SWIGLU7_ALIGN_C_BITS={int(alignment_c_bits)}",
+            ],
             build_directory=build_dir,
             verbose=False,
         )
@@ -383,9 +503,28 @@ _DISPATCH_CACHE: dict = {}
 def _resolve_dispatch(kind, ir_json, a_dtype, b_dtype, N_w, K_w, m_bucket, out_dtype):
     """Slow-path resolver — compiles the .cu module (cache miss) and binds
     the kernel callable. Cached by (kind, ir_json, A_dt, B_dt, N, K, bucket,
-    out_dtype) so each FX site × bucket only pays this once."""
+    out_dtype) so each FX site × bucket only pays this once.
+
+    AlignmentC is derived from the host-padded ldd that the runtime will pass
+    to CUTLASS. Under the current ``_aligned_n_stride`` (128-byte / cache-line
+    pad), n_pad is always a multiple of 8 bf16 elements ⇒ 128-bit AlignmentC
+    is always picked. The greedy fallback to 64 is wired for parity with A/B
+    so a future smaller-pad mode can drop without a code change here.
+    """
+    # n_out used by CUTLASS LayoutC = the kernel's logical output cols.
+    # evt_row / evt_col output shape is (M, N); swiglu7 outputs (M, N/2).
+    n_out_for_c = (N_w // 2) if kind == "swiglu7_dual" else N_w
+    ldd = _aligned_n_stride(n_out_for_c, out_dtype)
+    alignment_c_bits = _runtime_align_bits(ldd, out_dtype)
+
     if kind == "swiglu7_dual":
-        mod = _compile_swiglu7_dual(m_bucket, N_w, K_w)
+        # swiglu7 reads A's K and B's strided ldB = 2K. Both leading dims are
+        # multiples of K, so the alignment that fits K also fits 2K — deriving
+        # from K alone is sufficient. dtype is bf16 on both sides (FX gate).
+        align_bits = _runtime_align_bits(K_w, a_dtype)
+        mod = _compile_swiglu7_dual(
+            m_bucket, N_w, K_w, alignment_a_bits=align_bits, alignment_b_bits=align_bits, alignment_c_bits=alignment_c_bits
+        )
         return _DispatchEntry(mod.swiglu7_dual_matmul_out, False, out_dtype)
     if kind == "evt_row" or kind == "evt":
         b_layout = "row"
@@ -393,7 +532,25 @@ def _resolve_dispatch(kind, ir_json, a_dtype, b_dtype, N_w, K_w, m_bucket, out_d
         b_layout = "col"
     else:
         raise ValueError(f"Unknown EVT kind {kind!r}")
-    mod = _compile_evt_module(ir_json, a_dtype, b_dtype, b_layout=b_layout, m_bucket=m_bucket, N=N_w, K=K_w)
+    # Greedy-pick AlignmentA / AlignmentB from actual K and the layout-relevant
+    # B leading dim (N for row, K for col). Falls back from 128 → 64 bits when
+    # 128-bit isn't divisible. The FX gate has already proven at least 64 bits
+    # fits, so this can't raise here in practice.
+    alignment_a_bits = _runtime_align_bits(K_w, a_dtype)
+    b_lead_dim = N_w if b_layout == "row" else K_w
+    alignment_b_bits = _runtime_align_bits(b_lead_dim, b_dtype)
+    mod = _compile_evt_module(
+        ir_json,
+        a_dtype,
+        b_dtype,
+        b_layout=b_layout,
+        m_bucket=m_bucket,
+        N=N_w,
+        K=K_w,
+        alignment_a_bits=alignment_a_bits,
+        alignment_b_bits=alignment_b_bits,
+        alignment_c_bits=alignment_c_bits,
+    )
     return _DispatchEntry(mod.evt_matmul_out, True, out_dtype)
 
 
