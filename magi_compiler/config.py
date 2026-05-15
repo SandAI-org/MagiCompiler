@@ -69,9 +69,11 @@ class PassConfig(BaseModel):
         description=(
             "Whether to enable the matmul + elementwise epilogue fusion pass. "
             "On RTX 5090 (sm_120) this lowers fused chains to a CUTLASS Sm80EVT "
-            "kernel via the blackwell_geforce.MatmulEvtEpilogueFusionPass. The "
-            "pass is a no-op on older architectures regardless of this flag, "
-            "but the flag still controls whether it is registered at all."
+            "kernel via the cutlass_fusion.MatmulEvtEpilogueFusionPass; on H100 "
+            "(sm_90) the swiglu7 sub-path additionally uses the native Sm90 "
+            "TMA + WGMMA DualGemm. The pass is a no-op on older architectures "
+            "regardless of this flag, but the flag still controls whether it "
+            "is registered at all."
         ),
     )
 

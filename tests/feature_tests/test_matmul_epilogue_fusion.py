@@ -122,7 +122,7 @@ class _FusionStats:
 
 def _install_pass_instrument():
     """Returns (stats, restore_fn). Wraps the FX pass to record per-call deltas."""
-    from magi_compiler.passes.piecewise_graph.fusion.blackwell_geforce import matmul_epilogue_fusion as P
+    from magi_compiler.passes.piecewise_graph.fusion.cutlass_fusion import matmul_epilogue_fusion as P
 
     stats = _FusionStats()
     original = P.MatmulEvtEpilogueFusionPass.__call__
@@ -260,7 +260,7 @@ def _compile_and_check(
             f"Expected emitted kinds {sorted(expect_kinds)}, " f"got {sorted(stats.kinds)}"
         )
     if expect_out_dtype is not None:
-        from magi_compiler.passes.piecewise_graph.fusion.blackwell_geforce.evt_runtime import out_dtype_from_id
+        from magi_compiler.passes.piecewise_graph.fusion.cutlass_fusion.evt_runtime import out_dtype_from_id
 
         assert stats.out_dtype_ids, (
             f"expect_out_dtype={expect_out_dtype} but no fusion fired " f"(out_dtype_ids list is empty)"
@@ -575,7 +575,7 @@ def test_evt_no_fuse_swiglu7_n_not_mult_of_8():
 def test_evt_ir_canonical_determinism():
     """Same IR built twice → identical canonical JSON. If this regresses, the
     .cu module disk cache silently misses and recompiles every run."""
-    from magi_compiler.passes.piecewise_graph.fusion.blackwell_geforce.evt_ir import (
+    from magi_compiler.passes.piecewise_graph.fusion.cutlass_fusion.evt_ir import (
         Accum,
         Compute,
         Store,

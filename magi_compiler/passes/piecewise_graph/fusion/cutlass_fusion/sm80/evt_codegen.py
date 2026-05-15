@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Render a CUTLASS .cu source from an EVT IR tree.
+"""Render a CUTLASS .cu source from an EVT IR tree — RTX 5090 (sm_120) path.
 
 The output is a single self-contained file that:
   1. Declares any custom functor templates required by scalar-baked ops
@@ -25,30 +25,30 @@ We use CUTLASS 2.x ``Sm80EVT`` running backward-compat on sm_120; this matches
 ``$MAGI_CUTLASS_ROOT/examples/99_evt_demo/heavy_epi_torch_ext.cu`` (default
 ``/opt/cutlass/...``) which has been verified to deliver +5..+12 % vs the
 Triton TMA path on RTX 5090 bf16.
+
+This module is the 5090-specific renderer; the H100 / Sm90 path lives under
+``../sm90/evt_codegen.py`` and is selected by ``evt_runtime`` on sm_90 devices.
 """
 
 from __future__ import annotations
 
-import textwrap
 from typing import Dict, List, Tuple
 
-from .evt_ir import Accum, AuxLoad, ColBroadcast, Compute, RowBroadcast, Store, walk_leaves
+from ..common.codegen_shared import (
+    _BUILTIN_FN_TEMPLATE,
+    _DTYPE_TO_AT,
+    _DTYPE_TO_AT_CPP,
+    _DTYPE_TO_CUTLASS,
+    _VALID_ALIGN_BITS,
+    _emit_custom_functor,
+)
+from ..evt_ir import Accum, AuxLoad, ColBroadcast, Compute, RowBroadcast, Store, walk_leaves
 
-# ── PyTorch dtype string → CUTLASS type ──────────────────────────────────────
-_DTYPE_TO_CUTLASS = {"bfloat16": "cutlass::bfloat16_t", "float16": "cutlass::half_t", "float32": "float"}
-
-# PyTorch dtype string → at::ScalarType / pybind dtype string used in TORCH_CHECK.
-_DTYPE_TO_AT = {"bfloat16": "at::kBFloat16", "float16": "at::kHalf", "float32": "at::kFloat"}
-
-
-# ── Per-arch / per-M-bucket tile candidate sets ─────────────────────────────
+# ── Per-M-bucket tile candidate sets (RTX 5090 / sm_120) ────────────────────
 # Each tuple is (BM, BN, BK, WM, WN, WK, NumStages, label).
 # WarpShape is conventionally TileShape / (2, 2) along (M, N), keeping 4 warps.
 # We include WK == BK to match Sm80 TensorOp's default warp tiling.
 #
-# Per-arch set is selected by the runtime; unknown arch falls back to "sm120"
-# (the most conservative SMEM budget — works on Ada / Blackwell GeForce).
-
 # RTX 5090 (sm_120): 170 SMs, 100 KB SMEM / SM.
 # Per-stage SMEM = (BM + BN) * BK * 2 (bf16). Above ~96 KB total CUTLASS
 # auto-shrinks stages or `can_implement` rejects, so we keep tile×stages
@@ -87,175 +87,17 @@ _TILE_CANDIDATES_SM120: dict = {
     ],
 }
 
-# H100 (sm_90): 132 SMs, 228 KB SMEM / SM, HBM3 ~3.35 TB/s, ~989 TF bf16.
-# Compared to sm_120: 2.28× SMEM headroom + 6× compute ⇒ favour bigger tiles
-# to amortise loads. Fewer SMs ⇒ optimal grid wave is multiples of 132 (vs 170).
-# We're still on Sm80 mainloop (CUTLASS 2.x, no TMA / wgmma) — all sizes here
-# fit in cp.async-based smem budget.
-#
-#   per-stage SMEM (single GEMM) = (BM + BN) * BK * 2
-#   budget cap ~200 KB to leave headroom for reg spill / aux smem
-_TILE_CANDIDATES_SM90: dict = {
-    # ── small (decode) ───────────────────────────────────────────────────────
-    # H100 needs more CTAs spread across 132 SMs at small M; mix BM=64/128.
-    "small": [
-        (64, 64, 64, 32, 32, 64, 4, "T<64,64,64>_S4"),  # 64 KB
-        (64, 128, 64, 32, 64, 64, 3, "T<64,128,64>_S3"),  # 72 KB
-        (64, 128, 64, 32, 64, 64, 4, "T<64,128,64>_S4"),  # 96 KB
-        (64, 256, 64, 32, 64, 64, 3, "T<64,256,64>_S3"),  # 120 KB
-        (128, 64, 64, 64, 32, 64, 4, "T<128,64,64>_S4"),  # 96 KB
-        (128, 64, 64, 64, 32, 64, 5, "T<128,64,64>_S5"),  # 120 KB
-        (128, 128, 32, 64, 64, 32, 4, "T<128,128,32>_S4"),  # 64 KB
-        (128, 128, 64, 64, 64, 64, 3, "T<128,128,64>_S3"),  # 96 KB
-    ],
-    # ── medium (256 < M ≤ 2048) ──────────────────────────────────────────────
-    # Sweet spot for prefill on H100 — bigger BK to feed the bigger tensor cores.
-    "medium": [
-        (128, 128, 64, 64, 64, 64, 3, "T<128,128,64>_S3"),  # 96 KB
-        (128, 128, 64, 64, 64, 64, 4, "T<128,128,64>_S4"),  # 128 KB
-        (128, 128, 64, 64, 64, 64, 5, "T<128,128,64>_S5"),  # 160 KB
-        (128, 256, 64, 64, 64, 64, 3, "T<128,256,64>_S3"),  # 144 KB
-        (256, 128, 64, 64, 64, 64, 3, "T<256,128,64>_S3"),  # 144 KB
-        (256, 128, 32, 64, 64, 32, 4, "T<256,128,32>_S4"),  # 96 KB
-        (128, 256, 32, 64, 64, 32, 4, "T<128,256,32>_S4"),  # 96 KB
-        (256, 256, 32, 64, 64, 32, 3, "T<256,256,32>_S3"),  # 96 KB
-    ],
-    # ── large (M > 2048) ─────────────────────────────────────────────────────
-    # Big tiles to maximise arithmetic density; 132 SMs need fewer CTAs.
-    "large": [
-        (128, 256, 64, 64, 64, 64, 3, "T<128,256,64>_S3"),  # 144 KB
-        (128, 256, 64, 64, 64, 64, 4, "T<128,256,64>_S4"),  # 192 KB
-        (256, 128, 64, 64, 64, 64, 3, "T<256,128,64>_S3"),  # 144 KB
-        (256, 128, 64, 64, 64, 64, 4, "T<256,128,64>_S4"),  # 192 KB
-        (256, 256, 32, 64, 64, 32, 3, "T<256,256,32>_S3"),  # 96 KB
-        (256, 256, 64, 64, 64, 64, 3, "T<256,256,64>_S3"),  # 192 KB
-        (128, 128, 64, 64, 64, 64, 4, "T<128,128,64>_S4"),  # 128 KB
-    ],
-}
-
-# arch tag → per-bucket dict. Runtime maps device compute capability to a tag.
-_TILE_CANDIDATES: dict = {"sm120": _TILE_CANDIDATES_SM120, "sm90": _TILE_CANDIDATES_SM90}
-
 # Backward-compat alias: some external callers still reference this name.
 _TILE_CANDIDATES_5090 = _TILE_CANDIDATES_SM120
 
 
-def _emit_tile_candidates(m_bucket: str, arch: str = "sm120") -> str:
-    """Emit C++ EVT_TILE_CANDIDATE(...) statements for a given (arch, M bucket).
-
-    Unknown arch falls back to ``sm120`` (conservative SMEM budget).
-    """
-    arch_table = _TILE_CANDIDATES.get(arch, _TILE_CANDIDATES["sm120"])
-    candidates = arch_table.get(m_bucket, arch_table["medium"])
+def _emit_tile_candidates(m_bucket: str) -> str:
+    """Emit C++ EVT_TILE_CANDIDATE(...) statements for the given M bucket."""
+    candidates = _TILE_CANDIDATES_SM120.get(m_bucket, _TILE_CANDIDATES_SM120["medium"])
     lines = []
     for bm, bn, bk, wm, wn, wk, stages, label in candidates:
         lines.append(f'    EVT_TILE_CANDIDATE({bm}, {bn}, {bk}, {wm}, {wn}, {wk}, ' f'{stages}, "{label}");')
     return "\n".join(lines)
-
-
-# For data_ptr<T>() casts at the C++ layer.
-_DTYPE_TO_AT_CPP = {"bfloat16": "at::BFloat16", "float16": "at::Half", "float32": "float"}
-
-
-# ── Built-in CUTLASS op names for the visitor template-template parameter ────
-# Maps IR op name → (CUTLASS template name, is_class_template_with_T_only)
-# Each value must be a `template <class> class` accepting a single type arg.
-_BUILTIN_FN_TEMPLATE = {
-    # binary
-    "add": "cutlass::plus",
-    "sub": "cutlass::minus",
-    "mul": "cutlass::multiplies",
-    "div": "cutlass::divides",
-    "max": "cutlass::maximum",
-    "min": "cutlass::minimum",
-    # unary
-    "neg": "cutlass::negate",
-    "sigmoid": "cutlass::epilogue::thread::Sigmoid",
-    "silu": "cutlass::epilogue::thread::SiLu",
-    "tanh": "cutlass::epilogue::thread::Tanh",
-    "relu": "cutlass::epilogue::thread::ReLu",
-    "abs": "cutlass::absolute_value_op",
-}
-
-# Unary ops that need a custom emitted functor (CUTLASS has no built-in).
-# Each maps to a body template; the body uses ``T`` as the element type and
-# operates on a single ``T`` value named ``x``.
-_CUSTOM_UNARY_BODY = {
-    "square": "return x * x;",
-    "exp": "return cutlass::fast_exp(x);",
-    "log": "return cutlass::fast_log(x);",
-    "sqrt": "return cutlass::fast_sqrt(x);",
-    "rsqrt": "return cutlass::fast_rsqrt(x);",
-    "erf": "return T(erff(float(x)));",
-    "gelu_erf": "return T(0.5f) * x * (T(1.0f) + T(erff(float(x) * 0.70710678118654752f)));",
-    "gelu_tanh": (
-        "float v = float(x);" " return T(0.5f * v * (1.0f + tanhf(" "0.7978845608028654f * (v + 0.044715f * v * v * v))));"
-    ),
-}
-
-# Scalar-baked unary ops. The body template uses ``x`` and ``c`` (the baked
-# constant, emitted as a ``T`` literal — never a runtime value).
-_CUSTOM_SCALAR_BODY = {
-    "add_scalar": "return x + c;",
-    "sub_scalar": "return x - c;",
-    "mul_scalar": "return x * c;",
-    "div_scalar": "return x / c;",
-    "rsub_scalar": "return c - x;",
-    "clamp_min_c": "return x < c ? c : x;",
-    "clamp_max_c": "return x < c ? x : c;",
-    # scaled_silu_alpha(x, alpha) = x * sigmoid(alpha * x). Used by GELU7.
-    "scaled_silu_alpha": (
-        "T t = c * x;" " T one = T(1.0f);" " T sig = one / (one + cutlass::fast_exp(-t));" " return x * sig;"
-    ),
-    # pow_scalar(x, c) – emit as repeated multiplies for small int c.
-    # Otherwise fall back to powf.
-    "pow_scalar": "return T(powf(float(x), float(c)));",
-}
-
-
-def _scalar_literal_T(value: float) -> str:
-    """Emit a constant as a ``T(...)`` cast that survives bf16 / fp16 / fp32."""
-    # repr keeps round-trip precision; "f" suffix forces float in C++.
-    return f"T({float(value)!r}f)"
-
-
-def _emit_custom_functor(name: str, op: str, scalar=None) -> str:
-    """Emit a unary CUTLASS-compatible functor (scalar + Array<T,N> spec)."""
-    if op in _CUSTOM_UNARY_BODY:
-        body = _CUSTOM_UNARY_BODY[op]
-        scalar_decl = ""
-    elif op in _CUSTOM_SCALAR_BODY:
-        if scalar is None:
-            raise ValueError(f"Scalar op {op!r} needs a baked constant")
-        body = _CUSTOM_SCALAR_BODY[op]
-        scalar_decl = f"        const T c = {_scalar_literal_T(scalar)};\n"
-    else:
-        raise ValueError(f"No custom functor body for op {op!r}")
-    return textwrap.dedent(
-        f"""\
-        template <typename T>
-        struct {name} {{
-            static const bool kIsHeavy = true;
-            CUTLASS_HOST_DEVICE
-            T operator()(T const& x) const {{
-        {scalar_decl}        {body}
-            }}
-        }};
-
-        template <typename T, int N>
-        struct {name}<cutlass::Array<T, N>> {{
-            static const bool kIsHeavy = true;
-            CUTLASS_HOST_DEVICE
-            cutlass::Array<T, N> operator()(cutlass::Array<T, N> const& v) const {{
-                {name}<T> op;
-                cutlass::Array<T, N> out;
-                CUTLASS_PRAGMA_UNROLL
-                for (int i = 0; i < N; ++i) out[i] = op(v[i]);
-                return out;
-            }}
-        }};
-        """
-    )
 
 
 # ── EVT typedef + leaf args walker ────────────────────────────────────────────
@@ -401,7 +243,7 @@ def _emit_args_tree(node, leaf_args: Dict[int, str], indent: int = 4) -> str:
 
 
 _KERNEL_PREAMBLE = """\
-// AUTO-GENERATED by magi_compiler/passes/piecewise_graph/fusion/evt_codegen.py
+// AUTO-GENERATED by magi_compiler/passes/piecewise_graph/fusion/cutlass_fusion/sm80/evt_codegen.py
 // Do not edit by hand. Regenerate by re-running the FX pass.
 //
 // IR cache key: {cache_key}
@@ -784,9 +626,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
 """
 
 
-_VALID_ALIGN_BITS = (128, 64)
-
-
 def render_evt_cu(
     ir: Store,
     a_dtype: str,
@@ -799,7 +638,7 @@ def render_evt_cu(
     alignment_c_bits: int = 128,
     arch: str = "sm120",
 ) -> str:
-    """Render a complete .cu source for the given EVT IR.
+    """Render a complete .cu source for the given EVT IR (5090 / sm_120).
 
     Parameters
     ----------
@@ -816,10 +655,9 @@ def render_evt_cu(
         weight (== column-major (K, N)); LayoutB = ColumnMajor; ldB = K. Use
         ``"col"`` when the FX graph passes ``permute([1,0])(weight)`` as B.
     m_bucket : "small" | "medium" | "large"
-        Picks a tile-candidate set tuned for the chosen ``arch`` at the given
-        M regime. The runner inside the rendered .cu autotunes across all
-        candidates in that bucket on the first call per (M, N, K) shape and
-        caches the winner.
+        Picks a tile-candidate set tuned at the given M regime. The runner
+        inside the rendered .cu autotunes across all candidates in that
+        bucket on the first call per (M, N, K) shape and caches the winner.
     alignment_a_bits, alignment_b_bits, alignment_c_bits : int
         Bit-width baked into ``constexpr int AlignmentA / AlignmentB /
         AlignmentC``. Must be one of ``(128, 64)``. The runtime greedy-picks
@@ -830,9 +668,10 @@ def render_evt_cu(
         but the parameter is exposed so a smaller-pad mode can drop to 64
         without rebuilding the codegen template.
     arch : str
-        Compute-capability tag (``"sm90"`` for H100, ``"sm120"`` for RTX 5090).
-        Selects which per-bucket tile candidate set to inline. Unknown values
-        fall back to ``"sm120"``.
+        Accepted for signature parity with the sm90 renderer. This module
+        only emits sm_120-tuned tile candidates regardless of the value;
+        the dispatcher in ``evt_runtime`` is responsible for routing sm_90
+        devices to the sibling ``sm90.evt_codegen.render_evt_cu`` instead.
     """
     if b_layout not in ("row", "col"):
         raise ValueError(f"b_layout must be 'row' or 'col', got {b_layout!r}")
@@ -849,7 +688,8 @@ def render_evt_cu(
         )
     if not isinstance(ir, Store):
         raise TypeError("render_evt_cu expects a Store node as root")
-    tile_candidate_block = _emit_tile_candidates(m_bucket, arch)
+    del arch  # accepted for signature parity; sm80 renderer is sm_120-only
+    tile_candidate_block = _emit_tile_candidates(m_bucket)
 
     a_elem = _DTYPE_TO_CUTLASS[a_dtype]
     b_elem = _DTYPE_TO_CUTLASS[b_dtype]

@@ -12,13 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Single-kernel fully-fused swiglu7:
+// Single-kernel fully-fused swiglu7 — SM80 multistage path.
+//
+// Routes from sm_80 / sm_86 / sm_89 / sm_120 (Blackwell GeForce). The
+// Hopper (sm_90) native TMA + WGMMA implementation lives at
+// ../../sm90/cutlass_kernels/swiglu7_one_stage.cu and is selected by
+// _compile_swiglu7_dual in evt_runtime.py per device compute capability.
 //
 //   D = swiglu7(A @ B.T)
 //
 //   A : (M, K)   bf16 row-major
 //   B : (N, K)   bf16 row-major   (torch.nn.Linear weight convention; N even)
-//   D : (M, N/2) bf16 row-major
+//   D : (M, N/2) bf16 row-major   (strided view of (M, ldd) host-padded buffer)
 //
 // Implementation uses cutlass::gemm::device::DualGemm — the two GEMMs
 // A @ W_gate.T and A @ W_linear.T run in the same threadblock sharing A's
@@ -27,8 +32,8 @@
 //
 // AUTOTUNE: at first call per (M, N, K) tuple the runner times every
 // registered (TileShape, WarpShape, Stages) candidate and caches the
-// fastest one. The candidate set is hand-tuned for RTX 5090 (sm_120)
-// — see register_candidates() for the rationale and SMEM budget math.
+// fastest one. Candidate set is sized to the sm_120 / Ada SMEM budget
+// (~96 KB per CTA); see Sw7AutoTuneRunner for SMEM math.
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -238,48 +243,21 @@ class Sw7Impl : public Sw7Concept {
           cutlass::gemm::GemmShape<wa_m, wa_n, wa_k>,                           \
           stages>>>(label))
 
-// MAGI_TARGET_ARCH is set by the host compile pipeline to the device's
-// numeric compute capability (e.g. 90 for sm_90, 120 for sm_120). Default to
-// sm_120 if unset so existing source-only consumers keep building.
-#ifndef MAGI_TARGET_ARCH
-#define MAGI_TARGET_ARCH 120
-#endif
-
 class Sw7AutoTuneRunner {
  public:
   Sw7AutoTuneRunner() {
     // SMEM cost for DualGemm = (BM + 2*BN) * BK * 2B * stages because both
-    // B operands live in smem simultaneously.
+    // B operands live in smem simultaneously. Budget cap ~96 KB matches
+    // sm_120's per-SM SMEM (also fits sm_80 / sm_86 / sm_89).
     //
     // Bucket of M doesn't drive a separate .cu here — DualGemm compiles
     // fast enough that one runner with all candidates handles every M, and
     // the per-shape cache picks the best for whatever M it sees.
-
-#if MAGI_TARGET_ARCH >= 90 && MAGI_TARGET_ARCH < 100
-    // ── H100 / Hopper (sm_90): 132 SMs, 228 KB SMEM/SM, HBM3 ~3.35 TB/s ──
-    // 2.28× SMEM headroom + 6× compute vs sm_120 ⇒ favour bigger tiles +
-    // larger BK to amortise loads. Budget cap ~200 KB to leave room for
-    // register spill / scratch. Still on Sm80 mainloop (no TMA / wgmma).
-
-    // Decode / small M
-    SW7_TILE(64,  64, 64, 32, 32, 64, 4, "T<64,64,64>_S4");      // 96 KB
-    SW7_TILE(64, 128, 64, 32, 64, 64, 3, "T<64,128,64>_S3");     // 120 KB
-    SW7_TILE(128, 64, 64, 64, 32, 64, 4, "T<128,64,64>_S4");     // 128 KB
-    SW7_TILE(128, 128, 32, 64, 64, 32, 4, "T<128,128,32>_S4");   // 96 KB
-
-    // Medium M
-    SW7_TILE(128, 128, 64, 64, 64, 64, 3, "T<128,128,64>_S3");   // 144 KB
-    SW7_TILE(256,  64, 32, 64, 32, 32, 4, "T<256,64,32>_S4");    // 96 KB
-    SW7_TILE(256,  64, 64, 64, 32, 64, 3, "T<256,64,64>_S3");    // 144 KB
-    SW7_TILE(256, 128, 32, 64, 64, 32, 4, "T<256,128,32>_S4");   // 128 KB
-
-    // Large prefill M
-    SW7_TILE(256, 128, 64, 64, 64, 64, 3, "T<256,128,64>_S3");   // 192 KB
-    SW7_TILE(128, 256, 32, 64, 64, 32, 4, "T<128,256,32>_S4");   // 160 KB
-
-#else
-    // ── RTX 5090 / Blackwell GeForce (sm_120) and fallback ──
-    // 170 SMs, 100 KB SMEM/SM. Budget cap ~96 KB.
+    //
+    // Tile candidates for sm_120 / Ada / Ampere (the only consumers of this
+    // .cu). The Hopper (sm_90) path lives at
+    // ../../sm90/cutlass_kernels/swiglu7_one_stage.cu and ships its own
+    // candidate set sized for H100's 228 KB SMEM/SM budget.
 
     // Small / decode-friendly tiles
     SW7_TILE(64,  64, 32, 32, 32, 32, 4, "T<64,64,32>_S4");      // 36 KB
@@ -299,8 +277,6 @@ class Sw7AutoTuneRunner {
     // (256, 128, 32)*3 = 96 KB exact-budget, prone to SMEM alloc fail; omitted.
     // (128, 256, 32)*3 = 120 KB > 96 — omitted.
     // (64,  256, 32)*3 = 108 KB > 96 — omitted.
-
-#endif
   }
 
   void operator()(at::Tensor A, at::Tensor B, at::Tensor D) {

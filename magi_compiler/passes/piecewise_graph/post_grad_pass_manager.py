@@ -22,7 +22,7 @@ from ...utils import magi_logger, set_env_var
 from ...utils.envs import MAGI_PATTERN_MATCH_DEBUG
 from ..pass_base import InductorPass, get_pass_context
 from .fix_functionalization import FixFunctionalizationPass
-from .fusion.blackwell_geforce.matmul_epilogue_fusion import MatmulEvtEpilogueFusionPass
+from .fusion.cutlass_fusion.matmul_epilogue_fusion import MatmulEvtEpilogueFusionPass
 from .post_cleanup import PostCleanupPass
 
 

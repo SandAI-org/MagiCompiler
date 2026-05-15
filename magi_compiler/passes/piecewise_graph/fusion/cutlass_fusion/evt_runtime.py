@@ -20,9 +20,14 @@ This file owns:
   * Dispatch to one of two backends:
       - ``kind == "evt"``         → JIT-compiled CUTLASS Sm80EVT kernel.
       - ``kind == "swiglu7_dual"`` → vendored DualGemm one-stage kernel.
+        Routes to the SM80 cp.async multistage path on sm_120 (RTX 5090) and
+        to the SM90 TMA + WGMMA path on sm_90 (H100). Both expose the same
+        ``swiglu7_dual_matmul_out(A, B, D)`` PYBIND callable, so the
+        dispatcher is arch-agnostic.
 
-The kernel build directory uses the IR cache key as its name so re-runs and
-multi-process Inductor compile workers all hit the same on-disk cache.
+The kernel build directory uses the IR cache key + arch tag as its name so
+re-runs and multi-process Inductor compile workers all hit the same on-disk
+cache, and so a binary built for one arch never gets reused on another.
 """
 
 from __future__ import annotations
@@ -37,8 +42,9 @@ import torch
 
 from magi_compiler.config import get_compile_config
 
-from .evt_codegen import render_evt_cu
 from .evt_ir import Accum, AuxLoad, ColBroadcast, Compute, RowBroadcast, Store
+from .sm80.evt_codegen import render_evt_cu as _render_evt_cu_sm80
+from .sm90.evt_codegen import render_evt_cu as _render_evt_cu_sm90
 
 # ── torch.library op definition ───────────────────────────────────────────────
 # Reuse the existing ``magi_epilogue`` library so all our custom matmul ops
@@ -167,6 +173,11 @@ def _device_gencode_flags() -> list[str]:
     and emit a matching gencode plus a forward-compat PTX so future arches
     can JIT.
 
+    Special case: sm_90 must use the ``a`` (architecture-specific) feature
+    variant because all WGMMA / TMA kernels in CUTLASS 3.x are gated on it.
+    Plain ``sm_90`` exists in the toolchain but lacks WGMMA support, so any
+    Hopper-native kernel we ship would fail to compile against it.
+
     Override with ``MAGI_EVT_GENCODE`` (semicolon-separated nvcc args) for
     ad-hoc multi-arch builds.
     """
@@ -175,11 +186,13 @@ def _device_gencode_flags() -> list[str]:
         return [a for a in override.split(";") if a]
     cap = torch.cuda.get_device_capability()
     arch = f"{cap[0]}{cap[1]}"  # "90" for H100, "120" for RTX 5090, "80" for A100
+    # Use the wgmma-enabled "a" variant on Hopper; all other arches stay plain.
+    arch_for_code = f"{arch}a" if arch == "90" else arch
     return [
-        f"-gencode=arch=compute_{arch},code=sm_{arch}",
+        f"-gencode=arch=compute_{arch_for_code},code=sm_{arch_for_code}",
         # Embed PTX of the same arch so a slightly newer driver / different
         # minor revision JITs cleanly without rebuilding.
-        f"-gencode=arch=compute_{arch},code=compute_{arch}",
+        f"-gencode=arch=compute_{arch_for_code},code=compute_{arch_for_code}",
     ]
 
 
@@ -291,9 +304,14 @@ def _compile_evt_module(
             _MODULE_FAST_CACHE[fast_key] = cached
             return cached
 
-        # Re-hydrate the IR tree from JSON for codegen.
+        # Re-hydrate the IR tree from JSON for codegen. Pick renderer per arch:
+        # sm_90 → CUTLASS 3.x Sm90EVT (TMA + WGMMA, ~1.6-2× faster on H100);
+        # everything else → CUTLASS 2.x Sm80EVT (cp.async, runs on sm_80 / Ada
+        # / Blackwell GeForce). Both renderers expose the same `evt_matmul_out`
+        # PYBIND function so the dispatcher attribute lookup is uniform.
         ir = _ir_from_json(ir_json)
-        src = render_evt_cu(
+        render_fn = _render_evt_cu_sm90 if arch == "sm90" else _render_evt_cu_sm80
+        src = render_fn(
             ir,
             a_str,
             b_str,
@@ -320,6 +338,14 @@ def _compile_evt_module(
         cutlass_root = _cutlass_root()
         from torch.utils.cpp_extension import load
 
+        # SM90 EVT (CUTLASS 3.x) needs extra cflags for warp-specialized
+        # collectives + extended MMA shape selection. SM80 EVT doesn't need
+        # them and accepting them on sm_80 / sm_120 / sm_120 builds is also
+        # harmless, but we only pass them on sm_90 to keep the build minimal.
+        sm90_specific_cflags = (
+            ["--expt-extended-lambda", "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED=1"] if arch == "sm90" else []
+        )
+
         # cpp_extension.load uses its own file lock under build_directory, so
         # multi-process races resolve to a single nvcc invocation.
         module = load(
@@ -330,7 +356,9 @@ def _compile_evt_module(
                 os.path.join(cutlass_root, "tools", "util", "include"),
             ],
             extra_cflags=["-O3", "-std=c++17"],
-            extra_cuda_cflags=["-std=c++17", "-O3", "--expt-relaxed-constexpr"] + _device_gencode_flags(),
+            extra_cuda_cflags=(
+                ["-std=c++17", "-O3", "--expt-relaxed-constexpr"] + sm90_specific_cflags + _device_gencode_flags()
+            ),
             build_directory=build_dir,
             verbose=False,
         )
@@ -427,7 +455,14 @@ def _compile_swiglu7_dual(
 
         cutlass_root = _cutlass_root()
         here = os.path.dirname(os.path.abspath(__file__))
-        src = os.path.join(here, "cutlass_kernels", "swiglu7_epi_one_stage.cu")
+        # Pick the .cu source per device arch. sm_90 (Hopper / H100) gets the
+        # native TMA + WGMMA implementation built on the vendored Sm90DualGemm
+        # under sm90/cutlass_kernels/49_hopper_dual_gemm/. Everything else
+        # (sm_120 Blackwell GeForce, Ada, Ampere…) falls back to the SM80
+        # multistage path under sm80/cutlass_kernels/.
+        arch_tag = _device_arch_tag()
+        arch_subdir = "sm90" if arch_tag == "sm90" else "sm80"
+        src = os.path.join(here, arch_subdir, "cutlass_kernels", "swiglu7_one_stage.cu")
         if not os.path.exists(src):
             raise FileNotFoundError(f"vendored swiglu7 source not found: {src}")
         cache_root = get_compile_config().cache_root_dir
@@ -437,9 +472,24 @@ def _compile_swiglu7_dual(
         # reused (CUDA driver would refuse to load and CUTLASS surfaces it
         # as Status::kErrorInternal).
         build_tag = f"{m_bucket}_N{N}_K{K}" f"_aA{alignment_a_bits}_aB{alignment_b_bits}_aC{alignment_c_bits}"
-        build_dir = os.path.join(cache_root, "evt_kernels", _device_arch_tag(), f"swiglu7_dual_{build_tag}")
+        build_dir = os.path.join(cache_root, "evt_kernels", arch_tag, f"swiglu7_dual_{build_tag}")
         os.makedirs(build_dir, exist_ok=True)
         from torch.utils.cpp_extension import load
+
+        # SM90 path needs CUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED for the WGMMA
+        # tile selector and --expt-extended-lambda for the warp-specialized
+        # collective. Other arches don't need (or accept) these, so they're
+        # only added on the Hopper build.
+        sm90_specific_cflags = (
+            ["--expt-extended-lambda", "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED=1"] if arch_tag == "sm90" else []
+        )
+
+        # Both .cu files do `#include "swiglu7_combine.h"` (arch-agnostic
+        # math). Lives under common/cutlass_kernels/ so a single -I covers
+        # both arch builds. The sm_90 .cu additionally does
+        # `#include "49_hopper_dual_gemm/device/sm90_dual_gemm.h"`, resolved
+        # by sm90/cutlass_kernels/.
+        sm90_include_paths = [os.path.join(here, "sm90", "cutlass_kernels")] if arch_tag == "sm90" else []
 
         module = load(
             name=f"magi_swiglu7_dual_{build_tag}",
@@ -448,17 +498,16 @@ def _compile_swiglu7_dual(
                 os.path.join(cutlass_root, "include"),
                 os.path.join(cutlass_root, "tools", "util", "include"),
                 os.path.join(cutlass_root, "examples"),
-                os.path.join(here, "cutlass_kernels"),
+                os.path.join(here, "common", "cutlass_kernels"),
+                *sm90_include_paths,
             ],
             extra_cflags=["-O3", "-std=c++17"],
             extra_cuda_cflags=[
                 "-std=c++17",
                 "-O3",
                 "--expt-relaxed-constexpr",
+                *sm90_specific_cflags,
                 *_device_gencode_flags(),
-                # Numeric tag (e.g. 90 for sm_90, 120 for sm_120) so the .cu
-                # can #if-pick the right SW7_TILE candidate block per arch.
-                f"-DMAGI_TARGET_ARCH={_device_arch_tag()[2:]}",
                 f"-DMAGI_SWIGLU7_ALIGN_A_BITS={int(alignment_a_bits)}",
                 f"-DMAGI_SWIGLU7_ALIGN_B_BITS={int(alignment_b_bits)}",
                 f"-DMAGI_SWIGLU7_ALIGN_C_BITS={int(alignment_c_bits)}",

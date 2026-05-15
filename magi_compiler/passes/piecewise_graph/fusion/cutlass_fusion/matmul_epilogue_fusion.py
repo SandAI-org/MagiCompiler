@@ -540,6 +540,19 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         if not self.allow_extras and num_extras(ir_root) > 0:
             return False
 
+        # SM90 (H100) uses a CUTLASS 3.x EVT codegen that has slightly tighter
+        # constraints than the SM80 path — most notably it supports at most
+        # one AuxLoad (the C-operand TMA path is the only aux load CUTLASS
+        # 3.x's standard CollectiveBuilder exposes). If this IR isn't
+        # renderable on sm_90 we'd rather have torch.compile lower the chain
+        # than fall back to SM80-on-Hopper, which runs ~2× slower than cuBLAS
+        # in backward-compat mode.
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
+            from .sm90.evt_codegen import can_render as _sm90_can_render
+
+            if not _sm90_can_render(ir_root):
+                return False
+
         ir_json = to_canonical_json(ir_root)
         n_out = n_dim
         out_dt_id = evt_runtime.out_dtype_id(out_dt)
@@ -678,6 +691,20 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
             return False
         if _largest_pow2_align_bits(K, a_dtype) is None:
             return False
+        # SM90 (H100) swiglu7 path uses Sm90DualGemm with TMA — TMA requires
+        # the innermost stride **in bytes** to be a multiple of 16. For A's
+        # K-contiguous load that means K * sizeof(elem) % 16 == 0. CUTLASS
+        # encodes this in sm90_dual_gemm.h's can_implement as
+        #   constexpr int min_k_align = 128 / cutlass::sizeof_bits<ElementA>;
+        #   if (problem_size.k() % min_k_align != 0) return kErrorInvalidProblem;
+        # which is the same condition expressed in elements. Express it in
+        # bytes here so future fp8 / fp32 swiglu7 paths inherit the gate
+        # without a one-line dtype fix. On sm_120 / Ada the SM80 multistage
+        # path supports 64-bit alignment, so this gate only fires on Hopper.
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
+            elem_bytes = a_dtype.itemsize
+            if _is_static_int(K) and (int(K) * elem_bytes) % 16 != 0:
+                return False
 
         # We walk the chain in source order and collect every node belonging to
         # the swiglu7 epilogue — anything else aborts. We don't need to verify
