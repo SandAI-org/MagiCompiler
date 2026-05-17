@@ -12,14 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Magi custom-op registration: dataclass-aware wrapper around ``torch.library``.
+"""
+Magi custom-op registration: dataclass-aware wrapper around ``torch.library``.
 
-This module implements ``magi_register_custom_op`` -- a decorator that takes a
-plain Python function (possibly with frozen-dataclass parameters,
-``Literal[str, ...]`` / string-Enum annotations, or other Python-rich
-signatures that ``torch.library.infer_schema`` cannot consume) and registers
-it as a real custom op while letting the user keep calling it with their
-original, ergonomic signature.
+This module implements ``magi_register_custom_op`` -- a decorator that takes
+a plain Python function and registers it as a real custom op while letting
+the user keep calling it with their original signature.
 
 
 Part A. Registration-time pipeline -- the four slots
