@@ -146,20 +146,36 @@ def _emit_tile_candidates(m_bucket: str) -> str:
 def can_render(ir: Store) -> bool:
     """Return True iff the SM90 codegen can render this IR.
 
-    Restrictions vs SM80:
-      * At most one ``AuxLoad`` node — CUTLASS 3.x's standard CollectiveBuilder
-        exposes one C-operand load path (used by ``Sm90SrcFetch``). Multiple
-        aux inputs would need a custom collective with extra TMA atoms.
+    Multi-AuxLoad policy (CUTLASS canonical pattern, see
+    ``test/unit/gemm/device/sm90_evt_operations.hpp:364-368`` —
+    ``Sm90LinCombAuxLoadNoSmem``):
+
+      * The **first** ``AuxLoad`` (in IR pre-order) binds to ``Sm90SrcFetch``,
+        which borrows the C-operand TMA path already provided by
+        ``CollectiveEpilogue``. Zero extra SMEM / TMA atom.
+      * **Subsequent** ``AuxLoad`` nodes bind to ``Sm90AuxLoad<0, void, ...>``
+        — the zero-SMEM specialisation that does inline ``ld.global`` per
+        epilogue tile. Each instance is independent, so any count is fine.
+
+    Single hard restriction we still enforce:
+      * Each ``AuxLoad.input_idx`` may appear **at most once** in the IR
+        tree. Reusing the same external tensor in multiple positions (e.g.
+        ``mm * gate + gate``) would conflict at the leaf-args layer (one
+        position wants ``{}`` for SrcFetch, another wants ``{ptr, default,
+        stride}`` for inline AuxLoad). Such IRs are rare in practice; the FX
+        pass falls back to Inductor for them.
+
       * Op coverage matches SM80: any op in
         ``_BUILTIN_FN_TEMPLATE | _CUSTOM_UNARY_BODY | _CUSTOM_SCALAR_BODY``.
     """
     if not isinstance(ir, Store):
         return False
     ok = [True]
+    aux_input_indices: List[int] = []
 
     def _walk(node):
         if isinstance(node, AuxLoad):
-            nonlocal_aux[0] += 1
+            aux_input_indices.append(node.input_idx)
         elif isinstance(node, Compute):
             if node.op in _BUILTIN_FN_TEMPLATE and node.scalar is None:
                 pass
@@ -173,11 +189,13 @@ def can_render(ir: Store) -> bool:
             for c in node.children:
                 _walk(c)
 
-    nonlocal_aux = [0]
     _walk(ir.child)
     if not ok[0]:
         return False
-    if nonlocal_aux[0] > 1:
+    # Per-input_idx uniqueness: same external aux tensor reused at multiple
+    # IR positions would need two different leaf-args strings keyed on the
+    # same input_idx. Reject; let Inductor lower these cases.
+    if len(aux_input_indices) != len(set(aux_input_indices)):
         return False
     return True
 
@@ -205,11 +223,14 @@ class _Sm90EvtEmitter:
         self._emitted_functors: Dict[Tuple[str, str], str] = {}
         self._tmp_counter = 0
         # Per-leaf metadata: (typedef_name, leaf_kind, input_idx, dtype_str).
-        # leaf_kind ∈ {"row_bcast", "col_bcast", "src_fetch"}.
+        # leaf_kind ∈ {"row_bcast", "col_bcast", "src_fetch", "aux_load_inline"}.
         self.leaf_typedefs: List[Tuple[str, str, "int | None", str]] = []
         # First AuxLoad seen becomes Sm90SrcFetch (consumes the C operand
         # path). Track its IR ``input_idx`` so the launcher knows which
-        # ``extras[i]`` to bind to ptr_C.
+        # ``extras[i]`` to bind to ptr_C. Subsequent AuxLoad nodes become
+        # ``Sm90AuxLoad<0, void, ...>`` (no-SMEM inline ld.global; each
+        # instance is independent and carries its own ptr / stride in the
+        # EVT args tree).
         self.src_fetch_input_idx: "int | None" = None
         self.scalar_functor_counter = 0
 
@@ -268,18 +289,32 @@ class _Sm90EvtEmitter:
             self.leaf_typedefs.append((name, "col_bcast", node.input_idx, node.dtype))
             return name
         if isinstance(node, AuxLoad):
-            # First AuxLoad → Sm90SrcFetch (uses C operand TMA path). Multiple
-            # AuxLoad would need extra TMA atoms — rejected by ``can_render``.
-            if self.src_fetch_input_idx is not None:
-                raise NotImplementedError(
-                    "SM90 EVT supports at most one AuxLoad (mapped to Sm90SrcFetch). "
-                    "FX pass should reject before reaching codegen."
-                )
-            name = self._new_name("SrcFetch")
+            # Multi-AuxLoad policy (CUTLASS canonical, see Sm90LinCombAuxLoadNoSmem
+            # in test/unit/gemm/device/sm90_evt_operations.hpp):
+            #   * First AuxLoad in pre-order → Sm90SrcFetch, which borrows the
+            #     C-operand TMA path the CollectiveEpilogue already provides
+            #     (zero extra SMEM / TMA atom).
+            #   * Subsequent AuxLoad nodes → Sm90AuxLoad<0, void, Element,
+            #     RowMajor, void, void>, the zero-SMEM specialisation that
+            #     does inline ld.global per epilogue tile. Each instance is
+            #     independent so any count is fine.
+            # can_render() already rejected IRs where the same input_idx
+            # appears at multiple AuxLoad positions, so each leaf here gets a
+            # unique typedef + unique leaf_args entry.
             elem = _DTYPE_TO_CUTLASS[node.dtype]
-            self.typedef_lines.append(f"using {name} = cutlass::epilogue::fusion::Sm90SrcFetch<{elem}>;")
-            self.leaf_typedefs.append((name, "src_fetch", node.input_idx, node.dtype))
-            self.src_fetch_input_idx = node.input_idx
+            if self.src_fetch_input_idx is None:
+                name = self._new_name("SrcFetch")
+                self.typedef_lines.append(f"using {name} = cutlass::epilogue::fusion::Sm90SrcFetch<{elem}>;")
+                self.leaf_typedefs.append((name, "src_fetch", node.input_idx, node.dtype))
+                self.src_fetch_input_idx = node.input_idx
+            else:
+                name = self._new_name("AuxLoad")
+                self.typedef_lines.append(
+                    f"using {name} = cutlass::epilogue::fusion::Sm90AuxLoad<\n"
+                    f"    /*Stages=*/0, /*EpilogueTile=*/void, {elem},\n"
+                    f"    cutlass::layout::RowMajor, /*SmemLayoutAtom=*/void, /*CopyOpS2R=*/void>;"
+                )
+                self.leaf_typedefs.append((name, "aux_load_inline", node.input_idx, node.dtype))
             return name
         if isinstance(node, Compute):
             child_names = [self._emit_node(c) for c in node.children]
@@ -324,10 +359,12 @@ def _emit_args_tree(node, leaf_args: Dict[int, str], indent: int = 8) -> str:
     pad = " " * indent
     if isinstance(node, Accum):
         return f"{pad}{{}}"
-    if isinstance(node, AuxLoad):
-        # Sm90SrcFetch leaf — no per-leaf args (ptr_C plumbed at epilogue level).
-        return f"{pad}{{}}"
-    if isinstance(node, (RowBroadcast, ColBroadcast)):
+    if isinstance(node, (AuxLoad, RowBroadcast, ColBroadcast)):
+        # AuxLoad → either "{}" (when mapped to Sm90SrcFetch — pointer comes
+        # via outer epilogue ptrC) or "{ptr, default, stride_aux}" (when
+        # mapped to Sm90AuxLoad<0, void, ...>). The dispatch by input_idx is
+        # done by ``render_evt_cu`` when populating leaf_args; here we just
+        # look up the string.
         return f"{pad}{leaf_args[node.input_idx]}"
     if isinstance(node, Compute):
         children_str = ",\n".join(_emit_args_tree(c, leaf_args, indent + 2) for c in node.children)
@@ -541,6 +578,12 @@ class EvtImpl : public EvtConcept {{
     auto stride_B = cutlass::make_cute_packed_stride(StrideB{{}}, cute::make_shape(N, K, 1));
     auto stride_C = cutlass::make_cute_packed_stride(StrideC{{}}, cute::make_shape(M, N, 1));
     auto stride_D = cutlass::make_cute_packed_stride(StrideD{{}}, cute::make_shape(M, N, 1));
+    // Packed stride for inline aux loads (Sm90AuxLoad<0, void, ..., RowMajor>).
+    // All inline-aux nodes share this stride — they all read (M, N) row-major
+    // contiguous tensors. Emitted unconditionally; nvcc -O3 drops it when no
+    // Sm90AuxLoad instance references it.
+    auto stride_aux = cutlass::make_cute_packed_stride(
+        cute::Stride<int64_t, cute::_1, int64_t>{{}}, cute::make_shape(M, N, 1));
 
     // ptr_C: real pointer if AuxLoad present, else a null sentinel. CUTLASS
     // 3.x CollectiveBuilder requires ElementC to be non-void; passing
@@ -799,9 +842,10 @@ def render_evt_cu(
         raise TypeError("render_evt_cu (sm90) expects a Store node as root")
     if not can_render(ir):
         raise ValueError(
-            "IR is not renderable on the Sm90 EVT path (multiple AuxLoad or "
-            "an unsupported Compute op). The FX pass should call can_render() "
-            "first and reject before invoking codegen."
+            "IR is not renderable on the Sm90 EVT path (an unsupported "
+            "Compute op, or the same AuxLoad input_idx reused at multiple "
+            "IR positions). The FX pass should call can_render() first and "
+            "reject before invoking codegen."
         )
     del arch  # accepted for signature parity; sm90 renderer is sm_90-only
 
@@ -845,9 +889,17 @@ def render_evt_cu(
             ptr_expr = f"reinterpret_cast<{elem} const*>(a.ptr_extras[{i}])"
             leaf_args[i] = f"{{ {ptr_expr} }}"
         elif isinstance(leaf, AuxLoad):
-            # SrcFetch leaf has no args inside the EVT tree — pointer is the
-            # outer-epilogue C pointer (set via ptrC inside make_args).
-            pass
+            # First AuxLoad → Sm90SrcFetch: no per-leaf args (pointer comes via
+            # outer-epilogue ptrC inside make_args).
+            # Subsequent AuxLoad → Sm90AuxLoad<0, void, ...>: args are
+            # ``{ptr_aux, null_default, dAux}``. ``stride_aux`` is a local
+            # declared in make_args (always emitted; shared across all inline
+            # aux). null_default = Element(0).
+            if i == emitter.src_fetch_input_idx:
+                leaf_args[i] = "{}"
+            else:
+                ptr_expr = f"reinterpret_cast<{elem} const*>(a.ptr_extras[{i}])"
+                leaf_args[i] = f"{{ {ptr_expr}, {elem}(0), stride_aux }}"
 
         if i in seen_extras:
             continue
@@ -862,6 +914,15 @@ def render_evt_cu(
         elif isinstance(leaf, AuxLoad):
             extras_validation_lines.append(
                 f'    TORCH_CHECK(extras[{i}].size(0) == M && extras[{i}].size(1) == N,' f' "extras[{i}] must be (M,N)");'
+            )
+            # Sm90AuxLoad<0, void, ...> uses inline ld.global keyed by the
+            # cute row-major packed stride built in make_args (stride_aux).
+            # That assumes the aux row stride equals N. Sm90SrcFetch (first
+            # AuxLoad) likewise reads via stride_C = make_cute_packed_stride
+            # (also assumes row stride == N). Either way, innermost stride
+            # must be 1; otherwise inline loads would read transposed data.
+            extras_validation_lines.append(
+                f'    TORCH_CHECK(extras[{i}].stride(1) == 1,' f' "extras[{i}] innermost stride must be 1 (row-major)");'
             )
         extras_validation_lines.append(
             f'    TORCH_CHECK(extras[{i}].scalar_type() == {at_dtype},' f' "extras[{i}] must be {leaf.dtype}");'

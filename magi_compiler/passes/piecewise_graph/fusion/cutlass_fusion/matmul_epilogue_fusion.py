@@ -37,8 +37,8 @@ from typing import List, Optional, Tuple
 import torch
 import torch.fx as fx
 
-from magi_compiler.cuda.device import device_capability_major
 from magi_compiler.passes.pass_base import MagiInductorPass
+from magi_compiler.utils.device import device_capability_major
 
 from . import evt_runtime  # ensures torch.library op + fake impl are registered
 from .evt_ir import Accum, AuxLoad, ColBroadcast, Compute, RowBroadcast, Store, is_trivial, num_extras, to_canonical_json
@@ -210,12 +210,27 @@ _ABORT = object()
 
 
 class MatmulEvtEpilogueFusionPass(MagiInductorPass):
-    """Fuse aten.mm + elementwise chain into a CUTLASS EVT call (sm_120)."""
+    """Fuse aten.mm + elementwise chain into a CUTLASS EVT call.
+
+    Active on:
+      * sm_90 (Hopper / H100)        — lowers via CUTLASS 3.x Sm90EVT codegen.
+      * sm_120+ (Blackwell consumer) — lowers via CUTLASS 2.x Sm80EVT codegen.
+
+    The codegen renderer is picked inside ``evt_runtime._compile_evt_module``
+    based on the live device's arch tag. Each renderer has its own gating
+    (e.g. ``sm90.evt_codegen.can_render`` rejects unsupported op chains on
+    Hopper); this top-level switch only decides whether to attempt fusion
+    at all.
+    """
 
     def __init__(self, allow_extras: bool = True) -> None:
-        # On non-sm120 we degrade to a no-op; the manager wires us only on
-        # sm120 anyway, but defending against misuse is cheap.
-        self._enabled = device_capability_major() >= 12
+        # Enable on sm_90 (H100 Sm90EVT path) OR sm_120+ (consumer Blackwell
+        # Sm80EVT path). The earlier "≥12 only" condition predated the SM90
+        # codegen and now leaves it as dead code on H100 even though
+        # evt_runtime wires it in. ``can_render`` plus the SM90-specific
+        # gates in ``_try_fuse_evt`` provide the real safety net.
+        major = device_capability_major()
+        self._enabled = major == 9 or major >= 12
         self.allow_extras = allow_extras
 
     def __call__(self, graph: fx.Graph) -> bool:

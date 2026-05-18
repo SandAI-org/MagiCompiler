@@ -44,6 +44,11 @@ _SM120_ONLY = pytest.mark.skipif(
     reason="CUTLASS EVT path targets sm_120 (Blackwell consumer)",
 )
 
+_SM90_ONLY = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
+    reason="SM90 multi-AuxLoad EVT path targets Hopper (H100)",
+)
+
 
 # ── Activations from athena/performer_v16/activation.py (verbatim) ────────────
 
@@ -782,6 +787,178 @@ def test_evt_no_fuse_fp32_mm():
     assert stats.fused_count == 0, (
         f"fp32 mm should NOT fuse, but pass emitted {stats.fused_count} ops " f"(kinds={stats.kinds})"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SM90 multi-AuxLoad — the EVT codegen lets the first AuxLoad bind to
+# Sm90SrcFetch (TMA-staged C operand path) and subsequent AuxLoad nodes bind
+# to ``Sm90AuxLoad<0, void, Element, RowMajor, void, void>`` (zero-SMEM inline
+# ld.global). Tests below exercise the ≥2 AuxLoad path which previously was
+# rejected by ``can_render`` on H100.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@_SM90_ONLY
+def test_evt_sm90_single_aux_load_fuse():
+    """``(mm * gate)`` — single (M, N) auxiliary. Regression guard for the
+    multi-AuxLoad refactor: the single-AuxLoad path must keep mapping to
+    Sm90SrcFetch (TMA-staged C-operand load), not to the new inline
+    Sm90AuxLoad<0, void, ...>.
+
+    We use ``*`` instead of ``+`` because Inductor folds ``mm + tensor`` into
+    ``aten.addmm`` (which the EVT pass doesn't recognise), but ``mm * tensor``
+    stays as separate mm + mul nodes.
+    """
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(_N, _K))
+
+        def forward(self, a, gate):
+            y = torch.mm(a, self.weight.permute(1, 0)) * gate
+            return y.to(torch.bfloat16)
+
+    a = _input_a()
+    gate = torch.randn(_M, _N, device="cuda", dtype=torch.bfloat16)
+    _compile_and_check(
+        M(), (a, gate), atol=0.0, rtol=0.1, expect_fused=1, expect_kinds=["evt_col"], dynamic_arg_dims={"a": 0, "gate": 0}
+    )
+
+
+@_SM90_ONLY
+def test_evt_sm90_two_aux_loads_fuse():
+    """``(mm + R1 + R2)`` — two (M, N) residuals fuse into one EVT op.
+
+    Validates the SM90 multi-AuxLoad path end-to-end: codegen produces a tree
+    with Sm90SrcFetch + Sm90AuxLoad<0, void, ...>, the kernel compiles, runs,
+    and matches eager within bf16 tolerance.
+    """
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(_N, _K))
+
+        def forward(self, a, r1, r2):
+            y = torch.mm(a, self.weight.permute(1, 0)) + r1 + r2
+            return y.to(torch.bfloat16)
+
+    a = _input_a()
+    r1 = torch.randn(_M, _N, device="cuda", dtype=torch.bfloat16)
+    r2 = torch.randn(_M, _N, device="cuda", dtype=torch.bfloat16)
+    _compile_and_check(
+        M(),
+        (a, r1, r2),
+        atol=2.0,
+        rtol=0.05,
+        expect_fused=1,
+        expect_kinds=["evt_col"],
+        dynamic_arg_dims={"a": 0, "r1": 0, "r2": 0},
+    )
+
+
+@_SM90_ONLY
+def test_evt_sm90_three_aux_loads_fuse():
+    """``(mm + R1 + R2 + R3)`` — three (M, N) residuals.
+
+    Confirms ≥3 aux can compile / run on the SM90 path. Two of the three
+    AuxLoad nodes map to Sm90AuxLoad<0, void, ...> (the SrcFetch slot only
+    serves the first).
+    """
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(_N, _K))
+
+        def forward(self, a, r1, r2, r3):
+            y = torch.mm(a, self.weight.permute(1, 0)) + r1 + r2 + r3
+            return y.to(torch.bfloat16)
+
+    a = _input_a()
+    r1 = torch.randn(_M, _N, device="cuda", dtype=torch.bfloat16)
+    r2 = torch.randn(_M, _N, device="cuda", dtype=torch.bfloat16)
+    r3 = torch.randn(_M, _N, device="cuda", dtype=torch.bfloat16)
+    _compile_and_check(
+        M(),
+        (a, r1, r2, r3),
+        atol=3.0,
+        rtol=0.05,
+        expect_fused=1,
+        expect_kinds=["evt_col"],
+        dynamic_arg_dims={"a": 0, "r1": 0, "r2": 0, "r3": 0},
+    )
+
+
+# ── can_render unit tests — exercise the SM90 gate directly, no GPU needed ──
+
+
+def test_can_render_accepts_multi_aux():
+    """SM90 ``can_render`` accepts IR trees with multiple AuxLoad nodes
+    (one per distinct input_idx). This is the constraint we relaxed.
+    """
+    from magi_compiler.passes.piecewise_graph.fusion.cutlass_fusion.evt_ir import Accum, AuxLoad, Compute, Store
+    from magi_compiler.passes.piecewise_graph.fusion.cutlass_fusion.sm90.evt_codegen import can_render
+
+    # D = (acc + R1) + R2
+    ir = Store(
+        child=Compute(
+            op="add",
+            children=(
+                Compute(op="add", children=(Accum(), AuxLoad(input_idx=0, dtype="bfloat16"))),
+                AuxLoad(input_idx=1, dtype="bfloat16"),
+            ),
+        ),
+        out_dtype="bfloat16",
+    )
+    assert can_render(ir) is True
+
+    # Single AuxLoad still works (preserved single-aux path).
+    ir_one = Store(child=Compute(op="add", children=(Accum(), AuxLoad(input_idx=0, dtype="bfloat16"))), out_dtype="bfloat16")
+    assert can_render(ir_one) is True
+
+    # 3 distinct AuxLoad — confirm ≥3 isn't capped.
+    ir_three = Store(
+        child=Compute(
+            op="add",
+            children=(
+                Compute(
+                    op="add",
+                    children=(
+                        Compute(op="add", children=(Accum(), AuxLoad(input_idx=0, dtype="bfloat16"))),
+                        AuxLoad(input_idx=1, dtype="bfloat16"),
+                    ),
+                ),
+                AuxLoad(input_idx=2, dtype="bfloat16"),
+            ),
+        ),
+        out_dtype="bfloat16",
+    )
+    assert can_render(ir_three) is True
+
+
+def test_can_render_rejects_repeated_aux_idx():
+    """Same external tensor (same input_idx) reused at multiple AuxLoad
+    positions in the IR is rejected — the SM90 codegen's leaf_args dict is
+    keyed by input_idx and would clash. FX pass falls back to Inductor lower
+    for such cases.
+    """
+    from magi_compiler.passes.piecewise_graph.fusion.cutlass_fusion.evt_ir import Accum, AuxLoad, Compute, Store
+    from magi_compiler.passes.piecewise_graph.fusion.cutlass_fusion.sm90.evt_codegen import can_render
+
+    # D = (acc * gate) + gate  — same AuxLoad(input_idx=0) appears twice.
+    ir_dup = Store(
+        child=Compute(
+            op="add",
+            children=(
+                Compute(op="mul", children=(Accum(), AuxLoad(input_idx=0, dtype="bfloat16"))),
+                AuxLoad(input_idx=0, dtype="bfloat16"),
+            ),
+        ),
+        out_dtype="bfloat16",
+    )
+    assert can_render(ir_dup) is False
 
 
 if __name__ == "__main__":
