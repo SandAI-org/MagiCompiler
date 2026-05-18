@@ -203,30 +203,19 @@ def magi_register_custom_op(
     is_compute_sensitive: bool = False,
     is_subgraph_boundary: bool = False,
 ):
-    """Register a Python function as a custom op for ``torch.library`` / ``torch.compile``.
+    """
+    A unified decorator to register a custom operator with PyTorch's library.
 
-    Combines ``@torch.library.custom_op`` + ``@torch.library.register_fake`` +
-    ``fn.register_autograd`` into one decorator, plus the following ergonomic
-    affordances on top of bare ``torch.library``:
-
-    - **Frozen-dataclass parameters** (recursively nested) are flattened into
-      primitive leaves before being handed to ``infer_schema``, and reassembled
-      inside ``fn`` so the op body still sees the original dataclass.
-    - **Literal / string-Enum annotations** are auto-downgraded to ``str``;
-      the op body still receives the original value.
-    - **Unsupported defaults** (mutable, dataclass instances, ...) are scrubbed
-      from the lowered signature only; user-facing calls keep the original default.
-    - **Auto-generated op name** when ``name`` is omitted: derived from the
-      function's source file and ``__name__``.
-    - **Auto-generated meta function** when ``infer_output_meta_fn`` is omitted:
-      output ``i`` copies shape/dtype/device of the ``i``-th tensor input.
+    It supports advanced features like frozen-dataclass param and combines the
+    functionality of:
+    - @torch.library.custom_op
+    - @torch.library.register_fake
+    - fn.register_autograd
 
     Arguments:
-        name: Fully qualified op name (e.g. ``"namespace::op_name"``). If ``None``,
-            auto-generated from the function's source file and name.
-        mutates_args: Argument names that the op mutates. For a frozen-dataclass
-            argument, listing the dataclass parameter expands to every Tensor leaf
-            under it; lowered leaf names (e.g. ``"cfg__weight"``) are also accepted.
+        name: Fully qualified op name (e.g. ``"namespace::op_name"``). If
+            ``None``, auto-generated from the function's source file and name.
+        mutates_args: Argument names that the op mutates.
         infer_output_meta_fn: How to propagate output metadata at trace time.
             - ``None`` (default): output ``i`` copies the ``i``-th tensor input.
             - ``list[str]``: parameter names whose metadata to copy. E.g.
@@ -234,26 +223,18 @@ def magi_register_custom_op(
               and ``output[1]`` shape-match ``bias``.
             - ``Callable``: a function with the same signature as the op that
               returns ``torch.empty_like(...)`` tensors of the expected shapes.
-        setup_context_fn: Forward-context setup; signature
-            ``setup_context_fn(ctx, inputs, output)``. ``inputs`` is the
-            user-side (original-shape) tuple, including dataclass instances.
+        setup_context_fn: Function to save tensors/values for backward.
+            Signature: setup_context_fn(ctx, inputs, output)
         backward_fn: Gradient computation; signature
-            ``backward_fn(ctx, *grad_outputs) -> tuple of grads``. Return **one
-            grad per original parameter** (not per lowered leaf); use ``None``
-            for non-differentiable parameters, including whole dataclass args.
-        is_compute_sensitive: Mark as compute-intensive. During activation
-            recomputation, outputs of compute-sensitive ops are prioritised for
-            saving rather than recomputing.
+            ``backward_fn(ctx, *grad_outputs) -> tuple of grads``.
+        is_compute_sensitive: marks this operator as compute-intensive (e.g.,
+            MatMul, Attention). During training, outputs of compute-sensitive
+            ops are prioritised for saving rather than recomputing.
         is_subgraph_boundary: Split the FX graph at this op during compilation.
             Each sub-graph between boundary ops is compiled independently.
 
     Returns:
         A callable with the user's original signature.
-        - If ``fn`` has no dataclass parameter, returns a ``torch._ops.OpOverload``
-          directly (zero per-call overhead).
-        - If ``fn`` has a frozen-dataclass parameter, returns a Python wrapper
-          that flattens/unflattens on each call and dispatches to the underlying
-          ``OpOverload`` (accessible via ``op._magi_torch_registered_op``).
 
     Examples:
         1. Basic usage (forward only, auto-generated name and meta function):
@@ -283,32 +264,7 @@ def magi_register_custom_op(
         ...
         >>> @magi_register_custom_op()
         ... def attn(q: torch.Tensor, k: torch.Tensor, cfg: AttnCfg) -> torch.Tensor:
-        ...     scores = (q @ k.transpose(-1, -2)) * cfg.scale
-        ...     if cfg.causal:
-        ...         scores = scores.tril()
-        ...     return scores
-
-        4. Full custom op with autograd support:
-
-        >>> def _square_meta(x: torch.Tensor) -> torch.Tensor:
-        ...     return torch.empty_like(x)
-        ...
-        >>> def _square_setup_context(ctx, inputs, output):
-        ...     (x,) = inputs
-        ...     ctx.save_for_backward(x)
-        ...
-        >>> def _square_backward(ctx, grad_output):
-        ...     (x,) = ctx.saved_tensors
-        ...     return grad_output * 2 * x
-        ...
-        >>> @magi_register_custom_op(
-        ...     name="my_ops::square",
-        ...     infer_output_meta_fn=_square_meta,
-        ...     setup_context_fn=_square_setup_context,
-        ...     backward_fn=_square_backward,
-        ... )
-        ... def square(x: torch.Tensor) -> torch.Tensor:
-        ...     return x * x
+        ...     pass
     """
     return _magi_register_custom_op_impl(
         name=name,
