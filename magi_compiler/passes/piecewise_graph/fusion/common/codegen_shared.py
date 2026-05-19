@@ -12,42 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Arch-agnostic codegen helpers shared by the SM80 and SM90 EVT codegens.
-
-The two paths render structurally different .cu sources (CUTLASS 2.x Sm80EVT
-vs CUTLASS 3.x Sm90EVT), but the dtype tables, built-in op table, custom
-functor bodies, and helper functions are identical. Keep them here as the
-single source of truth.
-"""
+"""Arch-agnostic codegen helpers shared by the SM80 and SM90 EVT codegens."""
 
 from __future__ import annotations
 
 import textwrap
 
-# ── PyTorch dtype string → CUTLASS type ──────────────────────────────────────
 _DTYPE_TO_CUTLASS = {"bfloat16": "cutlass::bfloat16_t", "float16": "cutlass::half_t", "float32": "float"}
 
-# PyTorch dtype string → at::ScalarType used in TORCH_CHECK.
 _DTYPE_TO_AT = {"bfloat16": "at::kBFloat16", "float16": "at::kHalf", "float32": "at::kFloat"}
 
-# For data_ptr<T>() casts at the C++ layer.
 _DTYPE_TO_AT_CPP = {"bfloat16": "at::BFloat16", "float16": "at::Half", "float32": "float"}
 
 
-# ── Built-in CUTLASS op names for the visitor template-template parameter ────
-# Maps IR op name → CUTLASS template name. Each value must be a
-# ``template <class> class`` accepting a single type arg. These names exist in
-# both CUTLASS 2.x (Sm80EVT) and CUTLASS 3.x (Sm90EVT) under the same
-# namespaces, so the table is arch-agnostic.
+# IR op name → CUTLASS template name (arch-agnostic, works on both Sm80EVT and Sm90EVT).
 _BUILTIN_FN_TEMPLATE = {
-    # binary
     "add": "cutlass::plus",
     "sub": "cutlass::minus",
     "mul": "cutlass::multiplies",
     "div": "cutlass::divides",
     "max": "cutlass::maximum",
     "min": "cutlass::minimum",
-    # unary
     "neg": "cutlass::negate",
     "sigmoid": "cutlass::epilogue::thread::Sigmoid",
     "silu": "cutlass::epilogue::thread::SiLu",
@@ -56,9 +41,7 @@ _BUILTIN_FN_TEMPLATE = {
     "abs": "cutlass::absolute_value_op",
 }
 
-# Unary ops that need a custom emitted functor (CUTLASS has no built-in).
-# Each maps to a body template; the body uses ``T`` as the element type and
-# operates on a single ``T`` value named ``x``.
+# Custom functor bodies: ``T`` = element type, ``x`` = input value.
 _CUSTOM_UNARY_BODY = {
     "square": "return x * x;",
     "exp": "return cutlass::fast_exp(x);",
@@ -72,8 +55,7 @@ _CUSTOM_UNARY_BODY = {
     ),
 }
 
-# Scalar-baked unary ops. The body template uses ``x`` and ``c`` (the baked
-# constant, emitted as a ``T`` literal — never a runtime value).
+# Scalar-baked: body uses ``x`` and ``c`` (compile-time constant).
 _CUSTOM_SCALAR_BODY = {
     "add_scalar": "return x + c;",
     "sub_scalar": "return x - c;",
@@ -92,24 +74,15 @@ _CUSTOM_SCALAR_BODY = {
 }
 
 
-# ── Greedy alignment selector — shared by FX-pass + runtime ─────────────────
 _VALID_ALIGN_BITS = (128, 64)
 
 
 def _scalar_literal_T(value: float) -> str:
-    """Emit a constant as a ``T(...)`` cast that survives bf16 / fp16 / fp32."""
-    # repr keeps round-trip precision; "f" suffix forces float in C++.
     return f"T({float(value)!r}f)"
 
 
 def _emit_custom_functor(name: str, op: str, scalar=None) -> str:
-    """Emit a unary CUTLASS-compatible functor (scalar + Array<T,N> spec).
-
-    The same functor template body works on both Sm80EVT and Sm90EVT — both
-    paths instantiate it as a ``template<class>``-shaped op. The
-    ``cutlass::Array<T, N>`` specialisation lets the per-thread vector path
-    apply the op element-wise to a packed array.
-    """
+    """Emit a unary CUTLASS-compatible functor with scalar + Array<T,N> specialisation."""
     if op in _CUSTOM_UNARY_BODY:
         body = _CUSTOM_UNARY_BODY[op]
         scalar_decl = ""

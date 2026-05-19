@@ -12,38 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Render a CUTLASS 3.x .cu source from an EVT IR tree — SM90 / Hopper path.
+"""Render a CUTLASS 3.x Sm90EVT .cu source from an EVT IR tree — H100 path.
 
-Sibling of ``../sm80/evt_codegen.py``. Same IR (``..evt_ir``), same public
-function signature (``render_evt_cu``), same exported PYBIND name
-(``evt_matmul_out``) — but the rendered .cu uses the CUTLASS 3.x
-``Sm90EVT`` fusion API on top of TMA + WGMMA via the warp-specialized
-collective builders. The SM80 path renders Sm80EVT (CUTLASS 2.x cp.async
-mainloop); this one renders Sm90EVT and is roughly 1.6-2× faster on H100.
+Uses TMA + WGMMA via warp-specialized collective builders; ~1.6-2x faster
+than the SM80 path on H100. Selected by ``evt_runtime`` when arch == sm_90.
 
-Selected by ``evt_runtime.py::_compile_evt_module`` when
-``_device_arch_tag() == 'sm90'``. On every other arch (sm_120, Ada,
-Ampere) the SM80 path is selected. Architectural reference:
-``$MAGI_CUTLASS_ROOT/examples/99_evt_demo/heavy_epi_90_torch_ext.cu``.
-
-The rendered .cu autotunes across a per-M-bucket set of (TileShape,
-ClusterShape, KernelSchedule, EpilogueSchedule) tuples — same pattern as
-the sm80 path. H100 has a much larger search space than the 5090
-(Pingpong vs Cooperative warp-specialised mainloop, 1×1 / 2×1 / 2×2
-clusters, plus the bigger SMEM / WGMMA tile shapes), so the autotune
-buys 1.3–1.8× over the previous single-config implementation on prefill
-shapes and prevents Cluster_M=2 from being picked at small M (where its
-tail-effect cost dominates).
-
-Coverage policy — same op set as the SM80 codegen (see
-``common/codegen_shared.py``: ``_BUILTIN_FN_TEMPLATE``,
-``_CUSTOM_UNARY_BODY``, ``_CUSTOM_SCALAR_BODY``). The only structural
-restriction is **at most one AuxLoad** per IR — CUTLASS 3.x's standard
-``CollectiveBuilder`` exposes a single C-operand TMA load path, which we
-bind to ``Sm90SrcFetch``. Multiple aux inputs would need a hand-rolled
-collective epilogue with extra TMA atoms; out of scope for v1. The FX
-pass calls ``can_render(ir)`` to detect this case and falls back to
-torch.compile when needed.
+Restriction vs SM80: each ``AuxLoad.input_idx`` may appear at most once
+(first binds to Sm90SrcFetch via C-operand TMA; subsequent use inline
+Sm90AuxLoad). ``can_render(ir)`` gates this.
 """
 
 from __future__ import annotations
@@ -62,30 +38,12 @@ from ..common.codegen_shared import (
 )
 from ..evt_ir import Accum, AuxLoad, ColBroadcast, Compute, RowBroadcast, Store, walk_leaves
 
-# ── Per-M-bucket tile candidate sets (H100 / sm_90) ─────────────────────────
-# Each tuple is (TM, TN, TK, CM, CN, CK, schedule, label) where:
-#   * (TM, TN, TK)  — TileShape passed to both CollectiveBuilders. K=64 is
-#     one bf16 wgmma-K (16) × 4 ⇒ 4-instruction K-loop, the canonical Hopper
-#     setting; K=128 is also legal and lands more bytes/load but costs SMEM.
-#   * (CM, CN, CK)  — ClusterShape for the warp-specialised mainloop. Larger
-#     clusters give faster TMA multicast at the cost of needing M*N divisible
-#     by Cluster_M*Cluster_N. Cluster_M = 1 ⇒ Pingpong only; Cluster_M >= 2
-#     ⇒ Cooperative only (CUTLASS pingpong cluster constraint).
-#   * schedule      — "pingpong" | "cooperative". Maps to:
-#       "pingpong"   → KernelTmaWarpSpecializedPingpong   + TmaWarpSpecialized
-#       "cooperative" → KernelTmaWarpSpecializedCooperative + TmaWarpSpecializedCooperative
-#     Mismatched (schedule, cluster) tuples (e.g. pingpong + Cluster<2,1,1>)
-#     fail at can_implement and are skipped silently by the runtime autotune.
-#
-# H100 (sm_90): 132 SMs, 228 KB SMEM / SM, HBM3 ~3.35 TB/s, ~989 TF bf16.
-# Wave size = ceil_div(grid_M * grid_N, 132). Big-tile Cooperative reduces
-# wave count and amortises TMA setup; small-M decode wants more CTAs per
-# wave so we stay on Pingpong with smaller (TM, TN).
+# (TM, TN, TK, CM, CN, CK, schedule, label).
+# Cluster_M=1 → Pingpong; Cluster_M>=2 → Cooperative. Mismatched combos
+# fail at can_implement and are skipped by autotune.
+# H100: 132 SMs, 228 KB SMEM / SM.
 
 _TILE_CANDIDATES_SM90: dict = {
-    # ── small (M ≤ 256) ─────────────────────────────────────────────────────
-    # Decode regime: low M, full-N. Pingpong wins because its 1-CTA cluster
-    # spreads more CTAs across the 132 SMs; Cooperative would tail-effect.
     "small": [
         (64, 128, 64, 1, 1, 1, "pingpong", "T<64,128,64>_Cl<1,1,1>_PP"),
         (64, 256, 64, 1, 1, 1, "pingpong", "T<64,256,64>_Cl<1,1,1>_PP"),
@@ -94,9 +52,6 @@ _TILE_CANDIDATES_SM90: dict = {
         (64, 128, 128, 1, 1, 1, "pingpong", "T<64,128,128>_Cl<1,1,1>_PP"),
         (64, 256, 128, 1, 1, 1, "pingpong", "T<64,256,128>_Cl<1,1,1>_PP"),
     ],
-    # ── medium (256 < M ≤ 2048) ─────────────────────────────────────────────
-    # Sweet spot for prefill. Mix Pingpong (no cluster) and Cooperative
-    # (Cluster<2,1,1> for TMA multicast on B). Autotune picks per (M, N, K).
     "medium": [
         (128, 128, 64, 1, 1, 1, "pingpong", "T<128,128,64>_Cl<1,1,1>_PP"),
         (128, 256, 64, 1, 1, 1, "pingpong", "T<128,256,64>_Cl<1,1,1>_PP"),
@@ -105,9 +60,6 @@ _TILE_CANDIDATES_SM90: dict = {
         (256, 128, 64, 2, 1, 1, "cooperative", "T<256,128,64>_Cl<2,1,1>_CO"),
         (256, 256, 64, 2, 1, 1, "cooperative", "T<256,256,64>_Cl<2,1,1>_CO"),
     ],
-    # ── large (M > 2048) ────────────────────────────────────────────────────
-    # Big-M prefill. Cooperative + larger cluster — multicast amortises B
-    # loads across more consumers, less wave imbalance with fewer CTAs.
     "large": [
         (128, 256, 64, 2, 1, 1, "cooperative", "T<128,256,64>_Cl<2,1,1>_CO"),
         (256, 128, 64, 2, 1, 1, "cooperative", "T<256,128,64>_Cl<2,1,1>_CO"),
@@ -119,9 +71,6 @@ _TILE_CANDIDATES_SM90: dict = {
 }
 
 
-# Kernel/epilogue schedule type pair per ``schedule`` tag. Keep both halves in
-# lockstep — Pingpong⇄TmaWarpSpecialized, Cooperative⇄TmaWarpSpecializedCooperative.
-# A mismatched pair compiles but dies at can_implement.
 _SCHEDULE_TYPES = {
     "pingpong": ("cutlass::gemm::KernelTmaWarpSpecializedPingpong", "cutlass::epilogue::TmaWarpSpecialized"),
     "cooperative": ("cutlass::gemm::KernelTmaWarpSpecializedCooperative", "cutlass::epilogue::TmaWarpSpecializedCooperative"),
@@ -140,33 +89,12 @@ def _emit_tile_candidates(m_bucket: str) -> str:
     return "\n".join(lines)
 
 
-# ── Supportability gate (called by FX pass before deciding to fuse) ─────────
-
-
 def can_render(ir: Store) -> bool:
     """Return True iff the SM90 codegen can render this IR.
 
-    Multi-AuxLoad policy (CUTLASS canonical pattern, see
-    ``test/unit/gemm/device/sm90_evt_operations.hpp:364-368`` —
-    ``Sm90LinCombAuxLoadNoSmem``):
-
-      * The **first** ``AuxLoad`` (in IR pre-order) binds to ``Sm90SrcFetch``,
-        which borrows the C-operand TMA path already provided by
-        ``CollectiveEpilogue``. Zero extra SMEM / TMA atom.
-      * **Subsequent** ``AuxLoad`` nodes bind to ``Sm90AuxLoad<0, void, ...>``
-        — the zero-SMEM specialisation that does inline ``ld.global`` per
-        epilogue tile. Each instance is independent, so any count is fine.
-
-    Single hard restriction we still enforce:
-      * Each ``AuxLoad.input_idx`` may appear **at most once** in the IR
-        tree. Reusing the same external tensor in multiple positions (e.g.
-        ``mm * gate + gate``) would conflict at the leaf-args layer (one
-        position wants ``{}`` for SrcFetch, another wants ``{ptr, default,
-        stride}`` for inline AuxLoad). Such IRs are rare in practice; the FX
-        pass falls back to Inductor for them.
-
-      * Op coverage matches SM80: any op in
-        ``_BUILTIN_FN_TEMPLATE | _CUSTOM_UNARY_BODY | _CUSTOM_SCALAR_BODY``.
+    Rejects IRs where the same AuxLoad.input_idx appears at multiple positions
+    (would conflict in leaf-args: SrcFetch wants ``{}`` vs AuxLoad wants
+    ``{ptr, default, stride}``). Op coverage matches SM80.
     """
     if not isinstance(ir, Store):
         return False
@@ -192,28 +120,16 @@ def can_render(ir: Store) -> bool:
     _walk(ir.child)
     if not ok[0]:
         return False
-    # Per-input_idx uniqueness: same external aux tensor reused at multiple
-    # IR positions would need two different leaf-args strings keyed on the
-    # same input_idx. Reject; let Inductor lower these cases.
     if len(aux_input_indices) != len(set(aux_input_indices)):
         return False
     return True
 
 
-# ── EVT typedef walker (Sm90EVT-shaped) ──────────────────────────────────────
-
-
 class _Sm90EvtEmitter:
     """Bottom-up walker emitting Sm90EVT typedef chains.
 
-    Mirrors ``sm80.evt_codegen._EvtEmitter`` but emits CUTLASS 3.x
-    ``Sm90EVT<...>`` / ``Sm90Compute<...>`` / ``Sm90RowBroadcast<...>`` /
-    ``Sm90ColBroadcast<...>`` / ``Sm90SrcFetch<...>`` / ``Sm90AccFetch``.
-
-    Crucial structural difference vs SM80: there is **no Store node** at the
-    outermost layer. The CollectiveEpilogue owns the store; the EVT root is
-    the topmost compute node. ``ptr_D`` and ``stride_D`` are passed at the
-    epilogue-args level, outside the EVT args tree.
+    Unlike SM80, there is no Store wrapper — the CollectiveEpilogue owns
+    the store; the EVT root is the topmost compute node.
     """
 
     def __init__(self, root: Store):
@@ -222,15 +138,8 @@ class _Sm90EvtEmitter:
         self.functor_decls: List[str] = []
         self._emitted_functors: Dict[Tuple[str, str], str] = {}
         self._tmp_counter = 0
-        # Per-leaf metadata: (typedef_name, leaf_kind, input_idx, dtype_str).
-        # leaf_kind ∈ {"row_bcast", "col_bcast", "src_fetch", "aux_load_inline"}.
         self.leaf_typedefs: List[Tuple[str, str, "int | None", str]] = []
-        # First AuxLoad seen becomes Sm90SrcFetch (consumes the C operand
-        # path). Track its IR ``input_idx`` so the launcher knows which
-        # ``extras[i]`` to bind to ptr_C. Subsequent AuxLoad nodes become
-        # ``Sm90AuxLoad<0, void, ...>`` (no-SMEM inline ld.global; each
-        # instance is independent and carries its own ptr / stride in the
-        # EVT args tree).
+        # First AuxLoad → Sm90SrcFetch (C operand TMA); subsequent → Sm90AuxLoad (inline ld.global).
         self.src_fetch_input_idx: "int | None" = None
         self.scalar_functor_counter = 0
 
@@ -239,7 +148,6 @@ class _Sm90EvtEmitter:
         return f"{prefix}_{self._tmp_counter}"
 
     def _functor_name_for(self, op: str, scalar) -> str:
-        """Unique struct name for a custom functor, deduped by (op, scalar)."""
         key = (op, repr(scalar) if scalar is not None else "")
         if key in self._emitted_functors:
             return self._emitted_functors[key]
@@ -269,10 +177,6 @@ class _Sm90EvtEmitter:
         if isinstance(node, RowBroadcast):
             name = self._new_name("RowBcast")
             elem = _DTYPE_TO_CUTLASS[node.dtype]
-            # Sm90RowBroadcast<Stages, TileShape, Element, ElementCompute>
-            # Stages=0 means "load on the fly" — single-stage no smem prefetch.
-            # TileShape comes from the enclosing EvtConfig template parameter
-            # so each autotune candidate re-instantiates this typedef.
             self.typedef_lines.append(
                 f"using {name} = cutlass::epilogue::fusion::Sm90RowBroadcast<\n"
                 f"    /*Stages=*/0, TileShape, {elem}, ElementCompute>;"
@@ -289,18 +193,6 @@ class _Sm90EvtEmitter:
             self.leaf_typedefs.append((name, "col_bcast", node.input_idx, node.dtype))
             return name
         if isinstance(node, AuxLoad):
-            # Multi-AuxLoad policy (CUTLASS canonical, see Sm90LinCombAuxLoadNoSmem
-            # in test/unit/gemm/device/sm90_evt_operations.hpp):
-            #   * First AuxLoad in pre-order → Sm90SrcFetch, which borrows the
-            #     C-operand TMA path the CollectiveEpilogue already provides
-            #     (zero extra SMEM / TMA atom).
-            #   * Subsequent AuxLoad nodes → Sm90AuxLoad<0, void, Element,
-            #     RowMajor, void, void>, the zero-SMEM specialisation that
-            #     does inline ld.global per epilogue tile. Each instance is
-            #     independent so any count is fine.
-            # can_render() already rejected IRs where the same input_idx
-            # appears at multiple AuxLoad positions, so each leaf here gets a
-            # unique typedef + unique leaf_args entry.
             elem = _DTYPE_TO_CUTLASS[node.dtype]
             if self.src_fetch_input_idx is None:
                 name = self._new_name("SrcFetch")
@@ -320,15 +212,10 @@ class _Sm90EvtEmitter:
             child_names = [self._emit_node(c) for c in node.children]
             compute_name = self._new_name(f"Cmp_{node.op}")
             fn_template = self._compute_op_template(node)
-            # Sm90Compute<Op, ElementOutput, ElementCompute, RoundStyle>.
-            # ElementOutput is the type of the value returned by this compute
-            # node — for interior nodes it's ElementCompute (fp32); the root
-            # tanh in the reference uses ElementD for the final cast. We keep
-            # all interior outputs in ElementCompute for now and let the
-            # CollectiveEpilogue's final cast handle bf16 conversion.
+            elem_compute = _DTYPE_TO_CUTLASS[node.compute_dtype]
             self.typedef_lines.append(
                 f"using {compute_name} = cutlass::epilogue::fusion::Sm90Compute<\n"
-                f"    {fn_template}, ElementCompute, ElementCompute,\n"
+                f"    {fn_template}, {elem_compute}, {elem_compute},\n"
                 f"    cutlass::FloatRoundStyle::round_to_nearest>;"
             )
             evt_name = self._new_name(f"EVT_{node.op}")
@@ -340,31 +227,12 @@ class _Sm90EvtEmitter:
         raise TypeError(f"Unknown IR node type: {type(node).__name__}")
 
 
-# ── Argument-tree emitter (matches Sm90EVT brace layout) ─────────────────────
-
-
 def _emit_args_tree(node, leaf_args: Dict[int, str], indent: int = 8) -> str:
-    """Emit the nested-brace runtime args literal mirroring the EVT tree.
-
-    Per-node arg shapes (Sm90 EVT convention):
-      * Sm90AccFetch / Sm90SrcFetch    : ``{}``           (no runtime args)
-      * Sm90RowBroadcast               : ``{ptrBias}``
-      * Sm90ColBroadcast               : ``{ptrScale}``
-      * Sm90Compute                    : ``{}``           (op is stateless)
-
-    Compute nodes nest as
-      ``{ child_args..., op_args (=={}) }``
-    with each child's args in declaration order — same shape as the IR tree.
-    """
+    """Emit the nested-brace runtime args literal mirroring the Sm90EVT tree."""
     pad = " " * indent
     if isinstance(node, Accum):
         return f"{pad}{{}}"
     if isinstance(node, (AuxLoad, RowBroadcast, ColBroadcast)):
-        # AuxLoad → either "{}" (when mapped to Sm90SrcFetch — pointer comes
-        # via outer epilogue ptrC) or "{ptr, default, stride_aux}" (when
-        # mapped to Sm90AuxLoad<0, void, ...>). The dispatch by input_idx is
-        # done by ``render_evt_cu`` when populating leaf_args; here we just
-        # look up the string.
         return f"{pad}{leaf_args[node.input_idx]}"
     if isinstance(node, Compute):
         children_str = ",\n".join(_emit_args_tree(c, leaf_args, indent + 2) for c in node.children)
@@ -372,10 +240,8 @@ def _emit_args_tree(node, leaf_args: Dict[int, str], indent: int = 8) -> str:
     raise TypeError(f"Unknown IR node type: {type(node).__name__}")
 
 
-# ── Full .cu source template ────────────────────────────────────────────────
-
 _KERNEL_PREAMBLE_SM90 = """\
-// AUTO-GENERATED by magi_compiler/passes/piecewise_graph/fusion/cutlass_fusion/sm90/evt_codegen.py
+// AUTO-GENERATED by magi_compiler/passes/piecewise_graph/fusion/sm90/evt_codegen.py
 // Do not edit by hand. Regenerate by re-running the FX pass.
 //
 // IR cache key: {cache_key}
@@ -810,21 +676,7 @@ def render_evt_cu(
     alignment_c_bits: int = 128,
     arch: str = "sm90",
 ) -> str:
-    """Render the SM90 .cu source for ``ir``.
-
-    Signature matches ``sm80.evt_codegen.render_evt_cu`` so
-    ``evt_runtime._compile_evt_module`` can call either renderer with the
-    same args. ``arch`` is accepted for parity but ignored — this module
-    is sm_90-only.
-
-    ``m_bucket`` selects which H100-tuned (TileShape, ClusterShape,
-    KernelSchedule, EpilogueSchedule) candidate set the rendered .cu
-    autotunes over. The first call per (M, N, K) inside the bucket times
-    every candidate that ``can_implement`` accepts and caches the winner;
-    subsequent calls reuse it.
-
-    Caller must have verified ``can_render(ir) == True`` first.
-    """
+    """Render the SM90 .cu source for ``ir``. Caller must verify ``can_render(ir)`` first."""
     if b_layout not in ("row", "col"):
         raise ValueError(f"b_layout must be 'row' or 'col', got {b_layout!r}")
     if m_bucket not in _TILE_CANDIDATES_SM90:
@@ -847,7 +699,7 @@ def render_evt_cu(
             "IR positions). The FX pass should call can_render() first and "
             "reject before invoking codegen."
         )
-    del arch  # accepted for signature parity; sm90 renderer is sm_90-only
+    del arch
 
     a_elem = _DTYPE_TO_CUTLASS[a_dtype]
     b_elem = _DTYPE_TO_CUTLASS[b_dtype]
@@ -856,10 +708,7 @@ def render_evt_cu(
     emitter = _Sm90EvtEmitter(ir)
     evt_root = emitter.emit()
 
-    # Decide ElementC: if there's an AuxLoad → ElementC = AuxLoad's dtype
-    # (the C operand is the aux tensor); else ElementC = ElementD (the
-    # epilogue's CollectiveBuilder requires non-void C; we just won't bind a
-    # real C pointer).
+    # ElementC = AuxLoad's dtype if present, else ElementD.
     c_dtype_str = ir.out_dtype
     aux_idx = emitter.src_fetch_input_idx
     if aux_idx is not None:
@@ -870,8 +719,6 @@ def render_evt_cu(
                 break
     c_elem = _DTYPE_TO_CUTLASS[c_dtype_str]
 
-    # Per-leaf runtime arg snippets (RowBcast / ColBcast pointers; SrcFetch
-    # has no per-leaf args because its pointer is at the epilogue level).
     leaves = walk_leaves(ir)
     leaf_args: Dict[int, str] = {}
     extras_validation_lines: List[str] = []
@@ -889,12 +736,6 @@ def render_evt_cu(
             ptr_expr = f"reinterpret_cast<{elem} const*>(a.ptr_extras[{i}])"
             leaf_args[i] = f"{{ {ptr_expr} }}"
         elif isinstance(leaf, AuxLoad):
-            # First AuxLoad → Sm90SrcFetch: no per-leaf args (pointer comes via
-            # outer-epilogue ptrC inside make_args).
-            # Subsequent AuxLoad → Sm90AuxLoad<0, void, ...>: args are
-            # ``{ptr_aux, null_default, dAux}``. ``stride_aux`` is a local
-            # declared in make_args (always emitted; shared across all inline
-            # aux). null_default = Element(0).
             if i == emitter.src_fetch_input_idx:
                 leaf_args[i] = "{}"
             else:
@@ -904,7 +745,6 @@ def render_evt_cu(
         if i in seen_extras:
             continue
         seen_extras.add(i)
-        # Validation block + per-leaf pointer extraction.
         at_dtype = _DTYPE_TO_AT[leaf.dtype]
         at_cpp = _DTYPE_TO_AT_CPP[leaf.dtype]
         if isinstance(leaf, RowBroadcast):
@@ -915,12 +755,7 @@ def render_evt_cu(
             extras_validation_lines.append(
                 f'    TORCH_CHECK(extras[{i}].size(0) == M && extras[{i}].size(1) == N,' f' "extras[{i}] must be (M,N)");'
             )
-            # Sm90AuxLoad<0, void, ...> uses inline ld.global keyed by the
-            # cute row-major packed stride built in make_args (stride_aux).
-            # That assumes the aux row stride equals N. Sm90SrcFetch (first
-            # AuxLoad) likewise reads via stride_C = make_cute_packed_stride
-            # (also assumes row stride == N). Either way, innermost stride
-            # must be 1; otherwise inline loads would read transposed data.
+            # Both SrcFetch and inline AuxLoad assume row-major with stride(1)==1.
             extras_validation_lines.append(
                 f'    TORCH_CHECK(extras[{i}].stride(1) == 1,' f' "extras[{i}] innermost stride must be 1 (row-major)");'
             )
@@ -928,16 +763,10 @@ def render_evt_cu(
             f'    TORCH_CHECK(extras[{i}].scalar_type() == {at_dtype},' f' "extras[{i}] must be {leaf.dtype}");'
         )
         extras_validation_lines.append(f'    TORCH_CHECK(extras[{i}].is_cuda(), "extras[{i}] must be CUDA");')
-        # Push raw pointer into ea.ptr_extras for the per-Cfg make_args() side
-        # to read (it lives in a different scope than this launcher fn).
         extras_ptr_lines.append(f"    ea.ptr_extras.push_back(static_cast<void*>(" f"extras[{i}].data_ptr<{at_cpp}>()));")
 
     args_tree = _emit_args_tree(ir.child, leaf_args, indent=8)
 
-    # ptr_C resolution inside make_args: real pointer when an AuxLoad is
-    # present, dummy null sentinel otherwise. Both branches resolve to a
-    # single ``ElementC const*`` — the templated EvtImpl::make_args only
-    # cares about the pointer type matching CollectiveEpilogue's ElementC.
     if aux_idx is not None:
         ptr_C_expr_in_make_args = f"reinterpret_cast<ElementC const*>(a.ptr_extras[{aux_idx}])"
     else:
@@ -947,8 +776,6 @@ def render_evt_cu(
     extras_ptrs = "\n".join(extras_ptr_lines) if extras_ptr_lines else ""
 
     functor_decls = "\n".join(emitter.functor_decls) if emitter.functor_decls else "// (no custom functors)"
-    # typedef_block lives inside ``struct EvtConfig`` — indent each line by 2
-    # spaces so member typedefs read consistently with the surrounding struct.
     typedef_block = "\n".join("  " + l if l.strip() else l for l in "\n".join(emitter.typedef_lines).split("\n"))
 
     cutlass_b_layout = "RowMajor" if b_layout == "row" else "ColumnMajor"

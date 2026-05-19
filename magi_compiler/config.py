@@ -69,7 +69,7 @@ class PassConfig(BaseModel):
         description=(
             "Whether to enable the matmul + elementwise epilogue fusion pass. "
             "On RTX 5090 (sm_120) this lowers fused chains to a CUTLASS Sm80EVT "
-            "kernel via the cutlass_fusion.MatmulEvtEpilogueFusionPass; on H100 "
+            "kernel via the fusion.MatmulEvtEpilogueFusionPass; on H100 "
             "(sm_90) the swiglu7 sub-path additionally uses the native Sm90 "
             "TMA + WGMMA DualGemm. The pass is a no-op on older architectures "
             "regardless of this flag, but the flag still controls whether it "
@@ -153,6 +153,14 @@ class OffloadConfig(BaseModel):
     bandwidth_safety_factor: float = Field(0.9, description="The safety factor for the H2D bandwidth.")
 
 
+def _find_cutlass_root() -> str:
+    """Return the CUTLASS source root, or empty string if not found."""
+    path = os.environ.get("MAGI_CUTLASS_ROOT", "/opt/cutlass")
+    if os.path.isdir(path):
+        return path
+    return ""
+
+
 class CompileConfig(BaseSettings):
     """Top-level configuration consumed by ``magi_compile`` and the MagiCompiler backend.
 
@@ -183,6 +191,10 @@ class CompileConfig(BaseSettings):
     cache_root_dir: str = Field(
         default=os.path.expanduser("~/.cache/magi_compiler"),
         description="Root directory for persisting compiled artifacts and debug dumps.",
+    )
+    cutlass_root: str = Field(
+        default_factory=_find_cutlass_root,
+        description="Path to the CUTLASS source tree. Default: $MAGI_CUTLASS_ROOT or /opt/cutlass.",
     )
 
     # ---- Compilation mode ----
@@ -245,6 +257,10 @@ class CompileConfig(BaseSettings):
             "FULL captures the entire compiled graph as a single CUDA Graph."
         ),
     )
+
+    @property
+    def has_cutlass(self) -> bool:
+        return bool(self.cutlass_root)
 
     @property
     def hash(self) -> str:

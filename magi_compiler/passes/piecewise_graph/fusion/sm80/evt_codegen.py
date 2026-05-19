@@ -12,22 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Render a CUTLASS .cu source from an EVT IR tree — RTX 5090 (sm_120) path.
+"""Render a CUTLASS 2.x Sm80EVT .cu source from an EVT IR tree.
 
-The output is a single self-contained file that:
-  1. Declares any custom functor templates required by scalar-baked ops
-     (ClampMaxC, ScaledSiLuAlpha, GeluErf, …) — each baked with its constant.
-  2. Declares the bottom-up Sm80EVT typedef chain.
-  3. Declares the GemmKernel + DeviceGemm + entry point.
-  4. Exposes ``evt_matmul_out`` via PYBIND11.
-
-We use CUTLASS 2.x ``Sm80EVT`` running backward-compat on sm_120; this matches
-``$MAGI_CUTLASS_ROOT/examples/99_evt_demo/heavy_epi_torch_ext.cu`` (default
-``/opt/cutlass/...``) which has been verified to deliver +5..+12 % vs the
-Triton TMA path on RTX 5090 bf16.
-
-This module is the 5090-specific renderer; the H100 / Sm90 path lives under
-``../sm90/evt_codegen.py`` and is selected by ``evt_runtime`` on sm_90 devices.
+Used on sm_120 (RTX 5090) and all non-sm_90 arches. The H100 path is
+``../sm90/evt_codegen.py``, selected by ``evt_runtime`` on sm_90 devices.
 """
 
 from __future__ import annotations
@@ -44,18 +32,9 @@ from ..common.codegen_shared import (
 )
 from ..evt_ir import Accum, AuxLoad, ColBroadcast, Compute, RowBroadcast, Store, walk_leaves
 
-# ── Per-M-bucket tile candidate sets (RTX 5090 / sm_120) ────────────────────
-# Each tuple is (BM, BN, BK, WM, WN, WK, NumStages, label).
-# WarpShape is conventionally TileShape / (2, 2) along (M, N), keeping 4 warps.
-# We include WK == BK to match Sm80 TensorOp's default warp tiling.
-#
-# RTX 5090 (sm_120): 170 SMs, 100 KB SMEM / SM.
-# Per-stage SMEM = (BM + BN) * BK * 2 (bf16). Above ~96 KB total CUTLASS
-# auto-shrinks stages or `can_implement` rejects, so we keep tile×stages
-# inside that envelope.
+# (BM, BN, BK, WM, WN, WK, NumStages, label).
+# RTX 5090: 170 SMs, 100 KB SMEM / SM; tile×stages kept inside that envelope.
 _TILE_CANDIDATES_SM120: dict = {
-    # ── small (decode / single-token) ────────────────────────────────────────
-    # M ≤ 256: low parallelism along M. Small BM launches more CTAs along N.
     "small": [
         (64, 64, 32, 32, 32, 32, 4, "T<64,64,32>_S4"),
         (64, 64, 64, 32, 32, 64, 3, "T<64,64,64>_S3"),
@@ -66,7 +45,6 @@ _TILE_CANDIDATES_SM120: dict = {
         (128, 64, 32, 64, 32, 32, 3, "T<128,64,32>_S3"),
         (128, 64, 32, 64, 32, 32, 4, "T<128,64,32>_S4"),
     ],
-    # ── medium (256 < M ≤ 2048) ──────────────────────────────────────────────
     "medium": [
         (128, 128, 32, 64, 64, 32, 3, "T<128,128,32>_S3"),
         (128, 128, 32, 64, 64, 32, 4, "T<128,128,32>_S4"),
@@ -76,7 +54,6 @@ _TILE_CANDIDATES_SM120: dict = {
         (128, 64, 64, 64, 32, 64, 4, "T<128,64,64>_S4"),
         (64, 128, 64, 32, 64, 64, 4, "T<64,128,64>_S4"),
     ],
-    # ── large (M > 2048) ─────────────────────────────────────────────────────
     "large": [
         (128, 256, 32, 64, 64, 32, 3, "T<128,256,32>_S3"),
         (256, 128, 32, 64, 64, 32, 3, "T<256,128,32>_S3"),
@@ -100,9 +77,6 @@ def _emit_tile_candidates(m_bucket: str) -> str:
     return "\n".join(lines)
 
 
-# ── EVT typedef + leaf args walker ────────────────────────────────────────────
-
-
 class _EvtEmitter:
     """Bottom-up walker that emits typedef chains + leaf placeholders."""
 
@@ -112,8 +86,6 @@ class _EvtEmitter:
         self.functor_decls: List[str] = []
         self._emitted_functors: Dict[Tuple[str, str], str] = {}
         self._tmp_counter = 0
-        # Per-leaf metadata captured during walk: leaf identity (object id) →
-        # (typedef_name, leaf_kind, input_idx_or_None, dtype_str)
         self.leaf_typedefs: List[Tuple[str, str, "int | None", str]] = []
         self.scalar_functor_counter = 0
 
@@ -122,11 +94,9 @@ class _EvtEmitter:
         return f"{prefix}_{self._tmp_counter}"
 
     def _functor_name_for(self, op: str, scalar) -> str:
-        """Unique struct name for a custom functor, deduped by (op, scalar)."""
         key = (op, repr(scalar) if scalar is not None else "")
         if key in self._emitted_functors:
             return self._emitted_functors[key]
-        # Strip dots from the scalar so the name stays a valid C++ identifier.
         scalar_tag = ""
         if scalar is not None:
             self.scalar_functor_counter += 1
@@ -137,15 +107,13 @@ class _EvtEmitter:
         return name
 
     def _compute_op_template(self, node: Compute) -> str:
-        """Return the C++ template-name passed as ComputeFn to VisitorCompute."""
         if node.op in _BUILTIN_FN_TEMPLATE and node.scalar is None:
             return _BUILTIN_FN_TEMPLATE[node.op]
         # Custom functor — either scalar-baked or unary-no-builtin (e.g. erf).
         return self._functor_name_for(node.op, node.scalar)
 
     def emit(self) -> str:
-        """Walk the IR; return the typedef name of the root EVT type (EVT_D)."""
-        # Recurse from Store.child first to build up subtrees.
+        """Walk the IR; return the typedef name of the root EVT type."""
         body_root = self._emit_node(self.root.child)
         # The store leaf itself is the StoreD typedef wrapping body_root.
         store_name = self._new_name("StoreD")
@@ -202,9 +170,10 @@ class _EvtEmitter:
             child_names = [self._emit_node(c) for c in node.children]
             compute_name = self._new_name(f"Cmp_{node.op}")
             fn_template = self._compute_op_template(node)
+            elem_compute = _DTYPE_TO_CUTLASS[node.compute_dtype]
             self.typedef_lines.append(
                 f"using {compute_name} = cutlass::epilogue::threadblock::VisitorCompute<\n"
-                f"    {fn_template}, ElementCompute, ElementCompute,\n"
+                f"    {fn_template}, {elem_compute}, {elem_compute},\n"
                 f"    cutlass::FloatRoundStyle::round_to_nearest>;"
             )
             evt_name = self._new_name(f"EVT_{node.op}")
@@ -216,18 +185,8 @@ class _EvtEmitter:
         raise TypeError(f"Unknown IR node type: {type(node).__name__}")
 
 
-# ── Argument-tree emitter (matches EVT typedef tree) ──────────────────────────
-
-
 def _emit_args_tree(node, leaf_args: Dict[int, str], indent: int = 4) -> str:
-    """Emit the nested-brace runtime callback-args literal matching the IR.
-
-    ``leaf_args[input_idx]`` for non-Accum leaves is a small C++ snippet like
-    ``{ptrBias, ElementC(0), {_0{}, _1{}, int32_t(N)}}``. Accum / Compute /
-    Store args are empty braces ``{}``. The Store arg is ``{ptrD, {N, _1{},
-    MN}}`` and is handled by the caller — this emitter only renders the body
-    inside StoreD.
-    """
+    """Emit the nested-brace runtime args literal matching the EVT typedef tree."""
     pad = " " * indent
     if isinstance(node, Accum):
         return f"{pad}{{}}"
@@ -239,11 +198,8 @@ def _emit_args_tree(node, leaf_args: Dict[int, str], indent: int = 4) -> str:
     raise TypeError(f"Unknown IR node type: {type(node).__name__}")
 
 
-# ── Public API: render a complete .cu source string ──────────────────────────
-
-
 _KERNEL_PREAMBLE = """\
-// AUTO-GENERATED by magi_compiler/passes/piecewise_graph/fusion/cutlass_fusion/sm80/evt_codegen.py
+// AUTO-GENERATED by magi_compiler/passes/piecewise_graph/fusion/sm80/evt_codegen.py
 // Do not edit by hand. Regenerate by re-running the FX pass.
 //
 // IR cache key: {cache_key}
@@ -638,40 +594,12 @@ def render_evt_cu(
     alignment_c_bits: int = 128,
     arch: str = "sm120",
 ) -> str:
-    """Render a complete .cu source for the given EVT IR (5090 / sm_120).
+    """Render a complete .cu source for the given EVT IR.
 
-    Parameters
-    ----------
-    ir : Store
-        Root of the EVT IR tree.
-    a_dtype, b_dtype : str
-        Element types for A and B (typically ``"bfloat16"``). Output dtype is
-        taken from ``ir.out_dtype``.
-    cache_key_str : str
-        Optional hash echoed in a top-level comment, useful for debugging.
-    b_layout : "row" | "col"
-        ``"row"`` (default): B is contiguous (K, N) row-major; LayoutB =
-        RowMajor; ldB = N. ``"col"``: B is the underlying (N, K) row-major
-        weight (== column-major (K, N)); LayoutB = ColumnMajor; ldB = K. Use
-        ``"col"`` when the FX graph passes ``permute([1,0])(weight)`` as B.
-    m_bucket : "small" | "medium" | "large"
-        Picks a tile-candidate set tuned at the given M regime. The runner
-        inside the rendered .cu autotunes across all candidates in that
-        bucket on the first call per (M, N, K) shape and caches the winner.
-    alignment_a_bits, alignment_b_bits, alignment_c_bits : int
-        Bit-width baked into ``constexpr int AlignmentA / AlignmentB /
-        AlignmentC``. Must be one of ``(128, 64)``. The runtime greedy-picks
-        the largest width that divides the actual K (A), N or K (B), and
-        ldd (C); 64-bit is the fallback that admits shapes the strict
-        128-bit gate previously rejected. For C the host normally over-pads
-        D's row stride to satisfy 128 bits, so 128 is almost always picked,
-        but the parameter is exposed so a smaller-pad mode can drop to 64
-        without rebuilding the codegen template.
-    arch : str
-        Accepted for signature parity with the sm90 renderer. This module
-        only emits sm_120-tuned tile candidates regardless of the value;
-        the dispatcher in ``evt_runtime`` is responsible for routing sm_90
-        devices to the sibling ``sm90.evt_codegen.render_evt_cu`` instead.
+    ``b_layout``: "row" = B is (K, N) RowMajor; "col" = underlying (N, K) weight
+    read as ColumnMajor. ``m_bucket`` selects the tile-candidate set for autotune.
+    ``alignment_*_bits``: greedy-picked 128 or 64 to match actual shape divisibility.
+    ``arch`` accepted for signature parity with sm90 renderer; ignored here.
     """
     if b_layout not in ("row", "col"):
         raise ValueError(f"b_layout must be 'row' or 'col', got {b_layout!r}")
@@ -688,7 +616,7 @@ def render_evt_cu(
         )
     if not isinstance(ir, Store):
         raise TypeError("render_evt_cu expects a Store node as root")
-    del arch  # accepted for signature parity; sm80 renderer is sm_120-only
+    del arch
     tile_candidate_block = _emit_tile_candidates(m_bucket)
 
     a_elem = _DTYPE_TO_CUTLASS[a_dtype]
@@ -698,16 +626,9 @@ def render_evt_cu(
     emitter = _EvtEmitter(ir)
     evt_root = emitter.emit()
 
-    # Build per-leaf runtime arg fragments. These get inlined into
-    # ``EvtImpl::make_args`` (a method on a different class than the launcher
-    # that fills ea.ptr_extras). The only shared state between the two scopes
-    # is the EvtArgs struct ``a``, so we read pointers from a.ptr_extras[i]
-    # and cast back to the leaf's element type.
     leaves = walk_leaves(ir)
     leaf_args: Dict[int, str] = {}
     for leaf in leaves:
-        # Accum has no extras pointer / dtype — skip; it consumes the GEMM
-        # accumulator directly via VisitorAccFetch.
         if not isinstance(leaf, (RowBroadcast, ColBroadcast, AuxLoad)):
             continue
         elem = _DTYPE_TO_CUTLASS[leaf.dtype]
@@ -718,16 +639,10 @@ def render_evt_cu(
             leaf_args[leaf.input_idx] = f"{{{ptr_expr}, {elem}(0), {{_1{{}}, _0{{}}, int32_t(M)}}}}"
         else:  # AuxLoad
             leaf_args[leaf.input_idx] = f"{{{ptr_expr}, {elem}(0), {{int64_t(N), _1{{}}, MN}}}}"
-        # Accum has no explicit args entry.
 
     args_tree = _emit_args_tree(ir.child, leaf_args, indent=8)
 
-    # Extras-validation + pointer-extraction blocks. The same external tensor
-    # (same input_idx) may appear at multiple leaves in the IR tree — e.g. an
-    # ``add(mm, bias)`` value flowing into both ``sigmoid`` and ``mul`` creates
-    # two RowBroadcast(0) leaves. We must declare ``ptr_extra_0`` exactly once
-    # in the launcher; the runtime args tree still references the same ptr
-    # name from each leaf-arg fragment so this dedup is purely a C++ scope fix.
+    # Dedup by input_idx — same tensor may appear at multiple IR leaves.
     extras_validation_lines = []
     extras_ptr_lines = []
     seen_extras: set = set()
@@ -740,7 +655,6 @@ def render_evt_cu(
         seen_extras.add(i)
         at_dtype = _DTYPE_TO_AT[leaf.dtype]
         at_cpp = _DTYPE_TO_AT_CPP[leaf.dtype]
-        _DTYPE_TO_CUTLASS[leaf.dtype]
         if isinstance(leaf, RowBroadcast):
             extras_validation_lines.append(f'    TORCH_CHECK(extras[{i}].numel() == N, "extras[{i}] must have N elements");')
         elif isinstance(leaf, ColBroadcast):
@@ -753,42 +667,26 @@ def render_evt_cu(
             f'    TORCH_CHECK(extras[{i}].scalar_type() == {at_dtype},' f' "extras[{i}] must be {leaf.dtype}");'
         )
         extras_validation_lines.append(f'    TORCH_CHECK(extras[{i}].is_cuda(), "extras[{i}] must be CUDA");')
-        # Push raw pointer into ea.ptr_extras for the make_args() side to
-        # read (it lives in a different scope than this launcher fn).
         extras_ptr_lines.append(f"    ea.ptr_extras.push_back(static_cast<void*>(" f"extras[{i}].data_ptr<{at_cpp}>()));")
 
     extras_validation = "\n".join(extras_validation_lines) if extras_validation_lines else "    // no extras"
     extras_ptrs = "\n".join(extras_ptr_lines) if extras_ptr_lines else ""
 
-    # Emit. The functor decls already end with a trailing newline each.
     functor_decls = "\n".join(emitter.functor_decls) if emitter.functor_decls else "// (no custom functors)"
-    # typedef_block lives inside ``struct EvtConfig`` — indent each line by 2
-    # spaces so member typedefs read consistently with the surrounding struct.
     typedef_block = "\n".join("  " + l if l.strip() else l for l in "\n".join(emitter.typedef_lines).split("\n"))
 
     cutlass_b_layout = "RowMajor" if b_layout == "row" else "ColumnMajor"
     if b_layout == "row":
-        # B is (K, N) row-major contiguous: K from B.size(0), N from B.size(1), ldB = N.
         n_dim_expr = "B.size(1)"
         stride_b_expr = "N"
-        # Row-major B: innermost (N) stride is 1, row stride (ldB) is at least N.
-        # Don't require B.is_contiguous() — Inductor may hand us a
-        # reinterpret_tensor with the right strides but the wrong storage_offset
-        # / sizes-vs-stride relationship that fails the strict check.
         b_stride_check = (
             'TORCH_CHECK(B.stride(1) == 1, "B innermost stride must be 1; got ", B.stride(1));\n'
             '    TORCH_CHECK(B.stride(0) >= B.size(1),\n'
             '                "B row stride must be >= N; got stride(0)=", B.stride(0), ", N=", B.size(1));'
         )
     else:
-        # B is the underlying (N, K) row-major weight (we read the same
-        # bytes via ColumnMajor (K, N)): N from B.size(0), K from B.size(1), ldB = K.
         n_dim_expr = "B.size(0)"
         stride_b_expr = "K"
-        # ColumnMajor read: B is the underlying (N, K) row-major weight, so on
-        # the Tensor side innermost (K) stride is still 1; the col-major view
-        # is virtual (CUTLASS reads the same bytes with stride (1, K)).
-        # Required: B.stride(1) == 1, B.stride(0) >= K.
         b_stride_check = (
             'TORCH_CHECK(B.stride(1) == 1, "B innermost stride must be 1; got ", B.stride(1));\n'
             '    TORCH_CHECK(B.stride(0) >= B.size(1),\n'
@@ -807,8 +705,6 @@ def render_evt_cu(
         alignment_a_bits=alignment_a_bits,
         alignment_b_bits=alignment_b_bits,
         alignment_c_bits=alignment_c_bits,
-        # EvtImpl::make_args uses args_tree + stride_b_expr; same values as
-        # the launcher (per-IR / per-layout, not per-tile-config).
         args_tree=args_tree,
         stride_b_expr=stride_b_expr,
     )

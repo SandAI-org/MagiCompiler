@@ -106,6 +106,14 @@ pip install -r requirements.txt
 # Step 4 — Install MagiCompiler (pick one)
 pip install .   # End users (recommended)
 # pip install -e . --no-build-isolation --config-settings editable_mode=compat  # Developer / editable
+
+# Step 5 (optional) — Install CUTLASS for matmul epilogue fusion
+# Required for the CUTLASS-based matmul + epilogue fusion pass (sm_90 / sm_120).
+# Without CUTLASS the compiler still works but skips this optimization.
+git clone --depth 1 https://github.com/NVIDIA/cutlass.git /opt/cutlass
+# Or specify a custom path:
+#   git clone --depth 1 https://github.com/NVIDIA/cutlass.git /your/path
+#   export MAGI_CUTLASS_ROOT=/your/path
 ```
 
 ---

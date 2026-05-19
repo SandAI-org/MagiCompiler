@@ -17,12 +17,11 @@ import functools
 from torch import fx as fx
 from torch._inductor.custom_graph_pass import CustomGraphPass
 
-from ...config import PassConfig
+from ...config import PassConfig, get_compile_config
 from ...utils import magi_logger, set_env_var
 from ...utils.envs import MAGI_PATTERN_MATCH_DEBUG
 from ..pass_base import InductorPass, get_pass_context
 from .fix_functionalization import FixFunctionalizationPass
-from .fusion.cutlass_fusion.matmul_epilogue_fusion import MatmulEvtEpilogueFusionPass
 from .post_cleanup import PostCleanupPass
 
 
@@ -81,12 +80,9 @@ class PostGradPassManager(CustomGraphPass):
     def configure(self, pass_config: PassConfig):
         self.pass_config = pass_config
 
-        # Matmul + epilogue fusion. On sm_120 (Blackwell consumer / RTX 5090)
-        # we lower fused chains to a CUTLASS Sm80EVT kernel. Toggled via
-        # PassConfig.enable_mm_epilogue_fusion (default True). The device
-        # check is independent — even with the flag on, non-sm_120 hosts
-        # don't register the pass since its FX walker would just no-op.
-        if pass_config.enable_mm_epilogue_fusion:
+        if pass_config.enable_mm_epilogue_fusion and get_compile_config().has_cutlass:
+            from .fusion.matmul_epilogue_fusion import MatmulEvtEpilogueFusionPass
+
             self.add(MatmulEvtEpilogueFusionPass())
 
         # needs a functional graph

@@ -14,17 +14,10 @@
 
 """EVT (Epilogue Visitor Tree) intermediate representation.
 
-A small dataclass IR that the FX pass builds while walking the consumers of an
-``aten.mm`` node, and that ``evt_codegen.py`` consumes to render a CUTLASS .cu
-source. The IR is canonicalised to a deterministic JSON string used as the
-cache key for the JIT'd kernel module.
-
-The IR is rooted at a single ``Store`` node and forms a DAG of compute nodes
-over leaves (``Accum``, ``RowBroadcast``, ``ColBroadcast``, ``AuxLoad``).
-
-Op naming: every name in ``UNARY_OPS`` / ``BINARY_OPS`` corresponds to a
-CUTLASS visitor template that ``evt_codegen.py`` knows how to emit. Adding a
-new op requires updating both this file and the codegen.
+Dataclass IR built by the FX pass from ``aten.mm`` consumers, consumed by
+``evt_codegen.py`` to render a CUTLASS .cu. Canonicalised to deterministic
+JSON for the JIT module cache key. Adding a new op requires updating both
+this file and the codegen.
 """
 
 from __future__ import annotations
@@ -34,17 +27,12 @@ import json
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
-# Ops that take a single child tensor and produce a tensor of the same shape.
-# All run in fp32 inside the EVT epilogue.
 UNARY_OPS = frozenset(
     {"neg", "sigmoid", "silu", "gelu_erf", "gelu_tanh", "tanh", "relu", "square", "erf", "exp", "log", "sqrt", "rsqrt", "abs"}
 )
 
-# Ops that take two child tensors. Both children must be EVT subtrees.
 BINARY_OPS = frozenset({"add", "sub", "mul", "div", "max", "min"})
 
-# Unary ops that bake a single fp32 scalar into the functor at codegen time.
-# Used to fold scalar literals out of the IR so they don't bloat the cache key.
 SCALAR_UNARY_OPS = frozenset(
     {
         "add_scalar",  # x + c
@@ -61,12 +49,19 @@ SCALAR_UNARY_OPS = frozenset(
 
 ALL_OPS = UNARY_OPS | BINARY_OPS | SCALAR_UNARY_OPS
 
-# Output dtype tags propagated from FakeTensor metadata into Store and leaves.
-# Kept as strings (not torch.dtype) so the IR is JSON-serialisable.
+# Strings (not torch.dtype) so the IR is JSON-serialisable.
 DTYPES = frozenset({"bfloat16", "float16", "float32"})
 
-
-# ── Leaf nodes ────────────────────────────────────────────────────────────────
+# Hardware-native ALU compute types supported by the EVT epilogue.
+#
+# Floating-point: FP32, FP16, BF16 are full-speed on both H100 (sm_90) and
+# RTX 5090 (sm_120). FP64 is full-speed on H100 but extremely slow on 5090,
+# so we exclude it from the EVT path.
+#
+# Integer: INT64, INT32, INT16, INT8 are ALU-supported on both architectures,
+# but CUTLASS VisitorCompute / Sm90Compute templates are only instantiated
+# for floating-point types, so integer compute_dtype is not valid here.
+COMPUTE_DTYPES = frozenset({"bfloat16", "float16", "float32"})
 
 
 @dataclass(frozen=True)
@@ -78,11 +73,7 @@ class Accum:
 
 @dataclass(frozen=True)
 class RowBroadcast:
-    """1-D (N,) tensor broadcast along the M axis. Maps to VisitorRowBroadcast.
-
-    ``input_idx`` is the position of this tensor in the runtime ``extras`` list.
-    ``dtype`` is the storage dtype; the visitor casts to fp32 internally.
-    """
+    """1-D (N,) tensor broadcast along M. ``input_idx`` indexes the runtime extras list."""
 
     input_idx: int
     dtype: str
@@ -91,7 +82,7 @@ class RowBroadcast:
 
 @dataclass(frozen=True)
 class ColBroadcast:
-    """1-D (M,) tensor broadcast along the N axis. Maps to VisitorColBroadcast."""
+    """1-D (M,) tensor broadcast along N."""
 
     input_idx: int
     dtype: str
@@ -100,40 +91,34 @@ class ColBroadcast:
 
 @dataclass(frozen=True)
 class AuxLoad:
-    """2-D (M, N) row-major aux tensor. Maps to VisitorAuxLoad.
-
-    Caller must guarantee ``stride[1] == 1`` and that ``stride[0]`` is 16-byte
-    aligned (cp.async requirement).
-    """
+    """2-D (M, N) row-major aux tensor. stride[1] must be 1, stride[0] 16-byte aligned."""
 
     input_idx: int
     dtype: str
     kind: str = "aux_load"
 
 
-# ── Compute nodes ─────────────────────────────────────────────────────────────
-
-
 @dataclass(frozen=True)
 class Compute:
-    """An interior fp32 elementwise op.
+    """An interior elementwise op over EVT subtrees.
 
-    Children are EVT subtrees (any of the leaf or compute types).
-    For SCALAR_UNARY_OPS, ``children`` has length 1 and ``scalar`` carries the
-    baked constant.
-    For UNARY_OPS, ``children`` has length 1, ``scalar`` is None.
-    For BINARY_OPS, ``children`` has length 2, ``scalar`` is None.
+    ``compute_dtype`` controls the precision of this node's VisitorCompute /
+    Sm90Compute template instantiation. Defaults to ``"float32"`` (the GEMM
+    accumulator's native precision). A preceding ``to(bf16)`` in the FX
+    chain sets it to ``"bfloat16"`` so the kernel runs that op in bf16.
     """
 
     op: str
     children: tuple
     scalar: Optional[float] = None
+    compute_dtype: str = "float32"
     kind: str = "compute"
 
     def __post_init__(self):
-        # Validate at construction time so codegen never sees a malformed IR.
         if self.op not in ALL_OPS:
             raise ValueError(f"Unknown EVT op: {self.op!r}")
+        if self.compute_dtype not in COMPUTE_DTYPES:
+            raise ValueError(f"Unsupported compute_dtype {self.compute_dtype!r} for EVT. " f"Valid: {sorted(COMPUTE_DTYPES)}")
         if self.op in UNARY_OPS:
             if len(self.children) != 1 or self.scalar is not None:
                 raise ValueError(f"UNARY op {self.op!r} requires 1 child, no scalar")
@@ -158,20 +143,11 @@ class Store:
             raise ValueError(f"Unknown out_dtype {self.out_dtype!r}")
 
 
-# Union type alias for type hints.
 IRNode = Union[Accum, RowBroadcast, ColBroadcast, AuxLoad, Compute, Store]
 
 
-# ── Canonicalisation + serialisation ──────────────────────────────────────────
-
-
 def to_dict(node) -> dict:
-    """Recursively convert an IR node tree into a JSON-friendly dict.
-
-    The dict layout is designed for stable hashing: keys appear in a fixed
-    order and floats are formatted with ``repr`` so 1.702 vs 1.7020000001
-    never collide.
-    """
+    """Recursively convert an IR tree into a JSON-friendly dict for stable hashing."""
     if isinstance(node, Accum):
         return {"kind": "accum"}
     if isinstance(node, RowBroadcast):
@@ -183,9 +159,9 @@ def to_dict(node) -> dict:
     if isinstance(node, Compute):
         d = {"kind": "compute", "op": node.op, "children": [to_dict(c) for c in node.children]}
         if node.scalar is not None:
-            # repr of a float is round-trip-safe; explicitly stringify so JSON
-            # never serialises 1.7000000000000002.
             d["scalar"] = repr(float(node.scalar))
+        if node.compute_dtype != "float32":
+            d["compute_dtype"] = node.compute_dtype
         return d
     if isinstance(node, Store):
         return {"kind": "store", "out_dtype": node.out_dtype, "child": to_dict(node.child)}
@@ -204,12 +180,8 @@ def cache_key(node, a_dtype: str, b_dtype: str) -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
-# ── Tree walkers ──────────────────────────────────────────────────────────────
-
-
 def walk_leaves(node) -> List:
-    """Return all leaf nodes (Accum / RowBroadcast / ColBroadcast / AuxLoad)
-    in left-to-right pre-order. Used by codegen to enumerate kernel inputs."""
+    """Return all leaf nodes in left-to-right pre-order."""
     out: list = []
 
     def _go(n):
@@ -228,11 +200,7 @@ def walk_leaves(node) -> List:
 
 
 def is_trivial(node) -> bool:
-    """An IR is trivial when ``Store(Accum)`` — no compute on the accumulator.
-
-    Trivial IRs would replace cuBLAS with a more expensive kernel for no
-    benefit, so the FX pass should refuse to emit them.
-    """
+    """Store(Accum) — no compute; FX pass should refuse to emit these."""
     return isinstance(node, Store) and isinstance(node.child, Accum)
 
 

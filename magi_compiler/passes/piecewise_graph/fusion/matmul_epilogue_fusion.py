@@ -47,9 +47,8 @@ from .evt_ir import Accum, AuxLoad, ColBroadcast, Compute, RowBroadcast, Store, 
 # Pure passthrough — no value or dtype change; alias the same IR node.
 _PASSTHROUGH_OPS = frozenset({torch.ops.aten.clone.default, torch.ops.aten.contiguous.default, torch.ops.aten.alias.default})
 
-# Dtype-conversion ops; the EVT compute is always fp32 internally so these are
-# absorbed as no-ops as long as the start/end of the chain reach the same final
-# precision (we capture that via the Store node's out_dtype).
+# Dtype-conversion ops update current_compute_dtype so downstream Compute nodes
+# use the target precision (e.g. to(bf16) → subsequent ops run in bf16).
 _TYPE_CONV_OPS = frozenset({torch.ops.prims.convert_element_type.default, torch.ops.aten._to_copy.default})
 
 # Unary ops with a direct EVT IR equivalent.
@@ -68,7 +67,6 @@ _UNARY_OPS = {
     torch.ops.aten.abs.default: "abs",
 }
 
-# Binary tensor ops.
 _BINARY_OPS = {
     torch.ops.aten.add.Tensor: "add",
     torch.ops.aten.sub.Tensor: "sub",
@@ -224,11 +222,6 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
     """
 
     def __init__(self, allow_extras: bool = True) -> None:
-        # Enable on sm_90 (H100 Sm90EVT path) OR sm_120+ (consumer Blackwell
-        # Sm80EVT path). The earlier "≥12 only" condition predated the SM90
-        # codegen and now leaves it as dead code on H100 even though
-        # evt_runtime wires it in. ``can_render`` plus the SM90-specific
-        # gates in ``_try_fuse_evt`` provide the real safety net.
         major = device_capability_major()
         self._enabled = major == 9 or major >= 12
         self.allow_extras = allow_extras
@@ -274,19 +267,12 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         if _largest_pow2_align_bits(K, a_dtype) is None:
             return False
 
-        # node_to_ir: each fused fx.Node → its IR subtree. mm_node maps to Accum.
         node_to_ir: dict = {mm_node: Accum()}
-        # In-order list of fused fx nodes (for erase + escape detection).
         fused_nodes: List[fx.Node] = [mm_node]
-        # Walked-and-removed nodes including type-conv/passthrough that don't
-        # appear in node_to_ir as new IR nodes (they alias their input).
         walk_seen: List[fx.Node] = [mm_node]
-        # External tensors injected as RowBroadcast/ColBroadcast/AuxLoad leaves.
-        # extras_nodes[i] is the fx.Node passed at runtime as extras[i].
         extras_nodes: List[fx.Node] = []
-        # Tracks whether the IR has any swiglu7-style slice. If so we abort
-        # generic EVT and try the swiglu7 matcher instead.
         saw_slice = False
+        current_compute_dtype = "float32"
 
         last_node = mm_node
         last_ir = node_to_ir[mm_node]
@@ -301,7 +287,6 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
 
             target = curr.target
 
-            # ── Pass-through (clone / contiguous / alias) ─────────────────────
             if target in _PASSTHROUGH_OPS:
                 node_to_ir[curr] = node_to_ir[curr.args[0]]
                 walk_seen.append(curr)
@@ -310,8 +295,10 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
                 curr = curr.next
                 continue
 
-            # ── Type conversion (no-op in fp32 EVT) ───────────────────────────
             if target in _TYPE_CONV_OPS:
+                target_dtype = _val_dtype(curr)
+                if target_dtype is not None and target_dtype in _DTYPE_TO_STR:
+                    current_compute_dtype = _DTYPE_TO_STR[target_dtype]
                 node_to_ir[curr] = node_to_ir[curr.args[0]]
                 walk_seen.append(curr)
                 last_node = curr
@@ -319,7 +306,6 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
                 curr = curr.next
                 continue
 
-            # ── Pure view ops (only if shape unchanged) ───────────────────────
             if target in (torch.ops.aten.view.default, torch.ops.aten.reshape.default, torch.ops.aten._unsafe_view.default):
                 in_shape = _val_shape(curr.args[0])
                 out_shape = _val_shape(curr)
@@ -332,18 +318,16 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
                     continue
                 break
 
-            # ── Slice stride-2 (swiglu marker) ────────────────────────────────
             if target is torch.ops.aten.slice.Tensor:
                 step = curr.args[4] if len(curr.args) > 4 else curr.kwargs.get("step", 1)
                 if step == 2:
                     saw_slice = True
                 break
 
-            # ── Unary ops ─────────────────────────────────────────────────────
             if target in _UNARY_OPS:
                 op_name = _UNARY_OPS[target]
                 child_ir = node_to_ir[curr.args[0]]
-                ir = Compute(op_name, (child_ir,))
+                ir = Compute(op_name, (child_ir,), compute_dtype=current_compute_dtype)
                 node_to_ir[curr] = ir
                 fused_nodes.append(curr)
                 walk_seen.append(curr)
@@ -352,12 +336,11 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
                 curr = curr.next
                 continue
 
-            # ── GELU (default = erf, alternative = tanh) ──────────────────────
             if target is torch.ops.aten.gelu.default:
                 approx = curr.kwargs.get("approximate", "none")
                 op_name = "gelu_tanh" if approx == "tanh" else "gelu_erf"
                 child_ir = node_to_ir[curr.args[0]]
-                ir = Compute(op_name, (child_ir,))
+                ir = Compute(op_name, (child_ir,), compute_dtype=current_compute_dtype)
                 node_to_ir[curr] = ir
                 fused_nodes.append(curr)
                 walk_seen.append(curr)
@@ -366,14 +349,13 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
                 curr = curr.next
                 continue
 
-            # ── Scalar variants of add/sub/mul/div ────────────────────────────
             if target in _SCALAR_BINARY_TO_SCALAR_UNARY:
                 op_name = _SCALAR_BINARY_TO_SCALAR_UNARY[target]
                 child_ir = node_to_ir[curr.args[0]]
                 if not isinstance(curr.args[1], (int, float)):
                     break
                 scalar = float(curr.args[1])
-                ir = Compute(op_name, (child_ir,), scalar=scalar)
+                ir = Compute(op_name, (child_ir,), scalar=scalar, compute_dtype=current_compute_dtype)
                 node_to_ir[curr] = ir
                 fused_nodes.append(curr)
                 walk_seen.append(curr)
@@ -382,7 +364,6 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
                 curr = curr.next
                 continue
 
-            # ── Clamp family ──────────────────────────────────────────────────
             if target in (torch.ops.aten.clamp.default, torch.ops.aten.clamp_min.default, torch.ops.aten.clamp_max.default):
                 child_ir = node_to_ir[curr.args[0]]
                 if target is torch.ops.aten.clamp_min.default:
@@ -400,9 +381,9 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
                     break
                 ir_now = child_ir
                 if lo is not None:
-                    ir_now = Compute("clamp_min_c", (ir_now,), scalar=float(lo))
+                    ir_now = Compute("clamp_min_c", (ir_now,), scalar=float(lo), compute_dtype=current_compute_dtype)
                 if hi is not None:
-                    ir_now = Compute("clamp_max_c", (ir_now,), scalar=float(hi))
+                    ir_now = Compute("clamp_max_c", (ir_now,), scalar=float(hi), compute_dtype=current_compute_dtype)
                 node_to_ir[curr] = ir_now
                 fused_nodes.append(curr)
                 walk_seen.append(curr)
@@ -411,14 +392,13 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
                 curr = curr.next
                 continue
 
-            # ── pow.Tensor_Scalar — only the small-int special-cases ──────────
             if target is torch.ops.aten.pow.Tensor_Scalar:
                 exp = curr.args[1] if len(curr.args) > 1 else None
                 child_ir = node_to_ir[curr.args[0]]
                 if exp == 2 or exp == 2.0:
-                    ir = Compute("square", (child_ir,))
+                    ir = Compute("square", (child_ir,), compute_dtype=current_compute_dtype)
                 elif isinstance(exp, (int, float)):
-                    ir = Compute("pow_scalar", (child_ir,), scalar=float(exp))
+                    ir = Compute("pow_scalar", (child_ir,), scalar=float(exp), compute_dtype=current_compute_dtype)
                 else:
                     break
                 node_to_ir[curr] = ir
@@ -429,7 +409,6 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
                 curr = curr.next
                 continue
 
-            # ── Binary tensor ops ─────────────────────────────────────────────
             if target in _BINARY_OPS:
                 op_name = _BINARY_OPS[target]
                 lhs_raw = curr.args[0]
@@ -441,7 +420,7 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
                     )
                     if scalar_op is None:
                         break
-                    ir = Compute(scalar_op, (node_to_ir[lhs_raw],), scalar=float(rhs_raw))
+                    ir = Compute(scalar_op, (node_to_ir[lhs_raw],), scalar=float(rhs_raw), compute_dtype=current_compute_dtype)
                     node_to_ir[curr] = ir
                     fused_nodes.append(curr)
                     walk_seen.append(curr)
@@ -453,9 +432,13 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
                 if isinstance(lhs_raw, (int, float)) and isinstance(rhs_raw, fx.Node) and rhs_raw in node_to_ir:
                     if op_name in ("add", "mul"):
                         scalar_op = "add_scalar" if op_name == "add" else "mul_scalar"
-                        ir = Compute(scalar_op, (node_to_ir[rhs_raw],), scalar=float(lhs_raw))
+                        ir = Compute(
+                            scalar_op, (node_to_ir[rhs_raw],), scalar=float(lhs_raw), compute_dtype=current_compute_dtype
+                        )
                     elif op_name == "sub":
-                        ir = Compute("rsub_scalar", (node_to_ir[rhs_raw],), scalar=float(lhs_raw))
+                        ir = Compute(
+                            "rsub_scalar", (node_to_ir[rhs_raw],), scalar=float(lhs_raw), compute_dtype=current_compute_dtype
+                        )
                     else:
                         break
                     node_to_ir[curr] = ir
@@ -470,7 +453,7 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
                 rhs_ir = self._ir_for_arg(rhs_raw, node_to_ir, extras_nodes, A, B)
                 if lhs_ir is None or rhs_ir is None:
                     break
-                ir = Compute(op_name, (lhs_ir, rhs_ir))
+                ir = Compute(op_name, (lhs_ir, rhs_ir), compute_dtype=current_compute_dtype)
                 node_to_ir[curr] = ir
                 fused_nodes.append(curr)
                 walk_seen.append(curr)
@@ -479,7 +462,6 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
                 curr = curr.next
                 continue
 
-            # Unsupported op — stop greedy walk.
             break
 
         # If we saw a stride-2 slice and the chain is plausibly swiglu7, try
@@ -487,23 +469,12 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         if saw_slice:
             return self._try_fuse_swiglu7(graph, mm_node)
 
-        # Verify we made progress.
         if last_ir is node_to_ir[mm_node]:
-            return False  # only Accum — replacing cuBLAS with EVT is no win
+            return False
 
-        # Refuse if any escape: an intermediate fused node is consumed outside
-        # the fused region. (EVT has no "extra outputs"; the user explicitly
-        # opted out of cross-domain fan-out.)
-        #
-        # The exclusion ``n is not last_node`` is intentional — the last node
-        # in the fused chain becomes the EVT op's output and is allowed to
-        # have downstream consumers (that's the whole point of fusion).
-        # Earlier writes ([:-1] explicitly skips the last position) must not
-        # have any external user, otherwise the fused chain would silently
-        # drop their value. This previously read ``walk_seen[:-0]`` which is
-        # ``walk_seen[:0]`` (an empty slice!) so escape detection was a no-op
-        # and trivially-fusable chains like ``mm → add(residual) → square``
-        # were emitted even when ``add(residual)`` was reused downstream.
+        # Refuse if any intermediate is consumed outside the fused region.
+        # walk_seen[:-1] excludes the last node (which becomes the output).
+        # NB: was previously walk_seen[:-0] (== empty slice) — a no-op bug.
         fused_set = set(fused_nodes) | set(walk_seen)
         for n in walk_seen[:-1]:
             for u in n.users:
@@ -521,28 +492,16 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         if b_layout is None:
             return False
 
-        # Path-specific B-side alignment gate. evt_row: B is (K, N) row-major,
-        # ldB = N — must divide AlignmentB. We greedy-pick (128 → 64 bits) at
-        # runtime, so the FX gate only refuses N not even 64-bit-aligned.
-        # evt_col: B is (N, K) row-major (read as (K, N) col-major), ldB = K,
-        # already covered by the entry K-gate. D's N stays unconstrained —
-        # runtime pads.
+        # evt_row: ldB=N must be at least 64-bit aligned; evt_col: ldB=K already checked.
         if b_layout == "row":
             if _largest_pow2_align_bits(n_dim, b_dtype) is None:
                 return False
 
-        # Determine output dtype from the last fused node's FakeTensor metadata.
         out_dt = _val_dtype(last_node) or torch.bfloat16
         if out_dt not in _DTYPE_TO_STR:
             return False
 
-        # Output-side (D) alignment gate. The runtime allocates D as
-        # (M, n_pad) where n_pad = _aligned_n_stride(n_out, out_dt) and the
-        # CUTLASS AlignmentC is greedy-picked from that ldd at compile time
-        # (128 → 64 bits). The FX gate only refuses if even the smallest
-        # candidate (64 bits) can't divide n_pad — that catches future
-        # configurations where the host padding is reduced or disabled.
-        # SymInt n_dim defers to the runtime gate (returns the small candidate).
+        # Verify padded D stride satisfies at least 64-bit AlignmentC.
         if _is_static_int(n_dim):
             n_pad_static = evt_runtime._aligned_n_stride(int(n_dim), out_dt)
             if _largest_pow2_align_bits(n_pad_static, out_dt) is None:
@@ -555,13 +514,8 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         if not self.allow_extras and num_extras(ir_root) > 0:
             return False
 
-        # SM90 (H100) uses a CUTLASS 3.x EVT codegen that has slightly tighter
-        # constraints than the SM80 path — most notably it supports at most
-        # one AuxLoad (the C-operand TMA path is the only aux load CUTLASS
-        # 3.x's standard CollectiveBuilder exposes). If this IR isn't
-        # renderable on sm_90 we'd rather have torch.compile lower the chain
-        # than fall back to SM80-on-Hopper, which runs ~2× slower than cuBLAS
-        # in backward-compat mode.
+        # SM90 has tighter constraints (at most one AuxLoad); reject
+        # unrenderable IRs here rather than fall back to SM80-on-Hopper (~2× slower).
         if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
             from .sm90.evt_codegen import can_render as _sm90_can_render
 
@@ -578,10 +532,7 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
                 torch.ops.magi_epilogue.matmul_custom_evt.default,
                 args=(A, b_underlying, extras_nodes, ir_json, kind, n_out, out_dt_id),
             )
-        # Propagate FakeTensor meta with 128-bit-aligned row stride matching
-        # what the CUDA impl actually returns. Narrow the exception to the
-        # int(SymInt) cast for dynamic-N graphs — meta propagation is best-
-        # effort there; the runtime still returns a correct strided tensor.
+        # Propagate FakeTensor meta with padded row stride matching the CUDA impl.
         val_last = last_node.meta.get("val")
         if val_last is not None:
             try:
@@ -598,8 +549,7 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         return True
 
     def _ir_for_arg(self, arg, node_to_ir, extras_nodes, A_node, B_node):
-        """Return an IR subtree for a binary-op operand. Internal → IR; external
-        → leaf (RowBroadcast / ColBroadcast / AuxLoad). None ⇒ abort."""
+        """Classify operand: internal → existing IR; external → leaf node; None ⇒ abort."""
         if not isinstance(arg, fx.Node):
             return None
         if arg in node_to_ir:
@@ -677,9 +627,7 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         weight tensor of shape (N, K) — typically the predecessor of an
         ``aten.t`` node feeding the mm.
         """
-        # Recover the underlying weight: B should be a 2-D transpose
-        # (aten.t / transpose(0,1) / permute([1,0])) of a contiguous (N, K)
-        # weight. Otherwise bail (no two-stage fallback).
+        # B must be a 2-D transpose of a contiguous (N, K) weight.
         B_node = mm_node.args[1]
         if not isinstance(B_node, fx.Node) or not _is_transpose_node(B_node):
             return False
@@ -691,12 +639,7 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         if w_shape is None or len(w_shape) != 2 or w_stride is None:
             return False
         N, K = w_shape
-        # N must be even (gate/linear interleaved split). The output
-        # n_out = N // 2 is padded by the runtime to AlignmentC, so no
-        # further N divisibility is needed. K-side alignment is the same
-        # greedy 128 → 64 bit gate as the EVT path: the vendored .cu now
-        # accepts AlignmentA / AlignmentB via -D macros (see
-        # ``_compile_swiglu7_dual``), so K only needs to divide 64 bits.
+        # N must be even (gate/linear interleaved split).
         if not (_is_static_int(N) and N % 2 == 0):
             return False
         if w_stride != (K, 1):
@@ -706,26 +649,13 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
             return False
         if _largest_pow2_align_bits(K, a_dtype) is None:
             return False
-        # SM90 (H100) swiglu7 path uses Sm90DualGemm with TMA — TMA requires
-        # the innermost stride **in bytes** to be a multiple of 16. For A's
-        # K-contiguous load that means K * sizeof(elem) % 16 == 0. CUTLASS
-        # encodes this in sm90_dual_gemm.h's can_implement as
-        #   constexpr int min_k_align = 128 / cutlass::sizeof_bits<ElementA>;
-        #   if (problem_size.k() % min_k_align != 0) return kErrorInvalidProblem;
-        # which is the same condition expressed in elements. Express it in
-        # bytes here so future fp8 / fp32 swiglu7 paths inherit the gate
-        # without a one-line dtype fix. On sm_120 / Ada the SM80 multistage
-        # path supports 64-bit alignment, so this gate only fires on Hopper.
+        # SM90 TMA requires K * sizeof(elem) % 16 == 0; SM80 path is more lenient.
         if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
             elem_bytes = a_dtype.itemsize
             if _is_static_int(K) and (int(K) * elem_bytes) % 16 != 0:
                 return False
 
-        # We walk the chain in source order and collect every node belonging to
-        # the swiglu7 epilogue — anything else aborts. We don't need to verify
-        # the exact structure (the kernel does that intrinsically); we just need
-        # to find the final tensor that becomes the chain's only output, plus
-        # the set of nodes to erase.
+        # Collect all swiglu7 epilogue nodes; the kernel validates the exact structure.
         chain_nodes: List[fx.Node] = []
         chain_set: set = {mm_node}
         last_chain_node: Optional[fx.Node] = None
@@ -754,10 +684,6 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
                 torch.ops.aten.reshape.default,
                 torch.ops.aten._unsafe_view.default,
             ):
-                # Non-whitelist op consuming the chain → it's the boundary.
-                # Finalise last_chain_node as the previous node and stop.
-                # The output-shape check below verifies we actually saw the
-                # swiglu7 pattern (chain output's last dim must equal N//2).
                 break
             chain_nodes.append(curr)
             chain_set.add(curr)
@@ -766,7 +692,6 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
 
         if last_chain_node is None:
             return False
-        # Output dtype from the final node.
         out_dt = _val_dtype(last_chain_node) or torch.bfloat16
         out_shape = _val_shape(last_chain_node)
         if out_shape is None or len(out_shape) != 2:
@@ -775,23 +700,15 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
             # The swiglu7 output's last dim must be N/2.
             return False
 
-        # Output-side (D) alignment gate. Same logic as the EVT path —
-        # require that the host-padded ldd satisfies at least the 64-bit
-        # AlignmentC fallback (it always does under the current cache-line
-        # padding, but the gate future-proofs against a smaller-pad mode).
         n_pad_static = evt_runtime._aligned_n_stride(int(N) // 2, out_dt)
         if _largest_pow2_align_bits(n_pad_static, out_dt) is None:
             return False
 
-        # No escape: every chain node's external uses must funnel through the
-        # final node (otherwise the DualGemm kernel produces only D and we'd
-        # lose the intermediate consumer).
         for n in chain_nodes[:-1]:
             for u in n.users:
                 if u not in chain_set:
                     return False
 
-        # Emit the call. We do NOT pass IR JSON — the swiglu7 path ignores it.
         out_dt_id = evt_runtime.out_dtype_id(out_dt)
         n_out = N // 2
         with graph.inserting_after(last_chain_node):

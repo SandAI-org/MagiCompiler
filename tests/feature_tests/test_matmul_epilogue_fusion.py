@@ -123,11 +123,14 @@ class _FusionStats:
         # Tests assert against this to catch silent dtype regressions in the
         # FX pass's last-node meta lookup or codegen's ElementC typedef.
         self.out_dtype_ids: list = []
+        # ir_json strings (args[3]) of each emitted op. Used to verify
+        # per-node compute_dtype propagation through the walker.
+        self.ir_jsons: list = []
 
 
 def _install_pass_instrument():
     """Returns (stats, restore_fn). Wraps the FX pass to record per-call deltas."""
-    from magi_compiler.passes.piecewise_graph.fusion.cutlass_fusion import matmul_epilogue_fusion as P
+    from magi_compiler.passes.piecewise_graph.fusion import matmul_epilogue_fusion as P
 
     stats = _FusionStats()
     original = P.MatmulEvtEpilogueFusionPass.__call__
@@ -140,9 +143,12 @@ def _install_pass_instrument():
         after = sum(1 for n in graph.nodes if n.op == "call_function" and n.target in mm_targets)
         emitted_kinds = []
         emitted_out_dtype_ids = []
+        emitted_ir_jsons = []
         for n in graph.nodes:
             if n.op == "call_function" and n.target is evt_op:
                 # signature: (A, B, extras, ir_json, kind, n_out, out_dtype_id)
+                if len(n.args) >= 4:
+                    emitted_ir_jsons.append(n.args[3])
                 if len(n.args) >= 5:
                     emitted_kinds.append(n.args[4])
                 if len(n.args) >= 7:
@@ -152,6 +158,7 @@ def _install_pass_instrument():
         stats.fused_count += len(emitted_kinds)
         stats.kinds.extend(emitted_kinds)
         stats.out_dtype_ids.extend(emitted_out_dtype_ids)
+        stats.ir_jsons.extend(emitted_ir_jsons)
         return result
 
     P.MatmulEvtEpilogueFusionPass.__call__ = _instrumented
@@ -265,7 +272,7 @@ def _compile_and_check(
             f"Expected emitted kinds {sorted(expect_kinds)}, " f"got {sorted(stats.kinds)}"
         )
     if expect_out_dtype is not None:
-        from magi_compiler.passes.piecewise_graph.fusion.cutlass_fusion.evt_runtime import out_dtype_from_id
+        from magi_compiler.passes.piecewise_graph.fusion.evt_runtime import out_dtype_from_id
 
         assert stats.out_dtype_ids, (
             f"expect_out_dtype={expect_out_dtype} but no fusion fired " f"(out_dtype_ids list is empty)"
@@ -580,13 +587,7 @@ def test_evt_no_fuse_swiglu7_n_not_mult_of_8():
 def test_evt_ir_canonical_determinism():
     """Same IR built twice → identical canonical JSON. If this regresses, the
     .cu module disk cache silently misses and recompiles every run."""
-    from magi_compiler.passes.piecewise_graph.fusion.cutlass_fusion.evt_ir import (
-        Accum,
-        Compute,
-        Store,
-        cache_key,
-        to_canonical_json,
-    )
+    from magi_compiler.passes.piecewise_graph.fusion.evt_ir import Accum, Compute, Store, cache_key, to_canonical_json
 
     a = Store(Compute("silu", (Compute("add", (Accum(), Accum())),)), "bfloat16")
     b = Store(Compute("silu", (Compute("add", (Accum(), Accum())),)), "bfloat16")
@@ -898,8 +899,8 @@ def test_can_render_accepts_multi_aux():
     """SM90 ``can_render`` accepts IR trees with multiple AuxLoad nodes
     (one per distinct input_idx). This is the constraint we relaxed.
     """
-    from magi_compiler.passes.piecewise_graph.fusion.cutlass_fusion.evt_ir import Accum, AuxLoad, Compute, Store
-    from magi_compiler.passes.piecewise_graph.fusion.cutlass_fusion.sm90.evt_codegen import can_render
+    from magi_compiler.passes.piecewise_graph.fusion.evt_ir import Accum, AuxLoad, Compute, Store
+    from magi_compiler.passes.piecewise_graph.fusion.sm90.evt_codegen import can_render
 
     # D = (acc + R1) + R2
     ir = Store(
@@ -944,8 +945,8 @@ def test_can_render_rejects_repeated_aux_idx():
     keyed by input_idx and would clash. FX pass falls back to Inductor lower
     for such cases.
     """
-    from magi_compiler.passes.piecewise_graph.fusion.cutlass_fusion.evt_ir import Accum, AuxLoad, Compute, Store
-    from magi_compiler.passes.piecewise_graph.fusion.cutlass_fusion.sm90.evt_codegen import can_render
+    from magi_compiler.passes.piecewise_graph.fusion.evt_ir import Accum, AuxLoad, Compute, Store
+    from magi_compiler.passes.piecewise_graph.fusion.sm90.evt_codegen import can_render
 
     # D = (acc * gate) + gate  — same AuxLoad(input_idx=0) appears twice.
     ir_dup = Store(
@@ -959,6 +960,313 @@ def test_can_render_rejects_repeated_aux_idx():
         out_dtype="bfloat16",
     )
     assert can_render(ir_dup) is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-node compute_dtype — verify the IR, walker, codegen, and end-to-end
+# behaviour when type-conversion ops (to(fp32), to(bf16)) change the compute
+# precision of subsequent fused ops.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_evt_ir_compute_dtype_roundtrip():
+    """Compute with non-default compute_dtype serialises and round-trips."""
+    import json
+
+    from magi_compiler.passes.piecewise_graph.fusion.evt_ir import Accum, Compute, Store, to_canonical_json
+    from magi_compiler.passes.piecewise_graph.fusion.evt_runtime import _ir_from_json
+
+    # bf16 compute_dtype → must appear in JSON
+    ir_bf16 = Store(Compute("silu", (Accum(),), compute_dtype="bfloat16"), "bfloat16")
+    j_bf16 = to_canonical_json(ir_bf16)
+    parsed = json.loads(j_bf16)
+    assert parsed["child"]["compute_dtype"] == "bfloat16"
+
+    # Default fp32 → must NOT appear in JSON (backward compat)
+    ir_default = Store(Compute("silu", (Accum(),)), "bfloat16")
+    j_default = to_canonical_json(ir_default)
+    assert "compute_dtype" not in j_default
+
+    # Round-trip: bf16 survives
+    restored = _ir_from_json(j_bf16)
+    assert restored.child.compute_dtype == "bfloat16"
+
+    # Round-trip: old JSON without compute_dtype → defaults to fp32
+    restored_default = _ir_from_json(j_default)
+    assert restored_default.child.compute_dtype == "float32"
+
+    # Mixed chain: two Compute nodes with different compute_dtype
+    ir_mixed = Store(
+        Compute(
+            "add",
+            (Compute("silu", (Accum(),), compute_dtype="float32"), Compute("neg", (Accum(),), compute_dtype="bfloat16")),
+            compute_dtype="bfloat16",
+        ),
+        "bfloat16",
+    )
+    j_mixed = to_canonical_json(ir_mixed)
+    p = json.loads(j_mixed)
+    # root add → bfloat16
+    assert p["child"]["compute_dtype"] == "bfloat16"
+    # silu child → float32 (default, NOT in JSON)
+    silu_child = p["child"]["children"][0]
+    assert "compute_dtype" not in silu_child
+    # neg child → bfloat16
+    neg_child = p["child"]["children"][1]
+    assert neg_child["compute_dtype"] == "bfloat16"
+
+
+def test_evt_ir_compute_dtype_cache_key_differs():
+    """Same op tree with different compute_dtype MUST produce different cache keys."""
+    from magi_compiler.passes.piecewise_graph.fusion.evt_ir import Accum, Compute, Store, to_canonical_json
+
+    ir_fp32 = Store(Compute("silu", (Accum(),), compute_dtype="float32"), "bfloat16")
+    ir_bf16 = Store(Compute("silu", (Accum(),), compute_dtype="bfloat16"), "bfloat16")
+    assert to_canonical_json(ir_fp32) != to_canonical_json(ir_bf16)
+
+
+def test_evt_ir_compute_dtype_valid_types():
+    """All hardware-supported floating-point ALU types are accepted as compute_dtype.
+
+    H100 (sm_90) and RTX 5090 (sm_120) natively support FP32, FP16, BF16 at
+    full ALU speed. FP64 is full-speed on H100 but extremely slow on 5090;
+    INT64/32/16/8 are ALU-supported but CUTLASS VisitorCompute only templates
+    over floating-point. The EVT path therefore restricts compute_dtype to
+    {float32, float16, bfloat16}.
+    """
+    from magi_compiler.passes.piecewise_graph.fusion.evt_ir import Accum, Compute
+
+    # These must all succeed without raising.
+    for dt in ("float32", "float16", "bfloat16"):
+        node = Compute("silu", (Accum(),), compute_dtype=dt)
+        assert node.compute_dtype == dt
+
+
+def test_evt_ir_compute_dtype_rejects_unsupported():
+    """compute_dtype values outside the CUTLASS-supported set must raise.
+
+    FP64: full-speed on H100 but too slow on 5090 to be useful in epilogues.
+    INT types (int8/16/32/64): hardware ALU supports them but CUTLASS
+    VisitorCompute / Sm90Compute are floating-point-only templates.
+    """
+    from magi_compiler.passes.piecewise_graph.fusion.evt_ir import Accum, Compute
+
+    for bad_dt in ("float64", "int8", "int16", "int32", "int64"):
+        with pytest.raises(ValueError, match="Unsupported compute_dtype"):
+            Compute("silu", (Accum(),), compute_dtype=bad_dt)
+
+
+def test_evt_codegen_sm80_per_node_compute_dtype():
+    """SM80 codegen emits per-node element types in VisitorCompute."""
+    from magi_compiler.passes.piecewise_graph.fusion.evt_ir import Accum, Compute, Store
+    from magi_compiler.passes.piecewise_graph.fusion.sm80.evt_codegen import render_evt_cu
+
+    ir = Store(
+        Compute(
+            "add",
+            (Compute("silu", (Accum(),), compute_dtype="float32"), Compute("neg", (Accum(),), compute_dtype="bfloat16")),
+            compute_dtype="bfloat16",
+        ),
+        "bfloat16",
+    )
+    src = render_evt_cu(ir, "bfloat16", "bfloat16")
+
+    # The silu node should use float, float (default)
+    assert "VisitorCompute<" in src
+    # The neg and add nodes should use cutlass::bfloat16_t
+    assert "cutlass::bfloat16_t, cutlass::bfloat16_t" in src
+    # The silu node should use float, float
+    assert "float, float" in src
+
+
+def test_evt_codegen_sm90_per_node_compute_dtype():
+    """SM90 codegen emits per-node element types in Sm90Compute."""
+    from magi_compiler.passes.piecewise_graph.fusion.evt_ir import Accum, Compute, Store
+    from magi_compiler.passes.piecewise_graph.fusion.sm90.evt_codegen import can_render, render_evt_cu
+
+    ir = Store(
+        Compute(
+            "add",
+            (Compute("silu", (Accum(),), compute_dtype="float32"), Compute("neg", (Accum(),), compute_dtype="bfloat16")),
+            compute_dtype="bfloat16",
+        ),
+        "bfloat16",
+    )
+    assert can_render(ir) is True
+    src = render_evt_cu(ir, "bfloat16", "bfloat16")
+
+    assert "Sm90Compute<" in src
+    # bfloat16_t appears in at least one Sm90Compute (neg and add nodes)
+    assert "cutlass::bfloat16_t, cutlass::bfloat16_t" in src
+    # float appears in at least one Sm90Compute (silu node)
+    assert "float, float" in src
+
+
+def _parse_ir_compute_dtypes(ir_json_str: str) -> list:
+    """Extract all compute_dtype values from Compute nodes in an IR JSON string."""
+    import json
+
+    dtypes = []
+
+    def _walk(d):
+        if not isinstance(d, dict):
+            return
+        if d.get("kind") == "compute":
+            dtypes.append(d.get("compute_dtype", "float32"))
+            for c in d.get("children", []):
+                _walk(c)
+        elif d.get("kind") == "store":
+            _walk(d.get("child"))
+
+    _walk(json.loads(ir_json_str))
+    return dtypes
+
+
+@_SM120_ONLY
+def test_evt_mixed_compute_dtype_chain():
+    """mm → to(fp32) → silu → to(bf16) → add_scalar(0.5).
+
+    silu must have compute_dtype=float32 (fp32 region).
+    add_scalar must have compute_dtype=bfloat16 (bf16 region after cast).
+    Verifies: (1) fusion fires, (2) IR carries correct per-node dtypes,
+    (3) numerical result matches eager.
+    """
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(_N, _K))
+
+        def forward(self, a):
+            y = torch.mm(a, self.weight.permute(1, 0))
+            y = y.float()
+            y = F.silu(y)
+            y = y.bfloat16()
+            y = y + 0.5
+            return y
+
+    model = M().cuda().bfloat16()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    a = _input_a()
+
+    with torch.no_grad():
+        expected = model(a)
+
+    get_compile_config().disable_cache = True
+    stats, restore = _install_pass_instrument()
+    try:
+        compiled = magi_compile(model, dynamic_arg_dims={"a": 0})
+        with torch.no_grad():
+            actual = compiled(a)
+    finally:
+        restore()
+
+    # Numerical check
+    diff = (actual.float() - expected.float()).abs().max().item()
+    assert diff <= 1.5, f"Mixed compute_dtype chain max|diff|={diff}"
+
+    # Fusion must have fired
+    assert stats.fused_count == 1, f"Expected 1 fusion, got {stats.fused_count}"
+
+    # Verify per-node compute_dtype in the emitted IR
+    assert len(stats.ir_jsons) == 1, f"Expected 1 ir_json, got {len(stats.ir_jsons)}"
+    compute_dtypes = _parse_ir_compute_dtypes(stats.ir_jsons[0])
+    assert "bfloat16" in compute_dtypes, f"Expected at least one bfloat16 compute_dtype in IR, " f"got {compute_dtypes}"
+    assert "float32" in compute_dtypes, f"Expected at least one float32 compute_dtype in IR, " f"got {compute_dtypes}"
+
+
+@_SM120_ONLY
+def test_evt_default_compute_dtype_stays_fp32():
+    """mm → silu (no explicit cast) → to(bf16).
+
+    Without an explicit to(fp32) or to(bf16) before the silu, the walker's
+    current_compute_dtype stays at its default "float32" (the GEMM accumulator
+    precision). The silu Compute node must have compute_dtype=float32.
+    """
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(_N, _K))
+
+        def forward(self, a):
+            y = torch.mm(a, self.weight.permute(1, 0))
+            return F.silu(y).to(torch.bfloat16)
+
+    model = M().cuda().bfloat16()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    a = _input_a()
+
+    with torch.no_grad():
+        expected = model(a)
+
+    get_compile_config().disable_cache = True
+    stats, restore = _install_pass_instrument()
+    try:
+        compiled = magi_compile(model, dynamic_arg_dims={"a": 0})
+        with torch.no_grad():
+            actual = compiled(a)
+    finally:
+        restore()
+
+    diff = (actual.float() - expected.float()).abs().max().item()
+    assert diff <= 0.5, f"Default fp32 compute_dtype chain max|diff|={diff}"
+    assert stats.fused_count == 1, f"Expected 1 fusion, got {stats.fused_count}"
+
+    # All Compute nodes should be float32 (default — no cast in chain)
+    assert len(stats.ir_jsons) == 1
+    compute_dtypes = _parse_ir_compute_dtypes(stats.ir_jsons[0])
+    assert all(dt == "float32" for dt in compute_dtypes), f"Expected all compute_dtype=float32 (no cast), got {compute_dtypes}"
+
+
+@_SM90_ONLY
+def test_evt_sm90_mixed_compute_dtype_chain():
+    """SM90 variant of the mixed compute_dtype chain test.
+
+    mm → to(fp32) → silu → to(bf16) → add_scalar(0.5).
+    Same assertions as the SM120 test but exercises the Sm90Compute codegen path.
+    """
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(_N, _K))
+
+        def forward(self, a):
+            y = torch.mm(a, self.weight.permute(1, 0))
+            y = y.float()
+            y = F.silu(y)
+            y = y.bfloat16()
+            y = y + 0.5
+            return y
+
+    model = M().cuda().bfloat16()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    a = _input_a()
+
+    with torch.no_grad():
+        expected = model(a)
+
+    get_compile_config().disable_cache = True
+    stats, restore = _install_pass_instrument()
+    try:
+        compiled = magi_compile(model, dynamic_arg_dims={"a": 0})
+        with torch.no_grad():
+            actual = compiled(a)
+    finally:
+        restore()
+
+    diff = (actual.float() - expected.float()).abs().max().item()
+    assert diff <= 1.5, f"SM90 mixed compute_dtype chain max|diff|={diff}"
+    assert stats.fused_count == 1, f"Expected 1 fusion, got {stats.fused_count}"
+
+    assert len(stats.ir_jsons) == 1
+    compute_dtypes = _parse_ir_compute_dtypes(stats.ir_jsons[0])
+    assert "bfloat16" in compute_dtypes, f"Expected at least one bfloat16 compute_dtype in IR, " f"got {compute_dtypes}"
+    assert "float32" in compute_dtypes, f"Expected at least one float32 compute_dtype in IR, " f"got {compute_dtypes}"
 
 
 if __name__ == "__main__":
