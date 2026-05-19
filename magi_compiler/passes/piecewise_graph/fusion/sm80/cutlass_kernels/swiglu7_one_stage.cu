@@ -146,6 +146,9 @@ struct Sw7Args {
   void* ptr_B;    // (N, K) row-major weight; gate/linear interleaved
   void* ptr_D;    // (M, N_out) — strided view of an (M, ldd) padded buffer
   int64_t ldd;    // D's row stride in elements; >= N_out, multiple of EpilogueVecCount
+  float alpha;    // silu_alpha scaling: x * sigmoid(alpha * x)
+  float limit;    // clamp bound: clamp(gate, max=limit), clamp(linear, -limit, limit)
+  float one;      // additive offset: (x_linear + one)
 };
 
 class Sw7Concept {
@@ -195,7 +198,8 @@ class Sw7Impl : public Sw7Concept {
 
     typename EpilogueOp0::Params epi0{ElementCompute(1.0f), ElementCompute(0.0f)};
     typename EpilogueOp1::Params epi1{ElementCompute(1.0f), ElementCompute(0.0f)};
-    typename EpilogueOp2::Params epi2{};
+    typename EpilogueOp2::Params epi2{
+        ElementCompute(a.alpha), ElementCompute(a.limit), ElementCompute(a.one)};
 
     cutlass::gemm::GemmCoord problem{M, N_out, K};
     typename GemmType::Arguments args(
@@ -279,7 +283,8 @@ class Sw7AutoTuneRunner {
     // (64,  256, 32)*3 = 108 KB > 96 — omitted.
   }
 
-  void operator()(at::Tensor A, at::Tensor B, at::Tensor D) {
+  void operator()(at::Tensor A, at::Tensor B, at::Tensor D,
+                  float alpha, float limit, float one) {
     TORCH_CHECK(A.is_cuda() && B.is_cuda() && D.is_cuda(),
                 "all inputs must be CUDA tensors");
     TORCH_CHECK(A.scalar_type() == at::kBFloat16 && B.scalar_type() == at::kBFloat16
@@ -318,6 +323,7 @@ class Sw7AutoTuneRunner {
     ea.ptr_B = B.data_ptr<at::BFloat16>();
     ea.ptr_D = D.data_ptr<at::BFloat16>();
     ea.ldd = static_cast<int64_t>(D.stride(0));
+    ea.alpha = alpha; ea.limit = limit; ea.one = one;
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.device().index()).stream();
 
@@ -405,8 +411,9 @@ static Sw7AutoTuneRunner& runner() {
   return R;
 }
 
-void swiglu7_dual_matmul_out(at::Tensor A, at::Tensor B, at::Tensor D) {
-  runner()(std::move(A), std::move(B), std::move(D));
+void swiglu7_dual_matmul_out(at::Tensor A, at::Tensor B, at::Tensor D,
+                             float alpha, float limit, float one) {
+  runner()(std::move(A), std::move(B), std::move(D), alpha, limit, one);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -417,6 +424,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "A:(M,K) bf16, B:(N,K) bf16 (N even), D:(M,N/2) bf16",
         pybind11::arg("A"),
         pybind11::arg("B"),
-        pybind11::arg("D"));
+        pybind11::arg("D"),
+        pybind11::arg("alpha") = 1.702f,
+        pybind11::arg("limit") = 7.0f,
+        pybind11::arg("one") = 1.0f);
   m.def("num_configs", []() { return runner().num_configs(); });
 }

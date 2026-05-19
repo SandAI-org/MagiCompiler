@@ -355,6 +355,112 @@ def test_evt_swiglu7_dispatches_to_dualgemm():
     _compile_and_check(model, (_input_a(),), atol=0.5, rtol=0.05, expect_fused=1, expect_kinds=["swiglu7_dual"])
 
 
+@_SM120_ONLY
+def test_evt_swiglu7_custom_constants():
+    """SwiGLU7 with non-default alpha/limit/one still fuses and computes correctly."""
+
+    def swiglu7_custom(x, out_dtype=None):
+        out_dtype = x.dtype if out_dtype is None else out_dtype
+        x = x.to(torch.float32)
+        x_glu, x_linear = x[..., ::2], x[..., 1::2]
+        x_glu = x_glu.clamp(max=5.0)
+        x_linear = x_linear.clamp(min=-5.0, max=5.0)
+        out_glu = x_glu * torch.sigmoid(2.0 * x_glu)
+        return (out_glu * (x_linear + 1)).to(out_dtype)
+
+    model = _Bf16MmModel(_K, _N, swiglu7_custom)
+    _compile_and_check(model, (_input_a(),), atol=0.5, rtol=0.05, expect_fused=1, expect_kinds=["swiglu7_dual"])
+
+
+@_SM120_ONLY
+def test_evt_swiglu7_constants_roundtrip_in_ir_json():
+    """Verify that swiglu7 constant values are captured in ir_json."""
+    import json as _json
+
+    def swiglu7_custom(x, out_dtype=None):
+        out_dtype = x.dtype if out_dtype is None else out_dtype
+        x = x.to(torch.float32)
+        x_glu, x_linear = x[..., ::2], x[..., 1::2]
+        x_glu = x_glu.clamp(max=3.0)
+        x_linear = x_linear.clamp(min=-3.0, max=3.0)
+        out_glu = x_glu * torch.sigmoid(1.5 * x_glu)
+        return (out_glu * (x_linear + 1)).to(out_dtype)
+
+    model = _Bf16MmModel(_K, _N, swiglu7_custom).cuda().bfloat16()
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    get_compile_config().disable_cache = True
+    stats, restore = _install_pass_instrument()
+    try:
+        compiled = magi_compile(model, dynamic_arg_dims={"a": 0})
+        with torch.no_grad():
+            compiled(_input_a())
+    finally:
+        restore()
+
+    assert stats.fused_count == 1
+    assert stats.kinds == ["swiglu7_dual"]
+    assert len(stats.ir_jsons) == 1
+    sw7 = _json.loads(stats.ir_jsons[0])
+    assert sw7["alpha"] == 1.5, f"Expected alpha=1.5, got {sw7['alpha']}"
+    assert sw7["limit"] == 3.0, f"Expected limit=3.0, got {sw7['limit']}"
+    assert sw7["one"] == 1.0, f"Expected one=1.0, got {sw7['one']}"
+
+
+@_SM90_ONLY
+def test_evt_sm90_swiglu7_custom_constants():
+    """SM90: SwiGLU7 with non-default alpha/limit still fuses correctly."""
+
+    def swiglu7_custom(x, out_dtype=None):
+        out_dtype = x.dtype if out_dtype is None else out_dtype
+        x = x.to(torch.float32)
+        x_glu, x_linear = x[..., ::2], x[..., 1::2]
+        x_glu = x_glu.clamp(max=5.0)
+        x_linear = x_linear.clamp(min=-5.0, max=5.0)
+        out_glu = x_glu * torch.sigmoid(2.0 * x_glu)
+        return (out_glu * (x_linear + 1)).to(out_dtype)
+
+    model = _Bf16MmModel(_K, _N, swiglu7_custom)
+    _compile_and_check(model, (_input_a(),), atol=0.5, rtol=0.05, expect_fused=1, expect_kinds=["swiglu7_dual"])
+
+
+@_SM90_ONLY
+def test_evt_sm90_swiglu7_constants_roundtrip_in_ir_json():
+    """SM90: Verify that swiglu7 constant values are captured in ir_json."""
+    import json as _json
+
+    def swiglu7_custom(x, out_dtype=None):
+        out_dtype = x.dtype if out_dtype is None else out_dtype
+        x = x.to(torch.float32)
+        x_glu, x_linear = x[..., ::2], x[..., 1::2]
+        x_glu = x_glu.clamp(max=3.0)
+        x_linear = x_linear.clamp(min=-3.0, max=3.0)
+        out_glu = x_glu * torch.sigmoid(1.5 * x_glu)
+        return (out_glu * (x_linear + 1)).to(out_dtype)
+
+    model = _Bf16MmModel(_K, _N, swiglu7_custom).cuda().bfloat16()
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    get_compile_config().disable_cache = True
+    stats, restore = _install_pass_instrument()
+    try:
+        compiled = magi_compile(model, dynamic_arg_dims={"a": 0})
+        with torch.no_grad():
+            compiled(_input_a())
+    finally:
+        restore()
+
+    assert stats.fused_count == 1
+    assert stats.kinds == ["swiglu7_dual"]
+    assert len(stats.ir_jsons) == 1
+    sw7 = _json.loads(stats.ir_jsons[0])
+    assert sw7["alpha"] == 1.5, f"Expected alpha=1.5, got {sw7['alpha']}"
+    assert sw7["limit"] == 3.0, f"Expected limit=3.0, got {sw7['limit']}"
+    assert sw7["one"] == 1.0, f"Expected one=1.0, got {sw7['one']}"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Binary-op positive tests — chains containing add/sub/mul/div on the mm output
 # ─────────────────────────────────────────────────────────────────────────────

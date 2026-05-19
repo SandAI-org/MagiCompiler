@@ -16,7 +16,7 @@
 //
 //   D = silu_alpha( clamp(lhs, max=limit) ) * ( clamp(rhs, -limit, limit) + 1 )
 //
-//   silu_alpha(x) = x * sigmoid(alpha * x)        alpha = 1.702, limit = 7.0
+//   silu_alpha(x) = x * sigmoid(alpha * x)        default: alpha = 1.702, limit = 7.0
 //
 // `lhs` is the gate-path output fragment (Op0 applied to A @ W_gate.T),
 // `rhs` is the linear-path output fragment (Op1 applied to A @ W_linear.T).
@@ -72,12 +72,25 @@ public:
 
     static FloatRoundStyle const kRound = Round;
 
-    struct Params {};
+    struct Params {
+        ElementCompute alpha;
+        ElementCompute limit;
+        ElementCompute one;
+
+        CUTLASS_HOST_DEVICE
+        Params() : alpha(ElementCompute(1.702f)),
+                   limit(ElementCompute(7.0f)),
+                   one(ElementCompute(1.0f)) {}
+
+        CUTLASS_HOST_DEVICE
+        Params(ElementCompute alpha_, ElementCompute limit_, ElementCompute one_)
+            : alpha(alpha_), limit(limit_), one(one_) {}
+    };
 
 public:
 
     CUTLASS_HOST_DEVICE
-    Swiglu7Combine(Params const& /*params*/) {}
+    Swiglu7Combine(Params const& p) : alpha_(p.alpha), limit_(p.limit), one_(p.one) {}
 
     CUTLASS_HOST_DEVICE
     bool is_source_needed() const { return true; }
@@ -101,18 +114,15 @@ public:
         ComputeFragment out;
 
         Sigmoid<ElementCompute> sig;
-        ElementCompute const limit(7.0f);
-        ElementCompute const nlimit(-7.0f);
-        ElementCompute const alpha(1.702f);
-        ElementCompute const one(1.0f);
+        ElementCompute const nlimit = -limit_;
 
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < kCount; ++i) {
-            ElementCompute g = gate[i] < limit  ? gate[i] : limit;
+            ElementCompute g = gate[i] < limit_  ? gate[i] : limit_;
             ElementCompute r = lin[i]  < nlimit ? nlimit
-                              : (lin[i] > limit ? limit : lin[i]);
-            ElementCompute silu_g = g * sig(alpha * g);
-            out[i] = silu_g * (r + one);
+                              : (lin[i] > limit_ ? limit_ : lin[i]);
+            ElementCompute silu_g = g * sig(alpha_ * g);
+            out[i] = silu_g * (r + one_);
         }
         return c2o(out);
     }
@@ -122,18 +132,20 @@ public:
     ElementOutput operator()(ElementOutput const& lhs,
                              ElementOutput const& rhs) const {
         ElementCompute g(lhs), r(rhs);
-        ElementCompute const limit(7.0f);
-        ElementCompute const nlimit(-7.0f);
-        ElementCompute const alpha(1.702f);
-        ElementCompute const one(1.0f);
+        ElementCompute const nlimit = -limit_;
 
         Sigmoid<ElementCompute> sig;
 
-        g = g < limit  ? g : limit;
-        r = r < nlimit ? nlimit : (r > limit ? limit : r);
-        ElementCompute silu_g = g * sig(alpha * g);
-        return ElementOutput(silu_g * (r + one));
+        g = g < limit_  ? g : limit_;
+        r = r < nlimit ? nlimit : (r > limit_ ? limit_ : r);
+        ElementCompute silu_g = g * sig(alpha_ * g);
+        return ElementOutput(silu_g * (r + one_));
     }
+
+private:
+    ElementCompute alpha_;
+    ElementCompute limit_;
+    ElementCompute one_;
 };
 
 } // namespace thread

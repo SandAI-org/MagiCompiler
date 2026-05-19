@@ -31,6 +31,7 @@ the Triton fusion path on sm120; per user decision, EVT replaces it entirely.
 
 from __future__ import annotations
 
+import json
 import operator
 from typing import List, Optional, Tuple
 
@@ -198,6 +199,208 @@ def _b_layout_kind(B_node):
         # (N, K) with N = shape[1], K = shape[0]. Detection via stride alone.
         return "col", B_node, N_or_K1
     return None, None, None
+
+
+# ── swiglu7 structural validation ───────────────────────────────────────────
+def _validate_swiglu7_structure(chain_nodes: List[fx.Node], mm_node: fx.Node) -> Optional[Tuple[float, float, float]]:
+    """Strictly validate the decomposed swiglu7 pattern and extract constants.
+
+    The canonical decomposition is::
+
+        mm → _to_copy(fp32)
+          → slice(dim=1, start=0, step=2)  [gate]
+          → slice(dim=1, start=1, step=2)  [linear]
+          → clamp(gate, None, limit)
+          → clamp(linear, -limit, limit)
+          → mul(gate_clamp, alpha) → sigmoid → mul(gate_clamp, sigmoid)
+          → add(linear_clamp, one) → mul(gate_silu, linear_offset)
+          → _to_copy(out_dtype)
+
+    Returns ``(alpha, limit, one)`` on match, ``None`` on structural mismatch.
+    """
+    set(chain_nodes)
+
+    # ── Phase 1: classify nodes into roles ──────────────────────────────────
+    gate_slice: Optional[fx.Node] = None
+    linear_slice: Optional[fx.Node] = None
+    gate_clamp: Optional[fx.Node] = None
+    linear_clamp: Optional[fx.Node] = None
+    alpha_mul: Optional[fx.Node] = None
+    sigmoid_node: Optional[fx.Node] = None
+    gate_silu: Optional[fx.Node] = None
+    linear_add: Optional[fx.Node] = None
+    final_mul: Optional[fx.Node] = None
+
+    limit: Optional[float] = None
+    alpha: Optional[float] = None
+    one: Optional[float] = None
+
+    _clamp_targets = {torch.ops.aten.clamp.default, torch.ops.aten.clamp_max.default, torch.ops.aten.clamp_min.default}
+    _mul_targets = {torch.ops.aten.mul.Tensor, torch.ops.aten.mul.Scalar}
+    _add_targets = {torch.ops.aten.add.Tensor, torch.ops.aten.add.Scalar}
+
+    linear_clamp_min: Optional[fx.Node] = None
+    linear_clamp_min_val: Optional[float] = None
+
+    for n in chain_nodes:
+        t = n.target
+
+        # ── stride-2 slices ─────────────────────────────────────────────
+        if t == torch.ops.aten.slice.Tensor:
+            if len(n.args) >= 4 and n.args[1] == 1 and (len(n.args) < 5 or n.args[4] == 2):
+                step = n.args[4] if len(n.args) >= 5 else 1
+                if step != 2:
+                    continue
+                start = n.args[2]
+                if start == 0 and gate_slice is None:
+                    gate_slice = n
+                elif start == 1 and linear_slice is None:
+                    linear_slice = n
+
+        # ── clamp ───────────────────────────────────────────────────────
+        elif t in _clamp_targets:
+            if t == torch.ops.aten.clamp_min.default:
+                # clamp_min(linear_slice, -limit) — first half of decomposed
+                # linear clamp: clamp(x, -limit, limit) → clamp_min → clamp_max
+                if (
+                    len(n.args) >= 2
+                    and isinstance(n.args[0], fx.Node)
+                    and isinstance(n.args[1], (int, float))
+                    and n.args[0] is linear_slice
+                    and linear_clamp_min is None
+                ):
+                    linear_clamp_min = n
+                    linear_clamp_min_val = float(n.args[1])
+
+            elif t == torch.ops.aten.clamp_max.default:
+                if len(n.args) >= 2 and isinstance(n.args[0], fx.Node) and isinstance(n.args[1], (int, float)):
+                    if n.args[0] is gate_slice and gate_clamp is None:
+                        gate_clamp = n
+                        limit = float(n.args[1])
+                    elif n.args[0] is linear_clamp_min and linear_clamp is None:
+                        linear_clamp = n
+            else:
+                # clamp.default(x, min_val, max_val)
+                if len(n.args) >= 3 and isinstance(n.args[0], fx.Node):
+                    min_val = n.args[1]
+                    max_val = n.args[2]
+                    if (
+                        isinstance(max_val, (int, float))
+                        and n.args[0] is gate_slice
+                        and (min_val is None)
+                        and gate_clamp is None
+                    ):
+                        gate_clamp = n
+                        limit = float(max_val)
+                    elif (
+                        isinstance(min_val, (int, float))
+                        and isinstance(max_val, (int, float))
+                        and n.args[0] is linear_slice
+                        and linear_clamp is None
+                    ):
+                        linear_clamp = n
+
+        # ── sigmoid ─────────────────────────────────────────────────────
+        elif t == torch.ops.aten.sigmoid.default:
+            if sigmoid_node is None:
+                sigmoid_node = n
+
+        # ── mul / add ───────────────────────────────────────────────────
+        elif t in _mul_targets:
+            if (
+                len(n.args) >= 2
+                and isinstance(n.args[1], (int, float))
+                and any(u.target == torch.ops.aten.sigmoid.default for u in n.users)
+            ):
+                alpha_mul = n
+                alpha = float(n.args[1])
+            # Other muls are classified in Phase 2 (need sigmoid_node first).
+
+        elif t in _add_targets:
+            if len(n.args) >= 2 and isinstance(n.args[0], fx.Node) and isinstance(n.args[1], (int, float)):
+                if n.args[0] is linear_clamp and linear_add is None:
+                    linear_add = n
+                    one = float(n.args[1])
+
+    # ── Phase 2: classify mul nodes that depend on sigmoid ──────────────────
+    for n in chain_nodes:
+        t = n.target
+        if t not in _mul_targets:
+            continue
+        if n is alpha_mul:
+            continue
+        if len(n.args) < 2:
+            continue
+        a0, a1 = n.args[0], n.args[1]
+        if not (isinstance(a0, fx.Node) and isinstance(a1, fx.Node)):
+            continue
+        # gate_silu = mul(gate_clamp, sigmoid)
+        if (
+            gate_silu is None
+            and {a0, a1} == {gate_clamp, sigmoid_node}
+            and gate_clamp is not None
+            and sigmoid_node is not None
+        ):
+            gate_silu = n
+        # final_mul = mul(gate_silu, linear_add)
+        elif final_mul is None and gate_silu is not None and linear_add is not None and {a0, a1} == {gate_silu, linear_add}:
+            final_mul = n
+
+    # ── Phase 3: validate all required roles are present ────────────────────
+    if any(
+        x is None
+        for x in (
+            gate_slice,
+            linear_slice,
+            gate_clamp,
+            linear_clamp,
+            alpha_mul,
+            sigmoid_node,
+            gate_silu,
+            linear_add,
+            final_mul,
+        )
+    ):
+        return None
+
+    if alpha is None or limit is None or one is None:
+        return None
+
+    # ── Phase 4: cross-validate data-flow edges ─────────────────────────────
+
+    # Both slices must share the same source (the _to_copy of mm).
+    if gate_slice.args[0] is not linear_slice.args[0]:
+        return None
+
+    # Linear clamp limits must be consistent: min == -limit, max == limit.
+    # Two forms:
+    #   (a) clamp.default(x, -limit, limit)  — single op
+    #   (b) clamp_min(x, -limit) → clamp_max(_, limit)  — decomposed pair
+    if linear_clamp.target == torch.ops.aten.clamp.default:
+        lin_min = linear_clamp.args[1]
+        lin_max = linear_clamp.args[2]
+        if not (isinstance(lin_min, (int, float)) and float(lin_min) == -limit):
+            return None
+        if not (isinstance(lin_max, (int, float)) and float(lin_max) == limit):
+            return None
+    elif linear_clamp.target == torch.ops.aten.clamp_max.default and linear_clamp_min is not None:
+        if not (isinstance(linear_clamp_min_val, (int, float)) and float(linear_clamp_min_val) == -limit):
+            return None
+        lin_max_val = linear_clamp.args[1]
+        if not (isinstance(lin_max_val, (int, float)) and float(lin_max_val) == limit):
+            return None
+    else:
+        return None
+
+    # sigmoid input must be alpha_mul.
+    if sigmoid_node.args[0] is not alpha_mul:
+        return None
+
+    # alpha_mul input must be gate_clamp.
+    if alpha_mul.args[0] is not gate_clamp:
+        return None
+
+    return (alpha, limit, one)
 
 
 # ── Pass ─────────────────────────────────────────────────────────────────────
@@ -615,18 +818,7 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
     # ── swiglu7 special-case ──────────────────────────────────────────────────
 
     def _try_fuse_swiglu7(self, graph: fx.Graph, mm_node: fx.Node) -> bool:
-        """Match the canonical swiglu7 epilogue and dispatch to DualGemm.
-
-        We do not attempt to encode swiglu7 in the EVT IR (the dual GEMM is a
-        whole different kernel structure). Instead we walk forward from mm_node
-        looking for the exact pattern produced by ``athena.activation.swiglu7``
-        after Inductor decomposition.
-
-        On a successful match we emit the magi_epilogue.matmul_custom_evt op
-        with kind="swiglu7_dual". The ``B`` argument must be the underlying
-        weight tensor of shape (N, K) — typically the predecessor of an
-        ``aten.t`` node feeding the mm.
-        """
+        """Match the canonical swiglu7 epilogue and dispatch to DualGemm."""
         # B must be a 2-D transpose of a contiguous (N, K) weight.
         B_node = mm_node.args[1]
         if not isinstance(B_node, fx.Node) or not _is_transpose_node(B_node):
@@ -639,23 +831,20 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         if w_shape is None or len(w_shape) != 2 or w_stride is None:
             return False
         N, K = w_shape
-        # N must be even (gate/linear interleaved split).
         if not (_is_static_int(N) and N % 2 == 0):
             return False
         if w_stride != (K, 1):
-            return False  # not contiguous (N, K) — abort
+            return False
         a_dtype = _val_dtype(mm_node.args[0])
         if a_dtype != torch.bfloat16 or _val_dtype(weight_node) != torch.bfloat16:
             return False
         if _largest_pow2_align_bits(K, a_dtype) is None:
             return False
-        # SM90 TMA requires K * sizeof(elem) % 16 == 0; SM80 path is more lenient.
         if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
             elem_bytes = a_dtype.itemsize
             if _is_static_int(K) and (int(K) * elem_bytes) % 16 != 0:
                 return False
 
-        # Collect all swiglu7 epilogue nodes; the kernel validates the exact structure.
         chain_nodes: List[fx.Node] = []
         chain_set: set = {mm_node}
         last_chain_node: Optional[fx.Node] = None
@@ -697,7 +886,6 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         if out_shape is None or len(out_shape) != 2:
             return False
         if not _is_static_int(out_shape[1]) or out_shape[1] != N // 2:
-            # The swiglu7 output's last dim must be N/2.
             return False
 
         n_pad_static = evt_runtime._aligned_n_stride(int(N) // 2, out_dt)
@@ -709,12 +897,18 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
                 if u not in chain_set:
                     return False
 
+        constants = _validate_swiglu7_structure(chain_nodes, mm_node)
+        if constants is None:
+            return False
+        sw7_alpha, sw7_limit, sw7_one = constants
+        sw7_json = json.dumps({"alpha": sw7_alpha, "limit": sw7_limit, "one": sw7_one}, sort_keys=True)
+
         out_dt_id = evt_runtime.out_dtype_id(out_dt)
         n_out = N // 2
         with graph.inserting_after(last_chain_node):
             new_node = graph.call_function(
                 torch.ops.magi_epilogue.matmul_custom_evt.default,
-                args=(mm_node.args[0], weight_node, [], "", "swiglu7_dual", n_out, out_dt_id),
+                args=(mm_node.args[0], weight_node, [], sw7_json, "swiglu7_dual", n_out, out_dt_id),
             )
         # Propagate FakeTensor meta with 128-bit-aligned row stride matching
         # what the CUDA impl actually returns.

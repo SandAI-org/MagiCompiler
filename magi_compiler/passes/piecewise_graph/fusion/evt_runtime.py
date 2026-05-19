@@ -436,7 +436,16 @@ def _resolve_dispatch(kind, ir_json, a_dtype, b_dtype, N_w, K_w, m_bucket, out_d
         mod = _compile_swiglu7_dual(
             m_bucket, N_w, K_w, alignment_a_bits=align_bits, alignment_b_bits=align_bits, alignment_c_bits=alignment_c_bits
         )
-        return _DispatchEntry(mod.swiglu7_dual_matmul_out, False, out_dtype)
+        sw7 = json.loads(ir_json) if ir_json else {}
+        sw7_alpha = float(sw7.get("alpha", 1.702))
+        sw7_limit = float(sw7.get("limit", 7.0))
+        sw7_one = float(sw7.get("one", 1.0))
+        kernel_fn = mod.swiglu7_dual_matmul_out
+
+        def _sw7_call(A, B, D, _fn=kernel_fn, _a=sw7_alpha, _l=sw7_limit, _o=sw7_one):
+            return _fn(A, B, D, _a, _l, _o)
+
+        return _DispatchEntry(_sw7_call, False, out_dtype)
     if kind == "evt_row" or kind == "evt":
         b_layout = "row"
     elif kind == "evt_col":
