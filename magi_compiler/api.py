@@ -210,7 +210,7 @@ def magi_register_custom_op(
     functionality of:
     - @torch.library.custom_op
     - @torch.library.register_fake
-    - fn.register_autograd
+    - @torch.library.register_autograd
 
     Arguments:
         name: Fully qualified op name (e.g. ``"namespace::op_name"``). If
@@ -265,6 +265,37 @@ def magi_register_custom_op(
         >>> @magi_register_custom_op()
         ... def attn(q: torch.Tensor, k: torch.Tensor, cfg: AttnCfg) -> torch.Tensor:
         ...     pass
+
+        4. Backward with a dataclass input (per-field grads by field name):
+
+        For a dataclass input slot, the easiest way to express per-field
+        grads is to return a ``dict`` keyed by field name. Tensor fields
+        carry their grads; non-differentiable fields (or absent keys) use
+        ``None``. The bridge matches by field **name** (not by type), so
+        any object exposing the same names works; ``dict`` is just the
+        most convenient.
+
+        >>> @dataclasses.dataclass(frozen=True)
+        ... class WeightCfg:
+        ...     w: torch.Tensor
+        ...     b: torch.Tensor
+        ...
+        >>> def setup(ctx, inputs, output):
+        ...     x, cfg = inputs
+        ...     ctx.save_for_backward(x, cfg.w)
+        ...
+        >>> def bwd(ctx, gy):
+        ...     x, w = ctx.saved_tensors
+        ...     # Slot order matches the ORIGINAL signature of ``op`` below.
+        ...     return (
+        ...         gy * w,                      # grad for x   (Tensor)
+        ...         {"w": gy * x, "b": None},    # grad for cfg (dict: per-field)
+        ...         # equivalently: WeightCfg(w=gy * x, b=None)
+        ...     )
+        ...
+        >>> @magi_register_custom_op(setup_context_fn=setup, backward_fn=bwd)
+        ... def op(x: torch.Tensor, cfg: WeightCfg) -> torch.Tensor:
+        ...     return x * cfg.w + cfg.b
     """
     return _magi_register_custom_op_impl(
         name=name,
