@@ -20,102 +20,35 @@ a plain Python function and registers it as a real custom op while letting
 the user keep calling it with their original signature.
 
 
-Part A. Registration-time pipeline -- the four slots
-====================================================
-
-When ``@magi_register_custom_op(...)`` is applied to a user function, up to
-four named slots are produced. Each slot is a concrete callable object.
-
-    slot 0 -- fn
-        The user's original function. Always present.
-
-    slot 1 -- lowered_fn
-        A thin wrapper around ``fn`` whose ``__signature__`` /
-        ``__annotations__`` have been *lowered* (Literal/Enum -> str,
-        unsupported defaults scrubbed, dataclasses flattened into primitive
-        leaves) so that ``torch.library.infer_schema`` accepts it.
-        Skipped when ``fn``'s signature is already schema-compatible.
-
-    slot 2 -- torch_registered_op
-        The ``OpOverload`` returned by ``torch.library.custom_op`` /
-        ``register_fake`` after registering whichever of ``fn`` /
-        ``lowered_fn`` reached this point. Always present.
-
-    slot 3 -- magi_exposed_op
-        A magi-level Python wrapper around ``torch_registered_op`` that
-        preserves the user's ORIGINAL (dataclass-bearing) calling
-        convention. At call time it flattens incoming args via the static
-        ``param_mapping_tree`` and dispatches into slot 2. Only created
-        on the dataclass-flatten path.
-
-The naming is a deliberate dual: ``torch_registered_op`` is *registered
-into* torch.library's dispatcher; ``magi_exposed_op`` is *exposed out of*
-magi to user code.
-
-
-Part B. Runtime paths -- the three pipelines
-============================================
-
-Three pipelines are possible; the decorator returns whichever object sits
-at the end of the path:
-
-    1. simple                  fn -> torch_registered_op
-       Returned: ``torch._ops.OpOverload`` (slot 2).
-       Runtime: zero magi-level overhead -- straight into torch.library's
-       dispatcher.
-
-    2. sig-only-rewrite        fn -> lowered_fn -> torch_registered_op
-       Returned: ``torch._ops.OpOverload`` (slot 2).
-       Runtime: same as simple -- ``lowered_fn`` is a transparent
-       forwarding shim (the rewrite is registration-time only).
-
-    3. dataclass-flatten       fn -> lowered_fn -> torch_registered_op
-                                                -> magi_exposed_op
-       Returned: a Python callable carrying the
-       ``_magi_torch_registered_op`` attribute (slot 3).
-       Runtime forward (per call):
-         user code calls magi_exposed_op(x, cfg=...)
-           -> _flatten_call_args                (original kwargs -> flat tuple)
-              -> _flatten_value_into            (DFS over param_mapping_tree)
-           -> torch_registered_op(*flat)        (slot 2 -- enters dispatcher)
-              -> lowered_fn(*flat)              (slot 1 -- still in lowered shape)
-                 -> _reassemble_kwargs          (flat tuple -> original kwargs)
-                    -> _build_value_from_node   (rebuilds dataclass instances)
-                 -> fn(**original_kwargs)       (slot 0 -- user code finally sees
-                                                 its original dataclass-bearing
-                                                 signature)
-       Runtime backward (when backward_fn is supplied):
-         autograd calls _bridged_backward(ctx, *grads)
-           -> user_backward(ctx, *grads)        (returns one grad per ORIGINAL
-                                                 input, possibly a dataclass-shaped
-                                                 grad object)
-           -> _flatten_grads                    (original grads -> flat grads)
-              -> _flatten_grad_into             (DFS over param_mapping_tree)
-
-You can tell at runtime which pipeline an op went through by inspecting
-the decorator's return value: an ``OpOverload`` means simple/sig-rewrite;
-a Python callable carrying ``_magi_torch_registered_op`` means
-dataclass-flatten.
-
-
 File layout
 ===========
 
-    -- registration-time helpers (executed once) --
-    1. Validate the user's fn signature
-    2. Resolve types & sanitise defaults for infer_schema
-    3. Build & query the param mapping tree                (used by sec 4 and sec 7)
-    4. Lower fn's signature                                (produces slot 1)
-    5. Synthesise the meta/fake function                   (input to slot 2)
-    6. Register the op                                     (produces slot 2)
+The file has five blocks. Each block groups its own helpers (private,
+above) with the one core piece it exists to support (below). Block
+boundaries follow the 5-stage pipeline.
 
-    -- runtime helpers (executed on every call) --
-    7. Runtime bridge: flatten / unflatten on every call
+    Block 0 -- VALIDATE op signature constraints (registration-time)
+        helpers:  assertion predicates + validation primitives
+        core:     _validate_op_signature_constraints
 
-    -- main pipeline --
-    8. The decorator: orchestrates sec 1-6 and builds the runtime
-       closures from sec 7 (produces slot 3 on the flatten path)
+    Block 1 -- LOWER                   (registration-time)
+        helpers:  type resolution, default scrubbing, param-mapping-tree construction
+        core:     _lower_op_signature                       (produces slot 1)
+
+    Block 2 -- REGISTER                (registration-time)
+        helpers:  op-name generation, meta/fake-fn synthesis
+        core:     _register_torch_op                        (produces slot 2)
+
+    Block 3 -- RUNTIME ADAPTER         (runtime)
+        helpers:  flatten / unflatten primitives + signature-bound wrappers
+        core:     _DataclassRuntimeAdapter                  (used by slot 3)
+
+    Block 4 -- MAIN PIPELINE
+        core:     _magi_register_custom_op_impl             (the decorator;
+                  orchestrates blocks 0-3, produces slot 3 on the flatten path)
 """
+
+from __future__ import annotations
 
 import dataclasses
 import functools
@@ -129,12 +62,16 @@ from .config import get_compile_config
 from .utils.logger import magi_logger
 
 # ==============================================================================
-# 1. Validate the user's fn signature
-# ------------------------------------------------------------------------------
-# Predicate + assert helpers that reject `fn` signatures torch.library cannot
-# consume, each raising a clear `TypeError` instead of the opaque error that
-# would otherwise surface deep inside `infer_schema`. Called from
-# `_lower_op_signature` (sec 4) and `_build_dataclass_sub_mapping_tree` (sec 3).
+# BLOCK 0 -- VALIDATE op signature constraints
+#
+# Helpers:
+#   - type predicates:
+#       _is_frozen_dataclass
+#   - assertion primitives:
+#       _assert_not_unsupported_container, _assert_not_dataclass_return,
+#       _assert_not_mutable_dataclass, _assert_has_annotation,
+#       _assert_no_var_args, _assert_resolved_field_type
+# Core: _validate_op_signature_constraints
 # ==============================================================================
 
 
@@ -220,23 +157,72 @@ def _assert_resolved_field_type(f_type, *, where: str) -> None:
         )
 
 
+def _validate_op_signature_constraints(fn: Callable) -> None:
+    """Validate fn parameters/return and recursively validate frozen dataclass subtrees."""
+    original_sig = inspect.signature(fn)
+    resolved = _resolve_annotations(fn)
+
+    def _validate_through(
+        params_or_fields, *, owner_name: str, is_fn_params: bool, field_types: dict[str, Any] | None = None
+    ) -> None:
+        for item in params_or_fields:
+            if is_fn_params:
+                name, param = item
+                _assert_no_var_args(param, fn_name=fn.__name__)
+                annotation = resolved.get(name, param.annotation)
+                where = f"parameter {name!r} of {owner_name}"
+            else:
+                field = item
+                name = field.name
+                annotation = (field_types or {}).get(name, field.type)
+                where = f"field {owner_name}.{name}"
+                _assert_resolved_field_type(annotation, where=where)
+
+            _assert_has_annotation(annotation, where=where)
+            _assert_not_mutable_dataclass(annotation, where=where)
+
+            if _is_frozen_dataclass(annotation):
+                _validate_through(
+                    dataclasses.fields(annotation),
+                    owner_name=annotation.__name__,
+                    is_fn_params=False,
+                    field_types=_resolve_dataclass_field_types(annotation),
+                )
+            else:
+                _assert_not_unsupported_container(annotation, where=where)
+
+    _validate_through(original_sig.parameters.items(), owner_name=f"{fn.__name__!r}", is_fn_params=True)
+
+    return_annotation = resolved.get("return", original_sig.return_annotation)
+    _assert_has_annotation(return_annotation, where=f"return value of {fn.__name__!r}")
+    _assert_not_dataclass_return(return_annotation, fn_name=fn.__name__)
+
+
 # ==============================================================================
-# 2. Resolve types & sanitise defaults for infer_schema
+# BLOCK 1 -- LOWER fn signature
+#
+# Helpers:
+#   - type resolution & default scrubbing:
+#       _resolve_annotations, _resolve_dataclass_field_types,
+#       _maybe_downgrade_literal_or_enum,
+#       _schema_compatible_field_default, _schema_compatible_param_default
+#   - param-mapping-tree construction:
+#       _register_dataclass_pytree,
+#       _expand_mutates_args
+#   - lowered-signature utilities:
+#       _apply_lowered_signature,
+#       _make_lowered_signature_wrapper
+# Core: _lower_op_signature
+# ==============================================================================
+
+
 # ------------------------------------------------------------------------------
-# Resolve stringified annotations to real types, downgrade Literal/string-Enum
-# to `str`, and scrub defaults that `infer_schema` cannot render. Called by
-# `_lower_op_signature` (sec 4) and `_build_dataclass_sub_mapping_tree` (sec 3).
-# ==============================================================================
+# helpers: resolve types & sanitise defaults for infer_schema
+# ------------------------------------------------------------------------------
 
 
 def _resolve_annotations(fn: Callable) -> dict[str, Any]:
-    """Return ``fn``'s annotations as real types, resolving stringified ones.
-
-    Falls back to per-annotation eval against ``globals + closure nonlocals``
-    when ``get_type_hints`` can't resolve atomically (typical for functions
-    defined inside another function whose annotations reference enclosing
-    names).
-    """
+    """Return ``fn`` annotations as real types, with globals+closure eval fallback."""
     import typing
 
     try:
@@ -277,20 +263,38 @@ def _resolve_annotations(fn: Callable) -> dict[str, Any]:
 
 def _resolve_dataclass_field_types(cls: type) -> dict[str, Any]:
     """Return ``cls``'s field name -> resolved type (best-effort)."""
+    import sys
     import typing as _typing
 
     try:
         return _typing.get_type_hints(cls)
     except Exception:
-        return {f.name: f.type for f in dataclasses.fields(cls)}
+        pass
+
+    # ``get_type_hints(cls)`` is all-or-nothing; fall back to per-field eval so
+    # one unresolved annotation does not poison the whole dataclass.
+    namespace: dict[str, Any] = {}
+    module = sys.modules.get(getattr(cls, "__module__", ""))
+    if module is not None:
+        namespace.update(vars(module))
+    namespace.update(getattr(cls, "__dict__", {}))
+    namespace.setdefault(cls.__name__, cls)
+
+    resolved: dict[str, Any] = {}
+    for f in dataclasses.fields(cls):
+        tp = f.type
+        if isinstance(tp, str):
+            try:
+                resolved[f.name] = eval(tp, namespace, None)
+            except Exception:
+                resolved[f.name] = tp
+        else:
+            resolved[f.name] = tp
+    return resolved
 
 
 def _maybe_downgrade_literal_or_enum(annotation, *, where: str):
-    """Collapse ``Literal[str, ...]`` and string-Enum annotations to plain ``str``.
-
-    Lossless because the op body still receives the original string value.
-    Mixed/numeric Literals and non-string Enums raise (no safe downgrade).
-    """
+    """Downgrade ``Literal[str,...]`` and string-valued Enums to ``str`` or raise."""
     import enum
     import typing
 
@@ -321,23 +325,8 @@ def _maybe_downgrade_literal_or_enum(annotation, *, where: str):
 _SCHEMA_DEFAULT_TYPES: tuple[type, ...] = (int, float, bool, str, torch.device, torch.dtype)
 
 
-def _schema_compatible_param_default(default: Any) -> Any:
-    """Scrub a top-level parameter default that ``infer_schema`` cannot render.
-
-    Same rules as :func:`_schema_compatible_default`, but for raw values
-    rather than ``dataclasses.Field``.
-    """
-    if default is inspect.Parameter.empty:
-        return inspect.Parameter.empty
-    if default is None or isinstance(default, _SCHEMA_DEFAULT_TYPES):
-        return default
-    return inspect.Parameter.empty
-
-
-def _schema_compatible_default(f: "dataclasses.Field") -> Any:
-    """Lowered default for dataclass field ``f``: keep ``None`` / int / float /
-    bool / str / torch.device / torch.dtype; drop everything else (the user-
-    constructed dataclass instance still carries the real default at runtime)."""
+def _schema_compatible_field_default(f: "dataclasses.Field") -> Any:
+    """Return schema-safe field default (including resolved ``default_factory``) or empty."""
     if f.default is not dataclasses.MISSING:
         d = f.default
         if d is None or isinstance(d, _SCHEMA_DEFAULT_TYPES):
@@ -354,21 +343,24 @@ def _schema_compatible_default(f: "dataclasses.Field") -> Any:
     return inspect.Parameter.empty
 
 
-# ==============================================================================
-# 3. Build & query the param mapping tree
+def _schema_compatible_param_default(default: Any) -> Any:
+    """Return schema-safe parameter default or ``inspect.Parameter.empty``."""
+    if default is inspect.Parameter.empty:
+        return inspect.Parameter.empty
+    if default is None or isinstance(default, _SCHEMA_DEFAULT_TYPES):
+        return default
+    return inspect.Parameter.empty
+
+
 # ------------------------------------------------------------------------------
-# The `param_mapping_tree` is the single source of truth bridging the user's
-# (possibly nested-dataclass) signature and the lowered primitive signature.
-# Built once at registration time and consumed twice afterwards: by
-# `_expand_mutates_args` (statically, sec 6) and by the runtime bridge (sec 7).
-# ==============================================================================
+# helpers: build & query the param mapping tree
+# ------------------------------------------------------------------------------
 
 _DATACLASS_PYTREE_REGISTERED: set[type] = set()
 
 
 def _register_dataclass_pytree(cls: type) -> None:
-    """Register ``cls`` as a pytree node (idempotent) so Dynamo / AOTAutograd
-    can flatten and unflatten dataclass instances during tracing."""
+    """Idempotently register dataclass ``cls`` as a pytree node for tracing."""
     if cls in _DATACLASS_PYTREE_REGISTERED:
         return
 
@@ -388,80 +380,24 @@ def _register_dataclass_pytree(cls: type) -> None:
     _DATACLASS_PYTREE_REGISTERED.add(cls)
 
 
-def _build_dataclass_sub_mapping_tree(cls: type, attr_name: str, flat_prefix: str) -> tuple[tuple, list[inspect.Parameter]]:
-    """Recursively expand a frozen-dataclass type into one ``param_mapping_tree``
-    subtree plus its flat list of leaf ``inspect.Parameter`` objects (DFS order).
+def _expand_mutates_args(param_mapping_tree: list[tuple], mutates_args: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    """Expand/validate ``mutates_args`` from original names into lowered leaf names."""
 
-    ``attr_name`` is the field name on the parent dataclass (or the parameter
-    name on ``fn`` for a top-level dataclass arg). ``flat_prefix`` builds the
-    leaf parameter name; e.g. ``cfg: OuterCfg(inner: InnerCfg(val: float))``
-    becomes a lowered leaf parameter ``cfg__inner__val``.
-    """
-    _register_dataclass_pytree(cls)
+    def _collect_tensor_leaf_lowered_attr_names(node: tuple) -> list[str]:
+        if node[0] == "primitive":
+            _, _attr, lowered_attr_name, _ = node
+            return [lowered_attr_name]
+        out: list[str] = []
+        for child in node[3]:
+            out.extend(_collect_tensor_leaf_lowered_attr_names(child))
+        return out
 
-    field_types = _resolve_dataclass_field_types(cls)
-    children: list[tuple] = []
-    lowered_params: list[inspect.Parameter] = []
-
-    for f in dataclasses.fields(cls):
-        f_type = field_types.get(f.name, f.type)
-        child_flat_name = f"{flat_prefix}__{f.name}"
-        _assert_has_annotation(f_type, where=f"field {cls.__name__}.{f.name}")
-        _assert_resolved_field_type(f_type, where=f"field {cls.__name__}.{f.name}")
-        _assert_not_mutable_dataclass(f_type, where=f"field {cls.__name__}.{f.name}")
-        if _is_frozen_dataclass(f_type):
-            sub_node, sub_params = _build_dataclass_sub_mapping_tree(f_type, attr_name=f.name, flat_prefix=child_flat_name)
-            children.append(sub_node)
-            lowered_params.extend(sub_params)
-        else:
-            _assert_not_unsupported_container(f_type, where=f"field {cls.__name__}.{f.name}")
-            f_type = _maybe_downgrade_literal_or_enum(f_type, where=f"field {cls.__name__}.{f.name}")
-            children.append(("primitive", f.name, child_flat_name, None))
-            lowered_params.append(
-                inspect.Parameter(
-                    child_flat_name,
-                    # POSITIONAL_OR_KEYWORD: torch.library.custom_op does not yet
-                    # support kwarg-only Tensor arguments.
-                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                    default=_schema_compatible_default(f),
-                    annotation=f_type,
-                )
-            )
-
-    return ("dataclass", attr_name, cls, children), lowered_params
-
-
-def _count_leaves(node: tuple) -> int:
-    """Number of lowered parameter slots a ``param_mapping_tree`` ``node`` occupies."""
-    if node[0] == "primitive":
-        return 1
-    return sum(_count_leaves(c) for c in node[3])
-
-
-def _collect_tensor_leaf_lowered_names(node: tuple) -> list[str]:
-    """Lowered names of every leaf under ``node``. Used to expand a dataclass
-    parameter referenced in ``mutates_args`` (torch.library does its own
-    Tensor-type validation, so over-specifying non-Tensor leaves is fine)."""
-    if node[0] == "primitive":
-        _, _attr, lowered_name, _ = node
-        return [lowered_name]
-    out: list[str] = []
-    for child in node[3]:
-        out.extend(_collect_tensor_leaf_lowered_names(child))
-    return out
-
-
-def _expand_mutates_args(mutates_args: tuple[str, ...] | list[str], param_mapping_tree: list[tuple]) -> tuple[str, ...]:
-    """Translate ``mutates_args`` from the original parameter space to the
-    lowered space: top-level dataclass names expand to all their leaves;
-    primitive top-level names and already-lowered names pass through; unknown
-    names raise ``ValueError`` listing valid choices."""
     if not mutates_args:
         return tuple(mutates_args)
     by_attr: dict[str, tuple] = {node[1]: node for node in param_mapping_tree}
     valid_lowered: set[str] = set()
     for node in param_mapping_tree:
-        valid_lowered.update(_collect_tensor_leaf_lowered_names(node))
+        valid_lowered.update(_collect_tensor_leaf_lowered_attr_names(node))
     out: list[str] = []
     for name in mutates_args:
         if name in by_attr:
@@ -469,7 +405,7 @@ def _expand_mutates_args(mutates_args: tuple[str, ...] | list[str], param_mappin
             if node[0] == "primitive":
                 out.append(node[2])
             else:
-                out.extend(_collect_tensor_leaf_lowered_names(node))
+                out.extend(_collect_tensor_leaf_lowered_attr_names(node))
         elif name in valid_lowered:
             out.append(name)
         else:
@@ -487,31 +423,13 @@ def _expand_mutates_args(mutates_args: tuple[str, ...] | list[str], param_mappin
     return tuple(deduped)
 
 
-# ==============================================================================
-# 4. Lower fn's signature                                  (produces slot 1)
 # ------------------------------------------------------------------------------
-# Produces slot 1 (`lowered_fn`) in two stages:
-#   data:   `_lower_op_signature` walks `fn`'s parameters once and emits
-#           `(original_sig, lowered_sig, param_mapping_tree)`, calling into
-#           sec 1 (validate), sec 2 (resolve/sanitise), sec 3 (tree build).
-#   object: `_make_lowered_signature_wrapper` stamps the lowered signature
-#           onto a forwarding wrapper of `fn`.
-# `_signatures_differ` lets the decorator (sec 6) skip the wrapper entirely
-# when lowering was a no-op (zero-overhead path).
-# ==============================================================================
+# core: _lower_op_signature  (and its lowered-signature wrapper utilities)
+# ------------------------------------------------------------------------------
 
 
-def _signatures_differ(original: inspect.Signature, lowered: inspect.Signature) -> bool:
-    """True iff ``lowered`` differs from ``original`` on parameter names,
-    annotations, defaults, kinds, or return annotation. The decorator uses
-    this to skip slot 1 entirely when lowering was a no-op (zero-overhead path)."""
-    return original != lowered
-
-
-def _apply_lowered_signature_metadata(wrapper: Callable, lowered_sig: inspect.Signature) -> None:
-    """In-place: stamp ``wrapper`` with ``lowered_sig`` as its ``__signature__``
-    / ``__annotations__``, and strip ``__wrapped__`` so ``inspect.signature``
-    cannot fall back to the original (un-lowered) signature on ``fn``."""
+def _apply_lowered_signature(lowered_sig: inspect.Signature, wrapper: Callable) -> None:
+    """Stamp wrapper signature/annotations with ``lowered_sig`` and clear ``__wrapped__``."""
     wrapper.__signature__ = lowered_sig
     lowered_annotations = {
         p.name: p.annotation for p in lowered_sig.parameters.values() if p.annotation is not inspect.Parameter.empty
@@ -527,94 +445,127 @@ def _apply_lowered_signature_metadata(wrapper: Callable, lowered_sig: inspect.Si
         pass
 
 
-def _make_lowered_signature_wrapper(fn: Callable, lowered_sig: inspect.Signature) -> Callable:
-    """Forwarding wrapper around ``fn`` carrying ``lowered_sig`` as metadata.
-    Used on the no-flattening path so ``infer_schema`` sees the cleaned-up
-    signature instead of ``fn``'s original annotations."""
-
-    @functools.wraps(fn)
-    def _wrapped(*args, **kwargs):
-        return fn(*args, **kwargs)
-
-    _apply_lowered_signature_metadata(_wrapped, lowered_sig)
-    return _wrapped
-
-
 def _lower_op_signature(fn: Callable):
     """Lower ``fn``'s signature into a form ``torch.library.infer_schema`` accepts.
 
-    "Lower" is used in the compiler sense (high-level -> low-level): we walk
-    ``fn``'s parameters once and do six things at the same time -- they all
-    need the same resolved annotations and the same iteration:
-
-    1. VALIDATE  -- reject variadics, missing annotations, mutable dataclasses,
-                    unsupported containers, dataclass returns (sec 1).
-    2. RESOLVE   -- turn stringified annotations into real types via
-                    ``_resolve_annotations``, so dataclass detection works.
+    Pipeline:
+    1. RESOLVE   -- turn stringified annotations/dataclass fields into real types (best-effort).
+                    If failed, trying globals+closure evalining per annotation/dataclass field.
+    2. FLATTEN   -- recursively flatten frozen dataclass parameters into primitive leaves
+                    and register the dataclass types as pytree nodes for Dynamo/AOTAutograd tracing.
     3. NORMALIZE -- collapse parameter kinds to POSITIONAL_OR_KEYWORD,
                     downgrade Literal/Enum to ``str``, scrub unsupported defaults.
-    4. FLATTEN   -- expand each frozen-dataclass parameter (recursively) into
-                    its primitive leaves via ``_build_dataclass_sub_mapping_tree``.
-    5. PYTREE    -- side effect of step 4: register every dataclass as a pytree
-                    node so Dynamo / AOTAutograd can trace through it.
-    6. EMIT      -- assemble ``(original_sig, lowered_sig, param_mapping_tree)``.
-
-    A single pass is intentional: splitting concerns would force re-resolving
-    annotations and threading accumulator state. When the input is already
-    schema-compatible the lowered signature is bit-identical to the original,
-    and the caller's ``_signatures_differ`` check restores the zero-overhead path.
+    4. EMIT      -- assemble ``(original_sig, lowered_sig, param_mapping_tree)``.
 
     Returns:
-        original_sig (inspect.Signature): the user's un-flattened signature.
-        lowered_sig  (inspect.Signature): what ``infer_schema`` will see.
+        original_sig (inspect.Signature): the user's original input signature.
+        lowered_sig (inspect.Signature): schema-compatible signature for ``infer_schema``.
         param_mapping_tree (list[tuple]): the bridge between the two; a list
             of root nodes (one per original parameter), each of which is:
-              * ``("primitive", attr_name, lowered_name, None)``, or
-              * ``("dataclass", attr_name, cls, [child_nodes...])``.
-            ``attr_name`` is the parameter name at top level / field name
-            deeper down. The same tree drives both runtime translation
-            directions (sec 7).
+              * ``("primitive", attr_name, lowered_attr_name, None)``, or
+              * ``("dataclass", attr_name, dataclass_cls_type, [child_nodes...])``.
+
+    Example:
+        ``fn(x: Tensor, cfg: Outer(inner: Inner(scale: float, bias: Tensor), mode: str))``
+        -> ``original_sig(x: Tensor, cfg: Outer)``
+        -> ``lowered_sig(x: Tensor, cfg__inner__scale: float, cfg__inner__bias: Tensor, cfg__mode: str)``
+        -> ``param_mapping_tree = [("primitive", "x", "x", None),
+                                   ("dataclass", "cfg", Outer, [
+                                       ("dataclass", "inner", Inner, [
+                                           ("primitive", "scale", "cfg__inner__scale", None),
+                                           ("primitive", "bias", "cfg__inner__bias", None),
+                                       ]),
+                                       ("primitive", "mode", "cfg__mode", None),
+                                   ])]``
     """
+
     original_sig = inspect.signature(fn)
     resolved = _resolve_annotations(fn)
-    lowered_params: list[inspect.Parameter] = []
-    param_mapping_tree: list[tuple] = []
 
-    for name, param in original_sig.parameters.items():
-        _assert_no_var_args(param, fn_name=fn.__name__)
-        annotation = resolved.get(name, param.annotation)
-        _assert_has_annotation(annotation, where=f"parameter {name!r} of {fn.__name__!r}")
-        _assert_not_mutable_dataclass(annotation, where=f"parameter {name!r}")
-        if _is_frozen_dataclass(annotation):
-            node, sub_params = _build_dataclass_sub_mapping_tree(annotation, attr_name=name, flat_prefix=name)
-            param_mapping_tree.append(node)
-            lowered_params.extend(sub_params)
+    def _lower_through(
+        params_or_fields,
+        *,
+        is_fn_params: bool,
+        owner_name: str,
+        flat_prefix: str | None = None,
+        field_types: dict[str, Any] | None = None,
+    ) -> tuple[list[tuple], list[inspect.Parameter]]:
+        nodes: list[tuple] = []
+        lowered: list[inspect.Parameter] = []
+
+        if is_fn_params:
+            iterator = ((name, resolved.get(name, param.annotation), param) for name, param in params_or_fields)
         else:
-            _assert_not_unsupported_container(annotation, where=f"parameter {name!r}")
-            annotation = _maybe_downgrade_literal_or_enum(annotation, where=f"parameter {name!r}")
-            new_param = param.replace(
-                kind=inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                annotation=annotation,
-                default=_schema_compatible_param_default(param.default),
-            )
-            lowered_params.append(new_param)
-            param_mapping_tree.append(("primitive", name, name, None))
+            resolved_fields = field_types or {}
+            iterator = ((field.name, resolved_fields.get(field.name, field.type), field) for field in params_or_fields)
+
+        for name, annotation, source in iterator:
+            leaf_flat_name = name if is_fn_params else f"{flat_prefix}__{name}"
+            where = f"parameter {name!r}" if is_fn_params else f"field {owner_name}.{name}"
+
+            if _is_frozen_dataclass(annotation):
+                _register_dataclass_pytree(annotation)
+                child_nodes, child_params = _lower_through(
+                    dataclasses.fields(annotation),
+                    is_fn_params=False,
+                    owner_name=annotation.__name__,
+                    flat_prefix=leaf_flat_name,
+                    field_types=_resolve_dataclass_field_types(annotation),
+                )
+                nodes.append(("dataclass", name, annotation, child_nodes))
+                lowered.extend(child_params)
+            else:
+                annotation = _maybe_downgrade_literal_or_enum(annotation, where=where)
+                if is_fn_params:
+                    param = source
+                    lowered.append(
+                        param.replace(
+                            kind=inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                            annotation=annotation,
+                            default=_schema_compatible_param_default(param.default),
+                        )
+                    )
+                else:
+                    field = source
+                    lowered.append(
+                        inspect.Parameter(
+                            leaf_flat_name,
+                            # POSITIONAL_OR_KEYWORD: torch.library.custom_op does not yet
+                            # support kwarg-only Tensor arguments.
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                            annotation=annotation,
+                            default=_schema_compatible_field_default(field),
+                        )
+                    )
+                nodes.append(("primitive", name, leaf_flat_name, None))
+
+        return nodes, lowered
+
+    param_mapping_tree, lowered_params = _lower_through(
+        original_sig.parameters.items(), is_fn_params=True, owner_name=f"{fn.__name__!r}"
+    )
 
     return_annotation = resolved.get("return", original_sig.return_annotation)
-    _assert_has_annotation(return_annotation, where=f"return value of {fn.__name__!r}")
-    _assert_not_dataclass_return(return_annotation, fn_name=fn.__name__)
     lowered_sig = inspect.Signature(lowered_params, return_annotation=return_annotation)
     return original_sig, lowered_sig, param_mapping_tree
 
 
 # ==============================================================================
-# 5. Synthesise the meta/fake function                     (input to slot 2)
-# ------------------------------------------------------------------------------
-# Constructors for the meta ("fake") function torch.library uses for shape
-# propagation during tracing. Fallbacks: identity meta when the user passes
-# no `infer_output_meta_fn`; param-name-echoing meta when they pass a
-# `list[str]`. The result is handed to `register_fake` by sec 6.
+# BLOCK 2 -- REGISTER torch op
+#
+# Helpers:
+#   - meta/fake-fn synthesis:
+#       _get_num_outputs_from_return_annotation,
+#       _create_identity_meta_fn, _create_meta_fn_from_param_names
+#   - op-name generation:
+#       _generate_op_name
+# Core: _register_torch_op
 # ==============================================================================
+
+
+# ------------------------------------------------------------------------------
+# helpers: synthesise the meta/fake function
+# ------------------------------------------------------------------------------
 
 
 def _get_num_outputs_from_return_annotation(fn: Callable) -> int:
@@ -704,15 +655,9 @@ def _create_meta_fn_from_param_names(fn: Callable, param_names: list[str]) -> Ca
     return meta_fn
 
 
-# ==============================================================================
-# 6. Register the op                                       (produces slot 2)
 # ------------------------------------------------------------------------------
-# `_register_torch_op` calls `custom_op` + `register_fake`, yielding slot 2
-# (`torch_registered_op`). `_generate_op_name` derives a default op name
-# from the user's `fn` when one isn't supplied. The orchestrator that
-# stitches these together with sec 1-5 (and the runtime closures from
-# sec 7) lives in sec 8.
-# ==============================================================================
+# helpers: generate op name
+# ------------------------------------------------------------------------------
 
 
 def _generate_op_name(fn: Callable) -> str:
@@ -732,64 +677,102 @@ def _generate_op_name(fn: Callable) -> str:
     return f"{namespace}::{func_name}"
 
 
-def _register_torch_op(op_name: str, fn: Callable, mutates_args: tuple[str, ...], meta_fn: Callable):
-    """``custom_op`` + ``register_fake``; returns slot 2 (``torch_registered_op``)."""
-    torch_registered_op = torch.library.custom_op(op_name, mutates_args=mutates_args)(fn)
+# ------------------------------------------------------------------------------
+# core: _register_torch_op
+#
+# Forward reference: ``_DataclassRuntimeAdapter`` using ``from __future__ import annotations``.
+# ------------------------------------------------------------------------------
+
+
+def _register_torch_op(
+    op_name: str,
+    fn: Callable,
+    mutates_args: tuple[str, ...],
+    infer_output_meta_fn: Callable | list[str] | None,
+    setup_context_fn: Callable | None,
+    backward_fn: Callable | None,
+    dataclass_runtime_adapter: _DataclassRuntimeAdapter | None = None,
+):
+    """Register the op in torch.library.custom_op."""
+    effective_mutates_args = (
+        dataclass_runtime_adapter.expand_mutates_args(mutates_args) if dataclass_runtime_adapter is not None else mutates_args
+    )
+    torch_registered_op = torch.library.custom_op(op_name, mutates_args=effective_mutates_args)(fn)
+
+    # Build & register the meta/fake function.
+    if infer_output_meta_fn is None:
+        meta_fn = _create_identity_meta_fn(fn)
+    elif isinstance(infer_output_meta_fn, list):
+        meta_fn = _create_meta_fn_from_param_names(fn, infer_output_meta_fn)
+    elif dataclass_runtime_adapter is None:  # No flattening scenario
+        meta_fn = infer_output_meta_fn
+    else:  # Flattening scenario
+        user_meta = infer_output_meta_fn
+
+        def _bridged_meta_fn(*args, **kwargs):
+            return user_meta(**dataclass_runtime_adapter.unflatten_call_args(args, kwargs))
+
+        _bridged_meta_fn.__signature__ = inspect.signature(fn)
+        meta_fn = _bridged_meta_fn
     torch.library.register_fake(op_name)(meta_fn)
+
+    # Register autograd.
+    if backward_fn is not None:
+        if dataclass_runtime_adapter is None:  # No flattening scenario
+            torch_registered_op.register_autograd(backward_fn, setup_context=setup_context_fn)
+        else:  # Flattening scenario
+
+            def _bridged_setup_context(ctx, inputs, output):
+                if setup_context_fn is None:
+                    return None
+                original_inputs = dataclass_runtime_adapter.unflatten_setup_ctx_inputs(inputs)
+                return setup_context_fn(ctx, original_inputs, output)
+
+            def _bridged_backward(ctx, *grads):
+                original_grads = backward_fn(ctx, *grads)
+                if not isinstance(original_grads, tuple):
+                    original_grads = (original_grads,)
+                return dataclass_runtime_adapter.flatten_input_grads(original_grads)
+
+            torch_registered_op.register_autograd(_bridged_backward, setup_context=_bridged_setup_context)
+
     return torch_registered_op
 
 
 # ==============================================================================
-# 7. Runtime bridge: flatten / unflatten on every call
-# ------------------------------------------------------------------------------
-# Executed on every call to slot 1 (`lowered_fn`) or slot 3 (`magi_exposed_op`),
-# consuming the static `param_mapping_tree` from sec 3 to translate between
-# the original (dataclass) and lowered (primitive) call shapes. See Part B
-# of the module docstring for the full call-stack picture.
-#   original -> lowered: `_flatten_value_into`, `_flatten_call_args`
-#   lowered  -> original: `_build_value_from_node`, `_reassemble_kwargs`
-#   grad bridge:          `_flatten_grad_into`, `_flatten_grads`
+# BLOCK 3 -- RUNTIME ADAPTER
+#
+# Helpers (adapter field <- bound function):
+#   original -> lowered:  flatten_call_args          <- _flatten_call_args
+#                         flatten_input_grads        <- _flatten_input_grads
+#   lowered  -> original: unflatten_call_args        <- _unflatten_call_args
+#                         unflatten_setup_ctx_inputs <- _unflatten_setup_ctx_inputs
+#                         _reassemble_kwargs         (internal primitive)
+#   mutates_args expand:  expand_mutates_args        <- _expand_mutates_args
+#   signature stamping:   apply_lowered_signature    <- _apply_lowered_signature
+# Core: _DataclassRuntimeAdapter
 # ==============================================================================
 
 
-def _build_value_from_node(node: tuple, lowered_kwargs: dict):
-    """``lowered_kwargs`` -> one original-shaped value (recursive)."""
-    kind = node[0]
-    if kind == "primitive":
-        _, _attr, lowered_name, _ = node
-        return lowered_kwargs[lowered_name]
-    _, _attr, cls, children = node
-    init_kwargs: dict[str, Any] = {}
-    for child in children:
-        field_name = child[1]
-        init_kwargs[field_name] = _build_value_from_node(child, lowered_kwargs)
-    return cls(**init_kwargs)
-
-
-def _reassemble_kwargs(param_mapping_tree: list[tuple], lowered_kwargs: dict) -> dict:
-    """``lowered_kwargs`` -> original kwargs (the ``lowered -> original`` walk)."""
-    out: dict[str, Any] = {}
-    for node in param_mapping_tree:
-        out[node[1]] = _build_value_from_node(node, lowered_kwargs)
-    return out
-
-
-def _flatten_value_into(node: tuple, value: Any, out: list) -> None:
-    """Append leaves of ``value`` to ``out`` in DFS order (no isinstance check
-    on ``cls`` -- duck-typed via ``getattr`` so mocks / SimpleNamespace work)."""
-    kind = node[0]
-    if kind == "primitive":
-        out.append(value)
-        return
-    _, _attr, cls, children = node
-    for child in children:
-        field_name = child[1]
-        _flatten_value_into(child, getattr(value, field_name), out)
+# ---- flatten_call_args ----
 
 
 def _flatten_call_args(param_mapping_tree: list[tuple], original_sig: inspect.Signature, args: tuple, kwargs: dict) -> list:
     """User-side call -> flat positional list matching the lowered signature
     (the ``original -> lowered`` walk)."""
+
+    def _flatten_value_into(node: tuple, value: Any, out: list) -> None:
+        """Append leaves of ``value`` to ``out`` in DFS order (no isinstance check
+        on ``cls`` -- duck-typed via ``getattr`` so mocks / SimpleNamespace work)."""
+        kind = node[0]
+        if kind == "primitive":
+            out.append(value)
+            return
+        _, _attr, _cls, children = node
+        for child in children:
+            field_name = child[1]
+            _flatten_value_into(child, getattr(value, field_name), out)
+
     bound = original_sig.bind(*args, **kwargs)
     bound.apply_defaults()
     flat: list = []
@@ -798,35 +781,37 @@ def _flatten_call_args(param_mapping_tree: list[tuple], original_sig: inspect.Si
     return flat
 
 
-def _flatten_grad_into(node: tuple, grad: Any, out: list) -> None:
-    """Spread a user-returned grad across the lowered slots of one original input.
+# ---- flatten_input_grads ----
 
-    ``primitive`` -> append ``grad`` as-is. ``dataclass`` -> if ``grad`` is
-    ``None`` fill every leaf with ``None`` (the common whole-dataclass-not-
-    differentiable case); otherwise descend with ``dict``-aware lookup so
-    users can return dict / SimpleNamespace / dataclass-shaped objects.
-    """
-    if node[0] == "primitive":
-        out.append(grad)
-        return
-    _, _attr, _cls, children = node
-    if grad is None:
+
+def _flatten_input_grads(param_mapping_tree: list[tuple], original_grads: tuple) -> tuple:
+    """Original-space input grads -> lowered-space input grads."""
+
+    def _count_leaves(node: tuple) -> int:
+        if node[0] == "primitive":
+            return 1
+        return sum(_count_leaves(c) for c in node[3])
+
+    def _flatten_grad_into(node: tuple, grad: Any, out: list) -> None:
+        """Spread a user-returned grad across lowered slots for one original input."""
+        if node[0] == "primitive":
+            out.append(grad)
+            return
+        _, _attr, _cls, children = node
+        if grad is None:
+            for child in children:
+                for _ in range(_count_leaves(child)):
+                    out.append(None)
+            return
+        is_mapping = isinstance(grad, dict)
         for child in children:
-            for _ in range(_count_leaves(child)):
-                out.append(None)
-        return
-    is_mapping = isinstance(grad, dict)
-    for child in children:
-        field_name = child[1]
-        if is_mapping:
-            sub = grad.get(field_name)
-        else:
-            sub = getattr(grad, field_name, None)
-        _flatten_grad_into(child, sub, out)
+            field_name = child[1]
+            if is_mapping:
+                sub = grad.get(field_name)
+            else:
+                sub = getattr(grad, field_name, None)
+            _flatten_grad_into(child, sub, out)
 
-
-def _flatten_grads(param_mapping_tree: list[tuple], original_grads: tuple | list) -> list:
-    """Grads keyed by original-parameter order -> grads keyed by lowered order."""
     if len(original_grads) != len(param_mapping_tree):
         raise ValueError(
             f"@magi_register_custom_op: backward_fn returned {len(original_grads)} "
@@ -837,18 +822,67 @@ def _flatten_grads(param_mapping_tree: list[tuple], original_grads: tuple | list
     flat: list = []
     for node, g in zip(param_mapping_tree, original_grads):
         _flatten_grad_into(node, g, flat)
-    return flat
+    return tuple(flat)
+
+
+# ---- unflatten_call_args / unflatten_setup_ctx_inputs ----
+
+
+def _reassemble_kwargs(param_mapping_tree: list[tuple], lowered_kwargs: dict) -> dict:
+    """``lowered_kwargs`` -> original kwargs (the ``lowered -> original`` walk)."""
+
+    def _build_value_from_node(node: tuple):
+        kind = node[0]
+        if kind == "primitive":
+            _, _attr, lowered_attr_name, _ = node
+            return lowered_kwargs[lowered_attr_name]
+        _, _attr, cls, children = node
+        init_kwargs: dict[str, Any] = {}
+        for child in children:
+            field_name = child[1]
+            init_kwargs[field_name] = _build_value_from_node(child)
+        return cls(**init_kwargs)
+
+    out: dict[str, Any] = {}
+    for node in param_mapping_tree:
+        out[node[1]] = _build_value_from_node(node)
+    return out
+
+
+def _unflatten_call_args(lowered_sig: inspect.Signature, param_mapping_tree: list[tuple], args: tuple, kwargs: dict) -> dict:
+    """Lowered call args/kwargs -> original kwargs (dict for ``fn(**dict)``)."""
+    bound = lowered_sig.bind(*args, **kwargs)
+    bound.apply_defaults()
+    return _reassemble_kwargs(param_mapping_tree, bound.arguments)
+
+
+def _unflatten_setup_ctx_inputs(
+    lowered_sig: inspect.Signature, original_sig: inspect.Signature, param_mapping_tree: list[tuple], inputs: tuple
+) -> tuple:
+    """Lowered positional inputs tuple -> original positional inputs tuple
+    (for ``setup_context_fn(ctx, inputs, output)``)."""
+    lowered_kwargs = {p.name: v for p, v in zip(lowered_sig.parameters.values(), inputs)}
+    original_kwargs = _reassemble_kwargs(param_mapping_tree, lowered_kwargs)
+    return tuple(original_kwargs[p] for p in original_sig.parameters)
+
+
+# ---- core ----
+
+
+@dataclasses.dataclass(frozen=True)
+class _DataclassRuntimeAdapter:
+    """Runtime conversion adapter."""
+
+    flatten_call_args: Callable[[tuple, dict], list]
+    flatten_input_grads: Callable[[tuple], tuple]
+    unflatten_call_args: Callable[[tuple, dict], dict]
+    unflatten_setup_ctx_inputs: Callable[[tuple], tuple]
+    expand_mutates_args: Callable[[tuple[str, ...]], tuple[str, ...]]
+    apply_lowered_signature: Callable[[Callable], None]
 
 
 # ==============================================================================
-# 8. The decorator: main pipeline                          (produces slot 3)
-# ------------------------------------------------------------------------------
-# The single public entry point. Its inner `decorator` closure orchestrates the
-# full 4-slot pipeline (see module docstring): it calls sec 4 to lower the user's
-# signature (slot 1), sec 5 to synthesise the meta function, sec 6 to register
-# the op with torch.library (slot 2), and -- on the dataclass-flatten path --
-# additionally builds the user-facing wrapper (slot 3) plus the runtime closures
-# that drive sec 7 on each call.
+# BLOCK 4 -- MAIN PIPELINE
 # ==============================================================================
 
 
@@ -862,8 +896,7 @@ def _magi_register_custom_op_impl(
     is_subgraph_boundary: bool = False,
 ):
     def decorator(fn: Callable) -> Callable:
-        # See the module docstring for the 4-slot pipeline / 3-runtime-path
-        # picture; the body below just walks slot 0 -> 1 -> 2 (-> 3 if needed).
+        # A 4-slot pipeline.
 
         op_name = name if name is not None else _generate_op_name(fn)
         if is_compute_sensitive:
@@ -871,123 +904,84 @@ def _magi_register_custom_op_impl(
         if is_subgraph_boundary:
             get_compile_config().splitting_ops.append(op_name)
 
-        # Dataclass parameters are the only thing forcing slot 3; other lowering
-        # (Literal/Enum/default scrub) is handled by slot 1 alone at zero
-        # per-call cost.
+        _validate_op_signature_constraints(fn)
         original_sig, lowered_sig, param_mapping_tree = _lower_op_signature(fn)
         needs_flattening = any(kind == "dataclass" for kind, *_ in param_mapping_tree)
 
         if not needs_flattening:
-            # ----- No-flattening path: fn -> [lowered_fn?] -> torch_registered_op -----
-            # Step 1 (slot 1): only when the lowering actually rewrote the
-            # signature -- otherwise register ``fn`` directly (zero-overhead).
-            if _signatures_differ(original_sig, lowered_sig):
-                lowered_fn = _make_lowered_signature_wrapper(fn, lowered_sig)
-                fn_to_register = lowered_fn
-            else:
+            # ----- No-flattening scenario -----
+            # Path: fn -> [lowered_fn ->] torch_registered_op
+
+            # Step 1: Build ``lowered_fn`` iff the signature was rewritten.
+            if original_sig == lowered_sig:
                 fn_to_register = fn
+            else:  # Signatures differ, need to wrap the function
 
-            # Step 2: meta/fake function.
-            if infer_output_meta_fn is None:
-                meta_fn = _create_identity_meta_fn(fn_to_register)
-            elif isinstance(infer_output_meta_fn, list):
-                meta_fn = _create_meta_fn_from_param_names(fn_to_register, infer_output_meta_fn)
-            else:
-                meta_fn = infer_output_meta_fn
+                @functools.wraps(fn)
+                def lowered_fn(*args, **kwargs):
+                    return fn(*args, **kwargs)
 
-            # Step 3 (slot 2): custom_op + register_fake.
+                _apply_lowered_signature(lowered_sig, lowered_fn)
+                fn_to_register = lowered_fn
+
+            # Step 2: Register the op in torch and get ``torch_registered_op``.
             torch_registered_op = _register_torch_op(
-                op_name=op_name, fn=fn_to_register, mutates_args=mutates_args, meta_fn=meta_fn
+                op_name=op_name,
+                fn=fn_to_register,
+                mutates_args=mutates_args,
+                infer_output_meta_fn=infer_output_meta_fn,
+                setup_context_fn=setup_context_fn,
+                backward_fn=backward_fn,
+                dataclass_runtime_adapter=None,
             )
 
-            # Step 4: autograd.
-            if backward_fn is not None:
-                torch_registered_op.register_autograd(backward_fn, setup_context=setup_context_fn)
-
-            # No slot 3 needed: the user's calling convention already matches
-            # the lowered one, so ``torch_registered_op`` is itself returned.
+            # Return bare torch-level op (slot 2).
             return torch_registered_op
 
         else:
-            # ----- Flattening path: fn -> lowered_fn -> torch_registered_op -> magi_exposed_op -----
-            # Step 1 (slot 1): build the lowered-signature bridge. ``lowered_fn``
-            # speaks the flat primitive signature; it rebinds args, reassembles
-            # dataclasses, then dispatches to the user's ``fn``.
-            def _bind_to_original_kwargs(args, kwargs):
-                bound = lowered_sig.bind(*args, **kwargs)
-                bound.apply_defaults()
-                return _reassemble_kwargs(param_mapping_tree, bound.arguments)
+            # ----- Flattening scenario -----
+            # Path: fn -> lowered_fn -> torch_registered_op -> magi_exposed_op
 
-            @functools.wraps(fn)
-            def lowered_fn(*args, **kwargs):
-                return fn(**_bind_to_original_kwargs(args, kwargs))
-
-            _apply_lowered_signature_metadata(lowered_fn, lowered_sig)
-
-            # Step 2: meta/fake function. User-supplied meta_fn is bridged so
-            # it sees the original (dataclass-bearing) signature it was
-            # written against.
-            if infer_output_meta_fn is None:
-                meta_fn = _create_identity_meta_fn(lowered_fn)
-            elif isinstance(infer_output_meta_fn, list):
-                meta_fn = _create_meta_fn_from_param_names(lowered_fn, infer_output_meta_fn)
-            else:
-                user_meta = infer_output_meta_fn
-
-                def _bridged_meta_fn(*args, **kwargs):
-                    return user_meta(**_bind_to_original_kwargs(args, kwargs))
-
-                _bridged_meta_fn.__signature__ = lowered_sig
-                meta_fn = _bridged_meta_fn
-
-            # Step 3 (slot 2): custom_op + register_fake. ``mutates_args`` is
-            # expanded from original-space to lowered-space so torch.library
-            # sees the leaf parameter names it actually owns.
-            flat_mutates_args = _expand_mutates_args(mutates_args, param_mapping_tree)
-            torch_registered_op = _register_torch_op(
-                op_name=op_name, fn=lowered_fn, mutates_args=flat_mutates_args, meta_fn=meta_fn
+            # Step 0 (only in the flattening scenario): Build the scenario-wide adapter.
+            dataclass_runtime_adapter = _DataclassRuntimeAdapter(
+                flatten_call_args=functools.partial(_flatten_call_args, param_mapping_tree, original_sig),
+                flatten_input_grads=functools.partial(_flatten_input_grads, param_mapping_tree),
+                unflatten_call_args=functools.partial(_unflatten_call_args, lowered_sig, param_mapping_tree),
+                unflatten_setup_ctx_inputs=functools.partial(
+                    _unflatten_setup_ctx_inputs, lowered_sig, original_sig, param_mapping_tree
+                ),
+                expand_mutates_args=functools.partial(_expand_mutates_args, param_mapping_tree),
+                apply_lowered_signature=functools.partial(_apply_lowered_signature, lowered_sig),
             )
 
-            # Step 4: autograd. The user's hooks speak the ORIGINAL signature,
-            # but torch.library passes/expects LOWERED inputs and grads, so we
-            # wrap both ends.
-            if backward_fn is not None:
-                user_setup = setup_context_fn
-                user_backward = backward_fn
+            # Step 1: Build ``lowered_fn``.
+            @functools.wraps(fn)
+            def lowered_fn(*args, **kwargs):
+                return fn(**dataclass_runtime_adapter.unflatten_call_args(args, kwargs))
 
-                def _bridged_setup_context(ctx, inputs, output):
-                    if user_setup is None:
-                        return None
-                    # Reassemble the lowered positional tuple into the user's
-                    # original (possibly nested-dataclass) shape, preserving
-                    # original positional order so ``x, cfg = inputs`` works.
-                    lowered_kwargs = {p.name: v for p, v in zip(lowered_sig.parameters.values(), inputs)}
-                    original_kwargs = _reassemble_kwargs(param_mapping_tree, lowered_kwargs)
-                    original_inputs = tuple(original_kwargs[p] for p in original_sig.parameters)
-                    return user_setup(ctx, original_inputs, output)
+            dataclass_runtime_adapter.apply_lowered_signature(lowered_fn)
 
-                def _bridged_backward(ctx, *grads):
-                    original_grads = user_backward(ctx, *grads)
-                    if not isinstance(original_grads, tuple):
-                        # Single-input convenience: PyTorch allows a bare grad
-                        # when the op has one input.
-                        original_grads = (original_grads,)
-                    return tuple(_flatten_grads(param_mapping_tree, original_grads))
+            # Step 2: Register the op in torch and get ``torch_registered_op``.
+            torch_registered_op = _register_torch_op(
+                op_name=op_name,
+                fn=lowered_fn,
+                mutates_args=mutates_args,
+                infer_output_meta_fn=infer_output_meta_fn,
+                setup_context_fn=setup_context_fn,
+                backward_fn=backward_fn,
+                dataclass_runtime_adapter=dataclass_runtime_adapter,
+            )
 
-                torch_registered_op.register_autograd(_bridged_backward, setup_context=_bridged_setup_context)
-
-            # Step 5 (slot 3, flattening-only): the user-facing op that
-            # preserves the original signature, flattens at entry, and
-            # dispatches to ``torch_registered_op``.
+            # Step 3 (only in the flattening scenario): Wrap the torch-level op and get ``magi_exposed_op``.
             @functools.wraps(fn)
             def magi_exposed_op(*args, **kwargs):
-                flat = _flatten_call_args(param_mapping_tree, original_sig, args, kwargs)
+                flat = dataclass_runtime_adapter.flatten_call_args(args, kwargs)
                 return torch_registered_op(*flat)
 
-            # Internal handles so downstream tooling can drop one slot lower
-            # (e.g. dispatch the OpOverload directly with pre-flattened args).
             magi_exposed_op._magi_torch_registered_op = torch_registered_op
             magi_exposed_op._magi_param_mapping_tree = param_mapping_tree
+
+            # Return magi-level op.
             return magi_exposed_op
 
     return decorator
