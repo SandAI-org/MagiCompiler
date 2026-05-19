@@ -1856,6 +1856,125 @@ class TestPerFieldNoneGrad:
         # b did not require grad; nothing to assert beyond "no exception".
 
 
+class TestStructuralDataclassGrad:
+    """The dataclass-grad slot is matched **structurally by field name** -- the
+    returned object does NOT have to be an instance of the input dataclass.
+    Any object that exposes the same field names (the input dataclass itself,
+    a different dataclass, a ``SimpleNamespace``, etc.) is accepted, and
+    Tensor leaves are routed to the corresponding flat slots.
+    """
+
+    def test_grad_returned_as_same_dataclass(self):
+        """Baseline: backward_fn returns an instance of the *same* dataclass
+        type as the input. Tensor fields carry real grads, demonstrating that
+        the dataclass-grad path works end-to-end before we exercise the
+        structural (foreign-type) variants below."""
+
+        @dataclasses.dataclass(frozen=True)
+        class _Cfg:
+            w: torch.Tensor
+            b: torch.Tensor
+
+        def setup(ctx, inputs, output):
+            x, cfg = inputs
+            ctx.save_for_backward(x, cfg.w)
+
+        def bwd(ctx, gy):
+            x, w = ctx.saved_tensors
+            # Use the SAME dataclass type _Cfg to carry the field-level grads.
+            return gy * w, _Cfg(w=gy * x, b=torch.zeros_like(w))
+
+        @magi_register_custom_op(name="test::dc_grad_same_type", setup_context_fn=setup, backward_fn=bwd)
+        def _op(x: torch.Tensor, cfg: _Cfg) -> torch.Tensor:
+            return x * cfg.w + cfg.b
+
+        x = torch.randn(4, requires_grad=True)
+        w = torch.randn(4, requires_grad=True)
+        b = torch.randn(4, requires_grad=True)
+        cfg = _Cfg(w=w, b=b)
+        out = _op(x, cfg)
+        out.sum().backward()
+        assert torch.allclose(x.grad, w)
+        assert torch.allclose(w.grad, x)
+        # b's grad came from _Cfg.b = zeros_like(w), so it should be 0.
+        assert torch.allclose(b.grad, torch.zeros_like(b))
+
+    def test_grad_returned_as_different_dataclass(self):
+        """``backward_fn`` returns a *different* dataclass type that just
+        happens to share field names with the input dataclass. The bridge
+        must spread its Tensor fields to the correct flat grad slots based
+        purely on field-name matching."""
+
+        @dataclasses.dataclass(frozen=True)
+        class _Cfg:
+            w: torch.Tensor
+            b: torch.Tensor
+
+        @dataclasses.dataclass(frozen=True)
+        class _CfgGrad:
+            # Same field names as _Cfg, different class. Distinct identity
+            # to prove name-only matching (no isinstance check).
+            w: torch.Tensor
+            b: torch.Tensor
+
+        def setup(ctx, inputs, output):
+            x, cfg = inputs
+            ctx.save_for_backward(x, cfg.w)
+
+        def bwd(ctx, gy):
+            x, w = ctx.saved_tensors
+            # Express grads via a foreign dataclass type with matching field
+            # names. The bridge must NOT require _Cfg specifically.
+            return gy * w, _CfgGrad(w=gy * x, b=torch.zeros_like(w))
+
+        @magi_register_custom_op(name="test::dc_grad_foreign_type", setup_context_fn=setup, backward_fn=bwd)
+        def _op(x: torch.Tensor, cfg: _Cfg) -> torch.Tensor:
+            return x * cfg.w + cfg.b
+
+        x = torch.randn(4, requires_grad=True)
+        w = torch.randn(4, requires_grad=True)
+        b = torch.randn(4, requires_grad=True)
+        cfg = _Cfg(w=w, b=b)
+        out = _op(x, cfg)
+        out.sum().backward()
+        assert torch.allclose(x.grad, w)
+        assert torch.allclose(w.grad, x)
+        # b's grad came from _CfgGrad.b = zeros_like(w), so it should be 0.
+        assert torch.allclose(b.grad, torch.zeros_like(b))
+
+    def test_grad_returned_as_simple_namespace(self):
+        """A non-dataclass object (``types.SimpleNamespace``) that exposes
+        the dataclass field names should also be accepted."""
+        import types as _types
+
+        @dataclasses.dataclass(frozen=True)
+        class _Cfg:
+            w: torch.Tensor
+            b: torch.Tensor
+
+        def setup(ctx, inputs, output):
+            x, cfg = inputs
+            ctx.save_for_backward(x, cfg.w)
+
+        def bwd(ctx, gy):
+            x, w = ctx.saved_tensors
+            return gy * w, _types.SimpleNamespace(w=gy * x, b=torch.zeros_like(w))
+
+        @magi_register_custom_op(name="test::dc_grad_namespace", setup_context_fn=setup, backward_fn=bwd)
+        def _op(x: torch.Tensor, cfg: _Cfg) -> torch.Tensor:
+            return x * cfg.w + cfg.b
+
+        x = torch.randn(4, requires_grad=True)
+        w = torch.randn(4, requires_grad=True)
+        b = torch.randn(4, requires_grad=True)
+        cfg = _Cfg(w=w, b=b)
+        out = _op(x, cfg)
+        out.sum().backward()
+        assert torch.allclose(x.grad, w)
+        assert torch.allclose(w.grad, x)
+        assert torch.allclose(b.grad, torch.zeros_like(b))
+
+
 class TestBackwardCallsAnotherOp:
     """``backward_fn`` is allowed to call other registered ops to compute the
     gradient. This is the FlashAttention-style "forward op + backward op"
