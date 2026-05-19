@@ -211,6 +211,7 @@ def magi_register_custom_op(
     - @torch.library.custom_op
     - @torch.library.register_fake
     - @torch.library.register_autograd
+    and extends it to support nested dataclass parameters.
 
     Arguments:
         name: Fully qualified op name (e.g. ``"namespace::op_name"``). If
@@ -257,7 +258,7 @@ def magi_register_custom_op(
 
         3. Frozen-dataclass parameter (grouped config):
 
-        >>> @dataclasses.dataclass(frozen=True)
+        ... @dataclasses.dataclass(frozen=True)
         ... class AttnCfg:
         ...     scale: float
         ...     causal: bool = False
@@ -266,36 +267,43 @@ def magi_register_custom_op(
         ... def attn(q: torch.Tensor, k: torch.Tensor, cfg: AttnCfg) -> torch.Tensor:
         ...     pass
 
-        4. Backward with a dataclass input (per-field grads by field name):
+        4. Backward with a nested-dataclass input (per-field grads by field name):
 
         For a dataclass input slot, the easiest way to express per-field
-        grads is to return a ``dict`` keyed by field name. Tensor fields
-        carry their grads; non-differentiable fields (or absent keys) use
-        ``None``. The bridge matches by field **name** (not by type), so
-        any object exposing the same names works; ``dict`` is just the
-        most convenient.
+        grads is to return a ``dict`` keyed by field name (nested for
+        nested dataclasses). Tensor fields carry their grads; non-
+        differentiable fields (or absent keys) use ``None``. The bridge
+        matches by field **name** (not by type), so any object exposing
+        the same names works; ``dict`` is just the most convenient.
 
-        >>> @dataclasses.dataclass(frozen=True)
-        ... class WeightCfg:
+        ... @dataclasses.dataclass(frozen=True)
+        ... class Inner:
         ...     w: torch.Tensor
         ...     b: torch.Tensor
         ...
-        >>> def setup(ctx, inputs, output):
-        ...     x, cfg = inputs
-        ...     ctx.save_for_backward(x, cfg.w)
+        ... @dataclasses.dataclass(frozen=True)
+        ... class WeightCfg:
+        ...     inner: Inner
+        ...     scale: float
         ...
-        >>> def bwd(ctx, gy):
+        ... def setup(ctx, inputs, output):
+        ...     x, cfg = inputs
+        ...     ctx.save_for_backward(x, cfg.inner.w)
+        ...     ctx.scale = cfg.scale
+        ...
+        ... def bwd(ctx, gy):
         ...     x, w = ctx.saved_tensors
+        ...     s = ctx.scale
         ...     # Slot order matches the ORIGINAL signature of ``op`` below.
         ...     return (
-        ...         gy * w,                      # grad for x   (Tensor)
-        ...         {"w": gy * x, "b": None},    # grad for cfg (dict: per-field)
-        ...         # equivalently: WeightCfg(w=gy * x, b=None)
+        ...         gy * w * s,                                         # grad for x   (Tensor)
+        ...         {"inner": {"w": gy * x * s, "b": None}, "scale": None},  # grad for cfg (nested dict)
+        ...         # equivalently: WeightCfg(inner=Inner(w=gy * x * s, b=None), scale=None)
         ...     )
         ...
         >>> @magi_register_custom_op(setup_context_fn=setup, backward_fn=bwd)
         ... def op(x: torch.Tensor, cfg: WeightCfg) -> torch.Tensor:
-        ...     return x * cfg.w + cfg.b
+        ...     return (x * cfg.inner.w + cfg.inner.b) * cfg.scale
     """
     return _magi_register_custom_op_impl(
         name=name,
