@@ -390,14 +390,21 @@ def test_evt_swiglu7_constants_roundtrip_in_ir_json():
     for p in model.parameters():
         p.requires_grad_(False)
 
+    a = _input_a()
+    with torch.no_grad():
+        expected = model(a)
+
     get_compile_config().disable_cache = True
     stats, restore = _install_pass_instrument()
     try:
         compiled = magi_compile(model, dynamic_arg_dims={"a": 0})
         with torch.no_grad():
-            compiled(_input_a())
+            actual = compiled(a)
     finally:
         restore()
+
+    diff = (actual.float() - expected.float()).abs().max().item()
+    assert diff <= 0.5, f"swiglu7 custom constants max|diff|={diff}"
 
     assert stats.fused_count == 1
     assert stats.kinds == ["swiglu7_dual"]
@@ -443,14 +450,21 @@ def test_evt_sm90_swiglu7_constants_roundtrip_in_ir_json():
     for p in model.parameters():
         p.requires_grad_(False)
 
+    a = _input_a()
+    with torch.no_grad():
+        expected = model(a)
+
     get_compile_config().disable_cache = True
     stats, restore = _install_pass_instrument()
     try:
         compiled = magi_compile(model, dynamic_arg_dims={"a": 0})
         with torch.no_grad():
-            compiled(_input_a())
+            actual = compiled(a)
     finally:
         restore()
+
+    diff = (actual.float() - expected.float()).abs().max().item()
+    assert diff <= 0.5, f"SM90 swiglu7 custom constants max|diff|={diff}"
 
     assert stats.fused_count == 1
     assert stats.kinds == ["swiglu7_dual"]
@@ -645,9 +659,9 @@ def test_evt_no_fuse_k_misaligned():
 
 
 @_SM120_ONLY
-def test_evt_no_fuse_evt_n_misaligned():
-    """N not divisible by 4 fails the generic-EVT N-alignment guard
-    (CUTLASS AlignmentC = 4) — must fall back to torch.compile / cuBLAS."""
+def test_evt_col_n_misaligned_still_fuses():
+    """N=1026 is not 128-bit aligned for bf16 but the runtime pads the
+    output stride to a 128-byte boundary, so fusion should still fire."""
 
     class M(nn.Module):
         def __init__(self, k, n):
@@ -659,15 +673,15 @@ def test_evt_no_fuse_evt_n_misaligned():
             return high_precision_silu(y, out_dtype=torch.bfloat16)
 
     K = 1024
-    N = 1026  # 1026 % 4 = 2 → should NOT fuse
+    N = 1026
     a = torch.randn(_M, K, device="cuda", dtype=torch.bfloat16)
-    _compile_and_check(M(K, N), (a,), expect_fused=0)
+    _compile_and_check(M(K, N), (a,), expect_fused=1)
 
 
 @_SM120_ONLY
-def test_evt_no_fuse_swiglu7_n_not_mult_of_8():
-    """swiglu7 needs N % 8 == 0 so that n_out = N // 2 is 4-aligned for
-    bf16 (CUTLASS AlignmentC = 4). N = 12 (% 8 != 0) must fall back."""
+def test_evt_swiglu7_small_n_still_fuses():
+    """N=12: n_out=6 is not 128-bit aligned for bf16 but the runtime pads
+    the output stride, so swiglu7 fusion should still fire."""
 
     class M(nn.Module):
         def __init__(self, k, n):
@@ -679,9 +693,9 @@ def test_evt_no_fuse_swiglu7_n_not_mult_of_8():
             return swiglu7(y, out_dtype=torch.bfloat16)
 
     K = 1024
-    N = 12  # 12 % 2 == 0 (split OK) but 12 % 8 != 0 → NOT fused
+    N = 12
     a = torch.randn(_M, K, device="cuda", dtype=torch.bfloat16)
-    _compile_and_check(M(K, N), (a,), expect_fused=0)
+    _compile_and_check(M(K, N), (a,), expect_fused=1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -897,20 +911,15 @@ def test_evt_no_fuse_fp32_mm():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SM90 multi-AuxLoad — the EVT codegen lets the first AuxLoad bind to
-# Sm90SrcFetch (TMA-staged C operand path) and subsequent AuxLoad nodes bind
-# to ``Sm90AuxLoad<0, void, Element, RowMajor, void, void>`` (zero-SMEM inline
-# ld.global). Tests below exercise the ≥2 AuxLoad path which previously was
-# rejected by ``can_render`` on H100.
+# SM90 AuxLoad — all AuxLoad nodes use ``Sm90AuxLoad<0>`` (inline ld.global,
+# no SMEM staging). The C-operand TMA channel is left unused. Tests below
+# exercise single and multi-AuxLoad paths on H100.
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 @_SM90_ONLY
 def test_evt_sm90_single_aux_load_fuse():
-    """``(mm * gate)`` — single (M, N) auxiliary. Regression guard for the
-    multi-AuxLoad refactor: the single-AuxLoad path must keep mapping to
-    Sm90SrcFetch (TMA-staged C-operand load), not to the new inline
-    Sm90AuxLoad<0, void, ...>.
+    """``(mm * gate)`` — single (M, N) auxiliary via Sm90AuxLoad<0> (ld.global).
 
     We use ``*`` instead of ``+`` because Inductor folds ``mm + tensor`` into
     ``aten.addmm`` (which the EVT pass doesn't recognise), but ``mm * tensor``
@@ -937,9 +946,9 @@ def test_evt_sm90_single_aux_load_fuse():
 def test_evt_sm90_two_aux_loads_fuse():
     """``(mm + R1 + R2)`` — two (M, N) residuals fuse into one EVT op.
 
-    Validates the SM90 multi-AuxLoad path end-to-end: codegen produces a tree
-    with Sm90SrcFetch + Sm90AuxLoad<0, void, ...>, the kernel compiles, runs,
-    and matches eager within bf16 tolerance.
+    Both AuxLoad nodes use Sm90AuxLoad<0> (inline ld.global). Validates the
+    multi-AuxLoad path end-to-end: the kernel compiles, runs, and matches
+    eager within bf16 tolerance.
     """
 
     class M(nn.Module):
@@ -969,9 +978,8 @@ def test_evt_sm90_two_aux_loads_fuse():
 def test_evt_sm90_three_aux_loads_fuse():
     """``(mm + R1 + R2 + R3)`` — three (M, N) residuals.
 
-    Confirms ≥3 aux can compile / run on the SM90 path. Two of the three
-    AuxLoad nodes map to Sm90AuxLoad<0, void, ...> (the SrcFetch slot only
-    serves the first).
+    All three AuxLoad nodes use Sm90AuxLoad<0> (inline ld.global). Confirms
+    ≥3 aux can compile / run on the SM90 path.
     """
 
     class M(nn.Module):
@@ -998,7 +1006,7 @@ def test_evt_sm90_three_aux_loads_fuse():
     )
 
 
-# ── can_render unit tests — exercise the SM90 gate directly, no GPU needed ──
+# ── can_render unit tests — exercise the SM90 gate directly, no GPU needed ────
 
 
 def test_can_render_accepts_multi_aux():
@@ -1373,6 +1381,148 @@ def test_evt_sm90_mixed_compute_dtype_chain():
     compute_dtypes = _parse_ir_compute_dtypes(stats.ir_jsons[0])
     assert "bfloat16" in compute_dtypes, f"Expected at least one bfloat16 compute_dtype in IR, " f"got {compute_dtypes}"
     assert "float32" in compute_dtypes, f"Expected at least one float32 compute_dtype in IR, " f"got {compute_dtypes}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SM90 unary activation + scalar / bias tests — parity with SM120 positive
+# tests, exercising the TMA-based Sm90EVT codegen + runtime end-to-end.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@_SM90_ONLY
+@pytest.mark.parametrize(
+    "epi_name,epi_fn,atol,rtol",
+    [
+        ("silu", high_precision_silu, 0.5, 0.0),
+        ("sigmoid", high_precision_sigmoid, 0.5, 0.0),
+        ("gelu", high_precision_gelu, 0.5, 0.0),
+        ("gelu7", gelu7, 0.5, 0.0),
+        ("relu_square", relu_square, 0.0, 0.2),
+    ],
+)
+def test_evt_sm90_unary_activations_fuse(epi_name, epi_fn, atol, rtol):
+    """SM90: all unary activations must fuse and match eager."""
+    model = _Bf16MmModel(_K, _N, epi_fn)
+    _compile_and_check(model, (_input_a(),), atol=atol, rtol=rtol, expect_fused=1, expect_kinds=["evt_col"])
+
+
+@_SM90_ONLY
+def test_evt_sm90_swiglu7_dispatches_to_dualgemm():
+    """SM90: SwiGLU7 must take the dedicated DualGemm path."""
+    model = _Bf16MmModel(_K, _N, swiglu7)
+    _compile_and_check(model, (_input_a(),), atol=0.5, rtol=0.05, expect_fused=1, expect_kinds=["swiglu7_dual"])
+
+
+@_SM90_ONLY
+def test_evt_sm90_mm_plus_scalar():
+    """SM90: ``mm + 0.5`` scalar add."""
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(_N, _K))
+
+        def forward(self, a):
+            return (torch.mm(a, self.weight.permute(1, 0)) + 0.5).to(torch.bfloat16)
+
+    _compile_and_check(M(), (_input_a(),), atol=1.5, expect_fused=1, expect_kinds=["evt_col"])
+
+
+@_SM90_ONLY
+def test_evt_sm90_mm_plus_1d_bias():
+    """SM90: ``silu(mm + bias_N)`` — 1-D bias as RowBroadcast."""
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(_N, _K))
+            self.bias = nn.Parameter(torch.randn(_N))
+
+        def forward(self, a):
+            y = torch.mm(a, self.weight.permute(1, 0)) + self.bias
+            return high_precision_silu(y, out_dtype=torch.bfloat16)
+
+    _compile_and_check(M(), (_input_a(),), atol=1.5, expect_fused=1, expect_kinds=["evt_col"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SM90 D stride padding regression — exercises the fix where make_args() uses
+# ea.ldd (= n_pad) instead of N for stride_D.  When N is not 128-byte aligned
+# the runtime pads D to (M, n_pad) and passes the (M, N) slice; the TMA
+# descriptor must use n_pad as the globalStride or every row after the first
+# is written to the wrong offset.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@_SM90_ONLY
+def test_evt_sm90_d_stride_padding_silu():
+    """SM90 D stride regression: N=1032 is not 128-byte aligned for bf16.
+
+    Runtime pads D to n_pad=1088 (next 64-element boundary for bf16).
+    Before the fix, stride_D was built from N instead of ldd,
+    corrupting every row after the first.
+    N must be a multiple of 8 so Inductor doesn't pad the weight.
+    """
+    K = 1024
+    N = 1032
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(N, K))
+
+        def forward(self, a):
+            y = torch.mm(a, self.weight.permute(1, 0))
+            return high_precision_silu(y, out_dtype=torch.bfloat16)
+
+    a = torch.randn(_M, K, device="cuda", dtype=torch.bfloat16)
+    _compile_and_check(M(), (a,), atol=0.5, expect_fused=1, expect_kinds=["evt_col"])
+
+
+@_SM90_ONLY
+def test_evt_sm90_d_stride_padding_swiglu7():
+    """SM90 D stride regression for swiglu7: N=1040, n_out=520.
+
+    520 bf16 elements = 1040 bytes, not 128-byte aligned.
+    Runtime pads to n_pad=576 (next 64-element boundary).
+    N must be a multiple of 8 so Inductor doesn't pad the weight.
+    """
+    K = 1024
+    N = 1040
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(N, K))
+
+        def forward(self, a):
+            y = torch.mm(a, self.weight.permute(1, 0))
+            return swiglu7(y, out_dtype=torch.bfloat16)
+
+    a = torch.randn(_M, K, device="cuda", dtype=torch.bfloat16)
+    _compile_and_check(M(), (a,), atol=0.5, rtol=0.05, expect_fused=1, expect_kinds=["swiglu7_dual"])
+
+
+@_SM90_ONLY
+def test_evt_sm90_d_stride_padding_add_scalar():
+    """SM90 D stride regression: N=200 (not 128-byte aligned for bf16).
+
+    200 bf16 elements = 400 bytes. Runtime pads to n_pad=256 (512 bytes).
+    Exercises the stride mismatch (ldd=256 vs N=200) on a scalar-add chain.
+    """
+    K = 1024
+    N = 200
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(N, K))
+
+        def forward(self, a):
+            return (torch.mm(a, self.weight.permute(1, 0)) + 0.5).to(torch.bfloat16)
+
+    a = torch.randn(_M, K, device="cuda", dtype=torch.bfloat16)
+    _compile_and_check(M(), (a,), atol=1.5, expect_fused=1, expect_kinds=["evt_col"])
 
 
 if __name__ == "__main__":

@@ -55,12 +55,15 @@ _TILE_CANDIDATES_SM120: dict = {
         (64, 128, 64, 32, 64, 64, 4, "T<64,128,64>_S4"),
     ],
     "large": [
+        # 256×128×64 and 128×256×64 with 3 stages need ~144 KB SMEM/CTA, well
+        # over the sm_120 opt-in cap of 99 KB — cudaFuncSetAttribute fails for
+        # those during initialize() and leaves a sticky CUDA error that taints
+        # the next kernel's launch. Keep only tiles whose static SharedStorage
+        # fits inside cudaDevAttrMaxSharedMemoryPerBlockOptin on sm_120.
         (128, 256, 32, 64, 64, 32, 3, "T<128,256,32>_S3"),
         (256, 128, 32, 64, 64, 32, 3, "T<256,128,32>_S3"),
         (128, 128, 32, 64, 64, 32, 4, "T<128,128,32>_S4"),
         (128, 128, 64, 64, 64, 64, 3, "T<128,128,64>_S3"),
-        (256, 128, 64, 64, 64, 64, 3, "T<256,128,64>_S3"),
-        (128, 256, 64, 64, 64, 64, 3, "T<128,256,64>_S3"),
     ],
 }
 
@@ -210,6 +213,8 @@ _KERNEL_PREAMBLE = """\
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdlib>
 #include <math.h>
 #include <memory>
 #include <unordered_map>
@@ -518,31 +523,58 @@ class EvtAutoTuneRunner {{
     cudaEvent_t s, e;
     cudaEventCreate(&s); cudaEventCreate(&e);
 
+    // Drain any pre-existing CUDA error so we don't blame our first candidate
+    // for an upstream failure.
+    (void)cudaGetLastError();
+
     for (size_t i = 0; i < configs_.size(); ++i) {{
       auto& g = configs_[i];
       size_t ws_sz = 0;
       try {{ ws_sz = g->get_workspace_size(ea); }}
-      catch (...) {{ continue; }}
+      catch (...) {{ (void)cudaGetLastError(); continue; }}
       if (!ws_.defined() || ws_.numel() < (int64_t)ws_sz) {{
         ws_ = at::empty({{(int64_t)ws_sz + 1}},
             at::TensorOptions().dtype(at::kByte).device(at::kCUDA));
       }}
       void* ws_ptr = ws_sz > 0 ? ws_.data_ptr() : nullptr;
+      // initialize() can fail synchronously (e.g. cudaFuncSetAttribute returns
+      // cudaErrorInvalidValue for tiles whose SharedStorage exceeds the
+      // device opt-in cap). Clear the sticky CUDA error before moving on —
+      // otherwise the next launch (or post-autotune user run) inherits it
+      // and surfaces a misleading "Error Internal" against an unrelated tile.
       if (g->initialize(ea, ws_ptr, stream) != cutlass::Status::kSuccess) {{
+        (void)cudaGetLastError();
         continue;
       }}
 
       // Warmup — 10 iters so L2 / inst caches settle (3 was too few — first
       // timed iter saw a cold L2 and biased the choice towards smaller tiles).
-      for (int w = 0; w < 10; ++w) g->run(stream);
-      cudaStreamSynchronize(stream);
+      // Capture run() status and sync return codes so an async launch failure
+      // (e.g. invalid grid, latent SMEM issue) disqualifies the tile cleanly.
+      bool tile_ok = true;
+      for (int w = 0; w < 10; ++w) {{
+        if (g->run(stream) != cutlass::Status::kSuccess) {{ tile_ok = false; break; }}
+      }}
+      if (tile_ok && cudaStreamSynchronize(stream) != cudaSuccess) {{
+        tile_ok = false;
+      }}
+      if (!tile_ok) {{
+        (void)cudaGetLastError();
+        continue;
+      }}
 
       // Time — 20 iters for ~1% timing noise, matching torch.compile defaults.
       cudaEventRecord(s, stream);
       int iters = 20;
-      for (int p = 0; p < iters; ++p) g->run(stream);
+      for (int p = 0; p < iters; ++p) {{
+        if (g->run(stream) != cutlass::Status::kSuccess) {{ tile_ok = false; break; }}
+      }}
       cudaEventRecord(e, stream);
-      cudaEventSynchronize(e);
+      if (cudaEventSynchronize(e) != cudaSuccess) tile_ok = false;
+      if (!tile_ok) {{
+        (void)cudaGetLastError();
+        continue;
+      }}
       float ms = 0;
       cudaEventElapsedTime(&ms, s, e);
       float avg = ms / iters;

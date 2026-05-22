@@ -74,16 +74,16 @@ def out_dtype_from_id(i: int) -> torch.dtype:
 
 
 # Greedy alignment: 128 bits when divisible, 64-bit fallback.
-_GREEDY_ALIGN_BITS_RT = (128, 64)
+GREEDY_ALIGN_BITS = (128, 64)
 
 
 def _runtime_align_bits(dim: int, dtype: torch.dtype) -> int:
     n_int = int(dim)
-    for bits in _GREEDY_ALIGN_BITS_RT:
+    for bits in GREEDY_ALIGN_BITS:
         align_elems = max(1, bits // (dtype.itemsize * 8))
         if n_int % align_elems == 0:
             return bits
-    raise ValueError(f"dim={n_int} not even {_GREEDY_ALIGN_BITS_RT[-1]}-bit-aligned for dtype={dtype}")
+    raise ValueError(f"dim={n_int} not even {GREEDY_ALIGN_BITS[-1]}-bit-aligned for dtype={dtype}")
 
 
 def _aligned_n_stride(n_out: int, dtype: torch.dtype) -> int:
@@ -171,6 +171,97 @@ def _per_key_lock(key: str) -> threading.Lock:
         return lock
 
 
+# ``cpp_extension.load`` uses a ``FileBaton`` (torch/utils/file_baton.py) to
+# serialise multi-process compile requests for the same extension: the holding
+# process creates ``<build_dir>/lock`` and removes it inside a ``finally``.
+# If the holder is SIGKILL'd mid-build (Ctrl-C → timeout escalation, OOM,
+# container restart) ``release()`` never runs, the file stays on disk, and
+# every subsequent ``load()`` poll-waits on ``os.path.exists(lock)`` forever.
+#
+# We harden against this in two ways:
+#   1. **Skip the lock entirely when the .so is already built.** The hot path
+#      after a warm on-disk cache should never touch FileBaton — we just
+#      dlopen the .so directly.
+#   2. **Probe the existing lock with fcntl.flock(LOCK_EX|LOCK_NB).** The
+#      kernel releases flock'd advisory locks when the holding process dies
+#      (graceful or SIGKILL), so flock gives us a *correct* liveness check
+#      independent of mtime. If we can grab the flock, the previous owner is
+#      gone and the file is stale regardless of how recently it was created.
+#      mtime is only used as a coarse extra guard when flock isn't available.
+
+
+def _try_dlopen_prebuilt(build_dir: str, mod_name: str):
+    """Fast path: if the .so for this build_dir already exists, import it
+    directly without going through cpp_extension.load (which would try to
+    acquire FileBaton and could hang on a stale lock).
+
+    Returns the loaded module on success, None if the .so isn't there yet.
+    """
+    so_path = os.path.join(build_dir, f"{mod_name}.so")
+    if not os.path.isfile(so_path):
+        return None
+    try:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(mod_name, so_path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception:
+        # Anything goes wrong (corrupt .so, ABI mismatch, …) — let the slow
+        # path through cpp_extension.load() handle it properly.
+        return None
+
+
+def _evict_stale_lock(build_dir: str) -> None:
+    """Reclaim ``<build_dir>/lock`` if its owner is gone.
+
+    Strategy: open the lock file and try to ``flock(LOCK_EX|LOCK_NB)``. The
+    OS releases advisory locks when the holding process exits, including on
+    SIGKILL, so a successful non-blocking acquisition proves the previous
+    holder is dead. We then unlink the file and release our own flock so the
+    next FileBaton.try_acquire() succeeds.
+
+    If flock is unavailable (non-Unix) or the file is currently held by a
+    live process, we leave it alone — letting cpp_extension.load() block as
+    designed for genuine concurrent compiles.
+    """
+    lock_path = os.path.join(build_dir, "lock")
+    if not os.path.exists(lock_path):
+        return
+    try:
+        import fcntl
+    except ImportError:
+        # Windows / no fcntl — fall back to no-op; user must remove stale
+        # locks manually. We do NOT use mtime-only eviction here because the
+        # "rapid kill within N seconds" workflow can defeat any mtime cutoff.
+        return
+    try:
+        fd = os.open(lock_path, os.O_RDWR)
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, BlockingIOError):
+            # Someone is alive and holding the lock — leave it.
+            return
+        # We hold flock now; the previous owner is dead. Unlink and let our
+        # flock be released by closing the fd.
+        try:
+            os.remove(lock_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+    finally:
+        os.close(fd)
+
+
 def _compile_evt_module(
     ir_json: str,
     a_dtype: torch.dtype,
@@ -222,7 +313,7 @@ def _compile_evt_module(
             "alignB_bits": int(alignment_b_bits),
             "alignC_bits": int(alignment_c_bits),
             "arch": arch,
-            "version": 7,
+            "version": 10,
         },
         sort_keys=True,
     ).encode("utf-8")
@@ -258,12 +349,30 @@ def _compile_evt_module(
 
         build_dir = _evt_build_dir(key)
         os.makedirs(build_dir, exist_ok=True)
+        mod_name = f"magi_evt_{key[:12]}"
+
+        # Warm-cache fast path: if a previous run already produced the .so for
+        # this exact key, dlopen it directly and skip FileBaton entirely.
+        # Avoids hanging on a stale lock when the .so is already usable, and
+        # makes repeated kill+restart cycles converge as soon as one run
+        # produced the binary.
+        prebuilt = _try_dlopen_prebuilt(build_dir, mod_name)
+        if prebuilt is not None:
+            _MODULE_CACHE[key] = prebuilt
+            _MODULE_FAST_CACHE[fast_key] = prebuilt
+            return prebuilt
+
         src_path = os.path.join(build_dir, "evt.cu")
         # Atomic write: tmp + rename to avoid half-written files across ranks.
         tmp_path = f"{src_path}.{os.getpid()}.tmp"
         with open(tmp_path, "w") as f:
             f.write(src)
         os.replace(tmp_path, src_path)
+
+        # Reap any FileBaton lock left by a previous SIGKILL'd build (flock
+        # liveness check, mtime-independent). Must run inside the per-key
+        # Python lock so concurrent threads in this process cannot race.
+        _evict_stale_lock(build_dir)
 
         cutlass_root = get_compile_config().cutlass_root
         from torch.utils.cpp_extension import load
@@ -273,16 +382,33 @@ def _compile_evt_module(
             ["--expt-extended-lambda", "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED=1"] if arch == "sm90" else []
         )
 
+        # -fvisibility=hidden gives each .so its own copy of CUTLASS template
+        # static members like GemmUniversalBase<GemmKernel>::device_ordinal_.
+        # Without this, two .so files that instantiate the same GemmKernel
+        # type (e.g. medium and large m-bucket modules sharing the same EVT
+        # chain + tile shape) collide on the static symbol — the first .so
+        # to call init_device_props() poisons the cache for all later .so
+        # files: their kernels never get cudaFuncSetAttribute called, so any
+        # launch above the default 48 KB dynamic SMEM fails with cudaError-
+        # InvalidValue ("invalid argument").
         module = load(
-            name=f"magi_evt_{key[:12]}",
+            name=mod_name,
             sources=[src_path],
             extra_include_paths=[
                 os.path.join(cutlass_root, "include"),
                 os.path.join(cutlass_root, "tools", "util", "include"),
             ],
-            extra_cflags=["-O3", "-std=c++17"],
+            extra_cflags=["-O3", "-std=c++17", "-fvisibility=hidden", "-fvisibility-inlines-hidden"],
             extra_cuda_cflags=(
-                ["-std=c++17", "-O3", "--expt-relaxed-constexpr"] + sm90_specific_cflags + _device_gencode_flags()
+                [
+                    "-std=c++17",
+                    "-O3",
+                    "--expt-relaxed-constexpr",
+                    "-Xcompiler=-fvisibility=hidden",
+                    "-Xcompiler=-fvisibility-inlines-hidden",
+                ]
+                + sm90_specific_cflags
+                + _device_gencode_flags()
             ),
             build_directory=build_dir,
             verbose=False,
@@ -371,6 +497,18 @@ def _compile_swiglu7_dual(
         build_tag = f"{m_bucket}_N{N}_K{K}" f"_aA{alignment_a_bits}_aB{alignment_b_bits}_aC{alignment_c_bits}"
         build_dir = os.path.join(cache_root, "evt_kernels", arch_tag, f"swiglu7_dual_{build_tag}")
         os.makedirs(build_dir, exist_ok=True)
+        mod_name = f"magi_swiglu7_dual_{build_tag}"
+
+        # Warm-cache fast path — see _compile_evt_module for rationale.
+        prebuilt = _try_dlopen_prebuilt(build_dir, mod_name)
+        if prebuilt is not None:
+            _SWIGLU7_FAST_CACHE[fast_key] = prebuilt
+            return prebuilt
+
+        # See _evict_stale_lock — reap a SIGKILL-orphaned cpp_extension lock
+        # before cpp_extension.load tries to acquire it.
+        _evict_stale_lock(build_dir)
+
         from torch.utils.cpp_extension import load
 
         # SM90 needs extra cflags for WGMMA + warp-specialized collective.
@@ -380,8 +518,9 @@ def _compile_swiglu7_dual(
 
         sm90_include_paths = [os.path.join(here, "sm90", "cutlass_kernels")] if arch_tag == "sm90" else []
 
+        # -fvisibility=hidden — see _compile_evt_module above for rationale.
         module = load(
-            name=f"magi_swiglu7_dual_{build_tag}",
+            name=mod_name,
             sources=[src],
             extra_include_paths=[
                 os.path.join(cutlass_root, "include"),
@@ -390,11 +529,13 @@ def _compile_swiglu7_dual(
                 os.path.join(here, "common", "cutlass_kernels"),
                 *sm90_include_paths,
             ],
-            extra_cflags=["-O3", "-std=c++17"],
+            extra_cflags=["-O3", "-std=c++17", "-fvisibility=hidden", "-fvisibility-inlines-hidden"],
             extra_cuda_cflags=[
                 "-std=c++17",
                 "-O3",
                 "--expt-relaxed-constexpr",
+                "-Xcompiler=-fvisibility=hidden",
+                "-Xcompiler=-fvisibility-inlines-hidden",
                 *sm90_specific_cflags,
                 *_device_gencode_flags(),
                 f"-DMAGI_SWIGLU7_ALIGN_A_BITS={int(alignment_a_bits)}",

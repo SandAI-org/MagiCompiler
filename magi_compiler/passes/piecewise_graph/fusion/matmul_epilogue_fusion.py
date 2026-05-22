@@ -43,6 +43,7 @@ from magi_compiler.utils.device import device_capability_major
 
 from . import evt_runtime  # ensures torch.library op + fake impl are registered
 from .evt_ir import Accum, AuxLoad, ColBroadcast, Compute, RowBroadcast, Store, is_trivial, num_extras, to_canonical_json
+from .evt_runtime import GREEDY_ALIGN_BITS
 
 # ── Op tables ────────────────────────────────────────────────────────────────
 # Pure passthrough — no value or dtype change; alias the same IR node.
@@ -120,9 +121,6 @@ def _is_static_int(x) -> bool:
 # the leading dim divisible by AlignmentX, so picking the largest power-of-2
 # that fits gets us vectorised loads when shapes allow but doesn't lock out
 # 64-bit-only shapes (e.g. K=12 for bf16 → 4-elem-aligned).
-_GREEDY_ALIGN_BITS = (128, 64)
-
-
 def _largest_pow2_align_bits(n, dtype: torch.dtype) -> Optional[int]:
     """Return the largest bit-width in (128, 64) that divides ``n * itemsize_bits``.
 
@@ -132,9 +130,9 @@ def _largest_pow2_align_bits(n, dtype: torch.dtype) -> Optional[int]:
     case the caller must abort fusion.
     """
     if not _is_static_int(n):
-        return _GREEDY_ALIGN_BITS[-1]
+        return GREEDY_ALIGN_BITS[-1]
     n_int = int(n)
-    for bits in _GREEDY_ALIGN_BITS:
+    for bits in GREEDY_ALIGN_BITS:
         align_elems = max(1, bits // (dtype.itemsize * 8))
         if n_int % align_elems == 0:
             return bits
@@ -403,11 +401,146 @@ def _validate_swiglu7_structure(chain_nodes: List[fx.Node], mm_node: fx.Node) ->
     return (alpha, limit, one)
 
 
+# ── swiglu7 weight / chain validation ──────────────────────────────────────
+
+
+_SWIGLU7_CHAIN_OPS = frozenset(
+    {
+        torch.ops.aten.slice.Tensor,
+        torch.ops.aten.clamp.default,
+        torch.ops.aten.clamp_min.default,
+        torch.ops.aten.clamp_max.default,
+        torch.ops.aten.sigmoid.default,
+        torch.ops.aten.mul.Tensor,
+        torch.ops.aten.add.Tensor,
+        torch.ops.aten.add.Scalar,
+        torch.ops.aten.mul.Scalar,
+        torch.ops.prims.convert_element_type.default,
+        torch.ops.aten._to_copy.default,
+        torch.ops.aten.clone.default,
+        torch.ops.aten.contiguous.default,
+        torch.ops.aten.alias.default,
+        torch.ops.aten.view.default,
+        torch.ops.aten.reshape.default,
+        torch.ops.aten._unsafe_view.default,
+    }
+)
+
+
+def _validate_swiglu7_weight(mm_node: fx.Node) -> Optional[Tuple[fx.Node, fx.Node, int, int]]:
+    """Check B's underlying data is contiguous (N, K) bf16 with N even.
+
+    K alignment and A/B dtype-compatibility are guaranteed by the caller
+    (``_try_fuse_evt``).  This validates swiglu7-specific constraints only.
+
+    Requires an explicit transpose node (``t(weight)``) so we can extract the
+    underlying ``weight`` with shape (N, K).  The runtime reads ``B.size(0)``
+    as N, so the tensor passed to the kernel must be (N, K)-shaped.
+
+    Returns ``(B_node, weight_node, N, K)`` on success, ``None`` on failure.
+    """
+    B_node = mm_node.args[1]
+    if not isinstance(B_node, fx.Node) or not _is_transpose_node(B_node):
+        return None
+    weight_node = B_node.args[0]
+    if not isinstance(weight_node, fx.Node):
+        return None
+    w_shape = _val_shape(weight_node)
+    w_stride = _val_stride(weight_node)
+    if w_shape is None or len(w_shape) != 2 or w_stride is None:
+        return None
+    N, K = w_shape
+    if w_stride != (K, 1):
+        return None
+    if not (_is_static_int(N) and N % 2 == 0):
+        return None
+    if _val_dtype(mm_node.args[0]) != torch.bfloat16 or _val_dtype(weight_node) != torch.bfloat16:
+        return None
+    # SM90 TMA requires K * sizeof(elem) % 16 == 0.
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
+        elem_bytes = torch.bfloat16.itemsize
+        if _is_static_int(K) and (int(K) * elem_bytes) % 16 != 0:
+            return None
+    return B_node, weight_node, N, K
+
+
+def _validate_swiglu7_chain(mm_node: fx.Node, N: int) -> Optional[Tuple[List[fx.Node], fx.Node, torch.dtype, str]]:
+    """Collect the epilogue chain, validate shape/escape/structure, extract constants.
+
+    Returns ``(chain_nodes, last_chain_node, out_dt, sw7_json)`` on success,
+    ``None`` on failure.
+    """
+    chain_nodes: List[fx.Node] = []
+    chain_set: set = {mm_node}
+    last_chain_node: Optional[fx.Node] = None
+    curr = mm_node.next
+    while curr is not None and curr.op != "output":
+        uses_chain = any(isinstance(a, fx.Node) and a in chain_set for a in curr.args)
+        if not uses_chain:
+            curr = curr.next
+            continue
+        if curr.target not in _SWIGLU7_CHAIN_OPS:
+            break
+        chain_nodes.append(curr)
+        chain_set.add(curr)
+        last_chain_node = curr
+        curr = curr.next
+
+    if last_chain_node is None:
+        return None
+    out_dt = _val_dtype(last_chain_node) or torch.bfloat16
+    out_shape = _val_shape(last_chain_node)
+    if out_shape is None or len(out_shape) != 2:
+        return None
+    if not _is_static_int(out_shape[1]) or out_shape[1] != N // 2:
+        return None
+    # Refuse if any intermediate escapes the fused region.
+    for n in chain_nodes[:-1]:
+        for u in n.users:
+            if u not in chain_set:
+                return None
+    constants = _validate_swiglu7_structure(chain_nodes, mm_node)
+    if constants is None:
+        return None
+    sw7_alpha, sw7_limit, sw7_one = constants
+    sw7_json = json.dumps({"alpha": sw7_alpha, "limit": sw7_limit, "one": sw7_one}, sort_keys=True)
+    return chain_nodes, last_chain_node, out_dt, sw7_json
+
+
+# ── Shared graph-rewrite helper ────────────────────────────────────────────
+
+
+def _emit_and_replace(
+    graph: fx.Graph,
+    last_node: fx.Node,
+    op_args: tuple,
+    nodes_to_erase: List[fx.Node],
+    extra_dead: Optional[List[fx.Node]] = None,
+) -> fx.Node:
+    """Insert ``matmul_custom_evt``, propagate meta, replace uses, erase dead nodes."""
+    with graph.inserting_after(last_node):
+        new_node = graph.call_function(torch.ops.magi_epilogue.matmul_custom_evt.default, args=op_args)
+    val_last = last_node.meta.get("val")
+    if val_last is not None:
+        try:
+            n_pad = evt_runtime._aligned_n_stride(int(val_last.shape[-1]), val_last.dtype)
+        except (TypeError, ValueError):
+            n_pad = None
+        if n_pad is not None:
+            new_node.meta["val"] = val_last.new_empty_strided(val_last.shape, (n_pad, 1))
+
+    last_node.replace_all_uses_with(new_node)
+    for n in reversed(nodes_to_erase):
+        if len(n.users) == 0 and n is not new_node:
+            graph.erase_node(n)
+    if extra_dead:
+        for n in extra_dead:
+            if isinstance(n, fx.Node) and len(n.users) == 0:
+                graph.erase_node(n)
+    return new_node
+
+
 # ── Pass ─────────────────────────────────────────────────────────────────────
-
-
-# Sentinel returned by _try_fuse_evt to communicate "abort, leave mm intact".
-_ABORT = object()
 
 
 class MatmulEvtEpilogueFusionPass(MagiInductorPass):
@@ -418,10 +551,7 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
       * sm_120+ (Blackwell consumer) — lowers via CUTLASS 2.x Sm80EVT codegen.
 
     The codegen renderer is picked inside ``evt_runtime._compile_evt_module``
-    based on the live device's arch tag. Each renderer has its own gating
-    (e.g. ``sm90.evt_codegen.can_render`` rejects unsupported op chains on
-    Hopper); this top-level switch only decides whether to attempt fusion
-    at all.
+    based on the live device's arch tag.
     """
 
     def __init__(self, allow_extras: bool = True) -> None:
@@ -438,8 +568,7 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
                 continue
             if node.target not in (torch.ops.aten.mm.default, torch.ops.aten.mm):
                 continue
-            r = self._try_fuse_evt(graph, node)
-            if r:
+            if self._try_fuse_evt(graph, node):
                 fused += 1
         if fused:
             graph.eliminate_dead_code()
@@ -455,19 +584,15 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         b_dtype = _val_dtype(B)
         if a_dtype not in (torch.bfloat16, torch.float16) or a_dtype != b_dtype:
             return False
-        # Alignment gates — A is RowMajor (M, K) so ldA = K must divide
-        # AlignmentA. We greedy-pick AlignmentA at runtime (128 → 64 bits),
-        # so the FX gate only refuses K not even 64-bit-aligned (= K%4 for
-        # bf16/fp16). B's N-side gate is path-specific and checked after
-        # b_layout is resolved. D's N is unconstrained here: the runtime
-        # allocates a padded buffer and returns a strided view, so any n_out
-        # divides into AlignmentC.
         a_shape = _val_shape(A)
         b_shape = _val_shape(B)
         if a_shape is None or b_shape is None or len(a_shape) != 2 or len(b_shape) != 2:
             return False
         K = a_shape[1]
         if _largest_pow2_align_bits(K, a_dtype) is None:
+            return False
+        a_stride = _val_stride(A)
+        if a_stride is None or a_stride != (a_shape[1], 1):
             return False
 
         node_to_ir: dict = {mm_node: Accum()}
@@ -476,48 +601,51 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         extras_nodes: List[fx.Node] = []
         saw_slice = False
         current_compute_dtype = "float32"
-
         last_node = mm_node
         last_ir = node_to_ir[mm_node]
 
-        # Walk consumers in source order, greedily absorbing supported ops.
+        # ── Walker-local helpers ──
         curr = mm_node.next
+
+        def _absorb(ir):
+            nonlocal last_node, last_ir, curr
+            node_to_ir[curr] = ir
+            fused_nodes.append(curr)
+            walk_seen.append(curr)
+            last_node = curr
+            last_ir = ir
+            curr = curr.next
+
+        def _alias(existing_ir):
+            nonlocal last_node, last_ir, curr
+            node_to_ir[curr] = existing_ir
+            walk_seen.append(curr)
+            last_node = curr
+            last_ir = existing_ir
+            curr = curr.next
+
+        # Walk consumers in source order, greedily absorbing supported ops.
         while curr is not None and curr.op != "output":
-            uses_fused = any(isinstance(a, fx.Node) and a in node_to_ir for a in curr.args)
-            if not uses_fused:
+            if not any(isinstance(a, fx.Node) and a in node_to_ir for a in curr.args):
                 curr = curr.next
                 continue
 
             target = curr.target
 
             if target in _PASSTHROUGH_OPS:
-                node_to_ir[curr] = node_to_ir[curr.args[0]]
-                walk_seen.append(curr)
-                last_node = curr
-                last_ir = node_to_ir[curr]
-                curr = curr.next
+                _alias(node_to_ir[curr.args[0]])
                 continue
 
             if target in _TYPE_CONV_OPS:
                 target_dtype = _val_dtype(curr)
                 if target_dtype is not None and target_dtype in _DTYPE_TO_STR:
                     current_compute_dtype = _DTYPE_TO_STR[target_dtype]
-                node_to_ir[curr] = node_to_ir[curr.args[0]]
-                walk_seen.append(curr)
-                last_node = curr
-                last_ir = node_to_ir[curr]
-                curr = curr.next
+                _alias(node_to_ir[curr.args[0]])
                 continue
 
             if target in (torch.ops.aten.view.default, torch.ops.aten.reshape.default, torch.ops.aten._unsafe_view.default):
-                in_shape = _val_shape(curr.args[0])
-                out_shape = _val_shape(curr)
-                if in_shape == out_shape:
-                    node_to_ir[curr] = node_to_ir[curr.args[0]]
-                    walk_seen.append(curr)
-                    last_node = curr
-                    last_ir = node_to_ir[curr]
-                    curr = curr.next
+                if _val_shape(curr.args[0]) == _val_shape(curr):
+                    _alias(node_to_ir[curr.args[0]])
                     continue
                 break
 
@@ -528,43 +656,25 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
                 break
 
             if target in _UNARY_OPS:
-                op_name = _UNARY_OPS[target]
-                child_ir = node_to_ir[curr.args[0]]
-                ir = Compute(op_name, (child_ir,), compute_dtype=current_compute_dtype)
-                node_to_ir[curr] = ir
-                fused_nodes.append(curr)
-                walk_seen.append(curr)
-                last_node = curr
-                last_ir = ir
-                curr = curr.next
+                _absorb(Compute(_UNARY_OPS[target], (node_to_ir[curr.args[0]],), compute_dtype=current_compute_dtype))
                 continue
 
             if target is torch.ops.aten.gelu.default:
-                approx = curr.kwargs.get("approximate", "none")
-                op_name = "gelu_tanh" if approx == "tanh" else "gelu_erf"
-                child_ir = node_to_ir[curr.args[0]]
-                ir = Compute(op_name, (child_ir,), compute_dtype=current_compute_dtype)
-                node_to_ir[curr] = ir
-                fused_nodes.append(curr)
-                walk_seen.append(curr)
-                last_node = curr
-                last_ir = ir
-                curr = curr.next
+                op_name = "gelu_tanh" if curr.kwargs.get("approximate", "none") == "tanh" else "gelu_erf"
+                _absorb(Compute(op_name, (node_to_ir[curr.args[0]],), compute_dtype=current_compute_dtype))
                 continue
 
             if target in _SCALAR_BINARY_TO_SCALAR_UNARY:
-                op_name = _SCALAR_BINARY_TO_SCALAR_UNARY[target]
-                child_ir = node_to_ir[curr.args[0]]
                 if not isinstance(curr.args[1], (int, float)):
                     break
-                scalar = float(curr.args[1])
-                ir = Compute(op_name, (child_ir,), scalar=scalar, compute_dtype=current_compute_dtype)
-                node_to_ir[curr] = ir
-                fused_nodes.append(curr)
-                walk_seen.append(curr)
-                last_node = curr
-                last_ir = ir
-                curr = curr.next
+                _absorb(
+                    Compute(
+                        _SCALAR_BINARY_TO_SCALAR_UNARY[target],
+                        (node_to_ir[curr.args[0]],),
+                        scalar=float(curr.args[1]),
+                        compute_dtype=current_compute_dtype,
+                    )
+                )
                 continue
 
             if target in (torch.ops.aten.clamp.default, torch.ops.aten.clamp_min.default, torch.ops.aten.clamp_max.default):
@@ -587,169 +697,114 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
                     ir_now = Compute("clamp_min_c", (ir_now,), scalar=float(lo), compute_dtype=current_compute_dtype)
                 if hi is not None:
                     ir_now = Compute("clamp_max_c", (ir_now,), scalar=float(hi), compute_dtype=current_compute_dtype)
-                node_to_ir[curr] = ir_now
-                fused_nodes.append(curr)
-                walk_seen.append(curr)
-                last_node = curr
-                last_ir = ir_now
-                curr = curr.next
+                _absorb(ir_now)
                 continue
 
             if target is torch.ops.aten.pow.Tensor_Scalar:
                 exp = curr.args[1] if len(curr.args) > 1 else None
                 child_ir = node_to_ir[curr.args[0]]
                 if exp == 2 or exp == 2.0:
-                    ir = Compute("square", (child_ir,), compute_dtype=current_compute_dtype)
+                    _absorb(Compute("square", (child_ir,), compute_dtype=current_compute_dtype))
                 elif isinstance(exp, (int, float)):
-                    ir = Compute("pow_scalar", (child_ir,), scalar=float(exp), compute_dtype=current_compute_dtype)
+                    _absorb(Compute("pow_scalar", (child_ir,), scalar=float(exp), compute_dtype=current_compute_dtype))
                 else:
                     break
-                node_to_ir[curr] = ir
-                fused_nodes.append(curr)
-                walk_seen.append(curr)
-                last_node = curr
-                last_ir = ir
-                curr = curr.next
                 continue
 
             if target in _BINARY_OPS:
-                op_name = _BINARY_OPS[target]
-                lhs_raw = curr.args[0]
-                rhs_raw = curr.args[1]
-                # Fold int/float scalars on the RHS to scalar variants.
-                if isinstance(rhs_raw, (int, float)) and isinstance(lhs_raw, fx.Node) and lhs_raw in node_to_ir:
-                    scalar_op = {"add": "add_scalar", "sub": "sub_scalar", "mul": "mul_scalar", "div": "div_scalar"}.get(
-                        op_name
-                    )
-                    if scalar_op is None:
-                        break
-                    ir = Compute(scalar_op, (node_to_ir[lhs_raw],), scalar=float(rhs_raw), compute_dtype=current_compute_dtype)
-                    node_to_ir[curr] = ir
-                    fused_nodes.append(curr)
-                    walk_seen.append(curr)
-                    last_node = curr
-                    last_ir = ir
-                    curr = curr.next
-                    continue
-                # Fold scalar-on-LHS for commutative ops; for sub/div we need rsub/rdiv.
-                if isinstance(lhs_raw, (int, float)) and isinstance(rhs_raw, fx.Node) and rhs_raw in node_to_ir:
-                    if op_name in ("add", "mul"):
-                        scalar_op = "add_scalar" if op_name == "add" else "mul_scalar"
-                        ir = Compute(
-                            scalar_op, (node_to_ir[rhs_raw],), scalar=float(lhs_raw), compute_dtype=current_compute_dtype
-                        )
-                    elif op_name == "sub":
-                        ir = Compute(
-                            "rsub_scalar", (node_to_ir[rhs_raw],), scalar=float(lhs_raw), compute_dtype=current_compute_dtype
-                        )
-                    else:
-                        break
-                    node_to_ir[curr] = ir
-                    fused_nodes.append(curr)
-                    walk_seen.append(curr)
-                    last_node = curr
-                    last_ir = ir
-                    curr = curr.next
-                    continue
-                # Both tensor — either internal (already in IR) or external.
-                lhs_ir = self._ir_for_arg(lhs_raw, node_to_ir, extras_nodes, A, B)
-                rhs_ir = self._ir_for_arg(rhs_raw, node_to_ir, extras_nodes, A, B)
-                if lhs_ir is None or rhs_ir is None:
+                ir = self._try_lower_binary(curr, target, node_to_ir, extras_nodes, A, B, current_compute_dtype)
+                if ir is None:
                     break
-                ir = Compute(op_name, (lhs_ir, rhs_ir), compute_dtype=current_compute_dtype)
-                node_to_ir[curr] = ir
-                fused_nodes.append(curr)
-                walk_seen.append(curr)
-                last_node = curr
-                last_ir = ir
-                curr = curr.next
+                _absorb(ir)
                 continue
 
             break
 
-        # If we saw a stride-2 slice and the chain is plausibly swiglu7, try
-        # the dedicated matcher. It rebuilds independently from mm_node.
         if saw_slice:
             return self._try_fuse_swiglu7(graph, mm_node)
 
-        if last_ir is node_to_ir[mm_node]:
+        result = self._validate_evt_epilogue(
+            B, b_dtype, mm_node, node_to_ir, fused_nodes, walk_seen, last_node, last_ir, extras_nodes
+        )
+        if result is None:
             return False
+        ir_json, b_underlying, n_out, out_dt_id, kind = result
 
-        # Refuse if any intermediate is consumed outside the fused region.
-        # walk_seen[:-1] excludes the last node (which becomes the output).
-        # NB: was previously walk_seen[:-0] (== empty slice) — a no-op bug.
+        _emit_and_replace(graph, last_node, (A, b_underlying, extras_nodes, ir_json, kind, n_out, out_dt_id), walk_seen)
+        return True
+
+    # ── Post-walk EVT validation ──────────────────────────────────────────────
+
+    def _validate_evt_epilogue(
+        self, B, b_dtype, mm_node, node_to_ir, fused_nodes, walk_seen, last_node, last_ir, extras_nodes
+    ):
+        """Post-walk eligibility gates for the generic EVT path.
+
+        Returns ``(ir_json, b_underlying, n_out, out_dt_id, kind)`` on success,
+        ``None`` on any gate failure.
+        """
+        if last_ir is node_to_ir[mm_node]:
+            return None
+
         fused_set = set(fused_nodes) | set(walk_seen)
         for n in walk_seen[:-1]:
             for u in n.users:
                 if u not in fused_set:
-                    return False
+                    return None
 
-        # Final eligibility check: A contiguous, B in a supported layout.
-        a_stride = _val_stride(A)
-        if a_stride is None:
-            return False
-        a_shape_now = _val_shape(A)
-        if a_stride != (a_shape_now[1], 1):
-            return False
         b_layout, b_underlying, n_dim = _b_layout_kind(B)
         if b_layout is None:
-            return False
-
-        # evt_row: ldB=N must be at least 64-bit aligned; evt_col: ldB=K already checked.
-        if b_layout == "row":
-            if _largest_pow2_align_bits(n_dim, b_dtype) is None:
-                return False
+            return None
+        if b_layout == "row" and _largest_pow2_align_bits(n_dim, b_dtype) is None:
+            return None
 
         out_dt = _val_dtype(last_node) or torch.bfloat16
         if out_dt not in _DTYPE_TO_STR:
-            return False
-
-        # Verify padded D stride satisfies at least 64-bit AlignmentC.
-        if _is_static_int(n_dim):
-            n_pad_static = evt_runtime._aligned_n_stride(int(n_dim), out_dt)
-            if _largest_pow2_align_bits(n_pad_static, out_dt) is None:
-                return False
+            return None
 
         ir_root = Store(child=last_ir, out_dtype=_DTYPE_TO_STR[out_dt])
         if is_trivial(ir_root):
-            return False
-        # If extras are disabled, refuse any IR that needs them.
+            return None
         if not self.allow_extras and num_extras(ir_root) > 0:
-            return False
-
-        # SM90 has tighter constraints (at most one AuxLoad); reject
-        # unrenderable IRs here rather than fall back to SM80-on-Hopper (~2× slower).
+            return None
         if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
             from .sm90.evt_codegen import can_render as _sm90_can_render
 
             if not _sm90_can_render(ir_root):
-                return False
+                return None
 
         ir_json = to_canonical_json(ir_root)
-        n_out = n_dim
-        out_dt_id = evt_runtime.out_dtype_id(out_dt)
         kind = "evt_row" if b_layout == "row" else "evt_col"
+        return ir_json, b_underlying, n_dim, evt_runtime.out_dtype_id(out_dt), kind
 
-        with graph.inserting_after(last_node):
-            new_node = graph.call_function(
-                torch.ops.magi_epilogue.matmul_custom_evt.default,
-                args=(A, b_underlying, extras_nodes, ir_json, kind, n_out, out_dt_id),
-            )
-        # Propagate FakeTensor meta with padded row stride matching the CUDA impl.
-        val_last = last_node.meta.get("val")
-        if val_last is not None:
-            try:
-                n_pad = evt_runtime._aligned_n_stride(int(val_last.shape[-1]), val_last.dtype)
-            except (TypeError, ValueError):
-                n_pad = None
-            if n_pad is not None:
-                new_node.meta["val"] = val_last.new_empty_strided(val_last.shape, (n_pad, 1))
+    # ── Binary op lowering ────────────────────────────────────────────────────
 
-        last_node.replace_all_uses_with(new_node)
-        for n in reversed(walk_seen):
-            if len(n.users) == 0 and n is not new_node:
-                graph.erase_node(n)
-        return True
+    def _try_lower_binary(self, curr, target, node_to_ir, extras_nodes, A, B, compute_dtype):
+        """Try to lower a binary op to IR. Returns an IR node or None (caller breaks)."""
+        op_name = _BINARY_OPS[target]
+        lhs_raw, rhs_raw = curr.args[0], curr.args[1]
+
+        if isinstance(rhs_raw, (int, float)) and isinstance(lhs_raw, fx.Node) and lhs_raw in node_to_ir:
+            scalar_op = {"add": "add_scalar", "sub": "sub_scalar", "mul": "mul_scalar", "div": "div_scalar"}.get(op_name)
+            if scalar_op is None:
+                return None
+            return Compute(scalar_op, (node_to_ir[lhs_raw],), scalar=float(rhs_raw), compute_dtype=compute_dtype)
+
+        if isinstance(lhs_raw, (int, float)) and isinstance(rhs_raw, fx.Node) and rhs_raw in node_to_ir:
+            if op_name in ("add", "mul"):
+                scalar_op = "add_scalar" if op_name == "add" else "mul_scalar"
+                return Compute(scalar_op, (node_to_ir[rhs_raw],), scalar=float(lhs_raw), compute_dtype=compute_dtype)
+            if op_name == "sub":
+                return Compute("rsub_scalar", (node_to_ir[rhs_raw],), scalar=float(lhs_raw), compute_dtype=compute_dtype)
+            return None
+
+        lhs_ir = self._ir_for_arg(lhs_raw, node_to_ir, extras_nodes, A, B)
+        rhs_ir = self._ir_for_arg(rhs_raw, node_to_ir, extras_nodes, A, B)
+        if lhs_ir is None or rhs_ir is None:
+            return None
+        return Compute(op_name, (lhs_ir, rhs_ir), compute_dtype=compute_dtype)
+
+    # ── External operand classification ───────────────────────────────────────
 
     def _ir_for_arg(self, arg, node_to_ir, extras_nodes, A_node, B_node):
         """Classify operand: internal → existing IR; external → leaf node; None ⇒ abort."""
@@ -759,7 +814,6 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
             return node_to_ir[arg]
         if not self.allow_extras:
             return None
-        # Classify external tensor by shape relative to (M, N).
         a_shape = _val_shape(A_node)
         b_shape = _val_shape(B_node)
         if a_shape is None or b_shape is None:
@@ -774,17 +828,11 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         dt_str = _DTYPE_TO_STR.get(dt)
         if dt_str is None:
             return None
-        # 1-D case: must distinguish (N,) vs (M,). Compare ints directly.
-        # When M is SymInt (dynamic batch dim) the M==N collision can't happen
-        # at compile time, so trust the (N,) match for RowBroadcast. Only the
-        # "both static + equal" case is ambiguous and we abort.
         if len(shape) == 1:
             n0 = shape[0]
             m_is_static = _is_static_int(M)
             n_is_static = _is_static_int(N)
             if n_is_static and n0 == N:
-                # Could still collide with a (M,) col-broadcast iff M is also
-                # static and equal — abort in that ambiguous case.
                 if m_is_static and n0 == M:
                     return None
                 idx = self._add_extra(extras_nodes, arg)
@@ -794,15 +842,12 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
                 return ColBroadcast(input_idx=idx, dtype=dt_str)
             return None
         if len(shape) == 2:
-            # (1, N) row-broadcast view.
             if shape[0] == 1 and shape[1] == N:
                 idx = self._add_extra(extras_nodes, arg)
                 return RowBroadcast(input_idx=idx, dtype=dt_str)
-            # (M, 1) col-broadcast view.
             if shape[1] == 1 and shape[0] == M:
                 idx = self._add_extra(extras_nodes, arg)
                 return ColBroadcast(input_idx=idx, dtype=dt_str)
-            # Full (M, N) aux load — require row-major contiguous.
             if shape[0] == M and shape[1] == N and stride is not None and stride[1] == 1:
                 idx = self._add_extra(extras_nodes, arg)
                 return AuxLoad(input_idx=idx, dtype=dt_str)
@@ -819,115 +864,23 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
 
     def _try_fuse_swiglu7(self, graph: fx.Graph, mm_node: fx.Node) -> bool:
         """Match the canonical swiglu7 epilogue and dispatch to DualGemm."""
-        # B must be a 2-D transpose of a contiguous (N, K) weight.
-        B_node = mm_node.args[1]
-        if not isinstance(B_node, fx.Node) or not _is_transpose_node(B_node):
+        wt = _validate_swiglu7_weight(mm_node)
+        if wt is None:
             return False
-        weight_node = B_node.args[0]
-        if not isinstance(weight_node, fx.Node):
-            return False
-        w_shape = _val_shape(weight_node)
-        w_stride = _val_stride(weight_node)
-        if w_shape is None or len(w_shape) != 2 or w_stride is None:
-            return False
-        N, K = w_shape
-        if not (_is_static_int(N) and N % 2 == 0):
-            return False
-        if w_stride != (K, 1):
-            return False
-        a_dtype = _val_dtype(mm_node.args[0])
-        if a_dtype != torch.bfloat16 or _val_dtype(weight_node) != torch.bfloat16:
-            return False
-        if _largest_pow2_align_bits(K, a_dtype) is None:
-            return False
-        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
-            elem_bytes = a_dtype.itemsize
-            if _is_static_int(K) and (int(K) * elem_bytes) % 16 != 0:
-                return False
+        B_node, weight_node, N, K = wt
 
-        chain_nodes: List[fx.Node] = []
-        chain_set: set = {mm_node}
-        last_chain_node: Optional[fx.Node] = None
-        curr = mm_node.next
-        while curr is not None and curr.op != "output":
-            uses_chain = any(isinstance(a, fx.Node) and a in chain_set for a in curr.args)
-            if not uses_chain:
-                curr = curr.next
-                continue
-            if curr.target not in (
-                torch.ops.aten.slice.Tensor,
-                torch.ops.aten.clamp.default,
-                torch.ops.aten.clamp_min.default,
-                torch.ops.aten.clamp_max.default,
-                torch.ops.aten.sigmoid.default,
-                torch.ops.aten.mul.Tensor,
-                torch.ops.aten.add.Tensor,
-                torch.ops.aten.add.Scalar,
-                torch.ops.aten.mul.Scalar,
-                torch.ops.prims.convert_element_type.default,
-                torch.ops.aten._to_copy.default,
-                torch.ops.aten.clone.default,
-                torch.ops.aten.contiguous.default,
-                torch.ops.aten.alias.default,
-                torch.ops.aten.view.default,
-                torch.ops.aten.reshape.default,
-                torch.ops.aten._unsafe_view.default,
-            ):
-                break
-            chain_nodes.append(curr)
-            chain_set.add(curr)
-            last_chain_node = curr
-            curr = curr.next
-
-        if last_chain_node is None:
+        ch = _validate_swiglu7_chain(mm_node, N)
+        if ch is None:
             return False
-        out_dt = _val_dtype(last_chain_node) or torch.bfloat16
-        out_shape = _val_shape(last_chain_node)
-        if out_shape is None or len(out_shape) != 2:
-            return False
-        if not _is_static_int(out_shape[1]) or out_shape[1] != N // 2:
-            return False
-
-        n_pad_static = evt_runtime._aligned_n_stride(int(N) // 2, out_dt)
-        if _largest_pow2_align_bits(n_pad_static, out_dt) is None:
-            return False
-
-        for n in chain_nodes[:-1]:
-            for u in n.users:
-                if u not in chain_set:
-                    return False
-
-        constants = _validate_swiglu7_structure(chain_nodes, mm_node)
-        if constants is None:
-            return False
-        sw7_alpha, sw7_limit, sw7_one = constants
-        sw7_json = json.dumps({"alpha": sw7_alpha, "limit": sw7_limit, "one": sw7_one}, sort_keys=True)
+        chain_nodes, last_chain_node, out_dt, sw7_json = ch
 
         out_dt_id = evt_runtime.out_dtype_id(out_dt)
         n_out = N // 2
-        with graph.inserting_after(last_chain_node):
-            new_node = graph.call_function(
-                torch.ops.magi_epilogue.matmul_custom_evt.default,
-                args=(mm_node.args[0], weight_node, [], sw7_json, "swiglu7_dual", n_out, out_dt_id),
-            )
-        # Propagate FakeTensor meta with 128-bit-aligned row stride matching
-        # what the CUDA impl actually returns.
-        val_last = last_chain_node.meta.get("val")
-        if val_last is not None:
-            try:
-                n_pad = evt_runtime._aligned_n_stride(int(val_last.shape[-1]), val_last.dtype)
-            except (TypeError, ValueError):
-                n_pad = None
-            if n_pad is not None:
-                new_node.meta["val"] = val_last.new_empty_strided(val_last.shape, (n_pad, 1))
-
-        last_chain_node.replace_all_uses_with(new_node)
-        for n in reversed(chain_nodes):
-            if len(n.users) == 0 and n is not new_node:
-                graph.erase_node(n)
-        # Erase mm and the t() node if no longer used.
-        if len(mm_node.users) == 0:
-            graph.erase_node(mm_node)
-        if isinstance(B_node, fx.Node) and len(B_node.users) == 0:
-            graph.erase_node(B_node)
+        _emit_and_replace(
+            graph,
+            last_chain_node,
+            (mm_node.args[0], weight_node, [], sw7_json, "swiglu7_dual", n_out, out_dt_id),
+            chain_nodes,
+            extra_dead=[mm_node, B_node],
+        )
         return True

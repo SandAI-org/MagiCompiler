@@ -17,9 +17,10 @@
 Uses TMA + WGMMA via warp-specialized collective builders; ~1.6-2x faster
 than the SM80 path on H100. Selected by ``evt_runtime`` when arch == sm_90.
 
-Restriction vs SM80: each ``AuxLoad.input_idx`` may appear at most once
-(first binds to Sm90SrcFetch via C-operand TMA; subsequent use inline
-Sm90AuxLoad). ``can_render(ir)`` gates this.
+All AuxLoad nodes use ``Sm90AuxLoad<0>`` (inline ld.global, no SMEM
+staging). The C-operand TMA channel is left unused (ptr_C = nullptr).
+Each ``AuxLoad.input_idx`` may appear at most once; ``can_render(ir)``
+gates this.
 """
 
 from __future__ import annotations
@@ -92,9 +93,9 @@ def _emit_tile_candidates(m_bucket: str) -> str:
 def can_render(ir: Store) -> bool:
     """Return True iff the SM90 codegen can render this IR.
 
-    Rejects IRs where the same AuxLoad.input_idx appears at multiple positions
-    (would conflict in leaf-args: SrcFetch wants ``{}`` vs AuxLoad wants
-    ``{ptr, default, stride}``). Op coverage matches SM80.
+    Rejects IRs where the same AuxLoad.input_idx appears at multiple
+    positions (the leaf-args dict is keyed by input_idx and would clash).
+    Op coverage matches SM80.
     """
     if not isinstance(ir, Store):
         return False
@@ -139,8 +140,6 @@ class _Sm90EvtEmitter:
         self._emitted_functors: Dict[Tuple[str, str], str] = {}
         self._tmp_counter = 0
         self.leaf_typedefs: List[Tuple[str, str, "int | None", str]] = []
-        # First AuxLoad → Sm90SrcFetch (C operand TMA); subsequent → Sm90AuxLoad (inline ld.global).
-        self.src_fetch_input_idx: "int | None" = None
         self.scalar_functor_counter = 0
 
     def _new_name(self, prefix: str) -> str:
@@ -194,19 +193,13 @@ class _Sm90EvtEmitter:
             return name
         if isinstance(node, AuxLoad):
             elem = _DTYPE_TO_CUTLASS[node.dtype]
-            if self.src_fetch_input_idx is None:
-                name = self._new_name("SrcFetch")
-                self.typedef_lines.append(f"using {name} = cutlass::epilogue::fusion::Sm90SrcFetch<{elem}>;")
-                self.leaf_typedefs.append((name, "src_fetch", node.input_idx, node.dtype))
-                self.src_fetch_input_idx = node.input_idx
-            else:
-                name = self._new_name("AuxLoad")
-                self.typedef_lines.append(
-                    f"using {name} = cutlass::epilogue::fusion::Sm90AuxLoad<\n"
-                    f"    /*Stages=*/0, /*EpilogueTile=*/void, {elem},\n"
-                    f"    cutlass::layout::RowMajor, /*SmemLayoutAtom=*/void, /*CopyOpS2R=*/void>;"
-                )
-                self.leaf_typedefs.append((name, "aux_load_inline", node.input_idx, node.dtype))
+            name = self._new_name("AuxLoad")
+            self.typedef_lines.append(
+                f"using {name} = cutlass::epilogue::fusion::Sm90AuxLoad<\n"
+                f"    /*Stages=*/0, /*EpilogueTile=*/void, {elem},\n"
+                f"    cutlass::layout::RowMajor, /*SmemLayoutAtom=*/void, /*CopyOpS2R=*/void>;"
+            )
+            self.leaf_typedefs.append((name, "aux_load_inline", node.input_idx, node.dtype))
             return name
         if isinstance(node, Compute):
             child_names = [self._emit_node(c) for c in node.children]
@@ -290,9 +283,8 @@ using namespace cute;
 
 using ElementA       = {a_elem};
 using ElementB       = {b_elem};
-// On SM90 the C operand is repurposed as the (optional) Aux input via
-// Sm90SrcFetch; ElementC is therefore the AuxLoad's element type when an
-// AuxLoad is present, else falls back to ElementD (the final output dtype).
+// C-operand TMA channel is unused (all AuxLoad nodes use Sm90AuxLoad<0>
+// which loads via ld.global). ElementC = ElementD; ptr_C = nullptr.
 using ElementC       = {c_elem};
 using ElementD       = {d_elem};
 using ElementAccumulator = float;
@@ -402,9 +394,9 @@ struct EvtArgs {{
   int64_t lda;
   int64_t ldb;
   int64_t ldd;
-  // Extras pointers, in IR-leaf order. For the AuxLoad / SrcFetch case the
-  // C-operand pointer comes from this vector (looked up by its IR input_idx
-  // baked into the launcher).
+  // Extras pointers, in IR-leaf order. Each AuxLoad / RowBroadcast /
+  // ColBroadcast looks up its pointer from this vector by its IR
+  // input_idx baked into the launcher.
   std::vector<void*> ptr_extras;
 }};
 
@@ -443,7 +435,11 @@ class EvtImpl : public EvtConcept {{
     auto stride_A = cutlass::make_cute_packed_stride(StrideA{{}}, cute::make_shape(M, K, 1));
     auto stride_B = cutlass::make_cute_packed_stride(StrideB{{}}, cute::make_shape(N, K, 1));
     auto stride_C = cutlass::make_cute_packed_stride(StrideC{{}}, cute::make_shape(M, N, 1));
-    auto stride_D = cutlass::make_cute_packed_stride(StrideD{{}}, cute::make_shape(M, N, 1));
+    // D's row stride comes from the actual tensor (ea.ldd = D.stride(0)),
+    // which may be larger than N when the runtime pads the output buffer to
+    // a 128-byte boundary.  Using N here would give TMA a wrong
+    // globalStride, corrupting every row after the first.
+    auto stride_D = cutlass::make_cute_packed_stride(StrideD{{}}, cute::make_shape(M, static_cast<int>(a.ldd), 1));
     // Packed stride for inline aux loads (Sm90AuxLoad<0, void, ..., RowMajor>).
     // All inline-aux nodes share this stride — they all read (M, N) row-major
     // contiguous tensors. Emitted unconditionally; nvcc -O3 drops it when no
@@ -451,11 +447,9 @@ class EvtImpl : public EvtConcept {{
     auto stride_aux = cutlass::make_cute_packed_stride(
         cute::Stride<int64_t, cute::_1, int64_t>{{}}, cute::make_shape(M, N, 1));
 
-    // ptr_C: real pointer if AuxLoad present, else a null sentinel. CUTLASS
-    // 3.x CollectiveBuilder requires ElementC to be non-void; passing
-    // nullptr for ptr_C is fine since the EVT tree without SrcFetch never
-    // loads it. ``ptr_C_expr`` is a launcher-time constant; both branches
-    // resolve to a pointer of the same type ``ElementC const*``.
+    // C-operand TMA channel unused — all AuxLoad nodes use Sm90AuxLoad<0>
+    // (inline ld.global). ptr_C is nullptr; no node reports
+    // is_C_load_needed()=true so CollectiveEpilogue skips the C TMA load.
     auto ptrC = {ptr_C_expr_in_make_args};
 
     typename GemmType::Arguments args{{
@@ -597,6 +591,10 @@ class EvtAutoTuneRunner {{
     cudaEvent_t s, e;
     cudaEventCreate(&s); cudaEventCreate(&e);
 
+    // Drain any pre-existing CUDA error so we don't blame our first candidate
+    // for an upstream failure.
+    (void)cudaGetLastError();
+
     for (size_t i = 0; i < configs_.size(); ++i) {{
       auto& g = configs_[i];
       // can_implement gates illegal (schedule, cluster) combos and shapes
@@ -605,27 +603,50 @@ class EvtAutoTuneRunner {{
       if (g->can_implement(ea) != cutlass::Status::kSuccess) continue;
       size_t ws_sz = 0;
       try {{ ws_sz = g->get_workspace_size(ea); }}
-      catch (...) {{ continue; }}
+      catch (...) {{ (void)cudaGetLastError(); continue; }}
       if (!ws_.defined() || ws_.numel() < (int64_t)ws_sz) {{
         ws_ = at::empty({{(int64_t)ws_sz + 1}},
             at::TensorOptions().dtype(at::kByte).device(at::kCUDA));
       }}
       void* ws_ptr = ws_sz > 0 ? ws_.data_ptr() : nullptr;
+      // initialize() can fail synchronously (e.g. cudaFuncSetAttribute returns
+      // cudaErrorInvalidValue for tiles whose SharedStorage exceeds the
+      // device opt-in cap). Clear the sticky CUDA error before moving on —
+      // otherwise the next launch (or post-autotune user run) inherits it
+      // and surfaces a misleading "Error Internal" against an unrelated tile.
       if (g->initialize(ea, ws_ptr, stream) != cutlass::Status::kSuccess) {{
+        (void)cudaGetLastError();
         continue;
       }}
 
       // Warmup — 10 iters so L2 / inst caches settle (3 was too few — first
       // timed iter saw a cold L2 and biased the choice towards smaller tiles).
-      for (int w = 0; w < 10; ++w) g->run(stream);
-      cudaStreamSynchronize(stream);
+      // Capture run() status and sync return codes so an async launch failure
+      // (e.g. invalid grid, latent SMEM issue) disqualifies the tile cleanly.
+      bool tile_ok = true;
+      for (int w = 0; w < 10; ++w) {{
+        if (g->run(stream) != cutlass::Status::kSuccess) {{ tile_ok = false; break; }}
+      }}
+      if (tile_ok && cudaStreamSynchronize(stream) != cudaSuccess) {{
+        tile_ok = false;
+      }}
+      if (!tile_ok) {{
+        (void)cudaGetLastError();
+        continue;
+      }}
 
       // Time — 20 iters for ~1% timing noise, matching torch.compile defaults.
       cudaEventRecord(s, stream);
       int iters = 20;
-      for (int p = 0; p < iters; ++p) g->run(stream);
+      for (int p = 0; p < iters; ++p) {{
+        if (g->run(stream) != cutlass::Status::kSuccess) {{ tile_ok = false; break; }}
+      }}
       cudaEventRecord(e, stream);
-      cudaEventSynchronize(e);
+      if (cudaEventSynchronize(e) != cudaSuccess) tile_ok = false;
+      if (!tile_ok) {{
+        (void)cudaGetLastError();
+        continue;
+      }}
       float ms = 0;
       cudaEventElapsedTime(&ms, s, e);
       float avg = ms / iters;
@@ -708,16 +729,9 @@ def render_evt_cu(
     emitter = _Sm90EvtEmitter(ir)
     evt_root = emitter.emit()
 
-    # ElementC = AuxLoad's dtype if present, else ElementD.
-    c_dtype_str = ir.out_dtype
-    aux_idx = emitter.src_fetch_input_idx
-    if aux_idx is not None:
-        # Find the AuxLoad's dtype in the leaf list.
-        for typedef_name, kind, idx, dt in emitter.leaf_typedefs:
-            if kind == "src_fetch":
-                c_dtype_str = dt
-                break
-    c_elem = _DTYPE_TO_CUTLASS[c_dtype_str]
+    # No Sm90SrcFetch — the C-operand TMA channel is unused (ptr_C = nullptr).
+    # ElementC must still be a concrete type for the CollectiveBuilder template.
+    c_elem = d_elem
 
     leaves = walk_leaves(ir)
     leaf_args: Dict[int, str] = {}
@@ -736,11 +750,8 @@ def render_evt_cu(
             ptr_expr = f"reinterpret_cast<{elem} const*>(a.ptr_extras[{i}])"
             leaf_args[i] = f"{{ {ptr_expr} }}"
         elif isinstance(leaf, AuxLoad):
-            if i == emitter.src_fetch_input_idx:
-                leaf_args[i] = "{}"
-            else:
-                ptr_expr = f"reinterpret_cast<{elem} const*>(a.ptr_extras[{i}])"
-                leaf_args[i] = f"{{ {ptr_expr}, {elem}(0), stride_aux }}"
+            ptr_expr = f"reinterpret_cast<{elem} const*>(a.ptr_extras[{i}])"
+            leaf_args[i] = f"{{ {ptr_expr}, {elem}(0), stride_aux }}"
 
         if i in seen_extras:
             continue
@@ -755,7 +766,7 @@ def render_evt_cu(
             extras_validation_lines.append(
                 f'    TORCH_CHECK(extras[{i}].size(0) == M && extras[{i}].size(1) == N,' f' "extras[{i}] must be (M,N)");'
             )
-            # Both SrcFetch and inline AuxLoad assume row-major with stride(1)==1.
+            # Sm90AuxLoad<0> assumes row-major with stride(1)==1.
             extras_validation_lines.append(
                 f'    TORCH_CHECK(extras[{i}].stride(1) == 1,' f' "extras[{i}] innermost stride must be 1 (row-major)");'
             )
@@ -767,10 +778,7 @@ def render_evt_cu(
 
     args_tree = _emit_args_tree(ir.child, leaf_args, indent=8)
 
-    if aux_idx is not None:
-        ptr_C_expr_in_make_args = f"reinterpret_cast<ElementC const*>(a.ptr_extras[{aux_idx}])"
-    else:
-        ptr_C_expr_in_make_args = "static_cast<ElementC const*>(nullptr)"
+    ptr_C_expr_in_make_args = "static_cast<ElementC const*>(nullptr)"
 
     extras_validation = "\n".join(extras_validation_lines) if extras_validation_lines else "    // no extras"
     extras_ptrs = "\n".join(extras_ptr_lines) if extras_ptr_lines else ""

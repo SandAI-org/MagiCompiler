@@ -50,9 +50,9 @@
 #include "cutlass/epilogue/thread/linear_combination.h"
 #include "cutlass/epilogue/thread/scale_type.h"
 
-// Vendored at cutlass_kernels/49_hopper_dual_gemm/. Resolved by adding
+// Vendored at cutlass_kernels/hopper_dual_gemm/. Resolved by adding
 // cutlass_kernels/ itself to nvcc's extra_include_paths in evt_runtime.py.
-#include "49_hopper_dual_gemm/device/sm90_dual_gemm.h"
+#include "hopper_dual_gemm/device/sm90_dual_gemm.h"
 #include "swiglu7_combine.h"
 
 ////////////////////////////////////////////////////////////////////////////////
