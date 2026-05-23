@@ -55,11 +55,6 @@ _TILE_CANDIDATES_SM120: dict = {
         (64, 128, 64, 32, 64, 64, 4, "T<64,128,64>_S4"),
     ],
     "large": [
-        # 256×128×64 and 128×256×64 with 3 stages need ~144 KB SMEM/CTA, well
-        # over the sm_120 opt-in cap of 99 KB — cudaFuncSetAttribute fails for
-        # those during initialize() and leaves a sticky CUDA error that taints
-        # the next kernel's launch. Keep only tiles whose static SharedStorage
-        # fits inside cudaDevAttrMaxSharedMemoryPerBlockOptin on sm_120.
         (128, 256, 32, 64, 64, 32, 3, "T<128,256,32>_S3"),
         (256, 128, 32, 64, 64, 32, 3, "T<256,128,32>_S3"),
         (128, 128, 32, 64, 64, 32, 4, "T<128,128,32>_S4"),
@@ -328,11 +323,6 @@ struct EvtArgs {{
   void* ptr_A;
   void* ptr_B;
   void* ptr_D;
-  // Row strides of A, B, D in elements. lda/ldb default to the contiguous
-  // case (lda = K, ldb = stride_b_expr) when the host doesn't override; the
-  // launcher always sets them explicitly from the at::Tensor strides so that
-  // Inductor reinterpret_tensor inputs with non-contiguous strides still
-  // index correctly.
   int64_t lda;
   int64_t ldb;
   int64_t ldd;

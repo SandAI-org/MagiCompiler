@@ -35,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import threading
 from typing import Optional
 
@@ -87,29 +88,19 @@ def _runtime_align_bits(dim: int, dtype: torch.dtype) -> int:
 
 
 def _aligned_n_stride(n_out: int, dtype: torch.dtype) -> int:
-    """Round n_out up to a 128-byte (one L2 cache line) element count.
+    """Round n_out up to a 16-byte element count.
 
-    The CUTLASS-side requirement is only ``ldd % AlignmentC == 0`` where
-    ``AlignmentC = 128 / sizeof_bits<ElementC>`` (= 8 elements for bf16),
-    i.e. a 16-byte boundary. We over-align here to 128 bytes — a full L2
-    cache line — for two reasons:
-
-      1. Every row starts on a cache-line boundary, so the contiguous block
-         of cp.async / ld.global issued by the next op (typically a cuBLAS
-         GEMM that consumes our strided D) sees clean cache-line packing.
-      2. cuBLAS's GEMM heuristic picks a different (and on RTX 5090 measurably
-         slower) kernel for "awkward" lda values that are not 128-byte
-         multiples. Bumping the pad from one vector store (16 B) to one
-         cache line (128 B) costs at most 63 extra elements per row — under
-         a hundred KB even at large M — and recovers the cuBLAS kernel
-         heuristic's first-class path.
+    16 bytes is the minimum stride alignment required by both SM80
+    (``AlignmentC = 128 / sizeof_bits<ElementC>`` = 8 bf16 elements)
+    and SM90 TMA (``cudaTensorMapEncodeTiled`` requires globalStrides
+    to be multiples of 16 bytes).
 
     Bytes-based formula keeps this dtype-agnostic:
-      bf16 / fp16 → 64 element pad boundary
-      fp32        → 32 element pad boundary
-      fp8         → 128 element pad boundary
+      bf16 / fp16 → 8 element pad boundary
+      fp32        → 4 element pad boundary
+      fp8         → 16 element pad boundary
     """
-    align_bytes = 128
+    align_bytes = 16
     align = max(1, align_bytes // dtype.itemsize)
     n = int(n_out)
     return ((n + align - 1) // align) * align
@@ -171,32 +162,114 @@ def _per_key_lock(key: str) -> threading.Lock:
         return lock
 
 
-# ``cpp_extension.load`` uses a ``FileBaton`` (torch/utils/file_baton.py) to
-# serialise multi-process compile requests for the same extension: the holding
-# process creates ``<build_dir>/lock`` and removes it inside a ``finally``.
-# If the holder is SIGKILL'd mid-build (Ctrl-C → timeout escalation, OOM,
-# container restart) ``release()`` never runs, the file stays on disk, and
-# every subsequent ``load()`` poll-waits on ``os.path.exists(lock)`` forever.
+# Two-pronged hardening on top of ``cpp_extension.load``:
 #
-# We harden against this in two ways:
-#   1. **Skip the lock entirely when the .so is already built.** The hot path
-#      after a warm on-disk cache should never touch FileBaton — we just
-#      dlopen the .so directly.
-#   2. **Probe the existing lock with fcntl.flock(LOCK_EX|LOCK_NB).** The
-#      kernel releases flock'd advisory locks when the holding process dies
-#      (graceful or SIGKILL), so flock gives us a *correct* liveness check
-#      independent of mtime. If we can grab the flock, the previous owner is
-#      gone and the file is stale regardless of how recently it was created.
-#      mtime is only used as a coarse extra guard when flock isn't available.
+#   (1) Warm-cache fast path. If the .so for this build_dir is already on
+#       disk, dlopen it directly — skip cpp_extension.load (and therefore
+#       FileBaton) entirely. After the first successful build, no run ever
+#       touches the lock file again, so multi-rank warm starts cannot hang.
+#
+#   (2) Interruption cleanup. We only care about the on-disk lock during the
+#       call to cpp_extension.load. ``_track_build`` registers the build_dir
+#       before the call, ``_untrack_build`` un-registers it right after.
+#       atexit + SIGTERM/SIGINT/SIGHUP handlers fire only if we are still
+#       inside that window — they wipe the entire build_dir, eliminating the
+#       lock and any half-written ninja/nvcc artifacts so the next run
+#       starts from a clean slate.
+#
+# SIGKILL/OOM/power-loss leak the build_dir: signal handlers physically
+# cannot run for those. Recovery there is "rm -rf the build_dir" by hand.
+# Deliberately does NOT use fcntl.flock — multi-rank workloads on certain
+# filesystems reject blocking flock with EAGAIN.
+
+
+# Build_dirs whose cpp_extension.load is currently in flight. Touched only
+# by _track_build / _untrack_build and the atexit / signal callbacks.
+_PENDING_BUILD_DIRS: "set[str]" = set()
+_PENDING_LOCK = threading.Lock()
+_SIGNAL_HANDLERS_INSTALLED = False
+
+
+def _cleanup_pending_build_dirs() -> None:
+    """Wipe every build_dir registered by an in-flight cpp_extension.load.
+
+    Called from ``atexit`` and from SIGTERM/SIGINT/SIGHUP handlers. Removes
+    the whole directory — lock, ninja files, half-baked .cuda.o, partial
+    .so — so the next run rebuilds from scratch instead of inheriting
+    inconsistent state. Idempotent; never raises.
+    """
+    with _PENDING_LOCK:
+        dirs = list(_PENDING_BUILD_DIRS)
+        _PENDING_BUILD_DIRS.clear()
+    for d in dirs:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _install_exit_cleanup_once() -> None:
+    """Install ``atexit`` and forwarding signal handlers exactly once per
+    process. Signal handlers chain to whatever was previously registered
+    so we don't interfere with torchrun / app-level signal handling."""
+    global _SIGNAL_HANDLERS_INSTALLED
+    if _SIGNAL_HANDLERS_INSTALLED:
+        return
+    _SIGNAL_HANDLERS_INSTALLED = True
+
+    import atexit
+    import signal
+
+    atexit.register(_cleanup_pending_build_dirs)
+
+    def _make_handler(signum: int):
+        prev = signal.getsignal(signum)
+
+        def _handler(sn, frame, _prev=prev, _sig=signum):
+            try:
+                _cleanup_pending_build_dirs()
+            finally:
+                # Chain to whatever was installed before us; otherwise fall
+                # back to the signal's default action (terminate).
+                if callable(_prev) and _prev not in (signal.SIG_DFL, signal.SIG_IGN):
+                    _prev(sn, frame)
+                elif _prev == signal.SIG_IGN:
+                    return
+                else:
+                    signal.signal(_sig, signal.SIG_DFL)
+                    os.kill(os.getpid(), _sig)
+
+        return _handler
+
+    for sig_name in ("SIGTERM", "SIGINT", "SIGHUP"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _make_handler(sig))
+        except (ValueError, OSError):
+            # ValueError: not in main thread; OSError: invalid in this env.
+            pass
+
+
+def _track_build(build_dir: str) -> None:
+    """Register ``build_dir`` for cleanup-on-exit. Pair with ``_untrack_build``
+    on the success path so completed builds aren't wiped."""
+    _install_exit_cleanup_once()
+    with _PENDING_LOCK:
+        _PENDING_BUILD_DIRS.add(build_dir)
+
+
+def _untrack_build(build_dir: str) -> None:
+    """Unregister a build_dir after cpp_extension.load returns. The module is
+    already dlopen'd at this point so even if a signal beats us to the
+    discard, the in-memory module keeps working."""
+    with _PENDING_LOCK:
+        _PENDING_BUILD_DIRS.discard(build_dir)
 
 
 def _try_dlopen_prebuilt(build_dir: str, mod_name: str):
     """Fast path: if the .so for this build_dir already exists, import it
     directly without going through cpp_extension.load (which would try to
-    acquire FileBaton and could hang on a stale lock).
-
-    Returns the loaded module on success, None if the .so isn't there yet.
-    """
+    acquire FileBaton). Returns None on any miss / failure so the caller
+    falls back to the full compile path."""
     so_path = os.path.join(build_dir, f"{mod_name}.so")
     if not os.path.isfile(so_path):
         return None
@@ -210,56 +283,7 @@ def _try_dlopen_prebuilt(build_dir: str, mod_name: str):
         spec.loader.exec_module(module)
         return module
     except Exception:
-        # Anything goes wrong (corrupt .so, ABI mismatch, …) — let the slow
-        # path through cpp_extension.load() handle it properly.
         return None
-
-
-def _evict_stale_lock(build_dir: str) -> None:
-    """Reclaim ``<build_dir>/lock`` if its owner is gone.
-
-    Strategy: open the lock file and try to ``flock(LOCK_EX|LOCK_NB)``. The
-    OS releases advisory locks when the holding process exits, including on
-    SIGKILL, so a successful non-blocking acquisition proves the previous
-    holder is dead. We then unlink the file and release our own flock so the
-    next FileBaton.try_acquire() succeeds.
-
-    If flock is unavailable (non-Unix) or the file is currently held by a
-    live process, we leave it alone — letting cpp_extension.load() block as
-    designed for genuine concurrent compiles.
-    """
-    lock_path = os.path.join(build_dir, "lock")
-    if not os.path.exists(lock_path):
-        return
-    try:
-        import fcntl
-    except ImportError:
-        # Windows / no fcntl — fall back to no-op; user must remove stale
-        # locks manually. We do NOT use mtime-only eviction here because the
-        # "rapid kill within N seconds" workflow can defeat any mtime cutoff.
-        return
-    try:
-        fd = os.open(lock_path, os.O_RDWR)
-    except FileNotFoundError:
-        return
-    except OSError:
-        return
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (OSError, BlockingIOError):
-            # Someone is alive and holding the lock — leave it.
-            return
-        # We hold flock now; the previous owner is dead. Unlink and let our
-        # flock be released by closing the fd.
-        try:
-            os.remove(lock_path)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
-    finally:
-        os.close(fd)
 
 
 def _compile_evt_module(
@@ -351,11 +375,10 @@ def _compile_evt_module(
         os.makedirs(build_dir, exist_ok=True)
         mod_name = f"magi_evt_{key[:12]}"
 
-        # Warm-cache fast path: if a previous run already produced the .so for
-        # this exact key, dlopen it directly and skip FileBaton entirely.
-        # Avoids hanging on a stale lock when the .so is already usable, and
-        # makes repeated kill+restart cycles converge as soon as one run
-        # produced the binary.
+        # Warm-cache fast path: if a previous run already produced the .so
+        # for this exact key, dlopen it directly and skip cpp_extension.load
+        # (and its FileBaton) entirely. Makes repeated runs / multi-rank
+        # warm starts immune to any lock-file hang.
         prebuilt = _try_dlopen_prebuilt(build_dir, mod_name)
         if prebuilt is not None:
             _MODULE_CACHE[key] = prebuilt
@@ -368,11 +391,6 @@ def _compile_evt_module(
         with open(tmp_path, "w") as f:
             f.write(src)
         os.replace(tmp_path, src_path)
-
-        # Reap any FileBaton lock left by a previous SIGKILL'd build (flock
-        # liveness check, mtime-independent). Must run inside the per-key
-        # Python lock so concurrent threads in this process cannot race.
-        _evict_stale_lock(build_dir)
 
         cutlass_root = get_compile_config().cutlass_root
         from torch.utils.cpp_extension import load
@@ -391,28 +409,32 @@ def _compile_evt_module(
         # files: their kernels never get cudaFuncSetAttribute called, so any
         # launch above the default 48 KB dynamic SMEM fails with cudaError-
         # InvalidValue ("invalid argument").
-        module = load(
-            name=mod_name,
-            sources=[src_path],
-            extra_include_paths=[
-                os.path.join(cutlass_root, "include"),
-                os.path.join(cutlass_root, "tools", "util", "include"),
-            ],
-            extra_cflags=["-O3", "-std=c++17", "-fvisibility=hidden", "-fvisibility-inlines-hidden"],
-            extra_cuda_cflags=(
-                [
-                    "-std=c++17",
-                    "-O3",
-                    "--expt-relaxed-constexpr",
-                    "-Xcompiler=-fvisibility=hidden",
-                    "-Xcompiler=-fvisibility-inlines-hidden",
-                ]
-                + sm90_specific_cflags
-                + _device_gencode_flags()
-            ),
-            build_directory=build_dir,
-            verbose=False,
-        )
+        _track_build(build_dir)
+        try:
+            module = load(
+                name=mod_name,
+                sources=[src_path],
+                extra_include_paths=[
+                    os.path.join(cutlass_root, "include"),
+                    os.path.join(cutlass_root, "tools", "util", "include"),
+                ],
+                extra_cflags=["-O3", "-std=c++17", "-fvisibility=hidden", "-fvisibility-inlines-hidden"],
+                extra_cuda_cflags=(
+                    [
+                        "-std=c++17",
+                        "-O3",
+                        "--expt-relaxed-constexpr",
+                        "-Xcompiler=-fvisibility=hidden",
+                        "-Xcompiler=-fvisibility-inlines-hidden",
+                    ]
+                    + sm90_specific_cflags
+                    + _device_gencode_flags()
+                ),
+                build_directory=build_dir,
+                verbose=False,
+            )
+        finally:
+            _untrack_build(build_dir)
         _MODULE_CACHE[key] = module
         _MODULE_FAST_CACHE[fast_key] = module
         return module
@@ -505,10 +527,6 @@ def _compile_swiglu7_dual(
             _SWIGLU7_FAST_CACHE[fast_key] = prebuilt
             return prebuilt
 
-        # See _evict_stale_lock — reap a SIGKILL-orphaned cpp_extension lock
-        # before cpp_extension.load tries to acquire it.
-        _evict_stale_lock(build_dir)
-
         from torch.utils.cpp_extension import load
 
         # SM90 needs extra cflags for WGMMA + warp-specialized collective.
@@ -519,32 +537,36 @@ def _compile_swiglu7_dual(
         sm90_include_paths = [os.path.join(here, "sm90", "cutlass_kernels")] if arch_tag == "sm90" else []
 
         # -fvisibility=hidden — see _compile_evt_module above for rationale.
-        module = load(
-            name=mod_name,
-            sources=[src],
-            extra_include_paths=[
-                os.path.join(cutlass_root, "include"),
-                os.path.join(cutlass_root, "tools", "util", "include"),
-                os.path.join(cutlass_root, "examples"),
-                os.path.join(here, "common", "cutlass_kernels"),
-                *sm90_include_paths,
-            ],
-            extra_cflags=["-O3", "-std=c++17", "-fvisibility=hidden", "-fvisibility-inlines-hidden"],
-            extra_cuda_cflags=[
-                "-std=c++17",
-                "-O3",
-                "--expt-relaxed-constexpr",
-                "-Xcompiler=-fvisibility=hidden",
-                "-Xcompiler=-fvisibility-inlines-hidden",
-                *sm90_specific_cflags,
-                *_device_gencode_flags(),
-                f"-DMAGI_SWIGLU7_ALIGN_A_BITS={int(alignment_a_bits)}",
-                f"-DMAGI_SWIGLU7_ALIGN_B_BITS={int(alignment_b_bits)}",
-                f"-DMAGI_SWIGLU7_ALIGN_C_BITS={int(alignment_c_bits)}",
-            ],
-            build_directory=build_dir,
-            verbose=False,
-        )
+        _track_build(build_dir)
+        try:
+            module = load(
+                name=mod_name,
+                sources=[src],
+                extra_include_paths=[
+                    os.path.join(cutlass_root, "include"),
+                    os.path.join(cutlass_root, "tools", "util", "include"),
+                    os.path.join(cutlass_root, "examples"),
+                    os.path.join(here, "common", "cutlass_kernels"),
+                    *sm90_include_paths,
+                ],
+                extra_cflags=["-O3", "-std=c++17", "-fvisibility=hidden", "-fvisibility-inlines-hidden"],
+                extra_cuda_cflags=[
+                    "-std=c++17",
+                    "-O3",
+                    "--expt-relaxed-constexpr",
+                    "-Xcompiler=-fvisibility=hidden",
+                    "-Xcompiler=-fvisibility-inlines-hidden",
+                    *sm90_specific_cflags,
+                    *_device_gencode_flags(),
+                    f"-DMAGI_SWIGLU7_ALIGN_A_BITS={int(alignment_a_bits)}",
+                    f"-DMAGI_SWIGLU7_ALIGN_B_BITS={int(alignment_b_bits)}",
+                    f"-DMAGI_SWIGLU7_ALIGN_C_BITS={int(alignment_c_bits)}",
+                ],
+                build_directory=build_dir,
+                verbose=False,
+            )
+        finally:
+            _untrack_build(build_dir)
         _SWIGLU7_FAST_CACHE[fast_key] = module
         return module
 

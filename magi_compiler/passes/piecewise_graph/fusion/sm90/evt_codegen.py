@@ -388,9 +388,6 @@ struct EvtArgs {{
   void* ptr_A;
   void* ptr_B;
   void* ptr_D;
-  // Real strides from the at::Tensor (in elements). lda, ldb, ldd are passed
-  // in instead of recomputed so Inductor reinterpret_tensor inputs with
-  // non-default strides still index correctly.
   int64_t lda;
   int64_t ldb;
   int64_t ldd;
@@ -429,15 +426,12 @@ class EvtImpl : public EvtConcept {{
     int const N = a.N;
     int const K = a.K;
 
-    // Packed strides — Sm90 mainloop uses cute strides built from
-    // (M_or_N, K, L=1). Both A and B carry their own row stride; we bake
-    // them via cute_packed_stride which honours the Layout?Tag.
     auto stride_A = cutlass::make_cute_packed_stride(StrideA{{}}, cute::make_shape(M, K, 1));
     auto stride_B = cutlass::make_cute_packed_stride(StrideB{{}}, cute::make_shape(N, K, 1));
     auto stride_C = cutlass::make_cute_packed_stride(StrideC{{}}, cute::make_shape(M, N, 1));
     // D's row stride comes from the actual tensor (ea.ldd = D.stride(0)),
     // which may be larger than N when the runtime pads the output buffer to
-    // a 128-byte boundary.  Using N here would give TMA a wrong
+    // a 16-byte boundary.  Using N here would give TMA a wrong
     // globalStride, corrupting every row after the first.
     auto stride_D = cutlass::make_cute_packed_stride(StrideD{{}}, cute::make_shape(M, static_cast<int>(a.ldd), 1));
     // Packed stride for inline aux loads (Sm90AuxLoad<0, void, ..., RowMajor>).

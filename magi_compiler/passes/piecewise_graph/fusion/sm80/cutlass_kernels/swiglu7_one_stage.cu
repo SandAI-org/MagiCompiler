@@ -257,11 +257,6 @@ class Sw7AutoTuneRunner {
     // Bucket of M doesn't drive a separate .cu here — DualGemm compiles
     // fast enough that one runner with all candidates handles every M, and
     // the per-shape cache picks the best for whatever M it sees.
-    //
-    // Tile candidates for sm_120 / Ada / Ampere (the only consumers of this
-    // .cu). The Hopper (sm_90) path lives at
-    // ../../sm90/cutlass_kernels/swiglu7_one_stage.cu and ships its own
-    // candidate set sized for H100's 228 KB SMEM/SM budget.
 
     // Small / decode-friendly tiles
     SW7_TILE(64,  64, 32, 32, 32, 32, 4, "T<64,64,32>_S4");      // 36 KB
