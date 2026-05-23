@@ -15,7 +15,7 @@
 import copy
 import functools
 import inspect
-from typing import Callable, TypeVar
+from typing import Any, Callable, Literal, TypeVar
 
 from ._api import (
     _check_dynamic_arg_dims,
@@ -202,6 +202,9 @@ def magi_register_custom_op(
     backward_fn: Callable | None = None,
     is_compute_sensitive: bool = False,
     is_subgraph_boundary: bool = False,
+    extra_triton_kernels: list[Any] | tuple[Any, ...] | None = None,
+    force_register_mode: Literal["triton_op", "custom_op"] | None = None,
+    max_introspect_depth: int = 5,
 ):
     """
     A unified decorator to register a custom operator with PyTorch's library.
@@ -233,12 +236,64 @@ def magi_register_custom_op(
             ops are prioritised for saving rather than recomputing.
         is_subgraph_boundary: Split the FX graph at this op during compilation.
             Each sub-graph between boundary ops is compiled independently.
+        extra_triton_kernels: Escape hatch for triton kernels the AST scanner
+            can't pick up (e.g. ``self.kernel[grid](...)`` -- subscripted
+            attributes are not statically resolvable). Listed kernels are
+            treated as bare and shadowed via ``wrap_triton``. Also forces
+            ``has_direct_kernel = True`` in the decision matrix below.
+        force_register_mode: Override the auto-selected registration path:
+            - ``None`` (default): auto-decide; may also choose to *not*
+              register at all (returns ``fn`` unchanged with a warning) so
+              Inductor can inline the body for maximum fusion across nested
+              ops. See the decision matrix below.
+            - ``"triton_op"``: force ``torch.library.triton_op`` registration
+              (Inductor traces through). Raises ``ValueError`` if the body
+              contains a ``custom_op`` (fusion barriers cannot live inside
+              a triton_op) or has no triton content at all.
+            - ``"custom_op"``: force ``torch.library.custom_op`` (opaque
+              fusion barrier). Always succeeds.
+        max_introspect_depth: How many levels of helper-function calls the
+            AST scanner follows when looking for triton kernels. Default
+            ``5``. Doesn't bound flat AST scanning of ``fn`` itself, only
+            recursion into its callees. Nested ``torch.ops.<ns>.<op>(...)``
+            calls are never followed.
+
+    Registration-path decision matrix (when ``force_register_mode is None``):
+
+    +----+--------------------------------------+---------------------------+
+    |    | body of ``fn``                       | default path              |
+    +====+======================================+===========================+
+    | 1  | direct triton kernel only            | ``triton_op``             |
+    +----+--------------------------------------+---------------------------+
+    | 2  | nested triton_op only                | ``none`` (warns, inlines) |
+    +----+--------------------------------------+---------------------------+
+    | 3  | nested custom_op only                | ``custom_op``             |
+    +----+--------------------------------------+---------------------------+
+    | 4  | nested triton_op + custom_op only    | ``none`` (warns, inlines) |
+    +----+--------------------------------------+---------------------------+
+    | 5  | direct kernel + nested triton_op     | ``triton_op``             |
+    +----+--------------------------------------+---------------------------+
+    | 6  | direct kernel + nested custom_op     | ``ValueError`` (mistake)  |
+    +----+--------------------------------------+---------------------------+
+    | 7  | direct kernel + nested triton_op +   | ``ValueError`` (mistake)  |
+    |    | nested custom_op                     |                           |
+    +----+--------------------------------------+---------------------------+
+    | 8  | nothing triton-related               | ``custom_op``             |
+    +----+--------------------------------------+---------------------------+
+
+    Cases 6 / 7 are rejected because mixing a bare triton kernel with an
+    opaque ``custom_op`` in the same body is almost always a mistake (the
+    barrier already prevents fusing the kernel with anything else). Use
+    ``force_register_mode="custom_op"`` to silence the check.
 
     Returns:
         A callable with the user's original signature.
 
     Examples:
-        1. Basic usage (forward only, auto-generated name and meta function):
+
+        #### Basic usage
+
+        1. Forward only, auto-generated name and meta function:
 
         >>> @magi_register_custom_op()
         ... def my_relu(x: torch.Tensor) -> torch.Tensor:
@@ -313,4 +368,7 @@ def magi_register_custom_op(
         backward_fn=backward_fn,
         is_compute_sensitive=is_compute_sensitive,
         is_subgraph_boundary=is_subgraph_boundary,
+        extra_triton_kernels=extra_triton_kernels,
+        force_register_mode=force_register_mode,
+        max_introspect_depth=max_introspect_depth,
     )

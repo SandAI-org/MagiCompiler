@@ -53,11 +53,17 @@ from __future__ import annotations
 import dataclasses
 import functools
 import inspect
-from typing import Any, Callable, get_args, get_origin
+from typing import Any, Callable, Literal, get_args, get_origin
 
 import torch
 import torch.utils._pytree as pytree
 
+from ._triton_introspect import (
+    DEFAULT_MAX_INTROSPECT_DEPTH,
+    IntrospectionResult,
+    introspect_fn,
+    rewrite_fn_with_wrap_triton,
+)
 from .config import get_compile_config
 from .utils.logger import magi_logger
 
@@ -65,6 +71,8 @@ from .utils.logger import magi_logger
 # BLOCK 0 -- VALIDATE op signature constraints
 #
 # Helpers:
+#   - op-name guards:
+#       _assert_op_name_valid
 #   - type predicates:
 #       _is_frozen_dataclass
 #   - assertion primitives:
@@ -73,6 +81,42 @@ from .utils.logger import magi_logger
 #       _assert_no_var_args, _assert_resolved_field_type
 # Core: _validate_op_signature_constraints
 # ==============================================================================
+
+
+# Op names already registered via this decorator in the current process.
+_REGISTERED_OP_NAMES: set[str] = set()
+
+
+def _assert_op_name_valid(op_name: str) -> None:
+    """Reject ``op_name`` if it lacks the ``namespace::op_name`` form or has
+    already been registered (here or on ``torch.ops``). Surfaces a clear error
+    instead of ``torch.library``'s opaque schema-fingerprint mismatch."""
+    if "::" not in op_name:
+        raise ValueError(
+            f"@magi_register_custom_op: op name {op_name!r} is missing a "
+            "namespace. Use ``namespace::op_name`` (e.g. "
+            "``my_lib::my_op``). Pick a unique namespace for your project to "
+            "avoid clashing with other libraries."
+        )
+    if op_name in _REGISTERED_OP_NAMES:
+        raise RuntimeError(
+            f"@magi_register_custom_op: op name {op_name!r} is already "
+            "registered. Each magi op must use a unique "
+            "``namespace::op_name``. If you really want to override, delete "
+            "the previous registration with "
+            "``torch.library._del_library_impl`` first, or pass an explicit "
+            "``name=`` to disambiguate."
+        )
+    ns, _, opname = op_name.partition("::")
+    if ns and opname:
+        ns_obj = getattr(torch.ops, ns, None)
+        if ns_obj is not None and hasattr(ns_obj, opname):
+            raise RuntimeError(
+                f"@magi_register_custom_op: op name {op_name!r} is already "
+                f"defined on torch.ops.{ns}. Use a different name (or pass an "
+                "explicit ``name=`` to your decorator) to avoid clashing with "
+                "an existing operator."
+            )
 
 
 def _is_frozen_dataclass(tp) -> bool:
@@ -559,6 +603,14 @@ def _lower_op_signature(fn: Callable):
 #       _create_identity_meta_fn, _create_meta_fn_from_param_names
 #   - op-name generation:
 #       _generate_op_name
+#   - triton introspection consumer (works off a precomputed
+#     :class:`IntrospectionResult` -- a single recursive BFS feeds the
+#     heuristics-rejection, kernel-resolution, and nested-op classification
+#     paths, eliminating the old asymmetry where nested ops were only
+#     scanned at the top level while kernels were scanned recursively):
+#       _reject_heuristics_outermost
+#   - registration-path decision:
+#       _classify_nested_ops, _decide_registration_path
 # Core: _register_torch_op
 # ==============================================================================
 
@@ -678,9 +730,202 @@ def _generate_op_name(fn: Callable) -> str:
 
 
 # ------------------------------------------------------------------------------
+# helpers: triton introspection & wrap_triton intercept
+# ------------------------------------------------------------------------------
+
+
+def _reject_heuristics_outermost(
+    introspection: IntrospectionResult,
+    extra_triton_kernels: list[Any] | tuple[Any, ...] | None,
+) -> None:
+    """Reject kernels whose outermost decorator is ``@triton.heuristics``
+    (``wrap_triton`` only accepts JIT/Autotuner; surface here before the
+    path decision so the bug isn't silently demoted to ``custom_op``)."""
+    candidates = list(extra_triton_kernels or ()) + list(introspection.referenced_heuristics)
+    if not candidates:
+        return
+    from triton.runtime.autotuner import Autotuner, Heuristics
+    from triton.runtime.jit import JITFunction
+
+    for k in candidates:
+        if isinstance(k, (JITFunction, Autotuner)):
+            continue
+        if isinstance(k, Heuristics):
+            name = getattr(getattr(k, "fn", None), "__name__", repr(k))
+            raise RuntimeError(
+                f"@magi_register_custom_op: triton kernel {name!r} has "
+                "@triton.heuristics as its outermost decorator. "
+                "torch.library.wrap_triton (and therefore triton_op / Inductor) "
+                "only accepts triton.jit or triton.autotune at the top level. "
+                "Either remove @triton.heuristics, or place @triton.autotune "
+                "outside it: @triton.autotune -> @triton.heuristics -> @triton.jit."
+            )
+
+
+# ------------------------------------------------------------------------------
+# helpers: classify nested ops & decide registration path
+# ------------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class _NestedOpClassification:
+    """``"ns::op"`` strings bucketed into triton_op / custom_op / unresolved
+    (unresolved = not-yet-registered or torch lacks the introspection API;
+    treated as custom_op downstream -- conservative fusion-barrier choice)."""
+
+    triton_op_names: tuple[str, ...]
+    custom_op_names: tuple[str, ...]
+    unresolved_names: tuple[str, ...]
+
+
+def _classify_nested_ops(nested_op_calls: tuple[str, ...]) -> _NestedOpClassification:
+    """Bucket ``nested_op_calls`` into triton_op / custom_op / unresolved via
+    ``torch._library.triton.get_triton_kernels_for_op`` (non-empty -> triton_op)
+    plus ``torch._library.custom_ops.OPDEFS`` (definitive custom_op)."""
+    if not nested_op_calls:
+        return _NestedOpClassification((), (), ())
+
+    try:
+        from torch._library.triton import get_triton_kernels_for_op
+    except ImportError:  # older PyTorch
+        get_triton_kernels_for_op = None  # type: ignore[assignment]
+
+    try:
+        from torch._library.custom_ops import OPDEFS
+    except ImportError:  # very old PyTorch
+        OPDEFS = {}  # type: ignore[assignment]
+
+    triton_op_names: list[str] = []
+    custom_op_names: list[str] = []
+    unresolved_names: list[str] = []
+    for op_name in nested_op_calls:
+        is_triton_op: bool | None = None
+        if get_triton_kernels_for_op is not None:
+            try:
+                # Non-empty kernel list => registered via triton_op.
+                is_triton_op = bool(get_triton_kernels_for_op(op_name))
+            except Exception:
+                is_triton_op = None
+
+        if is_triton_op is True:
+            triton_op_names.append(op_name)
+        elif is_triton_op is False and op_name in OPDEFS:
+            # Definitively known to ``custom_ops``: it's a plain custom_op.
+            custom_op_names.append(op_name)
+        else:
+            # Op not yet registered, or torch lacks the introspection API.
+            unresolved_names.append(op_name)
+
+    return _NestedOpClassification(
+        triton_op_names=tuple(triton_op_names),
+        custom_op_names=tuple(custom_op_names),
+        unresolved_names=tuple(unresolved_names),
+    )
+
+
+# mode: "triton_op" (Inductor sees through) | "custom_op" (opaque barrier) |
+# "none" (skip registration so Inductor inlines and fuses nested triton_ops).
+@dataclasses.dataclass(frozen=True)
+class _RegistrationDecision:
+    mode: Literal["triton_op", "custom_op", "none"]
+    reason: str
+
+
+def _decide_registration_path(
+    fn: Callable,
+    has_direct_kernel: bool,
+    nested: _NestedOpClassification,
+    force_register_mode: Literal["triton_op", "custom_op"] | None,
+) -> _RegistrationDecision:
+    """Pick triton_op / custom_op / none from fn body content (8-case matrix).
+
+    ============================================  =========================  ==============  ==============
+    body                                          ``None`` (default)         ``"triton_op"`` ``"custom_op"``
+    ============================================  =========================  ==============  ==============
+    1. direct kernel only                         triton_op                  triton_op       custom_op
+    2. nested triton_op only                      none + warning             triton_op       custom_op
+    3. nested custom_op only                      custom_op                  ValueError      custom_op
+    4. nested triton_op + custom_op (no kernel)   none + warning             ValueError      custom_op
+    5. direct kernel + nested triton_op           triton_op                  triton_op       custom_op
+    6. direct kernel + nested custom_op           ValueError                 ValueError      custom_op
+    7. direct kernel + nested t.op + nested c.op  ValueError                 ValueError      custom_op
+    8. nothing                                    custom_op                  ValueError      custom_op
+    ============================================  =========================  ==============  ==============
+
+    6/7 reject because bare-kernel + fusion-barrier in one body is almost
+    always a bug; 2/4 inline because that maximises fusion across the
+    nested triton_ops at zero cost. ``force=custom_op`` is the universal
+    "I know what I'm doing" override.
+    """
+    has_triton_op = bool(nested.triton_op_names)
+    has_custom_op = bool(nested.custom_op_names) or bool(nested.unresolved_names)  # unresolved -> assume custom_op
+    fn_label = getattr(fn, "__qualname__", getattr(fn, "__name__", repr(fn)))
+
+    custom_op_list = list(nested.custom_op_names) or list(nested.unresolved_names)
+
+    def _err_force_triton_with_custom_op() -> str:
+        return (
+            f"@magi_register_custom_op: cannot register {fn_label!r} as triton_op: "
+            f"body calls custom_op(s) {custom_op_list!r} (fusion barriers, not allowed "
+            "inside triton_op). Drop force_register_mode='triton_op' or move the call out."
+        )
+
+    def _err_direct_kernel_plus_custom_op() -> str:
+        return (
+            f"@magi_register_custom_op: {fn_label!r} mixes a bare triton kernel with "
+            f"custom_op(s) {custom_op_list!r} (fusion barrier). Move one out, or pass "
+            "force_register_mode='custom_op' to silence."
+        )
+
+    # forced modes
+    if force_register_mode == "custom_op":
+        return _RegistrationDecision("custom_op", "explicit force_register_mode='custom_op'")
+
+    if force_register_mode == "triton_op":
+        if has_custom_op:  # cases 3,4,6,7
+            raise ValueError(_err_force_triton_with_custom_op())
+        if not has_direct_kernel and not has_triton_op:  # case 8
+            raise ValueError(
+                f"@magi_register_custom_op: cannot register {fn_label!r} as triton_op: "
+                "no direct triton kernel nor nested triton_op. Drop force_register_mode."
+            )
+        return _RegistrationDecision("triton_op", "explicit force_register_mode='triton_op'")
+
+    # auto-decision (force_register_mode is None)
+    if has_direct_kernel and has_custom_op:  # cases 6,7
+        raise ValueError(_err_direct_kernel_plus_custom_op())
+
+    if has_direct_kernel:  # cases 1,5
+        return _RegistrationDecision("triton_op", "direct triton kernel(s) detected")
+
+    if has_triton_op and not has_custom_op:  # case 2
+        magi_logger.warning(
+            "@magi_register_custom_op: %r has only nested triton_op(s) %s; skipping "
+            "registration so Inductor can inline for fusion. Pass force_register_mode to override.",
+            fn_label,
+            list(nested.triton_op_names),
+        )
+        return _RegistrationDecision("none", "nested triton_op(s) only; inlining for fusion")
+
+    if has_custom_op and has_triton_op:  # case 4
+        magi_logger.warning(
+            "@magi_register_custom_op: %r has nested triton_op(s) %s + custom_op(s) %s, "
+            "no direct kernel; skipping registration so Inductor can inline. "
+            "Pass force_register_mode='custom_op' to override.",
+            fn_label,
+            list(nested.triton_op_names),
+            list(nested.custom_op_names) + list(nested.unresolved_names),
+        )
+        return _RegistrationDecision("none", "nested triton_op + custom_op only; inlining")
+
+    if has_custom_op:  # case 3
+        return _RegistrationDecision("custom_op", "nested custom_op(s) only")
+
+    return _RegistrationDecision("custom_op", "no triton content detected")  # case 8
+
+
+# ------------------------------------------------------------------------------
 # core: _register_torch_op
-#
-# Forward reference: ``_DataclassRuntimeAdapter`` using ``from __future__ import annotations``.
 # ------------------------------------------------------------------------------
 
 
@@ -691,21 +936,28 @@ def _register_torch_op(
     infer_output_meta_fn: Callable | list[str] | None,
     setup_context_fn: Callable | None,
     backward_fn: Callable | None,
+    mode: Literal["triton_op", "custom_op"],
     dataclass_runtime_adapter: _DataclassRuntimeAdapter | None = None,
+    bare_triton_kernels: list[Any] | None = None,
+    excluded_kernel_ids: set[int] | None = None,
 ):
-    """Register the op in torch.library.custom_op."""
+    """Register via ``torch.library`` on the path selected by ``mode``; on
+    ``"triton_op"`` first shadow ``bare_triton_kernels`` via
+    :func:`rewrite_fn_with_wrap_triton`, and fall back to ``custom_op`` on failure."""
     effective_mutates_args = (
         dataclass_runtime_adapter.expand_mutates_args(mutates_args) if dataclass_runtime_adapter is not None else mutates_args
     )
-    torch_registered_op = torch.library.custom_op(op_name, mutates_args=effective_mutates_args)(fn)
 
-    # Build & register the meta/fake function.
+    # Build the meta/fake fn up front -- both registration paths need it.
     if infer_output_meta_fn is None:
         meta_fn = _create_identity_meta_fn(fn)
+        user_supplied_meta = False
     elif isinstance(infer_output_meta_fn, list):
         meta_fn = _create_meta_fn_from_param_names(fn, infer_output_meta_fn)
+        user_supplied_meta = True
     elif dataclass_runtime_adapter is None:  # No flattening scenario
         meta_fn = infer_output_meta_fn
+        user_supplied_meta = True
     else:  # Flattening scenario
         user_meta = infer_output_meta_fn
 
@@ -714,7 +966,47 @@ def _register_torch_op(
 
         _bridged_meta_fn.__signature__ = inspect.signature(fn)
         meta_fn = _bridged_meta_fn
-    torch.library.register_fake(op_name)(meta_fn)
+        user_supplied_meta = True
+
+    torch_registered_op = None
+    if mode == "triton_op":
+        try:
+            from torch.library import triton_op
+        except ImportError:
+            triton_op = None  # type: ignore[assignment]
+            magi_logger.warning(
+                "torch.library.triton_op not available; falling back to torch.library.custom_op for op %s",
+                op_name,
+            )
+        if triton_op is not None:
+            try:
+                fn_for_register = rewrite_fn_with_wrap_triton(
+                    fn, bare_triton_kernels or [], excluded_kernel_ids=excluded_kernel_ids
+                )
+                # rewriter rebuilds via FunctionType; restamp sig/annotations for infer_schema
+                if fn_for_register is not fn:
+                    sig_override = fn.__dict__.get("__signature__")
+                    if sig_override is not None:
+                        fn_for_register.__signature__ = sig_override
+                    if getattr(fn, "__annotations__", None):
+                        fn_for_register.__annotations__ = dict(fn.__annotations__)
+                torch_registered_op = triton_op(op_name, mutates_args=effective_mutates_args)(fn_for_register)
+                # triton_op self-registers fake; only override if user-supplied
+                if user_supplied_meta:
+                    torch_registered_op.register_fake(meta_fn)
+            except Exception:
+                magi_logger.warning(
+                    "triton_op registration failed for %s; falling back to "
+                    "custom_op + register_fake. Inductor will not be able to "
+                    "see through the op.",
+                    op_name,
+                    exc_info=True,
+                )
+                torch_registered_op = None
+
+    if torch_registered_op is None:
+        torch_registered_op = torch.library.custom_op(op_name, mutates_args=effective_mutates_args)(fn)
+        torch.library.register_fake(op_name)(meta_fn)
 
     # Register autograd.
     if backward_fn is not None:
@@ -894,11 +1186,15 @@ def _magi_register_custom_op_impl(
     backward_fn: Callable | None = None,
     is_compute_sensitive: bool = False,
     is_subgraph_boundary: bool = False,
+    extra_triton_kernels: list[Any] | tuple[Any, ...] | None = None,
+    force_register_mode: Literal["triton_op", "custom_op"] | None = None,
+    max_introspect_depth: int = DEFAULT_MAX_INTROSPECT_DEPTH,
 ):
     def decorator(fn: Callable) -> Callable:
         # A 4-slot pipeline.
 
         op_name = name if name is not None else _generate_op_name(fn)
+        _assert_op_name_valid(op_name)
         if is_compute_sensitive:
             get_compile_config().recompute_config.custom_compute_sensitive_ops.append(op_name)
         if is_subgraph_boundary:
@@ -907,6 +1203,41 @@ def _magi_register_custom_op_impl(
         _validate_op_signature_constraints(fn)
         original_sig, lowered_sig, param_mapping_tree = _lower_op_signature(fn)
         needs_flattening = any(kind == "dataclass" for kind, *_ in param_mapping_tree)
+
+        # Step A: single AST pass feeds every downstream check.
+        introspection = introspect_fn(
+            fn,
+            extra_triton_kernels=extra_triton_kernels,
+            max_depth=max_introspect_depth,
+        )
+
+        # Reject top-level ``@triton.heuristics`` before path decision for a precise error.
+        _reject_heuristics_outermost(introspection, extra_triton_kernels)
+
+        nested = _classify_nested_ops(introspection.nested_op_calls)
+        decision = _decide_registration_path(
+            fn,
+            has_direct_kernel=introspection.has_direct_kernel,
+            nested=nested,
+            force_register_mode=force_register_mode,
+        )
+        magi_logger.debug(
+            "@magi_register_custom_op: %s -> mode=%s (%s)",
+            op_name,
+            decision.mode,
+            decision.reason,
+        )
+
+        # mode="none" -> skip registration so Inductor inlines fn (warning already emitted).
+        if decision.mode == "none":
+            return fn
+
+        # Step B: project introspection -> rewriter inputs (custom_op skips wrap_triton).
+        if decision.mode == "triton_op":
+            bare_triton_kernels = list(introspection.bare_triton_kernels)
+            user_wrapped_ids = set(introspection.user_wrapped_kernel_ids)
+        else:
+            bare_triton_kernels, user_wrapped_ids = [], set()
 
         if not needs_flattening:
             # ----- No-flattening scenario -----
@@ -932,9 +1263,13 @@ def _magi_register_custom_op_impl(
                 infer_output_meta_fn=infer_output_meta_fn,
                 setup_context_fn=setup_context_fn,
                 backward_fn=backward_fn,
+                mode=decision.mode,
                 dataclass_runtime_adapter=None,
+                bare_triton_kernels=bare_triton_kernels,
+                excluded_kernel_ids=user_wrapped_ids,
             )
 
+            _REGISTERED_OP_NAMES.add(op_name)
             # Return bare torch-level op (slot 2).
             return torch_registered_op
 
@@ -962,6 +1297,8 @@ def _magi_register_custom_op_impl(
             dataclass_runtime_adapter.apply_lowered_signature(lowered_fn)
 
             # Step 2: Register the op in torch and get ``torch_registered_op``.
+            # On this path the rewriter shadows kernels on ``lowered_fn``
+            # (its ``__globals__`` were copied from ``fn`` by functools.wraps).
             torch_registered_op = _register_torch_op(
                 op_name=op_name,
                 fn=lowered_fn,
@@ -969,6 +1306,9 @@ def _magi_register_custom_op_impl(
                 infer_output_meta_fn=infer_output_meta_fn,
                 setup_context_fn=setup_context_fn,
                 backward_fn=backward_fn,
+                mode=decision.mode,
+                bare_triton_kernels=bare_triton_kernels,
+                excluded_kernel_ids=user_wrapped_ids,
                 dataclass_runtime_adapter=dataclass_runtime_adapter,
             )
 
@@ -981,6 +1321,7 @@ def _magi_register_custom_op_impl(
             magi_exposed_op._magi_torch_registered_op = torch_registered_op
             magi_exposed_op._magi_param_mapping_tree = param_mapping_tree
 
+            _REGISTERED_OP_NAMES.add(op_name)
             # Return magi-level op.
             return magi_exposed_op
 
