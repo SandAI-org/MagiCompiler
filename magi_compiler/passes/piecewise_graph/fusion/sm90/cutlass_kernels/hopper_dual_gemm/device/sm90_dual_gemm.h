@@ -4,9 +4,9 @@
 // VENDORED from upstream CUTLASS examples on 2026-05-09:
 //   examples/49_hopper_dual_gemm/device/sm90_dual_gemm.h
 // To resync, copy the upstream file verbatim over this one. Don't edit
-// in-tree — the swiglu7 path on top of it is in
+// in-tree — the swiglu path on top of it is in
 // magi_compiler/passes/piecewise_graph/fusion/cutlass_fusion/sm90/
-// cutlass_kernels/swiglu7_one_stage.cu and works around any contract quirks
+// cutlass_kernels/swiglu_one_stage.cu and works around any contract quirks
 // at the host side, leaving this file as a drop-in upstream copy.
 //
 // Sm90 DualGemm — device-level wrapper.
@@ -23,10 +23,10 @@
 //   D2 = epilogue2( A @ B0,  A @ B1 )
 //
 // Both matmuls accumulate in fp32 (or whatever ElementAccumulator the user
-// picks), the binary `epilogue2` (e.g. cutlass::epilogue::thread::Swiglu7Combine)
+// picks), the binary `epilogue2` (e.g. cutlass::epilogue::thread::SwigluCombine)
 // fuses them into a single ElementC output. D0 / D1 are not stored — the
 // only currently supported mode is StoreD0 = StoreD1 = false (the same mode
-// used by the Sm80 swiglu7 one-stage example).
+// used by the Sm80 swiglu one-stage example).
 //
 // Hardware: requires sm_90a (Hopper WGMMA + TMA). The kernel uses a single
 // 128-thread warpgroup per CTA, no cluster, non-persistent grid.
@@ -165,7 +165,7 @@ template <
     /// Per-GEMM linear-combination ops (only used when StoreD0/D1 are true).
     typename EpilogueOutputOp0_,
     typename EpilogueOutputOp1_,
-    /// Binary combine functor (e.g. cutlass::epilogue::thread::Swiglu7Combine).
+    /// Binary combine functor (e.g. cutlass::epilogue::thread::SwigluCombine).
     typename EpilogueOutputOp2_,
     /// Pipeline stages.  Defaults to 3 — bumping higher needs more dyn-smem.
     int Stages = 3,

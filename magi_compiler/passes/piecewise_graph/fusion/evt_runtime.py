@@ -19,10 +19,10 @@ This file owns:
   * A process-level cache mapping IR JSON → compiled cpp_extension module.
   * Dispatch to one of two backends:
       - ``kind == "evt"``         → JIT-compiled CUTLASS Sm80EVT kernel.
-      - ``kind == "swiglu7_dual"`` → vendored DualGemm one-stage kernel.
+      - ``kind == "swiglu_dual"`` → vendored DualGemm one-stage kernel.
         Routes to the SM80 cp.async multistage path on sm_120 (RTX 5090) and
         to the SM90 TMA + WGMMA path on sm_90 (H100). Both expose the same
-        ``swiglu7_dual_matmul_out(A, B, D)`` PYBIND callable, so the
+        ``swiglu_dual_matmul_out(A, B, D)`` PYBIND callable, so the
         dispatcher is arch-agnostic.
 
 The kernel build directory uses the IR cache key + arch tag as its name so
@@ -112,7 +112,7 @@ _MODULE_CACHE: dict = {}
 _MODULE_FAST_CACHE: dict = {}
 _MODULE_LOCKS: dict = {}
 _MODULE_LOCKS_GLOBAL = threading.Lock()
-_SWIGLU7_LOCK = threading.Lock()
+_SWIGLU_LOCK = threading.Lock()
 
 
 # Single-entry greedy D-buffer cache. Opt out with MAGI_EVT_DISABLE_D_CACHE=1.
@@ -482,26 +482,26 @@ def _node_from_dict(d):
 
 # Per-(m_bucket, N, K, align) cache — separate modules so each runner has its
 # own autotune state (best_idx_).
-_SWIGLU7_FAST_CACHE: dict = {}
-_SWIGLU7_BUILD_LOCKS: dict = {}
+_SWIGLU_FAST_CACHE: dict = {}
+_SWIGLU_BUILD_LOCKS: dict = {}
 
 
-def _compile_swiglu7_dual(
+def _compile_swiglu_dual(
     m_bucket: str, N: int, K: int, alignment_a_bits: int = 128, alignment_b_bits: int = 128, alignment_c_bits: int = 128
 ):
     """Lazy-load a per-(bucket, N, K, align) DualGemm kernel module."""
     fast_key = (m_bucket, int(N), int(K), int(alignment_a_bits), int(alignment_b_bits), int(alignment_c_bits))
-    cached = _SWIGLU7_FAST_CACHE.get(fast_key)
+    cached = _SWIGLU_FAST_CACHE.get(fast_key)
     if cached is not None:
         return cached
 
-    with _SWIGLU7_LOCK:
-        lock = _SWIGLU7_BUILD_LOCKS.get(fast_key)
+    with _SWIGLU_LOCK:
+        lock = _SWIGLU_BUILD_LOCKS.get(fast_key)
         if lock is None:
             lock = threading.Lock()
-            _SWIGLU7_BUILD_LOCKS[fast_key] = lock
+            _SWIGLU_BUILD_LOCKS[fast_key] = lock
     with lock:
-        cached = _SWIGLU7_FAST_CACHE.get(fast_key)
+        cached = _SWIGLU_FAST_CACHE.get(fast_key)
         if cached is not None:
             return cached
 
@@ -510,21 +510,21 @@ def _compile_swiglu7_dual(
         # sm_90 → TMA+WGMMA DualGemm; else → SM80 multistage path.
         arch_tag = _device_arch_tag()
         arch_subdir = "sm90" if arch_tag == "sm90" else "sm80"
-        src = os.path.join(here, arch_subdir, "cutlass_kernels", "swiglu7_one_stage.cu")
+        src = os.path.join(here, arch_subdir, "cutlass_kernels", "swiglu_one_stage.cu")
         if not os.path.exists(src):
-            raise FileNotFoundError(f"vendored swiglu7 source not found: {src}")
+            raise FileNotFoundError(f"vendored swiglu source not found: {src}")
         cache_root = get_compile_config().cache_root_dir
         # Build dir embeds (arch, bucket, N, K, align) — stale cross-arch
         # binaries cause cudaErrorInvalidDeviceFunction.
         build_tag = f"{m_bucket}_N{N}_K{K}" f"_aA{alignment_a_bits}_aB{alignment_b_bits}_aC{alignment_c_bits}"
-        build_dir = os.path.join(cache_root, "evt_kernels", arch_tag, f"swiglu7_dual_{build_tag}")
+        build_dir = os.path.join(cache_root, "evt_kernels", arch_tag, f"swiglu_dual_{build_tag}")
         os.makedirs(build_dir, exist_ok=True)
-        mod_name = f"magi_swiglu7_dual_{build_tag}"
+        mod_name = f"magi_swiglu_dual_{build_tag}"
 
         # Warm-cache fast path — see _compile_evt_module for rationale.
         prebuilt = _try_dlopen_prebuilt(build_dir, mod_name)
         if prebuilt is not None:
-            _SWIGLU7_FAST_CACHE[fast_key] = prebuilt
+            _SWIGLU_FAST_CACHE[fast_key] = prebuilt
             return prebuilt
 
         from torch.utils.cpp_extension import load
@@ -558,16 +558,16 @@ def _compile_swiglu7_dual(
                     "-Xcompiler=-fvisibility-inlines-hidden",
                     *sm90_specific_cflags,
                     *_device_gencode_flags(),
-                    f"-DMAGI_SWIGLU7_ALIGN_A_BITS={int(alignment_a_bits)}",
-                    f"-DMAGI_SWIGLU7_ALIGN_B_BITS={int(alignment_b_bits)}",
-                    f"-DMAGI_SWIGLU7_ALIGN_C_BITS={int(alignment_c_bits)}",
+                    f"-DMAGI_SWIGLU_ALIGN_A_BITS={int(alignment_a_bits)}",
+                    f"-DMAGI_SWIGLU_ALIGN_B_BITS={int(alignment_b_bits)}",
+                    f"-DMAGI_SWIGLU_ALIGN_C_BITS={int(alignment_c_bits)}",
                 ],
                 build_directory=build_dir,
                 verbose=False,
             )
         finally:
             _untrack_build(build_dir)
-        _SWIGLU7_FAST_CACHE[fast_key] = module
+        _SWIGLU_FAST_CACHE[fast_key] = module
         return module
 
 
@@ -589,21 +589,21 @@ _DISPATCH_CACHE: dict = {}
 
 def _resolve_dispatch(kind, ir_json, a_dtype, b_dtype, N_w, K_w, m_bucket, out_dtype):
     """Slow-path resolver — compiles the .cu module and binds the kernel callable."""
-    n_out_for_c = (N_w // 2) if kind == "swiglu7_dual" else N_w
+    n_out_for_c = (N_w // 2) if kind == "swiglu_dual" else N_w
     ldd = _aligned_n_stride(n_out_for_c, out_dtype)
     alignment_c_bits = _runtime_align_bits(ldd, out_dtype)
 
-    if kind == "swiglu7_dual":
+    if kind == "swiglu_dual":
         # K alignment also covers ldB=2K.
         align_bits = _runtime_align_bits(K_w, a_dtype)
-        mod = _compile_swiglu7_dual(
+        mod = _compile_swiglu_dual(
             m_bucket, N_w, K_w, alignment_a_bits=align_bits, alignment_b_bits=align_bits, alignment_c_bits=alignment_c_bits
         )
         sw7 = json.loads(ir_json) if ir_json else {}
         sw7_alpha = float(sw7.get("alpha", 1.702))
         sw7_limit = float(sw7.get("limit", 7.0))
         sw7_one = float(sw7.get("one", 1.0))
-        kernel_fn = mod.swiglu7_dual_matmul_out
+        kernel_fn = mod.swiglu_dual_matmul_out
 
         def _sw7_call(A, B, D, _fn=kernel_fn, _a=sw7_alpha, _l=sw7_limit, _o=sw7_one):
             return _fn(A, B, D, _a, _l, _o)
@@ -636,7 +636,7 @@ def _resolve_dispatch(kind, ir_json, a_dtype, b_dtype, N_w, K_w, m_bucket, out_d
 @torch.library.impl(_LIB, "matmul_custom_evt", "CUDA")
 def _matmul_custom_evt_cuda(A, B, extras, ir_json, kind, n_out, out_dtype_id_):
     """Runtime entry point. Do NOT call .contiguous() on B — the FX pass
-    controls the layout (evt_row=RowMajor, evt_col/swiglu7=ColumnMajor)."""
+    controls the layout (evt_row=RowMajor, evt_col/swiglu=ColumnMajor)."""
     # B.size(0)/size(1) avoids the Python tuple construction of .shape.
     B_size0 = B.size(0)
     B_size1 = B.size(1)
@@ -657,7 +657,7 @@ def _matmul_custom_evt_cuda(A, B, extras, ir_json, kind, n_out, out_dtype_id_):
         if kind == "evt_row":
             K_w, N_w = B_size0, B_size1
         else:
-            # evt_col / swiglu7_dual: B is (N, K) underlying weight.
+            # evt_col / swiglu_dual: B is (N, K) underlying weight.
             N_w, K_w = B_size0, B_size1
         entry = _resolve_dispatch(kind, ir_json, a_dtype, b_dtype_, N_w, K_w, m_bucket, out_dtype)
         _DISPATCH_CACHE[fast_key] = entry
@@ -679,7 +679,7 @@ def _matmul_custom_evt_cuda(A, B, extras, ir_json, kind, n_out, out_dtype_id_):
     if entry.is_evt:
         kernel_call(A, B, extras, D)
     else:
-        # swiglu7_dual: extras is always [] here (FX pass guarantees).
+        # swiglu_dual: extras is always [] here (FX pass guarantees).
         kernel_call(A, B, D)
     return D
 

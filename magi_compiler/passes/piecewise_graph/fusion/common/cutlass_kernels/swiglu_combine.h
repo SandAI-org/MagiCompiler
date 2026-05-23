@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Binary epilogue combine functor for the swiglu7 DualGemm fusion.
+// Binary epilogue combine functor for the swiglu DualGemm fusion.
 //
 //   D = silu_alpha( clamp(lhs, max=limit) ) * ( clamp(rhs, -limit, limit) + 1 )
 //
@@ -24,12 +24,12 @@
 // dual-epilogue call site (examples/45_dual_gemm/threadblock/dual_epilogue.h:413
 // passes `output_frag_ptr[0][i]` and `[1][i]`, which are post-conversion
 // output-type fragments, not raw accumulator fragments). The combine upcasts
-// to ElementCompute (fp32) internally, evaluates the swiglu7 expression, and
+// to ElementCompute (fp32) internally, evaluates the swiglu expression, and
 // converts back to bf16.
 //
 // Note on precision: the gate/linear matmuls accumulate in fp32 inside the
 // MMAs. Op0/Op1 (LinearCombination, ScaleType::Nothing) downcast those fp32
-// accumulators to bf16 before this combine runs. The swiglu7 math itself
+// accumulators to bf16 before this combine runs. The swiglu math itself
 // stays in fp32 here, so the only extra precision loss vs the two-stage EVT
 // version is the single fp32→bf16 round-trip on each accumulator at the
 // epilogue boundary. Empirically this is well within the bf16 noise floor.
@@ -58,7 +58,7 @@ template <
     typename ElementAccumulator_ = ElementOutput_,
     typename ElementCompute_     = ElementOutput_,
     FloatRoundStyle Round        = FloatRoundStyle::round_to_nearest>
-class Swiglu7Combine {
+class SwigluCombine {
 public:
 
     using ElementOutput      = ElementOutput_;
@@ -90,14 +90,14 @@ public:
 public:
 
     CUTLASS_HOST_DEVICE
-    Swiglu7Combine(Params const& p) : alpha_(p.alpha), limit_(p.limit), one_(p.one) {}
+    SwigluCombine(Params const& p) : alpha_(p.alpha), limit_(p.limit), one_(p.one) {}
 
     CUTLASS_HOST_DEVICE
     bool is_source_needed() const { return true; }
 
     CUTLASS_HOST_DEVICE
     void set_k_partition(int /*k_partition*/, int /*k_partition_count*/) {
-        // swiglu7 cannot be split-K-reduced (non-linear epilogue).
+        // swiglu cannot be split-K-reduced (non-linear epilogue).
         assert(false);
     }
 

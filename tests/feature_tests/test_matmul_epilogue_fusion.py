@@ -68,7 +68,7 @@ def high_precision_gelu(x, out_dtype: Optional[torch.dtype] = None):
     return F.gelu(x.to(torch.float32)).to(out_dtype)
 
 
-def swiglu7(x, alpha: float = 1.702, limit: float = 7.0, out_dtype: Optional[torch.dtype] = None):
+def swiglu(x, alpha: float = 1.702, limit: float = 7.0, out_dtype: Optional[torch.dtype] = None):
     out_dtype = x.dtype if out_dtype is None else out_dtype
     x = x.to(torch.float32)
     x_glu, x_linear = x[..., ::2], x[..., 1::2]
@@ -106,7 +106,7 @@ class _FusionStats:
                        replaced; ``mm_before - mm_after`` only matches when
                        fusion never aborts mid-walk).
       * kinds        — the ``kind`` arg of each emitted op, e.g.
-                       ["evt_row", "swiglu7_dual"].
+                       ["evt_row", "swiglu_dual"].
 
     Tests assert against these to prove the pass made the right choice — a
     purely numerical comparison against eager would silently pass even when
@@ -195,7 +195,7 @@ def _compile_and_check(
         tests (fusion must NOT fire). -1 disables the check.
     expect_kinds
         If set, the multiset of emitted op ``kind`` args must equal this list.
-        E.g. ``["swiglu7_dual"]`` for the swiglu7 special-case path.
+        E.g. ``["swiglu_dual"]`` for the swiglu special-case path.
     expect_out_dtype
         If set, every emitted op's ``out_dtype_id`` (args[6]) MUST decode to
         this dtype. Catches silent regressions where the FX pass picks the
@@ -349,17 +349,17 @@ def test_evt_relu_native():
 
 
 @_SM120_ONLY
-def test_evt_swiglu7_dispatches_to_dualgemm():
+def test_evt_swiglu_dispatches_to_dualgemm():
     """SwiGLU7 must take the dedicated DualGemm one-stage path, not generic EVT."""
-    model = _Bf16MmModel(_K, _N, swiglu7)
-    _compile_and_check(model, (_input_a(),), atol=0.5, rtol=0.05, expect_fused=1, expect_kinds=["swiglu7_dual"])
+    model = _Bf16MmModel(_K, _N, swiglu)
+    _compile_and_check(model, (_input_a(),), atol=0.5, rtol=0.05, expect_fused=1, expect_kinds=["swiglu_dual"])
 
 
 @_SM120_ONLY
-def test_evt_swiglu7_custom_constants():
+def test_evt_swiglu_custom_constants():
     """SwiGLU7 with non-default alpha/limit/one still fuses and computes correctly."""
 
-    def swiglu7_custom(x, out_dtype=None):
+    def swiglu_custom(x, out_dtype=None):
         out_dtype = x.dtype if out_dtype is None else out_dtype
         x = x.to(torch.float32)
         x_glu, x_linear = x[..., ::2], x[..., 1::2]
@@ -368,16 +368,16 @@ def test_evt_swiglu7_custom_constants():
         out_glu = x_glu * torch.sigmoid(2.0 * x_glu)
         return (out_glu * (x_linear + 1)).to(out_dtype)
 
-    model = _Bf16MmModel(_K, _N, swiglu7_custom)
-    _compile_and_check(model, (_input_a(),), atol=0.5, rtol=0.05, expect_fused=1, expect_kinds=["swiglu7_dual"])
+    model = _Bf16MmModel(_K, _N, swiglu_custom)
+    _compile_and_check(model, (_input_a(),), atol=0.5, rtol=0.05, expect_fused=1, expect_kinds=["swiglu_dual"])
 
 
 @_SM120_ONLY
-def test_evt_swiglu7_constants_roundtrip_in_ir_json():
-    """Verify that swiglu7 constant values are captured in ir_json."""
+def test_evt_swiglu_constants_roundtrip_in_ir_json():
+    """Verify that swiglu constant values are captured in ir_json."""
     import json as _json
 
-    def swiglu7_custom(x, out_dtype=None):
+    def swiglu_custom(x, out_dtype=None):
         out_dtype = x.dtype if out_dtype is None else out_dtype
         x = x.to(torch.float32)
         x_glu, x_linear = x[..., ::2], x[..., 1::2]
@@ -386,7 +386,7 @@ def test_evt_swiglu7_constants_roundtrip_in_ir_json():
         out_glu = x_glu * torch.sigmoid(1.5 * x_glu)
         return (out_glu * (x_linear + 1)).to(out_dtype)
 
-    model = _Bf16MmModel(_K, _N, swiglu7_custom).cuda().bfloat16()
+    model = _Bf16MmModel(_K, _N, swiglu_custom).cuda().bfloat16()
     for p in model.parameters():
         p.requires_grad_(False)
 
@@ -404,10 +404,10 @@ def test_evt_swiglu7_constants_roundtrip_in_ir_json():
         restore()
 
     diff = (actual.float() - expected.float()).abs().max().item()
-    assert diff <= 0.5, f"swiglu7 custom constants max|diff|={diff}"
+    assert diff <= 0.5, f"swiglu custom constants max|diff|={diff}"
 
     assert stats.fused_count == 1
-    assert stats.kinds == ["swiglu7_dual"]
+    assert stats.kinds == ["swiglu_dual"]
     assert len(stats.ir_jsons) == 1
     sw7 = _json.loads(stats.ir_jsons[0])
     assert sw7["alpha"] == 1.5, f"Expected alpha=1.5, got {sw7['alpha']}"
@@ -416,10 +416,10 @@ def test_evt_swiglu7_constants_roundtrip_in_ir_json():
 
 
 @_SM90_ONLY
-def test_evt_sm90_swiglu7_custom_constants():
+def test_evt_sm90_swiglu_custom_constants():
     """SM90: SwiGLU7 with non-default alpha/limit still fuses correctly."""
 
-    def swiglu7_custom(x, out_dtype=None):
+    def swiglu_custom(x, out_dtype=None):
         out_dtype = x.dtype if out_dtype is None else out_dtype
         x = x.to(torch.float32)
         x_glu, x_linear = x[..., ::2], x[..., 1::2]
@@ -428,16 +428,16 @@ def test_evt_sm90_swiglu7_custom_constants():
         out_glu = x_glu * torch.sigmoid(2.0 * x_glu)
         return (out_glu * (x_linear + 1)).to(out_dtype)
 
-    model = _Bf16MmModel(_K, _N, swiglu7_custom)
-    _compile_and_check(model, (_input_a(),), atol=0.5, rtol=0.05, expect_fused=1, expect_kinds=["swiglu7_dual"])
+    model = _Bf16MmModel(_K, _N, swiglu_custom)
+    _compile_and_check(model, (_input_a(),), atol=0.5, rtol=0.05, expect_fused=1, expect_kinds=["swiglu_dual"])
 
 
 @_SM90_ONLY
-def test_evt_sm90_swiglu7_constants_roundtrip_in_ir_json():
-    """SM90: Verify that swiglu7 constant values are captured in ir_json."""
+def test_evt_sm90_swiglu_constants_roundtrip_in_ir_json():
+    """SM90: Verify that swiglu constant values are captured in ir_json."""
     import json as _json
 
-    def swiglu7_custom(x, out_dtype=None):
+    def swiglu_custom(x, out_dtype=None):
         out_dtype = x.dtype if out_dtype is None else out_dtype
         x = x.to(torch.float32)
         x_glu, x_linear = x[..., ::2], x[..., 1::2]
@@ -446,7 +446,7 @@ def test_evt_sm90_swiglu7_constants_roundtrip_in_ir_json():
         out_glu = x_glu * torch.sigmoid(1.5 * x_glu)
         return (out_glu * (x_linear + 1)).to(out_dtype)
 
-    model = _Bf16MmModel(_K, _N, swiglu7_custom).cuda().bfloat16()
+    model = _Bf16MmModel(_K, _N, swiglu_custom).cuda().bfloat16()
     for p in model.parameters():
         p.requires_grad_(False)
 
@@ -464,10 +464,10 @@ def test_evt_sm90_swiglu7_constants_roundtrip_in_ir_json():
         restore()
 
     diff = (actual.float() - expected.float()).abs().max().item()
-    assert diff <= 0.5, f"SM90 swiglu7 custom constants max|diff|={diff}"
+    assert diff <= 0.5, f"SM90 swiglu custom constants max|diff|={diff}"
 
     assert stats.fused_count == 1
-    assert stats.kinds == ["swiglu7_dual"]
+    assert stats.kinds == ["swiglu_dual"]
     assert len(stats.ir_jsons) == 1
     sw7 = _json.loads(stats.ir_jsons[0])
     assert sw7["alpha"] == 1.5, f"Expected alpha=1.5, got {sw7['alpha']}"
@@ -679,9 +679,9 @@ def test_evt_col_n_misaligned_still_fuses():
 
 
 @_SM120_ONLY
-def test_evt_swiglu7_small_n_still_fuses():
+def test_evt_swiglu_small_n_still_fuses():
     """N=12: n_out=6 is not 128-bit aligned for bf16 but the runtime pads
-    the output stride, so swiglu7 fusion should still fire."""
+    the output stride, so swiglu fusion should still fire."""
 
     class M(nn.Module):
         def __init__(self, k, n):
@@ -690,7 +690,7 @@ def test_evt_swiglu7_small_n_still_fuses():
 
         def forward(self, a):
             y = torch.mm(a, self.weight.permute(1, 0))
-            return swiglu7(y, out_dtype=torch.bfloat16)
+            return swiglu(y, out_dtype=torch.bfloat16)
 
     K = 1024
     N = 12
@@ -1407,10 +1407,10 @@ def test_evt_sm90_unary_activations_fuse(epi_name, epi_fn, atol, rtol):
 
 
 @_SM90_ONLY
-def test_evt_sm90_swiglu7_dispatches_to_dualgemm():
+def test_evt_sm90_swiglu_dispatches_to_dualgemm():
     """SM90: SwiGLU7 must take the dedicated DualGemm path."""
-    model = _Bf16MmModel(_K, _N, swiglu7)
-    _compile_and_check(model, (_input_a(),), atol=0.5, rtol=0.05, expect_fused=1, expect_kinds=["swiglu7_dual"])
+    model = _Bf16MmModel(_K, _N, swiglu)
+    _compile_and_check(model, (_input_a(),), atol=0.5, rtol=0.05, expect_fused=1, expect_kinds=["swiglu_dual"])
 
 
 @_SM90_ONLY
@@ -1480,8 +1480,8 @@ def test_evt_sm90_d_stride_padding_silu():
 
 
 @_SM90_ONLY
-def test_evt_sm90_d_stride_padding_swiglu7():
-    """SM90 D stride regression for swiglu7: N=1040, n_out=520.
+def test_evt_sm90_d_stride_padding_swiglu():
+    """SM90 D stride regression for swiglu: N=1040, n_out=520.
 
     520 bf16 elements = 1040 bytes, not 128-byte aligned.
     Runtime pads to n_pad=576 (next 64-element boundary).
@@ -1497,10 +1497,10 @@ def test_evt_sm90_d_stride_padding_swiglu7():
 
         def forward(self, a):
             y = torch.mm(a, self.weight.permute(1, 0))
-            return swiglu7(y, out_dtype=torch.bfloat16)
+            return swiglu(y, out_dtype=torch.bfloat16)
 
     a = torch.randn(_M, K, device="cuda", dtype=torch.bfloat16)
-    _compile_and_check(M(), (a,), atol=0.5, rtol=0.05, expect_fused=1, expect_kinds=["swiglu7_dual"])
+    _compile_and_check(M(), (a,), atol=0.5, rtol=0.05, expect_fused=1, expect_kinds=["swiglu_dual"])
 
 
 @_SM90_ONLY

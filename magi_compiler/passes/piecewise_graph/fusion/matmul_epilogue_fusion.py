@@ -20,7 +20,7 @@ Two backends:
     matched chain with a single ``torch.ops.magi_epilogue.matmul_custom_evt``
     call. The runtime renders + JIT-compiles a CUTLASS Sm80EVT kernel keyed by
     the IR hash (see ``evt_runtime.py``).
-  * swiglu7 — pattern-matches the canonical recipe (slice-stride-2 + dual
+  * swiglu — pattern-matches the canonical recipe (slice-stride-2 + dual
     clamps + scaled SiLU) and dispatches to a vendored DualGemm one-stage
     kernel that writes (M, N/2) directly.
 
@@ -199,9 +199,9 @@ def _b_layout_kind(B_node):
     return None, None, None
 
 
-# ── swiglu7 structural validation ───────────────────────────────────────────
-def _validate_swiglu7_structure(chain_nodes: List[fx.Node], mm_node: fx.Node) -> Optional[Tuple[float, float, float]]:
-    """Strictly validate the decomposed swiglu7 pattern and extract constants.
+# ── swiglu structural validation ───────────────────────────────────────────
+def _validate_swiglu_structure(chain_nodes: List[fx.Node], mm_node: fx.Node) -> Optional[Tuple[float, float, float]]:
+    """Strictly validate the decomposed swiglu pattern and extract constants.
 
     The canonical decomposition is::
 
@@ -401,7 +401,7 @@ def _validate_swiglu7_structure(chain_nodes: List[fx.Node], mm_node: fx.Node) ->
     return (alpha, limit, one)
 
 
-# ── swiglu7 weight / chain validation ──────────────────────────────────────
+# ── swiglu weight / chain validation ──────────────────────────────────────
 
 
 _SWIGLU7_CHAIN_OPS = frozenset(
@@ -427,11 +427,11 @@ _SWIGLU7_CHAIN_OPS = frozenset(
 )
 
 
-def _validate_swiglu7_weight(mm_node: fx.Node) -> Optional[Tuple[fx.Node, fx.Node, int, int]]:
+def _validate_swiglu_weight(mm_node: fx.Node) -> Optional[Tuple[fx.Node, fx.Node, int, int]]:
     """Check B's underlying data is contiguous (N, K) bf16 with N even.
 
     K alignment and A/B dtype-compatibility are guaranteed by the caller
-    (``_try_fuse_evt``).  This validates swiglu7-specific constraints only.
+    (``_try_fuse_evt``).  This validates swiglu-specific constraints only.
 
     Requires an explicit transpose node (``t(weight)``) so we can extract the
     underlying ``weight`` with shape (N, K).  The runtime reads ``B.size(0)``
@@ -464,7 +464,7 @@ def _validate_swiglu7_weight(mm_node: fx.Node) -> Optional[Tuple[fx.Node, fx.Nod
     return B_node, weight_node, N, K
 
 
-def _validate_swiglu7_chain(mm_node: fx.Node, N: int) -> Optional[Tuple[List[fx.Node], fx.Node, torch.dtype, str]]:
+def _validate_swiglu_chain(mm_node: fx.Node, N: int) -> Optional[Tuple[List[fx.Node], fx.Node, torch.dtype, str]]:
     """Collect the epilogue chain, validate shape/escape/structure, extract constants.
 
     Returns ``(chain_nodes, last_chain_node, out_dt, sw7_json)`` on success,
@@ -499,7 +499,7 @@ def _validate_swiglu7_chain(mm_node: fx.Node, N: int) -> Optional[Tuple[List[fx.
         for u in n.users:
             if u not in chain_set:
                 return None
-    constants = _validate_swiglu7_structure(chain_nodes, mm_node)
+    constants = _validate_swiglu_structure(chain_nodes, mm_node)
     if constants is None:
         return None
     sw7_alpha, sw7_limit, sw7_one = constants
@@ -721,7 +721,7 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
             break
 
         if saw_slice:
-            return self._try_fuse_swiglu7(graph, mm_node)
+            return self._try_fuse_swiglu(graph, mm_node)
 
         result = self._validate_evt_epilogue(
             B, b_dtype, mm_node, node_to_ir, fused_nodes, walk_seen, last_node, last_ir, extras_nodes
@@ -860,16 +860,16 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         extras_nodes.append(arg)
         return len(extras_nodes) - 1
 
-    # ── swiglu7 special-case ──────────────────────────────────────────────────
+    # ── swiglu special-case ──────────────────────────────────────────────────
 
-    def _try_fuse_swiglu7(self, graph: fx.Graph, mm_node: fx.Node) -> bool:
-        """Match the canonical swiglu7 epilogue and dispatch to DualGemm."""
-        wt = _validate_swiglu7_weight(mm_node)
+    def _try_fuse_swiglu(self, graph: fx.Graph, mm_node: fx.Node) -> bool:
+        """Match the canonical swiglu epilogue and dispatch to DualGemm."""
+        wt = _validate_swiglu_weight(mm_node)
         if wt is None:
             return False
         B_node, weight_node, N, K = wt
 
-        ch = _validate_swiglu7_chain(mm_node, N)
+        ch = _validate_swiglu_chain(mm_node, N)
         if ch is None:
             return False
         chain_nodes, last_chain_node, out_dt, sw7_json = ch
@@ -879,7 +879,7 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         _emit_and_replace(
             graph,
             last_chain_node,
-            (mm_node.args[0], weight_node, [], sw7_json, "swiglu7_dual", n_out, out_dt_id),
+            (mm_node.args[0], weight_node, [], sw7_json, "swiglu_dual", n_out, out_dt_id),
             chain_nodes,
             extra_dead=[mm_node, B_node],
         )
