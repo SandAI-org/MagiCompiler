@@ -832,9 +832,7 @@ class TestIntrospection:
         def fn(x):
             out = torch.empty_like(x)
             n = x.numel()
-            ext.external_double_kernel.run(
-                x, out, n, BLOCK_SIZE=128, grid=_grid_1d(n), warmup=False
-            )
+            ext.external_double_kernel.run(x, out, n, BLOCK_SIZE=128, grid=_grid_1d(n), warmup=False)
             return out
 
         assert ext.external_double_kernel in introspect_fn(fn).bare_triton_kernels

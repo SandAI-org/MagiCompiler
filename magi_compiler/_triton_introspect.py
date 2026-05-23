@@ -38,12 +38,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_INTROSPECT_DEPTH: int = 5
 
 
-__all__ = [
-    "DEFAULT_MAX_INTROSPECT_DEPTH",
-    "IntrospectionResult",
-    "introspect_fn",
-    "rewrite_fn_with_wrap_triton",
-]
+__all__ = ["DEFAULT_MAX_INTROSPECT_DEPTH", "IntrospectionResult", "introspect_fn", "rewrite_fn_with_wrap_triton"]
 
 
 # ==============================================================================
@@ -414,12 +409,7 @@ def introspect_fn(
                     return None
             return obj
 
-        def _classify_name(
-            name: str,
-            *,
-            as_bare: bool,
-            visited_names: set[str],
-        ) -> None:
+        def _classify_name(name: str, *, as_bare: bool, visited_names: set[str]) -> None:
             """Classify ``name`` and route it to the right bucket: a kernel
             bucket (``bare`` vs ``user_wrapped`` per ``as_bare``), the
             ``heuristics`` bucket if the resolved object is a Triton
@@ -479,9 +469,7 @@ def introspect_fn(
             try:
                 _walk(helper_obj, depth + 1)
             except Exception:
-                logger.debug(
-                    "failed to analyze called helper %s", helper_name, exc_info=True
-                )
+                logger.debug("failed to analyze called helper %s", helper_name, exc_info=True)
 
     _walk(fn, 0)
 

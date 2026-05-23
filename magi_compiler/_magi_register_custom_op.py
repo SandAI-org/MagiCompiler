@@ -58,12 +58,7 @@ from typing import Any, Callable, Literal, get_args, get_origin
 import torch
 import torch.utils._pytree as pytree
 
-from ._triton_introspect import (
-    DEFAULT_MAX_INTROSPECT_DEPTH,
-    IntrospectionResult,
-    introspect_fn,
-    rewrite_fn_with_wrap_triton,
-)
+from ._triton_introspect import DEFAULT_MAX_INTROSPECT_DEPTH, IntrospectionResult, introspect_fn, rewrite_fn_with_wrap_triton
 from .config import get_compile_config
 from .utils.logger import magi_logger
 
@@ -735,8 +730,7 @@ def _generate_op_name(fn: Callable) -> str:
 
 
 def _reject_heuristics_outermost(
-    introspection: IntrospectionResult,
-    extra_triton_kernels: list[Any] | tuple[Any, ...] | None,
+    introspection: IntrospectionResult, extra_triton_kernels: list[Any] | tuple[Any, ...] | None
 ) -> None:
     """Reject kernels whose outermost decorator is ``@triton.heuristics``
     (``wrap_triton`` only accepts JIT/Autotuner; surface here before the
@@ -975,8 +969,7 @@ def _register_torch_op(
         except ImportError:
             triton_op = None  # type: ignore[assignment]
             magi_logger.warning(
-                "torch.library.triton_op not available; falling back to torch.library.custom_op for op %s",
-                op_name,
+                "torch.library.triton_op not available; falling back to torch.library.custom_op for op %s", op_name
             )
         if triton_op is not None:
             try:
@@ -1205,28 +1198,16 @@ def _magi_register_custom_op_impl(
         needs_flattening = any(kind == "dataclass" for kind, *_ in param_mapping_tree)
 
         # Step A: single AST pass feeds every downstream check.
-        introspection = introspect_fn(
-            fn,
-            extra_triton_kernels=extra_triton_kernels,
-            max_depth=max_introspect_depth,
-        )
+        introspection = introspect_fn(fn, extra_triton_kernels=extra_triton_kernels, max_depth=max_introspect_depth)
 
         # Reject top-level ``@triton.heuristics`` before path decision for a precise error.
         _reject_heuristics_outermost(introspection, extra_triton_kernels)
 
         nested = _classify_nested_ops(introspection.nested_op_calls)
         decision = _decide_registration_path(
-            fn,
-            has_direct_kernel=introspection.has_direct_kernel,
-            nested=nested,
-            force_register_mode=force_register_mode,
+            fn, has_direct_kernel=introspection.has_direct_kernel, nested=nested, force_register_mode=force_register_mode
         )
-        magi_logger.debug(
-            "@magi_register_custom_op: %s -> mode=%s (%s)",
-            op_name,
-            decision.mode,
-            decision.reason,
-        )
+        magi_logger.debug("@magi_register_custom_op: %s -> mode=%s (%s)", op_name, decision.mode, decision.reason)
 
         # mode="none" -> skip registration so Inductor inlines fn (warning already emitted).
         if decision.mode == "none":
