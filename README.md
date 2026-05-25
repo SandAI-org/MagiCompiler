@@ -114,6 +114,10 @@ git clone --depth 1 https://github.com/NVIDIA/cutlass.git /opt/cutlass
 # Or specify a custom path:
 #   git clone --depth 1 https://github.com/NVIDIA/cutlass.git /your/path
 #   export MAGI_CUTLASS_ROOT=/your/path
+export CUDACXX=${CUDA_INSTALL_PATH}/bin/nvcc
+mkdir /opt/cutlass/build && cd /opt/cutlass/build
+cmake .. -DCUTLASS_NVCC_ARCHS=90a # compiles for NVIDIA Hopper GPU architecture
+# cmake .. -DCUTLASS_NVCC_ARCHS=120a # compiles for NVIDIA consumer Blackwell (RTX 50 series)
 ```
 
 ---
