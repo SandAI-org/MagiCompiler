@@ -65,7 +65,7 @@ class PassConfig(BaseModel):
     # TODO: Add Ulysses overlap pass.
     enable_sage_attn: bool = Field(False, description="Whether to replace flash attention with sage attention.")
     enable_mm_epilogue_fusion: bool = Field(
-        True,
+        False,
         description=(
             "Whether to enable the matmul + elementwise epilogue fusion pass. "
             "On RTX 5090 (sm_120) this lowers fused chains to a CUTLASS Sm80EVT "

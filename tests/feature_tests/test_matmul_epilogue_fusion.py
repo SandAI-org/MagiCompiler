@@ -67,6 +67,15 @@ _TEST_RNG_SEED = 123
 
 
 @pytest.fixture(autouse=True)
+def _enable_mm_epilogue_fusion():
+    config = get_compile_config()
+    old_value = config.pass_config.enable_mm_epilogue_fusion
+    config.pass_config.enable_mm_epilogue_fusion = True
+    yield
+    config.pass_config.enable_mm_epilogue_fusion = old_value
+
+
+@pytest.fixture(autouse=True)
 def _fixed_rng_seed():
     """Make low-precision random numerical tests reproducible."""
     cpu_state = torch.random.get_rng_state()
