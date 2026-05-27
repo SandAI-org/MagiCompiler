@@ -4,7 +4,7 @@ FROM nvcr.io/nvidia/pytorch:25.10-py3
 ARG FLASH_ATTENTION_COMMIT_ID="b613d9e2c8475945baff3fd68f2030af1b890acf"
 
 # CUTLASS — source is always cloned (the magi_compiler EVT-fusion path
-# JIT-includes its headers and our /opt/cutlass tree is the readable
+# JIT-includes its headers and our /usr/local/cutlass tree is the readable
 # reference checkout). The CMake-driven profiler/library is compiled
 # only for supported targets; every other arch gets headers only.
 #
@@ -67,8 +67,8 @@ RUN --mount=type=secret,id=http_proxy,required=false \
     --mount=type=secret,id=https_proxy,required=false \
     export http_proxy="$(cat /run/secrets/http_proxy 2>/dev/null || true)" && \
     export https_proxy="$(cat /run/secrets/https_proxy 2>/dev/null || true)" && \
-    mkdir -p /opt/cutlass && \
-    cd /opt/cutlass && \
+    mkdir -p /usr/local/cutlass && \
+    cd /usr/local/cutlass && \
     git init -q && \
     git remote add origin https://github.com/NVIDIA/cutlass.git && \
     git fetch origin ${CUTLASS_COMMIT_ID} --depth 1 && \
@@ -116,7 +116,7 @@ RUN set -eu; \
         90a|120a) ;; \
         *) echo "[CUTLASS] Unsupported CUTLASS_NVCC_ARCHS=${NVCC_ARCHS} (expected 90a or 120a)."; exit 1 ;; \
     esac; \
-    [ -n "${DO_BUILD:-}" ] && cd /opt/cutlass && \
+    [ -n "${DO_BUILD:-}" ] && cd /usr/local/cutlass && \
     export CUDACXX="${CUDA_INSTALL_PATH:-${CUDA_HOME:-/usr/local/cuda}}/bin/nvcc" && \
     mkdir -p build && cd build && \
     cmake .. -DCUTLASS_NVCC_ARCHS="${NVCC_ARCHS}"

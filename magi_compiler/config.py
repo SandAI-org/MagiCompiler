@@ -155,7 +155,7 @@ class OffloadConfig(BaseModel):
 
 def _find_cutlass_root() -> str:
     """Return the CUTLASS source root, or empty string if not found."""
-    path = os.environ.get("MAGI_CUTLASS_ROOT", "/opt/cutlass")
+    path = os.environ.get("MAGI_CUTLASS_ROOT", "/usr/local/cutlass")
     if os.path.isdir(path):
         return path
     return ""
@@ -194,7 +194,7 @@ class CompileConfig(BaseSettings):
     )
     cutlass_root: str = Field(
         default_factory=_find_cutlass_root,
-        description="Path to the CUTLASS source tree. Default: $MAGI_CUTLASS_ROOT or /opt/cutlass.",
+        description="Path to the CUTLASS source tree. Default: $MAGI_CUTLASS_ROOT or /usr/local/cutlass.",
     )
 
     # ---- Compilation mode ----

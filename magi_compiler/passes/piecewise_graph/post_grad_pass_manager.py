@@ -88,8 +88,8 @@ class PostGradPassManager(CustomGraphPass):
                 self.add(MatmulEvtEpilogueFusionPass())
             else:
                 magi_logger.warning(
-                    "Skipping matmul epilogue fusion because CUTLASS is unavailable: %s",
-                    compile_config.cutlass_validation_error,
+                    "Skipping matmul epilogue fusion because CUTLASS is unavailable. "
+                    "Set MAGI_CUTLASS_ROOT or compile_config.cutlass_root to a valid CUTLASS source tree."
                 )
 
         # needs a functional graph
