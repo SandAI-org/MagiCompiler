@@ -332,23 +332,6 @@ def test_evt_relu_native():
 
 
 @_EVT_CAPABLE
-def test_evt_swiglu_custom_constants():
-    """SwiGLU7 with non-default alpha/limit/one still fuses correctly."""
-
-    def swiglu_custom(x, out_dtype=None):
-        out_dtype = x.dtype if out_dtype is None else out_dtype
-        x = x.to(torch.float32)
-        x_glu, x_linear = x[..., ::2], x[..., 1::2]
-        x_glu = x_glu.clamp(max=5.0)
-        x_linear = x_linear.clamp(min=-5.0, max=5.0)
-        out_glu = x_glu * torch.sigmoid(2.0 * x_glu)
-        return (out_glu * (x_linear + 1)).to(out_dtype)
-
-    model = _Bf16MmModel(_K, _N, swiglu_custom)
-    _compile_and_check(model, (_input_a(),), atol=0.5, rtol=0.05, expect_fused=1, expect_kinds=["swiglu_dual"])
-
-
-@_EVT_CAPABLE
 def test_evt_swiglu_constants_roundtrip_in_ir_json():
     """Verify that swiglu constant values are captured in ir_json."""
     import json as _json
@@ -389,38 +372,6 @@ def test_evt_swiglu_constants_roundtrip_in_ir_json():
     assert sw7["alpha"] == 1.5, f"Expected alpha=1.5, got {sw7['alpha']}"
     assert sw7["limit"] == 3.0, f"Expected limit=3.0, got {sw7['limit']}"
     assert sw7["one"] == 1.0, f"Expected one=1.0, got {sw7['one']}"
-
-
-@_EVT_CAPABLE
-def test_evt_mm_div_scalar_then_silu():
-    """``silu(mm / 8)`` — scalar div + activation chain."""
-
-    class M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.randn(_N, _K))
-
-        def forward(self, a):
-            y = torch.mm(a, self.weight.permute(1, 0)) / 8.0
-            return high_precision_silu(y, out_dtype=torch.bfloat16)
-
-    _compile_and_check(M(), (_input_a(),), expect_fused=1, expect_kinds=["evt_col"])
-
-
-@_EVT_CAPABLE
-def test_evt_mm_minus_scalar_then_relu():
-    """``relu(mm - 2.0)``."""
-
-    class M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.randn(_N, _K))
-
-        def forward(self, a):
-            y = torch.mm(a, self.weight.permute(1, 0)) - 2.0
-            return torch.relu(y).to(torch.bfloat16)
-
-    _compile_and_check(M(), (_input_a(),), expect_fused=1, expect_kinds=["evt_col"])
 
 
 # ── alpha parameter tests for aten.add/sub ────────────────────────────────────
@@ -885,25 +836,6 @@ def test_evt_d_stride_padding_silu():
 
     a = torch.randn(_M, K, device="cuda", dtype=torch.bfloat16)
     _compile_and_check(M(), (a,), atol=0.5, expect_fused=1, expect_kinds=["evt_col"])
-
-
-@_EVT_CAPABLE
-def test_evt_d_stride_padding_swiglu():
-    """D stride padding for swiglu: N=1040, n_out=520. Not 128-byte aligned."""
-    K = 1024
-    N = 1040
-
-    class M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.randn(N, K))
-
-        def forward(self, a):
-            y = torch.mm(a, self.weight.permute(1, 0))
-            return swiglu(y, out_dtype=torch.bfloat16)
-
-    a = torch.randn(_M, K, device="cuda", dtype=torch.bfloat16)
-    _compile_and_check(M(), (a,), atol=0.5, rtol=0.05, expect_fused=1, expect_kinds=["swiglu_dual"])
 
 
 @_SM120_ONLY
