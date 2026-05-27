@@ -31,7 +31,6 @@ class EliminateIdentityViewCastPass(MagiInductorPass):
         "to",
         "type",
         "contiguous",
-        "clone",
         "flatten",
         "permute",
         "transpose",

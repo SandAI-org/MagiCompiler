@@ -328,6 +328,10 @@ struct EvtArgs {{
   int64_t ldd;
   // Extras pointers, in IR-leaf order.
   std::vector<void*> ptr_extras;
+  // Row strides for AuxLoad extras (stride(0) in elements). Indexed in
+  // the same order as ptr_extras; RowBroadcast/ColBroadcast entries are
+  // unused but still present so indices stay aligned.
+  std::vector<int64_t> stride_extras;
 }};
 
 class EvtConcept {{
@@ -660,7 +664,9 @@ def render_evt_cu(
         elif isinstance(leaf, ColBroadcast):
             leaf_args[leaf.input_idx] = f"{{{ptr_expr}, {elem}(0), {{_1{{}}, _0{{}}, int32_t(M)}}}}"
         else:  # AuxLoad
-            leaf_args[leaf.input_idx] = f"{{{ptr_expr}, {elem}(0), {{int64_t(N), _1{{}}, MN}}}}"
+            stride_expr = f"a.stride_extras[{leaf.input_idx}]"
+            mn_expr = f"(static_cast<int64_t>(M) * {stride_expr})"
+            leaf_args[leaf.input_idx] = f"{{{ptr_expr}, {elem}(0), {{{stride_expr}, _1{{}}, {mn_expr}}}}}"
 
     args_tree = _emit_args_tree(ir.child, leaf_args, indent=8)
 
@@ -685,11 +691,16 @@ def render_evt_cu(
             extras_validation_lines.append(
                 f'    TORCH_CHECK(extras[{i}].size(0) == M && extras[{i}].size(1) == N,' f' "extras[{i}] must be (M,N)");'
             )
+            extras_validation_lines.append(
+                f'    TORCH_CHECK(extras[{i}].stride(1) == 1 && extras[{i}].stride(0) >= N,'
+                f' "extras[{i}] must be row-major with stride(1)==1 and stride(0)>=N");'
+            )
         extras_validation_lines.append(
             f'    TORCH_CHECK(extras[{i}].scalar_type() == {at_dtype},' f' "extras[{i}] must be {leaf.dtype}");'
         )
         extras_validation_lines.append(f'    TORCH_CHECK(extras[{i}].is_cuda(), "extras[{i}] must be CUDA");')
         extras_ptr_lines.append(f"    ea.ptr_extras.push_back(static_cast<void*>(" f"extras[{i}].data_ptr<{at_cpp}>()));")
+        extras_ptr_lines.append(f"    ea.stride_extras.push_back(static_cast<int64_t>(extras[{i}].stride(0)));")
 
     extras_validation = "\n".join(extras_validation_lines) if extras_validation_lines else "    // no extras"
     extras_ptrs = "\n".join(extras_ptr_lines) if extras_ptr_lines else ""

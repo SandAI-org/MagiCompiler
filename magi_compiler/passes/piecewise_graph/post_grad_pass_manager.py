@@ -80,10 +80,17 @@ class PostGradPassManager(CustomGraphPass):
     def configure(self, pass_config: PassConfig):
         self.pass_config = pass_config
 
-        if pass_config.enable_mm_epilogue_fusion and get_compile_config().has_cutlass:
-            from .fusion.matmul_epilogue_fusion import MatmulEvtEpilogueFusionPass
+        if pass_config.enable_mm_epilogue_fusion:
+            compile_config = get_compile_config()
+            if compile_config.has_cutlass:
+                from .fusion.matmul_epilogue_fusion import MatmulEvtEpilogueFusionPass
 
-            self.add(MatmulEvtEpilogueFusionPass())
+                self.add(MatmulEvtEpilogueFusionPass())
+            else:
+                magi_logger.warning(
+                    "Skipping matmul epilogue fusion because CUTLASS is unavailable: %s",
+                    compile_config.cutlass_validation_error,
+                )
 
         # needs a functional graph
         self.post_cleanup = PostCleanupPass()

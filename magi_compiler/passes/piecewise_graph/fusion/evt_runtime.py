@@ -115,11 +115,6 @@ _MODULE_LOCKS_GLOBAL = threading.Lock()
 _SWIGLU_LOCK = threading.Lock()
 
 
-# Single-entry greedy D-buffer cache. Opt out with MAGI_EVT_DISABLE_D_CACHE=1.
-_D_BUF_CACHE: dict = {}
-_D_CACHE_DISABLED: bool = os.environ.get("MAGI_EVT_DISABLE_D_CACHE", "0") not in ("0", "", "false", "False")
-
-
 def _device_gencode_flags() -> list[str]:
     """Return nvcc -gencode flags for the live device.
 
@@ -663,16 +658,7 @@ def _matmul_custom_evt_cuda(A, B, extras, ir_json, kind, n_out, out_dtype_id_):
         _DISPATCH_CACHE[fast_key] = entry
 
     n_pad = _aligned_n_stride(n_out, out_dtype)
-    if _D_CACHE_DISABLED:
-        D_pad = torch.empty((M, n_pad), device=A.device, dtype=out_dtype)
-    else:
-        dev_idx = A.device.index or 0
-        d_key = (M, n_pad, out_dtype, dev_idx)
-        D_pad = _D_BUF_CACHE.get(d_key)
-        if D_pad is None:
-            D_pad = torch.empty((M, n_pad), device=A.device, dtype=out_dtype)
-            _D_BUF_CACHE.clear()
-            _D_BUF_CACHE[d_key] = D_pad
+    D_pad = torch.empty((M, n_pad), device=A.device, dtype=out_dtype)
     D = D_pad[:, :n_out] if n_pad != n_out else D_pad
 
     kernel_call = entry.kernel_call

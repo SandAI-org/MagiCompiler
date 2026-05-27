@@ -19,8 +19,9 @@ than the SM80 path on H100. Selected by ``evt_runtime`` when arch == sm_90.
 
 All AuxLoad nodes use ``Sm90AuxLoad<0>`` (inline ld.global, no SMEM
 staging). The C-operand TMA channel is left unused (ptr_C = nullptr).
-Each ``AuxLoad.input_idx`` may appear at most once; ``can_render(ir)``
-gates this.
+The same ``AuxLoad.input_idx`` may appear at multiple positions in the
+EVT tree (matching SM80 behaviour); the leaf-args dict produces
+identical expressions for the same index so the overwrite is harmless.
 """
 
 from __future__ import annotations
@@ -93,18 +94,18 @@ def _emit_tile_candidates(m_bucket: str) -> str:
 def can_render(ir: Store) -> bool:
     """Return True iff the SM90 codegen can render this IR.
 
-    Rejects IRs where the same AuxLoad.input_idx appears at multiple
-    positions (the leaf-args dict is keyed by input_idx and would clash).
+    The same AuxLoad.input_idx may appear at multiple positions in the
+    tree (the leaf-args dict produces identical expressions for the same
+    input_idx, so the overwrite is harmless — matching SM80 behaviour).
     Op coverage matches SM80.
     """
     if not isinstance(ir, Store):
         return False
     ok = [True]
-    aux_input_indices: List[int] = []
 
     def _walk(node):
         if isinstance(node, AuxLoad):
-            aux_input_indices.append(node.input_idx)
+            pass
         elif isinstance(node, Compute):
             if node.op in _BUILTIN_FN_TEMPLATE and node.scalar is None:
                 pass
@@ -119,11 +120,7 @@ def can_render(ir: Store) -> bool:
                 _walk(c)
 
     _walk(ir.child)
-    if not ok[0]:
-        return False
-    if len(aux_input_indices) != len(set(aux_input_indices)):
-        return False
-    return True
+    return ok[0]
 
 
 class _Sm90EvtEmitter:
@@ -395,6 +392,10 @@ struct EvtArgs {{
   // ColBroadcast looks up its pointer from this vector by its IR
   // input_idx baked into the launcher.
   std::vector<void*> ptr_extras;
+  // Row strides for AuxLoad extras (stride(0) in elements). Indexed in
+  // the same order as ptr_extras; RowBroadcast/ColBroadcast entries are
+  // unused but still present so indices stay aligned.
+  std::vector<int64_t> stride_extras;
 }};
 
 class EvtConcept {{
@@ -434,12 +435,10 @@ class EvtImpl : public EvtConcept {{
     // a 16-byte boundary.  Using N here would give TMA a wrong
     // globalStride, corrupting every row after the first.
     auto stride_D = cutlass::make_cute_packed_stride(StrideD{{}}, cute::make_shape(M, static_cast<int>(a.ldd), 1));
-    // Packed stride for inline aux loads (Sm90AuxLoad<0, void, ..., RowMajor>).
-    // All inline-aux nodes share this stride — they all read (M, N) row-major
-    // contiguous tensors. Emitted unconditionally; nvcc -O3 drops it when no
-    // Sm90AuxLoad instance references it.
-    auto stride_aux = cutlass::make_cute_packed_stride(
-        cute::Stride<int64_t, cute::_1, int64_t>{{}}, cute::make_shape(M, N, 1));
+    // Per-AuxLoad strides — each extra may have a different row stride
+    // (e.g. padded buffers where stride(0) > N). Emitted unconditionally;
+    // nvcc -O3 drops unused variables.
+{aux_stride_decls}
 
     // C-operand TMA channel unused — all AuxLoad nodes use Sm90AuxLoad<0>
     // (inline ld.global). ptr_C is nullptr; no node reports
@@ -710,8 +709,7 @@ def render_evt_cu(
     if not can_render(ir):
         raise ValueError(
             "IR is not renderable on the Sm90 EVT path (an unsupported "
-            "Compute op, or the same AuxLoad input_idx reused at multiple "
-            "IR positions). The FX pass should call can_render() first and "
+            "Compute op). The FX pass should call can_render() first and "
             "reject before invoking codegen."
         )
     del arch
@@ -729,6 +727,7 @@ def render_evt_cu(
 
     leaves = walk_leaves(ir)
     leaf_args: Dict[int, str] = {}
+    aux_stride_decl_lines: List[str] = []
     extras_validation_lines: List[str] = []
     extras_ptr_lines: List[str] = []
     seen_extras: set = set()
@@ -745,7 +744,14 @@ def render_evt_cu(
             leaf_args[i] = f"{{ {ptr_expr} }}"
         elif isinstance(leaf, AuxLoad):
             ptr_expr = f"reinterpret_cast<{elem} const*>(a.ptr_extras[{i}])"
-            leaf_args[i] = f"{{ {ptr_expr}, {elem}(0), stride_aux }}"
+            stride_var = f"stride_aux_{i}"
+            leaf_args[i] = f"{{ {ptr_expr}, {elem}(0), {stride_var} }}"
+            if i not in seen_extras:
+                aux_stride_decl_lines.append(
+                    f"    auto {stride_var} = cutlass::make_cute_packed_stride(\n"
+                    f"        cute::Stride<int64_t, cute::_1, int64_t>{{}},\n"
+                    f"        cute::make_shape(M, static_cast<int>(a.stride_extras[{i}]), 1));"
+                )
 
         if i in seen_extras:
             continue
@@ -760,15 +766,16 @@ def render_evt_cu(
             extras_validation_lines.append(
                 f'    TORCH_CHECK(extras[{i}].size(0) == M && extras[{i}].size(1) == N,' f' "extras[{i}] must be (M,N)");'
             )
-            # Sm90AuxLoad<0> assumes row-major with stride(1)==1.
             extras_validation_lines.append(
-                f'    TORCH_CHECK(extras[{i}].stride(1) == 1,' f' "extras[{i}] innermost stride must be 1 (row-major)");'
+                f'    TORCH_CHECK(extras[{i}].stride(1) == 1 && extras[{i}].stride(0) >= N,'
+                f' "extras[{i}] must be row-major with stride(1)==1 and stride(0)>=N");'
             )
         extras_validation_lines.append(
             f'    TORCH_CHECK(extras[{i}].scalar_type() == {at_dtype},' f' "extras[{i}] must be {leaf.dtype}");'
         )
         extras_validation_lines.append(f'    TORCH_CHECK(extras[{i}].is_cuda(), "extras[{i}] must be CUDA");')
         extras_ptr_lines.append(f"    ea.ptr_extras.push_back(static_cast<void*>(" f"extras[{i}].data_ptr<{at_cpp}>()));")
+        extras_ptr_lines.append(f"    ea.stride_extras.push_back(static_cast<int64_t>(extras[{i}].stride(0)));")
 
     args_tree = _emit_args_tree(ir.child, leaf_args, indent=8)
 
@@ -776,6 +783,7 @@ def render_evt_cu(
 
     extras_validation = "\n".join(extras_validation_lines) if extras_validation_lines else "    // no extras"
     extras_ptrs = "\n".join(extras_ptr_lines) if extras_ptr_lines else ""
+    aux_stride_decls = "\n".join(aux_stride_decl_lines) if aux_stride_decl_lines else "    // (no AuxLoad strides)"
 
     functor_decls = "\n".join(emitter.functor_decls) if emitter.functor_decls else "// (no custom functors)"
     typedef_block = "\n".join("  " + l if l.strip() else l for l in "\n".join(emitter.typedef_lines).split("\n"))
@@ -811,9 +819,9 @@ def render_evt_cu(
         alignment_c_bits=alignment_c_bits,
         typedef_block=typedef_block,
         evt_root_name=evt_root,
-        # Substituted into EvtImpl::make_args body — ptr_C resolution.
         ptr_C_expr_in_make_args=ptr_C_expr_in_make_args,
         args_tree=args_tree,
+        aux_stride_decls=aux_stride_decls,
     )
     launcher = _LAUNCHER_TEMPLATE_SM90.format(
         a_dtype=a_dtype,

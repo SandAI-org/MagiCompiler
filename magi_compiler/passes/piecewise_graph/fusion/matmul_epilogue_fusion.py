@@ -179,9 +179,10 @@ def _b_layout_kind(B_node):
     if stride == (N_or_K1, 1):
         return "row", B_node, N_or_K1
     # Stride-transposed (K, N) view of a contig (N, K) weight: stride == (1, K).
-    # The underlying tensor is the transpose-producer's input when the FX
-    # graph models the view explicitly via t/transpose/permute([1,0]); fall
-    # back to using B itself (its data_ptr is the same).
+    # Only accept an explicit t/transpose/permute([1,0]) so we can pass the
+    # underlying (N, K) row-major weight to the runtime.  A bare stride-only
+    # view would keep the (K, N) logical shape, causing the runtime to swap
+    # N_w and K_w (it assumes B.size(0)=N for evt_col).
     if _is_transpose_node(B_node):
         weight = B_node.args[0]
         w_shape = _val_shape(weight) if isinstance(weight, fx.Node) else None
@@ -189,13 +190,6 @@ def _b_layout_kind(B_node):
         if w_shape is not None and len(w_shape) == 2 and w_stride == (w_shape[1], 1):
             # weight is (N, K) row-major contig; N = w_shape[0].
             return "col", weight, w_shape[0]
-    # Generic stride-transposed view (no explicit transpose node) — also OK:
-    # we read the same memory bytes as a (N, K) row-major buffer at B itself.
-    if stride == (1, K_or_N0):
-        # B is (K, N) col-major == underlying (N, K) row-major. We don't have
-        # an explicit weight node so we pass B directly; the kernel reads
-        # (N, K) with N = shape[1], K = shape[0]. Detection via stride alone.
-        return "col", B_node, N_or_K1
     return None, None, None
 
 
@@ -216,7 +210,6 @@ def _validate_swiglu_structure(chain_nodes: List[fx.Node], mm_node: fx.Node) -> 
 
     Returns ``(alpha, limit, one)`` on match, ``None`` on structural mismatch.
     """
-    set(chain_nodes)
 
     # ── Phase 1: classify nodes into roles ──────────────────────────────────
     gate_slice: Optional[fx.Node] = None
@@ -591,6 +584,16 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         K = a_shape[1]
         if _largest_pow2_align_bits(K, a_dtype) is None:
             return False
+        # SM90 TMA requires globalStride to be 16-byte aligned.  A is
+        # RowMajor (M, K) so stride_A[0] = K; need K * elem_bytes % 16 == 0.
+        # (For bf16 this reduces to K % 8 == 0.)
+        if (
+            torch.cuda.is_available()
+            and torch.cuda.get_device_capability() == (9, 0)
+            and _is_static_int(K)
+            and (int(K) * a_dtype.itemsize) % 16 != 0
+        ):
+            return False
         a_stride = _val_stride(A)
         if a_stride is None or a_stride != (a_shape[1], 1):
             return False
@@ -667,11 +670,17 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
             if target in _SCALAR_BINARY_TO_SCALAR_UNARY:
                 if not isinstance(curr.args[1], (int, float)):
                     break
+                scalar_val = float(curr.args[1])
+                if target in (torch.ops.aten.add.Scalar, torch.ops.aten.sub.Scalar):
+                    alpha = curr.kwargs.get("alpha", 1)
+                    if not isinstance(alpha, (int, float)):
+                        break
+                    scalar_val = float(alpha) * scalar_val
                 _absorb(
                     Compute(
                         _SCALAR_BINARY_TO_SCALAR_UNARY[target],
                         (node_to_ir[curr.args[0]],),
-                        scalar=float(curr.args[1]),
+                        scalar=scalar_val,
                         compute_dtype=current_compute_dtype,
                     )
                 )
@@ -762,6 +771,13 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         if out_dt not in _DTYPE_TO_STR:
             return None
 
+        if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0) and _is_static_int(n_dim):
+            n_int = int(n_dim)
+            if (n_int * out_dt.itemsize) % 16 != 0:
+                return None
+            if b_layout == "row" and (n_int * b_dtype.itemsize) % 16 != 0:
+                return None
+
         ir_root = Store(child=last_ir, out_dtype=_DTYPE_TO_STR[out_dt])
         if is_trivial(ir_root):
             return None
@@ -784,24 +800,41 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         op_name = _BINARY_OPS[target]
         lhs_raw, rhs_raw = curr.args[0], curr.args[1]
 
+        # aten.add.Tensor / aten.sub.Tensor carry an ``alpha`` kwarg:
+        #   add(self, other, alpha=a) → self + a * other
+        #   sub(self, other, alpha=a) → self - a * other
+        # operator.add/sub and mul/div/max/min have no alpha.
+        has_alpha = target in (torch.ops.aten.add.Tensor, torch.ops.aten.sub.Tensor)
+        alpha = 1
+        if has_alpha:
+            alpha = curr.kwargs.get("alpha", 1)
+            if not isinstance(alpha, (int, float)):
+                return None
+
         if isinstance(rhs_raw, (int, float)) and isinstance(lhs_raw, fx.Node) and lhs_raw in node_to_ir:
             scalar_op = {"add": "add_scalar", "sub": "sub_scalar", "mul": "mul_scalar", "div": "div_scalar"}.get(op_name)
             if scalar_op is None:
                 return None
-            return Compute(scalar_op, (node_to_ir[lhs_raw],), scalar=float(rhs_raw), compute_dtype=compute_dtype)
+            scalar_val = float(alpha) * float(rhs_raw) if has_alpha else float(rhs_raw)
+            return Compute(scalar_op, (node_to_ir[lhs_raw],), scalar=scalar_val, compute_dtype=compute_dtype)
 
         if isinstance(lhs_raw, (int, float)) and isinstance(rhs_raw, fx.Node) and rhs_raw in node_to_ir:
+            rhs_ir = node_to_ir[rhs_raw]
+            if has_alpha and alpha != 1:
+                rhs_ir = Compute("mul_scalar", (rhs_ir,), scalar=float(alpha), compute_dtype=compute_dtype)
             if op_name in ("add", "mul"):
                 scalar_op = "add_scalar" if op_name == "add" else "mul_scalar"
-                return Compute(scalar_op, (node_to_ir[rhs_raw],), scalar=float(lhs_raw), compute_dtype=compute_dtype)
+                return Compute(scalar_op, (rhs_ir,), scalar=float(lhs_raw), compute_dtype=compute_dtype)
             if op_name == "sub":
-                return Compute("rsub_scalar", (node_to_ir[rhs_raw],), scalar=float(lhs_raw), compute_dtype=compute_dtype)
+                return Compute("rsub_scalar", (rhs_ir,), scalar=float(lhs_raw), compute_dtype=compute_dtype)
             return None
 
         lhs_ir = self._ir_for_arg(lhs_raw, node_to_ir, extras_nodes, A, B)
         rhs_ir = self._ir_for_arg(rhs_raw, node_to_ir, extras_nodes, A, B)
         if lhs_ir is None or rhs_ir is None:
             return None
+        if has_alpha and alpha != 1:
+            rhs_ir = Compute("mul_scalar", (rhs_ir,), scalar=float(alpha), compute_dtype=compute_dtype)
         return Compute(op_name, (lhs_ir, rhs_ir), compute_dtype=compute_dtype)
 
     # ── External operand classification ───────────────────────────────────────
