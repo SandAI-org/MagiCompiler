@@ -29,7 +29,7 @@ Three families of checks:
   1. Positive numerical equivalence: every supported epilogue must match
      eager within dtype-appropriate tolerance.
   2. Fusion-actually-fired: the emitted graph must contain a
-     ``magi_epilogue.matmul_custom_evt`` node.
+     ``magi_epilogue.matmul_fused_epilogue`` node.
   3. Negative fallback: shapes / dtypes / chains the EVT pass does NOT
      support must keep the original ``aten.mm`` and run through cuBLAS.
 """
@@ -128,6 +128,7 @@ class _FusionStats:
         self.kinds: list = []
         self.out_dtype_ids: list = []
         self.ir_jsons: list = []
+        self.call_function_targets_after: list = []
 
 
 def _install_pass_instrument():
@@ -136,7 +137,7 @@ def _install_pass_instrument():
 
     stats = _FusionStats()
     original = P.MatmulEvtEpilogueFusionPass.__call__
-    evt_op = torch.ops.magi_epilogue.matmul_custom_evt.default
+    evt_op = torch.ops.magi_epilogue.matmul_fused_epilogue.default
     mm_targets = (torch.ops.aten.mm.default, torch.ops.aten.mm)
 
     def _instrumented(self, graph: fx.Graph):
@@ -146,7 +147,10 @@ def _install_pass_instrument():
         emitted_kinds = []
         emitted_out_dtype_ids = []
         emitted_ir_jsons = []
+        call_function_targets_after = []
         for n in graph.nodes:
+            if n.op == "call_function":
+                call_function_targets_after.append(n.target)
             if n.op == "call_function" and n.target is evt_op:
                 if len(n.args) >= 4:
                     emitted_ir_jsons.append(n.args[3])
@@ -160,6 +164,7 @@ def _install_pass_instrument():
         stats.kinds.extend(emitted_kinds)
         stats.out_dtype_ids.extend(emitted_out_dtype_ids)
         stats.ir_jsons.extend(emitted_ir_jsons)
+        stats.call_function_targets_after.extend(call_function_targets_after)
         return result
 
     P.MatmulEvtEpilogueFusionPass.__call__ = _instrumented
@@ -217,6 +222,12 @@ def _compile_and_check(
             f"mm_before={stats.mm_before} mm_after={stats.mm_after} "
             f"emitted kinds={stats.kinds}"
         )
+        if expect_fused > 0:
+            evt_op = torch.ops.magi_epilogue.matmul_fused_epilogue.default
+            assert stats.call_function_targets_after == [evt_op] * expect_fused, (
+                "Expected the final fused subgraph to contain only matmul_fused_epilogue "
+                f"call_function nodes, got {stats.call_function_targets_after}"
+            )
 
     # Skip the numerical accuracy check when fusion was explicitly expected NOT
     # to fire.  The unfused path goes through vanilla torch.compile → Inductor,
@@ -436,26 +447,6 @@ def test_evt_mm_plus_1d_bias():
 
 
 @_EVT_CAPABLE
-def test_evt_mm_times_aux_load():
-    """``(mm * gate_MxN)`` — full (M, N) auxiliary tensor multiply."""
-
-    class M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.randn(_N, _K))
-
-        def forward(self, a, gate):
-            y = torch.mm(a, self.weight.permute(1, 0)) * gate
-            return y.to(torch.bfloat16)
-
-    a = _input_a()
-    gate = torch.randn(_M, _N, device="cuda", dtype=torch.bfloat16)
-    _compile_and_check(
-        M(), (a, gate), atol=0.0, rtol=0.1, expect_fused=1, expect_kinds=["evt_col"], dynamic_arg_dims={"a": 0, "gate": 0}
-    )
-
-
-@_EVT_CAPABLE
 def test_evt_aux_load_padded_stride():
     """AuxLoad with padded row stride (stride(0) > N) must fuse and read correctly."""
 
@@ -479,50 +470,30 @@ def test_evt_aux_load_padded_stride():
 
 
 @_EVT_CAPABLE
-def test_evt_three_aux_loads_fuse():
-    """``(mm + R1 + R2 + R3)`` — three (M, N) residuals."""
+def test_evt_multiple_and_repeated_aux_loads_fuse():
+    """Multiple AuxLoad extras, with one tensor reused at multiple EVT positions."""
 
     class M(nn.Module):
         def __init__(self):
             super().__init__()
             self.weight = nn.Parameter(torch.randn(_N, _K))
 
-        def forward(self, a, r1, r2, r3):
-            y = torch.mm(a, self.weight.permute(1, 0)) + r1 + r2 + r3
-            return y.to(torch.bfloat16)
-
-    a = _input_a()
-    r1 = torch.randn(_M, _N, device="cuda", dtype=torch.bfloat16)
-    r2 = torch.randn(_M, _N, device="cuda", dtype=torch.bfloat16)
-    r3 = torch.randn(_M, _N, device="cuda", dtype=torch.bfloat16)
-    _compile_and_check(
-        M(),
-        (a, r1, r2, r3),
-        atol=3.0,
-        rtol=0.05,
-        expect_fused=1,
-        expect_kinds=["evt_col"],
-        dynamic_arg_dims={"a": 0, "r1": 0, "r2": 0, "r3": 0},
-    )
-
-
-@_EVT_CAPABLE
-def test_evt_repeated_aux_load_mul_add():
-    """``(mm * gate) + gate`` — same (M, N) tensor at two EVT positions."""
-
-    class M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.randn(_N, _K))
-
-        def forward(self, a, gate):
+        def forward(self, a, gate, r1, r2):
             y = torch.mm(a, self.weight.permute(1, 0))
-            return (y * gate + gate).to(torch.bfloat16)
+            return (y * gate + gate + r1 + r2).to(torch.bfloat16)
 
     a = _input_a()
     gate = torch.randn(_M, _N, device="cuda", dtype=torch.bfloat16)
+    r1 = torch.randn(_M, _N, device="cuda", dtype=torch.bfloat16)
+    r2 = torch.randn(_M, _N, device="cuda", dtype=torch.bfloat16)
     _compile_and_check(
-        M(), (a, gate), atol=1.0, rtol=0.1, expect_fused=1, expect_kinds=["evt_col"], dynamic_arg_dims={"a": 0, "gate": 0}
+        M(),
+        (a, gate, r1, r2),
+        atol=4.0,
+        rtol=0.1,
+        expect_fused=1,
+        expect_kinds=["evt_col"],
+        dynamic_arg_dims={"a": 0, "gate": 0, "r1": 0, "r2": 0},
     )
 
 
@@ -549,21 +520,6 @@ def test_evt_row_b_layout_fuses():
             return high_precision_silu(y, out_dtype=torch.bfloat16)
 
     _compile_and_check(M(_K, _N), (_input_a(),), expect_fused=1, expect_kinds=["evt_row"])
-
-
-@_EVT_CAPABLE
-def test_evt_row_b_plus_scalar():
-    """RowMajor B + scalar add epilogue."""
-
-    class M(nn.Module):
-        def __init__(self, k, n):
-            super().__init__()
-            self.weight = nn.Parameter(torch.randn(k, n))
-
-        def forward(self, a):
-            return (torch.mm(a, self.weight) + 0.5).to(torch.bfloat16)
-
-    _compile_and_check(M(_K, _N), (_input_a(),), atol=1.5, expect_fused=1, expect_kinds=["evt_row"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────

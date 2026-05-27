@@ -15,7 +15,7 @@
 """Runtime side of the EVT fusion: torch.library op + JIT loader + dispatch.
 
 This file owns:
-  * The ``magi_epilogue::matmul_custom_evt`` torch.library op + fake impl.
+  * The ``magi_epilogue::matmul_fused_epilogue`` torch.library op + fake impl.
   * A process-level cache mapping IR JSON → compiled cpp_extension module.
   * Dispatch to one of two backends:
       - ``kind == "evt"``         → JIT-compiled CUTLASS Sm80EVT kernel.
@@ -53,7 +53,8 @@ from .sm90.evt_codegen import render_evt_cu as _render_evt_cu_sm90
 # ``matmul_epilogue_fusion.py`` has already initialised the library.
 _LIB = torch.library.Library("magi_epilogue", "FRAGMENT")
 _LIB.define(
-    "matmul_custom_evt(Tensor A, Tensor B, Tensor[] extras, str ir_json," " str kind, int n_out, int out_dtype_id) -> Tensor"
+    "matmul_fused_epilogue(Tensor A, Tensor B, Tensor[] extras, str ir_json,"
+    " str kind, int n_out, int out_dtype_id) -> Tensor"
 )
 
 
@@ -628,8 +629,8 @@ def _resolve_dispatch(kind, ir_json, a_dtype, b_dtype, N_w, K_w, m_bucket, out_d
     return _DispatchEntry(mod.evt_matmul_out, True, out_dtype)
 
 
-@torch.library.impl(_LIB, "matmul_custom_evt", "CUDA")
-def _matmul_custom_evt_cuda(A, B, extras, ir_json, kind, n_out, out_dtype_id_):
+@torch.library.impl(_LIB, "matmul_fused_epilogue", "CUDA")
+def _matmul_fused_epilogue_cuda(A, B, extras, ir_json, kind, n_out, out_dtype_id_):
     """Runtime entry point. Do NOT call .contiguous() on B — the FX pass
     controls the layout (evt_row=RowMajor, evt_col/swiglu=ColumnMajor)."""
     # B.size(0)/size(1) avoids the Python tuple construction of .shape.
@@ -670,8 +671,8 @@ def _matmul_custom_evt_cuda(A, B, extras, ir_json, kind, n_out, out_dtype_id_):
     return D
 
 
-@torch.library.register_fake("magi_epilogue::matmul_custom_evt")
-def _matmul_custom_evt_fake(A, B, extras, ir_json, kind, n_out, out_dtype_id_):
+@torch.library.register_fake("magi_epilogue::matmul_fused_epilogue")
+def _matmul_fused_epilogue_fake(A, B, extras, ir_json, kind, n_out, out_dtype_id_):
     out_dtype = out_dtype_from_id(out_dtype_id_)
     # Strided (M, n_out) view of an (M, n_pad) buffer — must match the
     # stride layout the CUDA impl actually returns, otherwise Inductor's

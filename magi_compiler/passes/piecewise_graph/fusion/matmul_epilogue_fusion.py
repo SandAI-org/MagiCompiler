@@ -17,7 +17,7 @@
 Two backends:
   * Generic EVT — for the 6 non-swiglu activations and 1-D bias/scale variants.
     Builds an IR tree (see ``evt_ir.py``), serialises to JSON, replaces the
-    matched chain with a single ``torch.ops.magi_epilogue.matmul_custom_evt``
+    matched chain with a single ``torch.ops.magi_epilogue.matmul_fused_epilogue``
     call. The runtime renders + JIT-compiles a CUTLASS Sm80EVT kernel keyed by
     the IR hash (see ``evt_runtime.py``).
   * swiglu — pattern-matches the canonical recipe (slice-stride-2 + dual
@@ -510,9 +510,9 @@ def _emit_and_replace(
     nodes_to_erase: List[fx.Node],
     extra_dead: Optional[List[fx.Node]] = None,
 ) -> fx.Node:
-    """Insert ``matmul_custom_evt``, propagate meta, replace uses, erase dead nodes."""
+    """Insert ``matmul_fused_epilogue``, propagate meta, replace uses, erase dead nodes."""
     with graph.inserting_after(last_node):
-        new_node = graph.call_function(torch.ops.magi_epilogue.matmul_custom_evt.default, args=op_args)
+        new_node = graph.call_function(torch.ops.magi_epilogue.matmul_fused_epilogue.default, args=op_args)
     val_last = last_node.meta.get("val")
     if val_last is not None:
         try:
