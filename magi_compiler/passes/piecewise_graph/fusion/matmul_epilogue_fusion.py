@@ -783,12 +783,6 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
             return None
         if not self.allow_extras and num_extras(ir_root) > 0:
             return None
-        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
-            from .sm90.evt_codegen import can_render as _sm90_can_render
-
-            if not _sm90_can_render(ir_root):
-                return None
-
         ir_json = to_canonical_json(ir_root)
         kind = "evt_row" if b_layout == "row" else "evt_col"
         return ir_json, b_underlying, n_dim, evt_runtime.out_dtype_id(out_dt), kind

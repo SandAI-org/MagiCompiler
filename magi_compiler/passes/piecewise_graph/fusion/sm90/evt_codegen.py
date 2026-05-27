@@ -30,8 +30,6 @@ from typing import Dict, List, Tuple
 
 from ..common.codegen_shared import (
     _BUILTIN_FN_TEMPLATE,
-    _CUSTOM_SCALAR_BODY,
-    _CUSTOM_UNARY_BODY,
     _DTYPE_TO_AT,
     _DTYPE_TO_AT_CPP,
     _DTYPE_TO_CUTLASS,
@@ -89,38 +87,6 @@ def _emit_tile_candidates(m_bucket: str) -> str:
             f"    EVT_TILE_CANDIDATE(" f"{tm}, {tn}, {tk}, {cm}, {cn}, {ck}, " f"{kernel_sched}, {epi_sched}, " f'"{label}");'
         )
     return "\n".join(lines)
-
-
-def can_render(ir: Store) -> bool:
-    """Return True iff the SM90 codegen can render this IR.
-
-    The same AuxLoad.input_idx may appear at multiple positions in the
-    tree (the leaf-args dict produces identical expressions for the same
-    input_idx, so the overwrite is harmless — matching SM80 behaviour).
-    Op coverage matches SM80.
-    """
-    if not isinstance(ir, Store):
-        return False
-    ok = [True]
-
-    def _walk(node):
-        if isinstance(node, AuxLoad):
-            pass
-        elif isinstance(node, Compute):
-            if node.op in _BUILTIN_FN_TEMPLATE and node.scalar is None:
-                pass
-            elif node.op in _CUSTOM_UNARY_BODY and node.scalar is None:
-                pass
-            elif node.op in _CUSTOM_SCALAR_BODY and node.scalar is not None:
-                pass
-            else:
-                ok[0] = False
-                return
-            for c in node.children:
-                _walk(c)
-
-    _walk(ir.child)
-    return ok[0]
 
 
 class _Sm90EvtEmitter:
@@ -690,7 +656,7 @@ def render_evt_cu(
     alignment_c_bits: int = 128,
     arch: str = "sm90",
 ) -> str:
-    """Render the SM90 .cu source for ``ir``. Caller must verify ``can_render(ir)`` first."""
+    """Render the SM90 .cu source for ``ir``."""
     if b_layout not in ("row", "col"):
         raise ValueError(f"b_layout must be 'row' or 'col', got {b_layout!r}")
     if m_bucket not in _TILE_CANDIDATES_SM90:
@@ -706,12 +672,6 @@ def render_evt_cu(
         )
     if not isinstance(ir, Store):
         raise TypeError("render_evt_cu (sm90) expects a Store node as root")
-    if not can_render(ir):
-        raise ValueError(
-            "IR is not renderable on the Sm90 EVT path (an unsupported "
-            "Compute op). The FX pass should call can_render() first and "
-            "reject before invoking codegen."
-        )
     del arch
 
     a_elem = _DTYPE_TO_CUTLASS[a_dtype]

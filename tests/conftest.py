@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import shutil
-
-os.environ.setdefault("MAGI_CUTLASS_ROOT", "/usr/local/cutlass")
 
 import pytest
 import torch
@@ -46,8 +43,6 @@ def rms_norm_config():
 @pytest.fixture(scope="function", autouse=True)
 def cleanup_cache():
     """Auto cleanup cache fixture, executed before and after each test"""
-    compile_config = get_compile_config()
-    compile_config.cutlass_root = "/usr/local/cutlass"
-    shutil.rmtree(compile_config.cache_root_dir, ignore_errors=True)
+    shutil.rmtree(get_compile_config().cache_root_dir, ignore_errors=True)
     yield
-    shutil.rmtree(compile_config.cache_root_dir, ignore_errors=True)
+    shutil.rmtree(get_compile_config().cache_root_dir, ignore_errors=True)
