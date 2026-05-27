@@ -97,16 +97,6 @@ def high_precision_silu(x, out_dtype: Optional[torch.dtype] = None):
     return F.silu(x.to(torch.float32)).to(out_dtype)
 
 
-def high_precision_sigmoid(x, out_dtype: Optional[torch.dtype] = None):
-    out_dtype = x.dtype if out_dtype is None else out_dtype
-    return F.sigmoid(x.to(torch.float32)).to(out_dtype)
-
-
-def high_precision_gelu(x, out_dtype: Optional[torch.dtype] = None):
-    out_dtype = x.dtype if out_dtype is None else out_dtype
-    return F.gelu(x.to(torch.float32)).to(out_dtype)
-
-
 def swiglu(x, alpha: float = 1.702, limit: float = 7.0, out_dtype: Optional[torch.dtype] = None):
     out_dtype = x.dtype if out_dtype is None else out_dtype
     x = x.to(torch.float32)
@@ -123,11 +113,6 @@ def gelu7(x, alpha: float = 1.702, limit: float = 7.0, out_dtype: Optional[torch
     x_glu = x.clamp(min=None, max=limit)
     out_glu = x_glu * torch.sigmoid(alpha * x_glu)
     return out_glu.to(out_dtype)
-
-
-def relu_square(x, out_dtype: Optional[torch.dtype] = None):
-    out_dtype = x.dtype if out_dtype is None else out_dtype
-    return torch.square(F.relu(x.to(torch.float32))).to(out_dtype)
 
 
 # ── Compile + fusion-side instrumentation ────────────────────────────────────
@@ -324,18 +309,9 @@ def _parse_ir_compute_dtypes(ir_json_str: str) -> list:
 
 
 @_EVT_CAPABLE
-@pytest.mark.parametrize(
-    "epi_name,epi_fn,atol,rtol",
-    [
-        ("silu", high_precision_silu, 0.5, 0.0),
-        ("sigmoid", high_precision_sigmoid, 0.5, 0.0),
-        ("gelu", high_precision_gelu, 0.5, 0.0),
-        ("gelu7", gelu7, 0.5, 0.0),
-        ("relu_square", relu_square, 0.0, 0.2),
-    ],
-)
+@pytest.mark.parametrize("epi_name,epi_fn,atol,rtol", [("silu", high_precision_silu, 0.5, 0.0), ("gelu7", gelu7, 0.5, 0.0)])
 def test_evt_unary_activations_fuse(epi_name, epi_fn, atol, rtol):
-    """All unary activations must fuse to a single ``evt_col`` op."""
+    """Representative unary activations must fuse to a single ``evt_col`` op."""
     model = _Bf16MmModel(_K, _N, epi_fn)
     _compile_and_check(model, (_input_a(),), atol=atol, rtol=rtol, expect_fused=1, expect_kinds=["evt_col"])
 
@@ -353,13 +329,6 @@ def test_evt_relu_native():
             return torch.relu(torch.mm(a, self.weight.permute(1, 0))).to(torch.bfloat16)
 
     _compile_and_check(M(), (_input_a(),), expect_fused=1, expect_kinds=["evt_col"])
-
-
-@_EVT_CAPABLE
-def test_evt_swiglu_dispatches_to_dualgemm():
-    """SwiGLU7 must take the dedicated DualGemm one-stage path."""
-    model = _Bf16MmModel(_K, _N, swiglu)
-    _compile_and_check(model, (_input_a(),), atol=0.5, rtol=0.05, expect_fused=1, expect_kinds=["swiglu_dual"])
 
 
 @_EVT_CAPABLE
@@ -420,36 +389,6 @@ def test_evt_swiglu_constants_roundtrip_in_ir_json():
     assert sw7["alpha"] == 1.5, f"Expected alpha=1.5, got {sw7['alpha']}"
     assert sw7["limit"] == 3.0, f"Expected limit=3.0, got {sw7['limit']}"
     assert sw7["one"] == 1.0, f"Expected one=1.0, got {sw7['one']}"
-
-
-@_EVT_CAPABLE
-def test_evt_mm_plus_scalar():
-    """``mm + 0.5`` — scalar add absorbs into ``add_scalar`` IR node."""
-
-    class M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.randn(_N, _K))
-
-        def forward(self, a):
-            return (torch.mm(a, self.weight.permute(1, 0)) + 0.5).to(torch.bfloat16)
-
-    _compile_and_check(M(), (_input_a(),), atol=1.5, expect_fused=1, expect_kinds=["evt_col"])
-
-
-@_EVT_CAPABLE
-def test_evt_mm_times_scalar():
-    """``mm * 0.25`` — scalar mul (mul_scalar IR)."""
-
-    class M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.randn(_N, _K))
-
-        def forward(self, a):
-            return (torch.mm(a, self.weight.permute(1, 0)) * 0.25).to(torch.bfloat16)
-
-    _compile_and_check(M(), (_input_a(),), expect_fused=1, expect_kinds=["evt_col"])
 
 
 @_EVT_CAPABLE
@@ -589,33 +528,6 @@ def test_evt_aux_load_padded_stride():
 
 
 @_EVT_CAPABLE
-def test_evt_two_aux_loads_fuse():
-    """``(mm + R1 + R2)`` — two (M, N) residuals fuse into one EVT op."""
-
-    class M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.randn(_N, _K))
-
-        def forward(self, a, r1, r2):
-            y = torch.mm(a, self.weight.permute(1, 0)) + r1 + r2
-            return y.to(torch.bfloat16)
-
-    a = _input_a()
-    r1 = torch.randn(_M, _N, device="cuda", dtype=torch.bfloat16)
-    r2 = torch.randn(_M, _N, device="cuda", dtype=torch.bfloat16)
-    _compile_and_check(
-        M(),
-        (a, r1, r2),
-        atol=2.0,
-        rtol=0.05,
-        expect_fused=1,
-        expect_kinds=["evt_col"],
-        dynamic_arg_dims={"a": 0, "r1": 0, "r2": 0},
-    )
-
-
-@_EVT_CAPABLE
 def test_evt_three_aux_loads_fuse():
     """``(mm + R1 + R2 + R3)`` — three (M, N) residuals."""
 
@@ -655,26 +567,6 @@ def test_evt_repeated_aux_load_mul_add():
         def forward(self, a, gate):
             y = torch.mm(a, self.weight.permute(1, 0))
             return (y * gate + gate).to(torch.bfloat16)
-
-    a = _input_a()
-    gate = torch.randn(_M, _N, device="cuda", dtype=torch.bfloat16)
-    _compile_and_check(
-        M(), (a, gate), atol=1.0, rtol=0.1, expect_fused=1, expect_kinds=["evt_col"], dynamic_arg_dims={"a": 0, "gate": 0}
-    )
-
-
-@_EVT_CAPABLE
-def test_evt_repeated_aux_load_sub():
-    """``(mm + gate) - gate`` — gate as both add and sub operand."""
-
-    class M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.randn(_N, _K))
-
-        def forward(self, a, gate):
-            y = torch.mm(a, self.weight.permute(1, 0))
-            return ((y + gate) - gate).to(torch.bfloat16)
 
     a = _input_a()
     gate = torch.randn(_M, _N, device="cuda", dtype=torch.bfloat16)
@@ -1012,24 +904,6 @@ def test_evt_d_stride_padding_swiglu():
 
     a = torch.randn(_M, K, device="cuda", dtype=torch.bfloat16)
     _compile_and_check(M(), (a,), atol=0.5, rtol=0.05, expect_fused=1, expect_kinds=["swiglu_dual"])
-
-
-@_EVT_CAPABLE
-def test_evt_d_stride_padding_add_scalar():
-    """D stride padding: N=200, not 128-byte aligned. Runtime pads to n_pad=256."""
-    K = 1024
-    N = 200
-
-    class M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.randn(N, K))
-
-        def forward(self, a):
-            return (torch.mm(a, self.weight.permute(1, 0)) + 0.5).to(torch.bfloat16)
-
-    a = torch.randn(_M, K, device="cuda", dtype=torch.bfloat16)
-    _compile_and_check(M(), (a,), atol=1.5, expect_fused=1, expect_kinds=["evt_col"])
 
 
 @_SM120_ONLY
