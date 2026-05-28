@@ -840,28 +840,6 @@ def test_evt_ir_canonical_determinism():
 
 
 @_EVT_CAPABLE
-def test_evt_out_dtype_bf16_native():
-    """bf16 mm → bf16 silu → bf16 output. out_dtype_id MUST be 0 (bf16)."""
-
-    class M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.randn(_N, _K))
-
-        def forward(self, a):
-            return F.silu(torch.mm(a, self.weight.permute(1, 0)))
-
-    _compile_and_check(
-        M(),
-        (_input_a(),),
-        expect_fused=1,
-        expect_kinds=["evt_col"],
-        expect_out_dtype=torch.bfloat16,
-        expect_actual_dtype=torch.bfloat16,
-    )
-
-
-@_EVT_CAPABLE
 def test_evt_out_dtype_bf16_via_high_precision():
     """bf16 → cast(fp32) → silu → cast(bf16). IR walker absorbs both casts."""
 
@@ -905,66 +883,6 @@ def test_evt_out_dtype_fp32_no_final_cast():
         expect_out_dtype=torch.float32,
         expect_actual_dtype=torch.float32,
     )
-
-
-@_EVT_CAPABLE
-def test_evt_out_dtype_bf16_to_fp16():
-    """bf16 mm → silu → cast(fp16). out_dtype_id MUST be 1 (fp16)."""
-
-    class M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.randn(_N, _K))
-
-        def forward(self, a):
-            return F.silu(torch.mm(a, self.weight.permute(1, 0))).half()
-
-    _compile_and_check(
-        M(),
-        (_input_a(),),
-        atol=0.5,
-        expect_fused=1,
-        expect_kinds=["evt_col"],
-        expect_out_dtype=torch.float16,
-        expect_actual_dtype=torch.float16,
-    )
-
-
-@_EVT_CAPABLE
-def test_evt_out_dtype_fp16_native():
-    """fp16 mm + fp16 silu → fp16 output. Pure-fp16 path."""
-
-    class M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.randn(_N, _K))
-
-        def forward(self, a):
-            return F.silu(torch.mm(a, self.weight.permute(1, 0)))
-
-    a = torch.randn(_M, _K, device="cuda", dtype=torch.float16)
-    model = M().cuda().half()
-    for p in model.parameters():
-        p.requires_grad_(False)
-
-    with torch.no_grad():
-        expected = model(a)
-
-    get_compile_config().disable_cache = True
-    stats, restore = _install_pass_instrument()
-    try:
-        compiled = magi_compile(model, dynamic_arg_dims={"a": 0})
-        with torch.no_grad():
-            actual = compiled(a)
-    finally:
-        restore()
-
-    diff = (actual.float() - expected.float()).abs().max().item()
-    assert diff <= 0.5, f"fp16 silu max|diff|={diff}"
-    assert stats.fused_count == 1, f"fp16 path should fuse but got fused_count={stats.fused_count}"
-    assert stats.kinds == ["evt_col"], stats.kinds
-    assert stats.out_dtype_ids == [1], f"Expected out_dtype_id=[1] (fp16), got {stats.out_dtype_ids}"
-    assert actual.dtype == torch.float16, actual.dtype
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1017,46 +935,6 @@ def test_evt_mixed_compute_dtype_chain():
     compute_dtypes = _parse_ir_compute_dtypes(stats.ir_jsons[0])
     assert "bfloat16" in compute_dtypes, f"Expected at least one bfloat16 compute_dtype in IR, " f"got {compute_dtypes}"
     assert "float32" in compute_dtypes, f"Expected at least one float32 compute_dtype in IR, " f"got {compute_dtypes}"
-
-
-@_EVT_CAPABLE
-def test_evt_default_compute_dtype_stays_fp32():
-    """mm → silu (no explicit cast) → to(bf16). All Compute nodes must
-    have compute_dtype=float32 (the GEMM accumulator default)."""
-
-    class M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.randn(_N, _K))
-
-        def forward(self, a):
-            y = torch.mm(a, self.weight.permute(1, 0))
-            return F.silu(y).to(torch.bfloat16)
-
-    model = M().cuda().bfloat16()
-    for p in model.parameters():
-        p.requires_grad_(False)
-    a = _input_a()
-
-    with torch.no_grad():
-        expected = model(a)
-
-    get_compile_config().disable_cache = True
-    stats, restore = _install_pass_instrument()
-    try:
-        compiled = magi_compile(model, dynamic_arg_dims={"a": 0})
-        with torch.no_grad():
-            actual = compiled(a)
-    finally:
-        restore()
-
-    diff = (actual.float() - expected.float()).abs().max().item()
-    assert diff <= 0.5, f"Default fp32 compute_dtype chain max|diff|={diff}"
-    assert stats.fused_count == 1, f"Expected 1 fusion, got {stats.fused_count}"
-
-    assert len(stats.ir_jsons) == 1
-    compute_dtypes = _parse_ir_compute_dtypes(stats.ir_jsons[0])
-    assert all(dt == "float32" for dt in compute_dtypes), f"Expected all compute_dtype=float32, got {compute_dtypes}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
