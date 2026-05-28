@@ -775,8 +775,6 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
             n_int = int(n_dim)
             if (n_int * out_dt.itemsize) % 16 != 0:
                 return None
-            if b_layout == "row" and (n_int * b_dtype.itemsize) % 16 != 0:
-                return None
 
         ir_root = Store(child=last_ir, out_dtype=_DTYPE_TO_STR[out_dt])
         if is_trivial(ir_root):

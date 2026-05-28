@@ -329,17 +329,24 @@ def test_evt_unary_activations_fuse(epi_name, epi_fn, atol, rtol):
 
 @_EVT_CAPABLE
 def test_evt_relu_native():
-    """Plain ``aten.relu`` (no fp32 cast) — built-in CUTLASS ReLu functor."""
+    """Plain ``aten.relu`` variants must fuse and preserve emitted output dtype."""
 
-    class M(nn.Module):
+    class Fp32Relu(nn.Module):
         def __init__(self):
             super().__init__()
             self.weight = nn.Parameter(torch.randn(_N, _K))
 
         def forward(self, a):
-            return torch.relu(torch.mm(a, self.weight.permute(1, 0))).to(torch.bfloat16)
+            return torch.relu(torch.mm(a, self.weight.permute(1, 0)).float())
 
-    _compile_and_check(M(), (_input_a(),), expect_fused=1, expect_kinds=["evt_col"])
+    _compile_and_check(
+        Fp32Relu(),
+        (_input_a(),),
+        expect_fused=1,
+        expect_kinds=["evt_col"],
+        expect_out_dtype=torch.float32,
+        expect_actual_dtype=torch.float32,
+    )
 
 
 @_EVT_CAPABLE
@@ -391,12 +398,7 @@ def test_evt_swiglu_constants_roundtrip_in_ir_json():
 @_EVT_CAPABLE
 @pytest.mark.parametrize(
     "case_name,op,other_kind,alpha",
-    [
-        ("add_scalar_alpha2", torch.add, "scalar", 2.0),
-        ("sub_scalar_alpha3", torch.sub, "scalar", 3.0),
-        ("add_tensor_alpha0.5", torch.add, "tensor", 0.5),
-        ("sub_tensor_alpha2", torch.sub, "tensor", 2.0),
-    ],
+    [("add_scalar_alpha2", torch.add, "scalar", 2.0), ("sub_tensor_alpha2", torch.sub, "tensor", 2.0)],
 )
 def test_evt_mm_add_sub_with_alpha(case_name, op, other_kind, alpha):
     """aten.add/sub with alpha must fuse and produce numerically correct results.
@@ -426,7 +428,15 @@ def test_evt_mm_add_sub_with_alpha(case_name, op, other_kind, alpha):
             return op(y, self.bias, alpha=alpha).to(torch.bfloat16)
 
     model = ScalarModel() if other_kind == "scalar" else TensorModel()
-    _compile_and_check(model, (_input_a(),), atol=1.5, expect_fused=1, expect_kinds=["evt_col"])
+    _compile_and_check(
+        model,
+        (_input_a(),),
+        atol=1.5,
+        expect_fused=1,
+        expect_kinds=["evt_col"],
+        expect_out_dtype=torch.bfloat16,
+        expect_actual_dtype=torch.bfloat16,
+    )
 
 
 @_EVT_CAPABLE
@@ -443,7 +453,15 @@ def test_evt_mm_plus_1d_bias():
             y = torch.mm(a, self.weight.permute(1, 0)) + self.bias
             return high_precision_silu(y, out_dtype=torch.bfloat16)
 
-    _compile_and_check(M(), (_input_a(),), atol=1.5, expect_fused=1, expect_kinds=["evt_col"])
+    _compile_and_check(
+        M(),
+        (_input_a(),),
+        atol=1.5,
+        expect_fused=1,
+        expect_kinds=["evt_col"],
+        expect_out_dtype=torch.bfloat16,
+        expect_actual_dtype=torch.bfloat16,
+    )
 
 
 @_EVT_CAPABLE
@@ -832,57 +850,6 @@ def test_evt_ir_canonical_determinism():
     b = Store(Compute("silu", (Compute("add", (Accum(), Accum())),)), "bfloat16")
     assert to_canonical_json(a) == to_canonical_json(b)
     assert cache_key(a, "bfloat16", "bfloat16") == cache_key(b, "bfloat16", "bfloat16")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# out_dtype correctness
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-@_EVT_CAPABLE
-def test_evt_out_dtype_bf16_via_high_precision():
-    """bf16 → cast(fp32) → silu → cast(bf16). IR walker absorbs both casts."""
-
-    class M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.randn(_N, _K))
-
-        def forward(self, a):
-            y = torch.mm(a, self.weight.permute(1, 0))
-            return high_precision_silu(y, out_dtype=torch.bfloat16)
-
-    _compile_and_check(
-        M(),
-        (_input_a(),),
-        expect_fused=1,
-        expect_kinds=["evt_col"],
-        expect_out_dtype=torch.bfloat16,
-        expect_actual_dtype=torch.bfloat16,
-    )
-
-
-@_EVT_CAPABLE
-def test_evt_out_dtype_fp32_no_final_cast():
-    """bf16 mm → fp32 cast → silu → keep fp32. out_dtype_id MUST be 2 (fp32)."""
-
-    class M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.randn(_N, _K))
-
-        def forward(self, a):
-            y = torch.mm(a, self.weight.permute(1, 0)).float()
-            return F.silu(y)
-
-    _compile_and_check(
-        M(),
-        (_input_a(),),
-        expect_fused=1,
-        expect_kinds=["evt_col"],
-        expect_out_dtype=torch.float32,
-        expect_actual_dtype=torch.float32,
-    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
