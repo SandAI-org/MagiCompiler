@@ -905,83 +905,8 @@ def test_evt_mixed_compute_dtype_chain():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# No-GPU tests: can_render, codegen, IR invariants
+# No-GPU tests: codegen, IR invariants
 # ─────────────────────────────────────────────────────────────────────────────
-
-
-def test_can_render_accepts_multi_aux():
-    """SM90 ``can_render`` accepts IR trees with multiple AuxLoad nodes."""
-    from magi_compiler.passes.piecewise_graph.fusion.evt_ir import Accum, AuxLoad, Compute, Store
-    from magi_compiler.passes.piecewise_graph.fusion.sm90.evt_codegen import can_render
-
-    ir = Store(
-        child=Compute(
-            op="add",
-            children=(
-                Compute(op="add", children=(Accum(), AuxLoad(input_idx=0, dtype="bfloat16"))),
-                AuxLoad(input_idx=1, dtype="bfloat16"),
-            ),
-        ),
-        out_dtype="bfloat16",
-    )
-    assert can_render(ir) is True
-
-    ir_one = Store(child=Compute(op="add", children=(Accum(), AuxLoad(input_idx=0, dtype="bfloat16"))), out_dtype="bfloat16")
-    assert can_render(ir_one) is True
-
-    ir_three = Store(
-        child=Compute(
-            op="add",
-            children=(
-                Compute(
-                    op="add",
-                    children=(
-                        Compute(op="add", children=(Accum(), AuxLoad(input_idx=0, dtype="bfloat16"))),
-                        AuxLoad(input_idx=1, dtype="bfloat16"),
-                    ),
-                ),
-                AuxLoad(input_idx=2, dtype="bfloat16"),
-            ),
-        ),
-        out_dtype="bfloat16",
-    )
-    assert can_render(ir_three) is True
-
-
-def test_can_render_accepts_repeated_aux_idx():
-    """Same input_idx at multiple AuxLoad positions is accepted."""
-    from magi_compiler.passes.piecewise_graph.fusion.evt_ir import Accum, AuxLoad, Compute, Store
-    from magi_compiler.passes.piecewise_graph.fusion.sm90.evt_codegen import can_render
-
-    ir_dup = Store(
-        child=Compute(
-            op="add",
-            children=(
-                Compute(op="mul", children=(Accum(), AuxLoad(input_idx=0, dtype="bfloat16"))),
-                AuxLoad(input_idx=0, dtype="bfloat16"),
-            ),
-        ),
-        out_dtype="bfloat16",
-    )
-    assert can_render(ir_dup) is True
-
-    ir_triple = Store(
-        child=Compute(
-            op="add",
-            children=(
-                Compute(
-                    op="mul",
-                    children=(
-                        Compute(op="add", children=(Accum(), AuxLoad(input_idx=0, dtype="bfloat16"))),
-                        AuxLoad(input_idx=0, dtype="bfloat16"),
-                    ),
-                ),
-                AuxLoad(input_idx=0, dtype="bfloat16"),
-            ),
-        ),
-        out_dtype="bfloat16",
-    )
-    assert can_render(ir_triple) is True
 
 
 def test_sm90_codegen_repeated_aux_idx():
@@ -989,7 +914,7 @@ def test_sm90_codegen_repeated_aux_idx():
     import re
 
     from magi_compiler.passes.piecewise_graph.fusion.evt_ir import Accum, AuxLoad, Compute, Store
-    from magi_compiler.passes.piecewise_graph.fusion.sm90.evt_codegen import can_render, render_evt_cu
+    from magi_compiler.passes.piecewise_graph.fusion.sm90.evt_codegen import render_evt_cu
 
     ir = Store(
         child=Compute(
@@ -1001,7 +926,6 @@ def test_sm90_codegen_repeated_aux_idx():
         ),
         out_dtype="bfloat16",
     )
-    assert can_render(ir) is True
     src = render_evt_cu(ir, "bfloat16", "bfloat16")
 
     aux_load_defs = re.findall(r"using\s+\w+\s*=\s*cutlass::epilogue::fusion::Sm90AuxLoad<", src)
@@ -1015,7 +939,7 @@ def test_sm90_codegen_repeated_aux_idx_mixed_with_distinct():
     import re
 
     from magi_compiler.passes.piecewise_graph.fusion.evt_ir import Accum, AuxLoad, Compute, Store
-    from magi_compiler.passes.piecewise_graph.fusion.sm90.evt_codegen import can_render, render_evt_cu
+    from magi_compiler.passes.piecewise_graph.fusion.sm90.evt_codegen import render_evt_cu
 
     ir = Store(
         child=Compute(
@@ -1033,7 +957,6 @@ def test_sm90_codegen_repeated_aux_idx_mixed_with_distinct():
         ),
         out_dtype="bfloat16",
     )
-    assert can_render(ir) is True
     src = render_evt_cu(ir, "bfloat16", "bfloat16")
 
     aux_load_defs = re.findall(r"using\s+\w+\s*=\s*cutlass::epilogue::fusion::Sm90AuxLoad<", src)
@@ -1126,7 +1049,7 @@ def test_evt_codegen_sm80_per_node_compute_dtype():
 def test_evt_codegen_sm90_per_node_compute_dtype():
     """SM90 codegen emits per-node element types in Sm90Compute."""
     from magi_compiler.passes.piecewise_graph.fusion.evt_ir import Accum, Compute, Store
-    from magi_compiler.passes.piecewise_graph.fusion.sm90.evt_codegen import can_render, render_evt_cu
+    from magi_compiler.passes.piecewise_graph.fusion.sm90.evt_codegen import render_evt_cu
 
     ir = Store(
         Compute(
@@ -1136,7 +1059,6 @@ def test_evt_codegen_sm90_per_node_compute_dtype():
         ),
         "bfloat16",
     )
-    assert can_render(ir) is True
     src = render_evt_cu(ir, "bfloat16", "bfloat16")
     assert "Sm90Compute<" in src
     assert "cutlass::bfloat16_t, cutlass::bfloat16_t" in src
