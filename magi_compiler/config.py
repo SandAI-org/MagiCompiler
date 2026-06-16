@@ -16,7 +16,7 @@ import json
 import os
 from enum import Enum, unique
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import torch
 from pydantic import BaseModel, Field
@@ -216,6 +216,15 @@ class CompileConfig(BaseSettings):
     enable_inductor_max_autotune: bool = Field(False, description="Enable Inductor max_autotune for kernel selection.")
     enable_inductor_coordinate_descent_tuning: bool = Field(
         False, description="Enable Inductor coordinate_descent_tuning for kernel selection."
+    )
+    enable_dynamic_nd_tiling: Optional[bool] = Field(
+        None,
+        description=(
+            "Triton ND-tiling workaround (prefer_nd_tiling + max_tiles=3 + tile_reductions) "
+            "for Inductor's coalesce tiling bailing out under dynamic shapes. "
+            "Tri-state: None = auto (on for dynamic shapes on PyTorch < 2.11.0); True/False = force. "
+            "Settable via the MAGI_COMPILE_ENABLE_DYNAMIC_ND_TILING env var."
+        ),
     )
     compile_sizes: list[int] = Field(
         default_factory=list,

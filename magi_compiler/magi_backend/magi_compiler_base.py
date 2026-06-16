@@ -124,7 +124,12 @@ class MagiCompileState:
         if self.compiled_entry is not None:
             return
         backend = init_backend(
-            self.compile_config, self.model_idx, self.model_tag, self.traced_files, self.inductor_compile_config
+            self.compile_config,
+            self.model_idx,
+            self.model_tag,
+            self.traced_files,
+            self.inductor_compile_config,
+            self.dynamic_arg_dims,
         )
         options = None
         if isinstance(backend, str) and backend == "inductor":

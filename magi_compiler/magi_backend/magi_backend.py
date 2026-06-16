@@ -14,6 +14,7 @@
 
 import ast
 import dataclasses
+import functools
 import pprint
 import time
 from collections.abc import Callable
@@ -28,6 +29,7 @@ import torch
 import torch.fx as fx
 from torch._dispatch.python import enable_python_dispatcher
 from torch._guards import detect_fake_mode
+from torch.torch_version import TorchVersion
 
 import magi_compiler.utils.envs as envs
 from magi_compiler.config import CompileConfig, CompileMode, CudaGraphMode, inductor_compile_config_hash, magi_cache_dump_path
@@ -468,6 +470,17 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         return output
 
 
+@functools.lru_cache(maxsize=1)
+def _inductor_needs_nd_tiling_workaround() -> bool:
+    """Under dynamic shapes, Inductor's coalesce tiling analysis used to bail out on
+    symbolic numels, degrading transpose/permute/channels-last pointwise kernels to
+    untiled Grid1D. PyTorch >= 2.11.0 fixed this upstream, so on those versions
+    prefer_nd_tiling workaround is unnecessary (and would actively bypass the native
+    coalesce path). Gate purely on the PyTorch version.
+    """
+    return TorchVersion(torch.__version__) < (2, 11, 0)
+
+
 class MagiBackend:
     """
     The compilation backend for `torch.compile` with MagiCompiler.
@@ -488,12 +501,14 @@ class MagiBackend:
         model_tag: str,
         traced_files: "OrderedSet",
         inductor_compile_config: dict[str, Any],
+        dynamic_arg_dims: dict[str, Any] | None = None,
     ):
         self.compile_config = compile_config
         self.model_idx = model_idx
         self.model_tag = model_tag
         self.traced_files = traced_files
         self.inductor_compile_config = inductor_compile_config
+        self.dynamic_arg_dims = dynamic_arg_dims
         self._configure_custom_passes()
         self.compiler_manager: CompilerManager = CompilerManager(self.compile_config)
         self._called_once = False
@@ -522,6 +537,35 @@ class MagiBackend:
             assert existing_pass.uuid() == post_grad_pass_manager.uuid()
 
         self.inductor_compile_config[post_grad_key] = post_grad_pass_manager
+
+        # On PyTorch < 2.11.0, Inductor's coalesce tiling analysis bails out on
+        # symbolic numels, so dynamic-shape transpose/permute/channels-last kernels
+        # degrade to untiled Grid1D. Forcing prefer_nd_tiling restores ND tiling
+        # (WAN 2.2 VAE 540p decode: ~1.45x.
+        if self._should_enable_nd_tiling():
+            self.inductor_compile_config["triton.prefer_nd_tiling"] = True
+            self.inductor_compile_config["triton.max_tiles"] = 3
+            self.inductor_compile_config["triton.tile_reductions"] = True
+
+    def _should_enable_nd_tiling(self) -> bool:
+        cfg = self.compile_config.enable_dynamic_nd_tiling
+        if cfg is not None:
+            return bool(cfg)
+
+        return self._is_dynamic_compilation() and _inductor_needs_nd_tiling_workaround()
+
+    def _is_dynamic_compilation(self) -> bool:
+        """Best-effort detection of dynamic-shape compilation from intent."""
+        dims = self.dynamic_arg_dims
+        if not dims:
+            return False
+        for v in dims.values():
+            if isinstance(v, (list, tuple)):
+                if len(v) > 0:
+                    return True
+            elif v is not None:
+                return True
+        return False
 
     def _init_cache(self) -> str:
         hash_key = compute_hash(
@@ -646,7 +690,12 @@ class MagiBackend:
 
 
 def init_backend(
-    compile_config: CompileConfig, model_idx: int, model_tag: str, traced_files: "OrderedSet", inductor_config: dict[str, Any]
+    compile_config: CompileConfig,
+    model_idx: int,
+    model_tag: str,
+    traced_files: "OrderedSet",
+    inductor_config: dict[str, Any],
+    dynamic_arg_dims: dict[str, Any] | None = None,
 ) -> str | Callable:
     """
     Initialize the backend based on CompileConfig.
@@ -663,6 +712,6 @@ def init_backend(
         return compile_config.backend
     elif compile_config.compile_mode == CompileMode.MAGI_COMPILE:
         assert compile_config.backend in ["eager", "inductor"], f"Invalid backend for MagiCompiler: {compile_config.backend}"
-        return MagiBackend(compile_config, model_idx, model_tag, traced_files, inductor_config)
+        return MagiBackend(compile_config, model_idx, model_tag, traced_files, inductor_config, dynamic_arg_dims)
     else:
         raise ValueError(f"Invalid compile mode: {compile_config.compile_mode}")
