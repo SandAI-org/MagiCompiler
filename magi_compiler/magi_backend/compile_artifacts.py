@@ -171,23 +171,12 @@ class MagiSerializableFunction(SerializableCallable):
         compile_inputs = [inp if inp is not None else placeholder_fake_values[i] for i, inp in enumerate(self.example_inputs)]
 
         fake_mode = detect_fake_mode(compile_inputs)
-
-        def _has_symbolic_dims(t) -> bool:
-            shape = getattr(t, "shape", None)
-            if shape is None:
-                return False
-            return any(isinstance(s, torch.SymInt) for s in shape)
-
-        is_dynamic = any(_has_symbolic_dims(inp) for inp in compile_inputs)
-        rebuilt_dynamic_arg_dims = {"__rebuilt__": [0]} if is_dynamic else None
-
         magi_backend = MagiBackend(
             self.compile_config,
             model_idx=self.model_idx,
             model_tag=self.model_tag,
             traced_files=OrderedSet(self.traced_files),
             inductor_compile_config={},
-            dynamic_arg_dims=rebuilt_dynamic_arg_dims,
         )
 
         with tracing(TracingContext(fake_mode)):
