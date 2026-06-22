@@ -14,10 +14,8 @@
 
 import functools
 
-import torch
 from torch import fx as fx
 from torch._inductor.custom_graph_pass import CustomGraphPass
-from torch.torch_version import TorchVersion
 
 from ...config import PassConfig, get_compile_config
 from ...utils import magi_logger, set_env_var
@@ -82,14 +80,10 @@ class PostGradPassManager(CustomGraphPass):
     def configure(self, pass_config: PassConfig):
         self.pass_config = pass_config
 
-        if pass_config.enable_nd_tiling_workaround != False:
+        if pass_config.enable_nd_tiling_workaround:
             from .nd_tiling_workaround import ND_TilingWorkaroundPass
 
-            self.add(
-                ND_TilingWorkaroundPass(
-                    force_on=pass_config.enable_nd_tiling_workaround == True, torch_version=TorchVersion(torch.__version__)
-                )
-            )
+            self.add(ND_TilingWorkaroundPass())
 
         if pass_config.enable_mm_epilogue_fusion:
             compile_config = get_compile_config()

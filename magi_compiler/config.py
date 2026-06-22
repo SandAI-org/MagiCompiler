@@ -16,7 +16,7 @@ import json
 import os
 from enum import Enum, unique
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 import torch
 from pydantic import BaseModel, Field
@@ -63,14 +63,22 @@ class PassConfig(BaseModel):
     # TODO: Add no-op elimination pass.
     # TODO: Add sequence parallelism pass and async TP pass.
     # TODO: Add Ulysses overlap pass.
-    enable_sage_attn: bool = Field(False, description="Whether to replace flash attention with sage attention.")
-    enable_nd_tiling_workaround: Optional[bool] = Field(
-        None,
+    enable_sage_attn: bool = Field(
+        False,
+        description=(
+            "Whether to replace flash attention with sage attention. "
+            "Env var: MAGI_COMPILE_PASS_CONFIG__ENABLE_SAGE_ATTN (1/0/true/false)."
+        ),
+    )
+    enable_nd_tiling_workaround: bool = Field(
+        True,
         description=(
             "Triton ND-tiling workaround (prefer_nd_tiling + max_tiles=3 + tile_reductions) "
             "for Inductor's coalesce tiling bailing out under dynamic shapes. "
-            "Tri-state: None = auto (decided by the Pass's internal heuristics, if any); True/False = force. "
-            "See MagiInductorPass.__init__ for how this maps to the Pass's force_on flag."
+            "True (default): register the pass and let its internal heuristics decide whether to "
+            "apply (currently: torch < 2.11.0 AND dynamic shapes AND conv-heavy). "
+            "False: do not register the pass at all. "
+            "Env var: MAGI_COMPILE_PASS_CONFIG__ENABLE_ND_TILING_WORKAROUND (1/0/true/false)."
         ),
     )
     enable_mm_epilogue_fusion: bool = Field(
@@ -82,7 +90,8 @@ class PassConfig(BaseModel):
             "(sm_90) the swiglu sub-path additionally uses the native Sm90 "
             "TMA + WGMMA DualGemm. The pass is a no-op on older architectures "
             "regardless of this flag, but the flag still controls whether it "
-            "is registered at all."
+            "is registered at all. "
+            "Env var: MAGI_COMPILE_PASS_CONFIG__ENABLE_MM_EPILOGUE_FUSION (1/0/true/false)."
         ),
     )
 

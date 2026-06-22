@@ -15,22 +15,21 @@
 """Decision-logic tests for ``ND_TilingWorkaroundPass``.
 
 When applicable, the pass flips three ``torch._inductor.config`` triton keys
-(``prefer_nd_tiling`` / ``max_tiles`` / ``tile_reductions``) ON. Whether it does
-so is driven by the ``enable_nd_tiling_workaround`` config:
+(``prefer_nd_tiling`` / ``max_tiles`` / ``tile_reductions``) ON. The binary
+``enable_nd_tiling_workaround`` config controls registration:
 
-  * ``True``  -> force on, skip heuristics
-  * ``False`` -> pass not registered at all
-  * ``None``  -> auto: on iff dynamic shapes AND PyTorch < 2.11.0 AND not conv-heavy
+  * ``True`` (default) -> register the pass; its internal heuristics then decide:
+    apply iff dynamic shapes AND PyTorch < 2.11.0 AND conv-heavy.
+  * ``False`` -> pass not registered at all.
 
-These tests assert that mapping. The shared base-class utilities (``is_dynamic``,
-``is_conv_heavy``, config snapshot/anti-leakage) are tested in
-``test_magi_inductor_pass.py``; the end-to-end speedup in
-``tests/perf_tests/test_dynamic_nd_tiling_perf.py``.
+These tests assert the registered pass's heuristic decision. The shared
+base-class utilities (``is_dynamic``, ``is_conv_heavy``, config
+snapshot/anti-leakage) are tested in ``test_magi_inductor_pass.py``; the
+end-to-end speedup in ``tests/perf_tests/test_nd_tiling_perf_workaround.py``.
 """
 
 import pytest
 import torch
-from torch.torch_version import TorchVersion
 
 from magi_compiler.config import PassConfig
 from magi_compiler.passes.piecewise_graph.nd_tiling_workaround import ND_TilingWorkaroundPass
@@ -52,8 +51,17 @@ def _restore_inductor_config():
         cfg.triton.prefer_nd_tiling, cfg.triton.max_tiles, cfg.triton.tile_reductions = saved
 
 
-def _make_pass(*, force_on=False, version="2.9.1"):
-    return ND_TilingWorkaroundPass(force_on=force_on, torch_version=TorchVersion(version))
+def _make_pass(*, is_target_torch_version=True):
+    """Build the pass and pin its version gate.
+
+    The pass reads ``torch.__version__`` at construction and caches whether it is
+    a target version (< 2.11.0) in ``is_target_torch_version``. Tests override that
+    cached flag directly so the version branch is exercised regardless of the
+    installed torch.
+    """
+    pass_ = ND_TilingWorkaroundPass()
+    pass_.is_target_torch_version = is_target_torch_version
+    return pass_
 
 
 def _assert_injected(injected):
@@ -69,43 +77,25 @@ def _assert_injected(injected):
 
 
 def _auto_eligible_graph(fake_mode):
-    """Dynamic graph with 1 conv + plenty of filler nodes (nnodes >= 300 * nconv)."""
-    return build_graph_module(fake_mode, placeholder_vals=[dynamic_tensor(fake_mode)], n_conv=1, n_filler=320)
+    """Dynamic, conv-heavy graph (nnodes < 300 * nconv): the workaround applies."""
+    return build_graph_module(fake_mode, placeholder_vals=[dynamic_tensor(fake_mode)], n_conv=1, n_filler=5)
 
 
-# ── config field tri-state ───────────────────────────────────────────────
-
-
-@pytest.mark.parametrize("value", [True, False, None])
-def test_config_field_tristate(value):
-    """enable_nd_tiling_workaround accepts True/False/None."""
+@pytest.mark.parametrize("value", [True, False])
+def test_config_field_binary(value):
+    """enable_nd_tiling_workaround accepts True/False (default True covered in test_magi_inductor_pass)."""
     assert PassConfig(enable_nd_tiling_workaround=value).enable_nd_tiling_workaround is value
 
 
-def test_config_field_default_is_none():
-    assert PassConfig().enable_nd_tiling_workaround is None
-
-
-# ── ND-tiling injection decision ─────────────────────────────────────────
-
-
-def test_force_on_injects_even_when_static_and_fixed_version(fake_mode):
-    """force_on=True flips the config regardless of graph/version."""
-    pass_ = _make_pass(force_on=True, version="2.11.0")
-    gm = build_graph_module(fake_mode, placeholder_vals=[static_tensor(fake_mode)], n_conv=1, n_filler=0)
-    pass_(gm.graph)
-    _assert_injected(True)
-
-
 def test_auto_injects_when_all_conditions_met(fake_mode):
-    pass_ = _make_pass(version="2.9.1")
+    pass_ = _make_pass(is_target_torch_version=True)
     gm = _auto_eligible_graph(fake_mode)
     pass_(gm.graph)
     _assert_injected(True)
 
 
 def test_auto_skips_on_static_shapes(fake_mode):
-    pass_ = _make_pass(version="2.9.1")
+    pass_ = _make_pass(is_target_torch_version=True)
     gm = build_graph_module(fake_mode, placeholder_vals=[static_tensor(fake_mode)], n_conv=0, n_filler=5)
     pass_(gm.graph)
     _assert_injected(False)
@@ -113,15 +103,15 @@ def test_auto_skips_on_static_shapes(fake_mode):
 
 def test_auto_skips_on_fixed_version(fake_mode):
     """Dynamic shapes but PyTorch >= 2.11.0: native coalesce path handles it."""
-    pass_ = _make_pass(version="2.11.0")
+    pass_ = _make_pass(is_target_torch_version=False)
     gm = _auto_eligible_graph(fake_mode)
     pass_(gm.graph)
     _assert_injected(False)
 
 
-def test_auto_skips_when_graph_too_conv_dense(fake_mode):
-    """``nnodes < 300 * nconv`` (conv-dense graph): the heuristic bails out."""
-    pass_ = _make_pass(version="2.9.1")
-    gm = build_graph_module(fake_mode, placeholder_vals=[dynamic_tensor(fake_mode)], n_conv=1, n_filler=5)
+def test_auto_skips_when_graph_not_conv_heavy(fake_mode):
+    """``nnodes >= 300 * nconv`` (conv-sparse graph): low conv ratio, ND-tiling gives little, so skip."""
+    pass_ = _make_pass(is_target_torch_version=True)
+    gm = build_graph_module(fake_mode, placeholder_vals=[dynamic_tensor(fake_mode)], n_conv=1, n_filler=320)
     pass_(gm.graph)
     _assert_injected(False)

@@ -14,11 +14,15 @@
 
 """Unit tests for the base class MagiInductorPass and its helper utilities."""
 
+import pytest
 import torch
+from pydantic import ValidationError
 
 from magi_compiler.config import CompileConfig
 from magi_compiler.passes.pass_base import MagiInductorPass, snapshot_original_inductor_configs
 from tests.feature_tests.conftest import build_graph_module, dynamic_tensor, static_tensor
+
+_ND_TILING_ENV = "MAGI_COMPILE_PASS_CONFIG__ENABLE_ND_TILING_WORKAROUND"
 
 
 class DummyPass(MagiInductorPass):
@@ -134,50 +138,49 @@ def test_snapshot_prevents_global_leakage(fake_mode):
     assert cfg.triton.max_tiles == orig_max_tiles
 
 
-def test_env_nested_delimiter_config_parsing(monkeypatch):
-    """Verify that nested sub-configs can be overridden via double-underscore environment variables."""
-    # Simulate setting the environment variable
-    monkeypatch.setenv("MAGI_COMPILE_PASS_CONFIG__ENABLE_ND_TILING_WORKAROUND", "1")
+@pytest.mark.parametrize("env_value, expected", [("1", True), ("true", True), ("0", False), ("false", False)])
+def test_env_nested_delimiter_config_parsing(monkeypatch, env_value, expected):
+    """A nested sub-config field is overridable via the MAGI_COMPILE_<SUBCONFIG>__<FIELD> env var.
 
+    pydantic parses the bool field here, so only truthy/falsy literals
+    (1/0/true/false) are accepted as on/off.
+    """
+    monkeypatch.setenv(_ND_TILING_ENV, env_value)
+    config = CompileConfig()
+    assert config.pass_config.enable_nd_tiling_workaround is expected
+
+
+def test_env_unset_defaults_to_true(monkeypatch):
+    """When the env var is unset, the binary field defaults to True."""
+    monkeypatch.delenv(_ND_TILING_ENV, raising=False)
     config = CompileConfig()
     assert config.pass_config.enable_nd_tiling_workaround is True
 
-    # Test setting to False ("0")
-    monkeypatch.setenv("MAGI_COMPILE_PASS_CONFIG__ENABLE_ND_TILING_WORKAROUND", "0")
-    config = CompileConfig()
-    assert config.pass_config.enable_nd_tiling_workaround is False
 
+@pytest.mark.parametrize("env_value", ["none", "null", "maybe", ""])
+def test_env_rejects_non_bool_strings(monkeypatch, env_value):
+    """The field is a bool, so non-bool strings raise a ValidationError.
 
-def test_tristate_compatibility_with_bistate_passes():
-    """Verify that the tri-state configuration is fully compatible with bi-state passes.
-
-    If a pass does not implement None/auto mode, it behaves the same as False when force_on is False.
+    Only 1/0/true/false round-trip; everything else is rejected.
     """
-    # 1. Test a pass that DOES NOT implement any auto heuristics (e.g. UndeclaredPass)
-    # When force_on is False (mapped from config = None/Auto), it should behave the same as False.
-    pass_bistate = UndeclaredPass(force_on=False)
-    assert not pass_bistate.force_on
+    monkeypatch.setenv(_ND_TILING_ENV, env_value)
+    with pytest.raises(ValidationError):
+        CompileConfig()
 
-    # 2. Verify PostGradPassManager's mapping of tri-state config to bi-state force_on:
-    # - config = True  --> force_on = True
-    # - config = None  --> force_on = False (runs heuristics, if any)
-    # - config = False --> pass is not registered at all
+
+def test_config_binary_registration_mapping():
+    """PostGradPassManager registers the pass iff enable_nd_tiling_workaround is True.
+
+    - config = True  --> pass is registered
+    - config = False --> pass is not registered at all
+    """
     from magi_compiler.config import PassConfig
     from magi_compiler.passes.piecewise_graph.post_grad_pass_manager import PostGradPassManager
 
-    # Case A: config = True
     pm_true = PostGradPassManager()
     pm_true.configure(PassConfig(enable_nd_tiling_workaround=True))
     assert len(pm_true.passes) == 1
-    assert pm_true.passes[0].force_on is True
 
-    # Case B: config = None (Auto)
-    pm_none = PostGradPassManager()
-    pm_none.configure(PassConfig(enable_nd_tiling_workaround=None))
-    assert len(pm_none.passes) == 1
-    assert pm_none.passes[0].force_on is False
-
-    # Case C: config = False
     pm_false = PostGradPassManager()
     pm_false.configure(PassConfig(enable_nd_tiling_workaround=False))
     assert len(pm_false.passes) == 0

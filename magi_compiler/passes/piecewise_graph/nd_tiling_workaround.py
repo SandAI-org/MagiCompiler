@@ -29,15 +29,14 @@ class ND_TilingWorkaroundPass(MagiInductorPass):
         "triton.tile_reductions",
     )
 
-    def __init__(self, force_on: bool = False, torch_version: TorchVersion = None):
-        super().__init__(force_on=force_on)
-        self.torch_version = torch_version if torch_version is not None else TorchVersion(torch.__version__)
+    def __init__(self):
+        super().__init__()
+        self.is_target_torch_version = TorchVersion(torch.__version__) < (2, 11, 0)
 
     @emit_pass_lifecycle
     def __call__(self, graph: torch.fx.Graph):
-        if not self.force_on:
-            if self.torch_version >= (2, 11, 0) or not self.is_dynamic(graph) or self.is_conv_heavy(graph):
-                return False
+        if not self.is_target_torch_version or not self.is_dynamic(graph) or not self.is_conv_heavy(graph):
+            return False
 
         # On PyTorch < 2.11.0, Inductor's coalesce tiling analysis bails out on
         # symbolic numels, so dynamic-shape transpose/permute/channels-last kernels

@@ -19,13 +19,16 @@ Background
 On PyTorch < 2.11.0, Inductor's coalesce tiling analysis bails out on symbolic
 numels (``tiling_utils.extract_normalized_read_writes`` returns ``None``), so
 transpose/permute/channels-last pointwise kernels in a dynamic-shape graph
-degrade to untiled Grid1D. MagiCompiler works around this by auto-enabling
-``triton.prefer_nd_tiling`` (+ ``max_tiles=3`` + ``tile_reductions``) for dynamic
-compilation; see ``magi_compiler.passes.piecewise_graph.nd_tiling_workaround.ND_TilingWorkaroundPass``.
+degrade to untiled Grid1D. ``ND_TilingWorkaroundPass`` works around this by
+enabling ``triton.prefer_nd_tiling`` (+ ``max_tiles=3`` + ``tile_reductions``)
+when the post-grad graph is dynamic AND conv-heavy (the regime where the
+degraded kernels dominate); see
+``magi_compiler.passes.piecewise_graph.nd_tiling_workaround.ND_TilingWorkaroundPass``.
 
 This test exercises a WAN-2.2-VAE-decode-like workload (stacked 3D conv resblocks
-+ spatial upsampling) compiled with **dynamic H/W**, and checks that magi_compile
-(with the workaround on) beats vanilla ``torch.compile`` on that path.
++ spatial upsampling) compiled with **dynamic H/W** — a dynamic, conv-heavy graph
+that triggers the pass — and checks that magi_compile beats vanilla
+``torch.compile`` on that path.
 
 Real WAN 2.2 VAE decode (540p, dynamic H/W) numbers that motivate this:
   - with conv channels-last layout: 1.252s -> 542ms / decode (~2.3x)
@@ -52,18 +55,16 @@ LATENT_C, LATENT_T, LATENT_H, LATENT_W = 48, 7, 34, 60
 ND_TILING_SPEEDUP_THRESHOLD = 1.20
 
 
-@pytest.fixture(scope="module")
-def decoder_device():
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-@pytest.fixture(scope="module")
-def decoder_input(decoder_device):
-    return torch.randn(1, LATENT_C, LATENT_T, LATENT_H, LATENT_W, device=decoder_device, dtype=torch.bfloat16)
+@pytest.fixture(scope="function")
+def decoder_input(device):
+    return torch.randn(1, LATENT_C, LATENT_T, LATENT_H, LATENT_W, device=device, dtype=torch.bfloat16)
 
 
 def _compile_decoder(device: torch.device):
     def _patch(cfg):
+        # This decoder is dynamic + conv-heavy, so the pass's heuristics fire and
+        # the workaround is applied. The pass mutates triton configs only inside the
+        # compilation's config.patch scope, so nothing leaks to the torch baseline.
         cfg.pass_config.enable_nd_tiling_workaround = True
         return cfg
 
@@ -78,7 +79,7 @@ def _compile_torch(device: torch.device):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
-def test_nd_tiling_workaround_speedup(decoder_device, decoder_input):
+def test_nd_tiling_workaround_speedup(device, decoder_input):
     """ND-tiling ON should beat vanilla torch.compile on the dynamic path."""
     # Build isolated inputs to prevent dynamic shape marking leakage
     eager_input = decoder_input.clone()
@@ -88,9 +89,9 @@ def test_nd_tiling_workaround_speedup(decoder_device, decoder_input):
     # Explicitly mark dynamic dimensions for the vanilla torch.compile environment
     torch._dynamo.mark_dynamic(torch_input, [3, 4])
 
-    eager_model = VAEDecoderLike().to(decoder_device).to(torch.bfloat16).eval()
-    magi_compiled = _compile_decoder(decoder_device)
-    torch_compiled = _compile_torch(decoder_device)
+    eager_model = VAEDecoderLike().to(device).to(torch.bfloat16).eval()
+    magi_compiled = _compile_decoder(device)
+    torch_compiled = _compile_torch(device)
 
     with torch.no_grad():
         eager_result = cuda_benchmark(lambda: eager_model(eager_input))

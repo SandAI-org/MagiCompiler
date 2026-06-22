@@ -20,7 +20,6 @@ from torch.fx.experimental.symbolic_shapes import has_free_symbols
 
 from .inductor_pass import InductorPass
 
-
 DEFAULT_CONV_HEAVY_THRESHOLD = 300
 
 
@@ -38,25 +37,6 @@ class MagiInductorPass(InductorPass):
     # configs. Passes running in ``FullGraphPassManager`` **MUST NOT** modify them, as full-graph
     # passes do not trigger compilation and cannot be patched/isolated.
     inductor_config_keys_potentially_mutated_by_this_pass: tuple[str, ...] = ()
-
-    def __init__(self, force_on: bool = False):
-        """
-        Initialize the pass.
-
-        ### Switch Mapping
-        The external tri-state config is mapped to this bi-state `force_on` by the Pass Manager:
-
-        User Config (Tri-state)   -->   Pass Manager Action   -->   Pass `force_on` (Bi-state)
-        -----------------------         -------------------         --------------------------
-        False                           Skip registration           (Not instantiated)
-        True                            Add pass                    force_on = True (Bypass heuristics)
-        None (Auto)                     Add pass                    force_on = False (Run heuristics, if any)
-
-        :param force_on: If True, force enable the pass, bypassing any auto-detection heuristics.
-                         If False, run in auto mode (relying on pass-specific heuristics).
-        """
-        super().__init__()
-        self.force_on = force_on
 
     def is_dynamic(self, graph: torch.fx.Graph) -> bool:
         """Determine if the graph has dynamic shapes by checking if any placeholder carries free symbols."""
