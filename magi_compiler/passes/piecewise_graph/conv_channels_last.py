@@ -18,11 +18,15 @@ Forces channels-last (NHWC for 4D, NDHWC for 5D) at every ``aten.convolution``
 boundary by graph rewriting only -- no patching of PyTorch internals.
 
 Mechanism: insert ``aten.clone(memory_format=channels_last(_3d))`` before each
-conv input/weight with the clone's ``meta["val"]`` set channels-last. With
-``layout_optimization=False`` (set by this pass), the pre-registered
-``constrain_conv_to_fx_strides`` reads those FX meta strides and pins the conv
-boundary channels-last; the clone lowers to a zero-cost FlexibleLayout Pointwise
-and ``conv_layout()`` infers a channels-last output.
+conv input/weight and set the clone's ``meta["val"]`` to a channels-last
+FakeTensor. The clone *lowering* ignores ``memory_format`` (a TODO in
+``lowering.py``), so the channels-last signal lives purely in the FX meta
+strides. With ``layout_optimization=False`` (set by this pass), the
+pre-registered ``constrain_conv_to_fx_strides`` reads those conv-input FX meta
+strides -- now channels-last -- and applies ``require_stride_order`` at the conv
+boundary. The clone lowers to a FlexibleLayout Pointwise, so that freeze is
+zero-cost (the buffer is allocated channels-last directly, no extra copy) and
+``conv_layout()`` then infers a channels-last output.
 
 In auto mode the pass only fires on static, conv-dense graphs; dynamic-shape
 graphs are skipped. ``force_on=True`` applies it unconditionally.
@@ -54,9 +58,11 @@ class ConvChannelsLastPass(MagiInductorPass):
     """
     Make conv2d/conv3d inputs channels-last on the post-grad ATen graph.
 
-    For every ``aten.convolution`` node, clone x and weight to channels-last
-    so ``constrain_conv_to_fx_strides`` (layout_optimization=False) enforces
-    channels-last at the conv boundary and ``conv_layout`` infers a
+    For every ``aten.convolution`` node, clone x and weight with their FX
+    ``meta["val"]`` set channels-last (the clone lowering itself ignores
+    ``memory_format``). With layout_optimization=False,
+    ``constrain_conv_to_fx_strides`` reads those meta strides and enforces
+    channels-last at the conv boundary, and ``conv_layout`` infers a
     channels-last output.
 
     If the conv input comes from a single-consumer layout-transparent op
