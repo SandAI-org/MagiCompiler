@@ -80,6 +80,11 @@ class PostGradPassManager(CustomGraphPass):
     def configure(self, pass_config: PassConfig):
         self.pass_config = pass_config
 
+        if pass_config.enable_conv_channels_last != False:
+            from .conv_channels_last import ConvChannelsLastPass
+
+            self.add(ConvChannelsLastPass(force_on=pass_config.enable_conv_channels_last == True))
+
         if pass_config.enable_nd_tiling_workaround:
             from .nd_tiling_workaround import ND_TilingWorkaroundPass
 

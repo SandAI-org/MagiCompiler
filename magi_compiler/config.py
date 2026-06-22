@@ -16,7 +16,7 @@ import json
 import os
 from enum import Enum, unique
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import torch
 from pydantic import BaseModel, Field
@@ -70,6 +70,18 @@ class PassConfig(BaseModel):
             "Env var: MAGI_COMPILE_PASS_CONFIG__ENABLE_SAGE_ATTN (1/0/true/false)."
         ),
     )
+    enable_conv_channels_last: Optional[bool] = Field(
+        None,
+        description=(
+            "Conv channels-last layout pass (ConvChannelsLastPass). "
+            "Rewrites the post-grad ATen graph so every aten.convolution (conv2d/conv3d) "
+            "consumes channels-last (NHWC/NDHWC) inputs/weights, letting cuDNN pick the "
+            "faster channels-last kernels; sets layout_optimization=False so layout is "
+            "owned entirely by this pass. "
+            "Tri-state: True/False = force on/off; None = auto (on only for static, "
+            "conv-dense graphs)."
+        ),
+    )
     enable_nd_tiling_workaround: bool = Field(
         True,
         description=(
@@ -91,7 +103,7 @@ class PassConfig(BaseModel):
             "TMA + WGMMA DualGemm. The pass is a no-op on older architectures "
             "regardless of this flag, but the flag still controls whether it "
             "is registered at all. "
-            "Env var: MAGI_COMPILE_PASS_CONFIG__ENABLE_MM_EPILOGUE_FUSION (1/0/true/false)."
+            "Settable via the MAGI_COMPILE_PASS_CONFIG__ENABLE_MM_EPILOGUE_FUSION env var."
         ),
     )
 
