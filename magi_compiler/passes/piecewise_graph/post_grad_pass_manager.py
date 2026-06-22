@@ -14,13 +14,15 @@
 
 import functools
 
+import torch
 from torch import fx as fx
 from torch._inductor.custom_graph_pass import CustomGraphPass
+from torch.torch_version import TorchVersion
 
 from ...config import PassConfig, get_compile_config
 from ...utils import magi_logger, set_env_var
 from ...utils.envs import MAGI_PATTERN_MATCH_DEBUG
-from ..pass_base import InductorPass, get_pass_context
+from ..pass_base import InductorPass, get_pass_context, snapshot_original_inductor_configs
 from .fix_functionalization import FixFunctionalizationPass
 from .post_cleanup import PostCleanupPass
 
@@ -80,6 +82,15 @@ class PostGradPassManager(CustomGraphPass):
     def configure(self, pass_config: PassConfig):
         self.pass_config = pass_config
 
+        if pass_config.enable_nd_tiling_workaround != False:
+            from .nd_tiling_workaround import ND_TilingWorkaroundPass
+
+            self.add(
+                ND_TilingWorkaroundPass(
+                    force_on=pass_config.enable_nd_tiling_workaround == True, torch_version=TorchVersion(torch.__version__)
+                )
+            )
+
         if pass_config.enable_mm_epilogue_fusion:
             compile_config = get_compile_config()
             if compile_config.has_cutlass:
@@ -99,6 +110,10 @@ class PostGradPassManager(CustomGraphPass):
     def add(self, pass_: InductorPass):
         assert isinstance(pass_, InductorPass)
         self.passes.append(pass_)
+
+    def snapshot_original_inductor_configs(self, inductor_compile_config: dict) -> None:
+        """Snapshot original values of global Inductor configs potentially mutated by passes."""
+        snapshot_original_inductor_configs(self.passes, inductor_compile_config)
 
     def uuid(self):
         """

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from .inductor_pass import InductorPass
-from .magi_inductor_pass import MagiInductorPass
+from .magi_inductor_pass import MagiInductorPass, snapshot_original_inductor_configs
 from .pass_context import get_pass_context, pass_context
 
-__all__ = ["InductorPass", "pass_context", "get_pass_context", "MagiInductorPass"]
+__all__ = ["InductorPass", "pass_context", "get_pass_context", "MagiInductorPass", "snapshot_original_inductor_configs"]

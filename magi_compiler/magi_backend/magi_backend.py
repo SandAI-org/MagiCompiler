@@ -16,7 +16,6 @@ import ast
 import dataclasses
 import pprint
 import time
-from collections import Counter
 from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
@@ -29,8 +28,6 @@ import torch
 import torch.fx as fx
 from torch._dispatch.python import enable_python_dispatcher
 from torch._guards import detect_fake_mode
-from torch.fx.experimental.symbolic_shapes import has_free_symbols
-from torch.torch_version import TorchVersion
 
 import magi_compiler.utils.envs as envs
 from magi_compiler.config import CompileConfig, CompileMode, CudaGraphMode, inductor_compile_config_hash, magi_cache_dump_path
@@ -47,7 +44,6 @@ from .partition_rules import resolve_defined_ops
 from .piecewise_backend import PiecewiseBackend
 from .piecewise_compiler import CompilerInterface, EagerAdaptor, InductorStandaloneAdaptor
 
-TORCH_VERSION = TorchVersion(torch.__version__)
 compilation_start_time: float = 0.0
 
 
@@ -527,32 +523,7 @@ class MagiBackend:
 
         self.inductor_compile_config[post_grad_key] = post_grad_pass_manager
 
-    def _configure_custom_passes_by_graph_info(self, graph: fx.GraphModule, example_inputs) -> None:
-        """Configure custom passes based on the graph information."""
-        # Check if the graph is dynamic
-        placeholder_vals = (n.meta.get("example_value") for n in graph.graph.nodes if n.op == "placeholder")
-        self.is_dynamic = any(v is not None and has_free_symbols(v) for v in (*placeholder_vals, *example_inputs))
-
-        # Count number of nodes
-        nnodes = len(list(graph.graph.nodes))
-        conv_nodes = [n for n in graph.graph.nodes if n.target == torch.ops.aten.convolution.default]
-        nconv = len(conv_nodes)
-        Counter(n.args[1].meta["val"].dim() - 2 for n in conv_nodes)
-        # dim_counts[1] / dim_counts[2] / dim_counts[3] means number of conv1d/2d/3d
-
-        if (self.compile_config.enable_dynamic_nd_tiling is True) or (
-            self.compile_config.enable_dynamic_nd_tiling is None
-            and self.is_dynamic
-            and TORCH_VERSION < (2, 11, 0)
-            and nnodes > 300 * nconv
-        ):
-            # On PyTorch < 2.11.0, Inductor's coalesce tiling analysis bails out on
-            # symbolic numels, so dynamic-shape transpose/permute/channels-last kernels
-            # degrade to untiled Grid1D. Forcing prefer_nd_tiling restores ND tiling
-            # (WAN 2.2 VAE 540p decode: ~1.45x.
-            self.inductor_compile_config["triton.prefer_nd_tiling"] = True
-            self.inductor_compile_config["triton.max_tiles"] = 3
-            self.inductor_compile_config["triton.tile_reductions"] = True
+        post_grad_pass_manager.snapshot_original_inductor_configs(self.inductor_compile_config)
 
     def _init_cache(self) -> str:
         hash_key = compute_hash(
@@ -633,8 +604,6 @@ class MagiBackend:
         assert not self._called_once, "MagiBackend can only be called once cause compilation is a one-time process"
         magi_logger.info("Dynamo traced files (for compilation cache):\n%s", "\n".join(self.traced_files))
         compilation_counter.num_graphs_seen += 1
-
-        self._configure_custom_passes_by_graph_info(graph, example_inputs)
 
         self._init_cache()
 

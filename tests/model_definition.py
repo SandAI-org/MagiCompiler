@@ -398,6 +398,49 @@ class Transformer(nn.Module):
         return self.lm_head(x)
 
 
+class ResBlock3D(nn.Module):
+    """3D conv residual block (GroupNorm + SiLU + Conv3d, ×2) with a skip path."""
+
+    def __init__(self, cin: int, cout: int):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(32, cin)
+        self.conv1 = nn.Conv3d(cin, cout, 3, padding=1)
+        self.norm2 = nn.GroupNorm(32, cout)
+        self.conv2 = nn.Conv3d(cout, cout, 3, padding=1)
+        self.skip = nn.Conv3d(cin, cout, 1) if cin != cout else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.conv1(F.silu(self.norm1(x)))
+        h = self.conv2(F.silu(self.norm2(h)))
+        return h + self.skip(x)
+
+
+class VAEDecoderLike(nn.Module):
+    """Stacked 3D conv resblocks + spatial upsampling, mimicking a VAE decoder."""
+
+    def __init__(self, zc: int = 48, base: int = 128):
+        super().__init__()
+        self.conv_in = nn.Conv3d(zc, base, 3, padding=1)
+        self.r1 = ResBlock3D(base, base)
+        self.up1 = nn.Conv3d(base, base, 3, padding=1)
+        self.r2 = ResBlock3D(base, base // 2)
+        self.up2 = nn.Conv3d(base // 2, base // 2, 3, padding=1)
+        self.r3 = ResBlock3D(base // 2, base // 4)
+        self.norm_out = nn.GroupNorm(32, base // 4)
+        self.conv_out = nn.Conv3d(base // 4, 3, 3, padding=1)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        x = self.conv_in(z)
+        x = self.r1(x)
+        x = F.interpolate(x, scale_factor=(1, 2, 2), mode="nearest")
+        x = self.up1(x)
+        x = self.r2(x)
+        x = F.interpolate(x, scale_factor=(1, 2, 2), mode="nearest")
+        x = self.up2(x)
+        x = self.r3(x)
+        return self.conv_out(F.silu(self.norm_out(x)))
+
+
 def create_transformer_model(config: TransformerConfig, device: torch.device) -> Transformer:
     """Create Transformer model
 

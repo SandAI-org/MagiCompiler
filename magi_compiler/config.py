@@ -64,6 +64,15 @@ class PassConfig(BaseModel):
     # TODO: Add sequence parallelism pass and async TP pass.
     # TODO: Add Ulysses overlap pass.
     enable_sage_attn: bool = Field(False, description="Whether to replace flash attention with sage attention.")
+    enable_nd_tiling_workaround: Optional[bool] = Field(
+        None,
+        description=(
+            "Triton ND-tiling workaround (prefer_nd_tiling + max_tiles=3 + tile_reductions) "
+            "for Inductor's coalesce tiling bailing out under dynamic shapes. "
+            "Tri-state: None = auto (decided by the Pass's internal heuristics, if any); True/False = force. "
+            "See MagiInductorPass.__init__ for how this maps to the Pass's force_on flag."
+        ),
+    )
     enable_mm_epilogue_fusion: bool = Field(
         False,
         description=(
@@ -171,6 +180,10 @@ class CompileConfig(BaseSettings):
 
     model_config = SettingsConfigDict(
         env_prefix="MAGI_COMPILE_",
+        # Nested sub-configs (e.g. pass_config, offload_config) are reachable via
+        # ``MAGI_COMPILE_<SUBCONFIG>__<FIELD>`` env vars, e.g.
+        # ``MAGI_COMPILE_PASS_CONFIG__ENABLE_ND_TILING_WORKAROUND=1``.
+        env_nested_delimiter="__",
         populate_by_name=True,
         cli_parse_args=True,
         cli_ignore_unknown_args=True,
@@ -216,15 +229,6 @@ class CompileConfig(BaseSettings):
     enable_inductor_max_autotune: bool = Field(False, description="Enable Inductor max_autotune for kernel selection.")
     enable_inductor_coordinate_descent_tuning: bool = Field(
         False, description="Enable Inductor coordinate_descent_tuning for kernel selection."
-    )
-    enable_dynamic_nd_tiling: Optional[bool] = Field(
-        None,
-        description=(
-            "Triton ND-tiling workaround (prefer_nd_tiling + max_tiles=3 + tile_reductions) "
-            "for Inductor's coalesce tiling bailing out under dynamic shapes. "
-            "Tri-state: None = auto (on for dynamic shapes on PyTorch < 2.11.0); True/False = force. "
-            "Settable via the MAGI_COMPILE_ENABLE_DYNAMIC_ND_TILING env var."
-        ),
     )
     compile_sizes: list[int] = Field(
         default_factory=list,
