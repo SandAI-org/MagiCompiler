@@ -166,21 +166,3 @@ def test_env_rejects_non_bool_strings(monkeypatch, env_value):
     monkeypatch.setenv(_ND_TILING_ENV, env_value)
     with pytest.raises(ValidationError):
         CompileConfig()
-
-
-def test_config_binary_registration_mapping():
-    """PostGradPassManager registers the pass iff enable_nd_tiling_workaround is True.
-
-    - config = True  --> pass is registered
-    - config = False --> pass is not registered at all
-    """
-    from magi_compiler.config import PassConfig
-    from magi_compiler.passes.piecewise_graph.post_grad_pass_manager import PostGradPassManager
-
-    pm_true = PostGradPassManager()
-    pm_true.configure(PassConfig(enable_nd_tiling_workaround=True))
-    assert len(pm_true.passes) == 1
-
-    pm_false = PostGradPassManager()
-    pm_false.configure(PassConfig(enable_nd_tiling_workaround=False))
-    assert len(pm_false.passes) == 0

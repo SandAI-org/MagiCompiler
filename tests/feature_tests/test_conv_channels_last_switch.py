@@ -12,33 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Logic tests for the conv channels-last switch (``enable_conv_channels_last``).
+"""Decision-logic tests for ``ConvChannelsLastPass``.
 
-The switch is tri-state (``magi_compiler/config.py``):
+When applicable, the pass rewrites static, conv-heavy graphs (by inserting
+``aten.clone`` layout-changing nodes) to trigger channels-last convolutions.
+The binary ``enable_conv_channels_last`` config controls registration:
 
-  * ``True``  -> force on
-  * ``False`` -> force off
-  * ``None``  -> auto
+  * ``True`` (default) -> register the pass; its internal heuristics then decide:
+    apply iff static shapes AND conv-heavy.
+  * ``False`` -> pass not registered at all.
 
-Its behaviour is split across two layers:
-
-1. Registration (``PostGradPassManager.configure``):
-     - ``False``       -> the pass is **not** registered at all.
-     - ``True``/``None`` -> the pass is registered; ``force_on`` is set to
-       ``enable_conv_channels_last == True`` (i.e. only ``True`` forces on).
-
-2. Runtime decision (``ConvChannelsLastPass.__call__``):
-     - ``force_on=True``  -> rewrite unconditionally.
-     - ``force_on=False`` (auto) -> **skip** (``return False``) when the graph
-       ``is_dynamic`` OR is conv-sparse (``nnodes < 300 * nconv``); only a
-       *static, conv-dense* graph gets rewritten.
-
-The end-to-end speedup is validated separately in
-``tests/perf_tests/test_conv_channels_last_perf.py``.
-
-NOTE: ``__call__`` is wrapped by ``@emit_pass_lifecycle`` so its boolean return
-value is not a reliable "did it rewrite?" signal. We instead assert on whether
-``aten.clone`` (channels-last) nodes were inserted into the graph.
+These tests assert the registered pass's heuristic decision. The shared
+base-class utilities (``is_dynamic``, ``is_conv_heavy``, config
+snapshot/anti-leakage) are tested in ``test_magi_inductor_pass.py``; the
+end-to-end speedup in ``tests/perf_tests/test_conv_channels_last_perf.py``.
 """
 
 import pytest
@@ -47,18 +34,8 @@ import torch.fx as fx
 
 from magi_compiler.config import PassConfig
 from magi_compiler.passes.piecewise_graph.conv_channels_last import ConvChannelsLastPass
-from magi_compiler.passes.piecewise_graph.post_grad_pass_manager import PostGradPassManager
 
 aten = torch.ops.aten
-
-
-@pytest.fixture
-def fake_mode():
-    """A FakeTensorMode backed by a fresh ShapeEnv for symbolic shapes."""
-    from torch._subclasses.fake_tensor import FakeTensorMode
-    from torch.fx.experimental.symbolic_shapes import ShapeEnv
-
-    return FakeTensorMode(shape_env=ShapeEnv())
 
 
 def _build_conv_graph(fake_mode, *, dynamic: bool, n_conv: int = 1, n_filler: int = 0) -> fx.Graph:
@@ -106,80 +83,37 @@ def _num_channels_last_clones(graph: fx.Graph) -> int:
     return sum(1 for n in graph.nodes if n.op == "call_function" and n.target == aten.clone.default)
 
 
-def _run_pass(graph: fx.Graph, *, force_on: bool) -> int:
+def _run_pass(graph: fx.Graph) -> int:
     """Run the pass on ``graph`` and return how many channels-last clones it inserted."""
-    ConvChannelsLastPass(force_on=force_on)(graph)
+    ConvChannelsLastPass()(graph)
     return _num_channels_last_clones(graph)
 
 
-# ── Layer 1: registration + force_on tri-state ───────────────────────────
-
-
-@pytest.mark.parametrize(
-    "enable, expect_registered, expect_force_on",
-    [
-        (None, True, False),  # auto: registered, decides at runtime
-        (True, True, True),  # force on: registered, unconditional
-        (False, False, None),  # force off: not registered at all
-    ],
-)
-def test_registration_tri_state(enable, expect_registered, expect_force_on):
-    pm = PostGradPassManager()
-    pm.configure(PassConfig(enable_conv_channels_last=enable))
-
-    conv_passes = [p for p in pm.passes if isinstance(p, ConvChannelsLastPass)]
-    assert len(conv_passes) == (1 if expect_registered else 0)
-    if expect_registered:
-        assert conv_passes[0].force_on is expect_force_on
-
-
-# ── Layer 2: runtime decision in __call__ ────────────────────────────────
-
-
-def test_force_on_rewrites_even_dynamic(fake_mode):
-    """force_on=True applies channels-last regardless of dynamic/density."""
-    graph = _build_conv_graph(fake_mode, dynamic=True, n_conv=1, n_filler=0)
-    assert _run_pass(graph, force_on=True) > 0
-
-
-def test_force_on_rewrites_static(fake_mode):
-    """force_on=True applies channels-last on a static graph too."""
-    graph = _build_conv_graph(fake_mode, dynamic=False, n_conv=1, n_filler=0)
-    assert _run_pass(graph, force_on=True) > 0
+@pytest.mark.parametrize("value", [True, False])
+def test_config_field_binary(value):
+    """enable_conv_channels_last accepts True/False (default True covered in test_magi_inductor_pass)."""
+    assert PassConfig(enable_conv_channels_last=value).enable_conv_channels_last is value
 
 
 def test_auto_skips_dynamic(fake_mode):
     """auto: a dynamic graph is skipped (no clones inserted)."""
-    graph = _build_conv_graph(fake_mode, dynamic=True, n_conv=1, n_filler=320)
-    assert _run_pass(graph, force_on=False) == 0
+    graph = _build_conv_graph(fake_mode, dynamic=True, n_conv=1, n_filler=0)
+    assert _run_pass(graph) == 0
 
 
 def test_auto_skips_static_conv_sparse(fake_mode):
-    """auto: a static but conv-sparse graph (nnodes < 300 * nconv) is skipped."""
+    """auto: a static but conv-sparse graph (nnodes >= 300 * nconv, i.e. not is_conv_heavy) is skipped."""
+    graph = _build_conv_graph(fake_mode, dynamic=False, n_conv=1, n_filler=320)
+    assert _run_pass(graph) == 0
+
+
+def test_auto_rewrites_static_conv_heavy(fake_mode):
+    """auto: a static, conv-heavy graph (nnodes < 300 * nconv, i.e. is_conv_heavy) gets rewritten."""
     graph = _build_conv_graph(fake_mode, dynamic=False, n_conv=1, n_filler=0)
-    assert _run_pass(graph, force_on=False) == 0
+    assert _run_pass(graph) > 0
 
 
-def test_auto_rewrites_static_conv_dense(fake_mode):
-    """auto: a static, conv-dense graph (nnodes >= 300 * nconv) gets rewritten."""
-    graph = _build_conv_graph(fake_mode, dynamic=False, n_conv=1, n_filler=320)
-    assert _run_pass(graph, force_on=False) > 0
-
-
-def test_auto_skips_dynamic_conv_dense(fake_mode):
-    """auto: dynamic dominates -- even a conv-dense dynamic graph is skipped."""
-    graph = _build_conv_graph(fake_mode, dynamic=True, n_conv=1, n_filler=320)
-    assert _run_pass(graph, force_on=False) == 0
-
-
-# ── End-to-end through the pass manager (registration + run) ─────────────
-
-
-def test_force_off_pass_manager_makes_no_change(fake_mode):
-    """enable=False: pass not registered, so the manager never touches conv layout."""
-    pm = PostGradPassManager()
-    pm.configure(PassConfig(enable_conv_channels_last=False))
-    graph = _build_conv_graph(fake_mode, dynamic=False, n_conv=1, n_filler=320)
-    for pass_ in [p for p in pm.passes if isinstance(p, ConvChannelsLastPass)]:
-        pass_(graph)
-    assert _num_channels_last_clones(graph) == 0
+def test_auto_skips_dynamic_conv_heavy(fake_mode):
+    """auto: dynamic dominates -- even a conv-heavy dynamic graph is skipped."""
+    graph = _build_conv_graph(fake_mode, dynamic=True, n_conv=1, n_filler=0)
+    assert _run_pass(graph) == 0

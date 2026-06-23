@@ -17,26 +17,30 @@
 Forces channels-last (NHWC for 4D, NDHWC for 5D) at every ``aten.convolution``
 boundary by graph rewriting only -- no patching of PyTorch internals.
 
-Mechanism: insert ``aten.clone(memory_format=channels_last(_3d))`` before each
-conv input/weight and set the clone's ``meta["val"]`` to a channels-last
-FakeTensor. The clone *lowering* ignores ``memory_format`` (a TODO in
-``lowering.py``), so the channels-last signal lives purely in the FX meta
-strides. With ``layout_optimization=False`` (set by this pass), the
-pre-registered ``constrain_conv_to_fx_strides`` reads those conv-input FX meta
-strides -- now channels-last -- and applies ``require_stride_order`` at the conv
-boundary. The clone lowers to a FlexibleLayout Pointwise, so that freeze is
-zero-cost (the buffer is allocated channels-last directly, no extra copy) and
-``conv_layout()`` then infers a channels-last output.
+Mechanism Under the Hood:
+1. **FX-Meta Stride Injection**: The pass inserts ``aten.clone`` nodes before
+   each conv input/weight and manually configures their ``node.meta["val"]``
+   to carry channels-last FakeTensors. Because Inductor's clone lowering
+   ignores ``memory_format`` (a known PyTorch upstream TODO), the channels-last
+   signal is carried purely within the FX meta strides.
+2. **Inductor Constraint Co-design**: With ``layout_optimization=False`` set
+   by this pass, Inductor's pre-registered ``constrain_conv_to_fx_strides``
+   (in ``torch/_inductor/kernel/conv.py``) fires. It reads our modified FX input
+   meta strides and triggers ``require_stride_order`` at the conv boundary.
+3. **Zero-Cost Strided Allocation**: The clone lowers to a Pointwise kernel
+   with ``FlexibleLayout``. Consequently, the ``require_stride_order`` constraint
+   is zero-cost: the upstream buffer is allocated directly in channels-last
+   layout without generating an extra transpose copy kernel.
+4. **cuDNN Memory-Format Probe**: With channels-last inputs safely matching
+   stride constraints, ``conv_layout()`` naturally infers a channels-last
+   cuDNN output ``FixedLayout``.
 
-In auto mode the pass only fires on static, conv-dense graphs; dynamic-shape
-graphs are skipped. ``force_on=True`` applies it unconditionally.
+The pass only fires on static, conv-heavy graphs; dynamic-shape or conv-sparse
+graphs are skipped (their channels-last transpose tiles badly / gains little).
 """
-
-from collections import Counter
 
 import torch
 from torch import fx
-from torch.fx.experimental.symbolic_shapes import has_free_symbols
 
 from ...magi_depyf.timeline import emit_pass_lifecycle
 from ...utils import magi_logger
@@ -55,48 +59,26 @@ _HOISTABLE_OPS = (aten.constant_pad_nd.default,)
 
 
 class ConvChannelsLastPass(MagiInductorPass):
-    """
-    Make conv2d/conv3d inputs channels-last on the post-grad ATen graph.
+    """Make conv2d/conv3d inputs channels-last on the post-grad ATen graph.
 
-    For every ``aten.convolution`` node, clone x and weight with their FX
-    ``meta["val"]`` set channels-last (the clone lowering itself ignores
-    ``memory_format``). With layout_optimization=False,
-    ``constrain_conv_to_fx_strides`` reads those meta strides and enforces
-    channels-last at the conv boundary, and ``conv_layout`` infers a
-    channels-last output.
-
-    If the conv input comes from a single-consumer layout-transparent op
-    (``constant_pad_nd``), the clone is hoisted above it and its FX meta
-    rewritten to channels-last, so the pad kernel stays coalesced instead of
-    becoming an NC(D)HW->N(D)HWC transpose (which Inductor tiles badly under
-    dynamic shapes).
+    If the conv input comes from a single-consumer, layout-transparent op
+    (e.g., ``constant_pad_nd``), the clone is hoisted above it and its meta
+    rewritten to channels-last. This keeps the pad kernel coalesced instead of
+    triggering an extra memory-bound NC(D)HW -> N(D)HWC transpose.
     """
 
-    def __init__(self, force_on: bool = False):
-        # force_on=True (config enable_conv_channels_last is True) applies the
-        # rewrite unconditionally; force_on=False (auto / None) lets __call__
-        # decide from the graph (static + conv-dense graphs only).
-        self.force_on = force_on
+    inductor_config_keys_potentially_mutated_by_this_pass = ("layout_optimization",)
 
     @emit_pass_lifecycle
     def __call__(self, graph: fx.Graph) -> bool:
-        if not self.force_on:
-            # Decide dynamic-ness from the graph's own placeholders: a graph is
-            # dynamic if any placeholder's fake/example value carries free symbols.
-            placeholder_vals = (n.meta.get("val", n.meta.get("example_value")) for n in graph.nodes if n.op == "placeholder")
-            is_dynamic = any(v is not None and has_free_symbols(v) for v in placeholder_vals)
-
-            # Count number of nodes
-            nnodes = len(list(graph.nodes))
-            conv_nodes = [n for n in graph.nodes if n.target == torch.ops.aten.convolution.default]
-            nconv = len(conv_nodes)
-            Counter(n.args[1].meta["val"].dim() - 2 for n in conv_nodes)
-            # dim_counts[1] / dim_counts[2] / dim_counts[3] means number of conv1d/2d/3d
-
-            # TODO: If tiling optimization is upgraded to support conv layout opt
-            # under dynamic shapes, we can remove `is_dynamic` check.
-            if is_dynamic or nnodes < 300 * nconv:
-                return False
+        # Only rewrite static, conv-heavy graphs. Channels-last inserts an
+        # NC(D)HW->N(D)HWC transpose; under dynamic shapes Inductor tiles it
+        # badly, and on conv-sparse graphs the few cuDNN channels-last kernels
+        # don't pay for the extra copies.
+        # TODO: If tiling optimization is upgraded to support conv layout opt
+        # under dynamic shapes, we can remove the ``is_dynamic`` check.
+        if self.is_dynamic(graph) or not self.is_conv_heavy(graph):
+            return False
 
         torch._inductor.config.layout_optimization = False
 
