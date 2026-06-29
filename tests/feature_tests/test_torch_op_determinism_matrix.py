@@ -262,17 +262,15 @@ class TestTorchDeterministicContract:
 
     @pytest.mark.parametrize("name,category,builder", CASES, ids=_IDS)
     def test_flag_on_is_deterministic_or_refuses(self, name, category, builder):
-        # Step 1: strict mode. Either the op runs (and must be bitwise identical),
-        # or it has no deterministic implementation and RAISES.
+        # Strict mode: the op either runs (and must be bitwise identical) or has
+        # no deterministic implementation and RAISES.
         try:
             with torch_deterministic(True):
                 outs = run_collect(builder)
         except RuntimeError as e:
-            # No deterministic implementation. The loud refusal is the safe
-            # contract -- BUT we must NOT stop here: the user still wants to know
-            # whether this op is reproducible run-to-run when the switch falls
-            # back to its nondeterministic kernel. So re-run it in warn_only mode
-            # and MEASURE reproducibility (report-only: it may legitimately drift).
+            # No deterministic implementation: the raise is the safe contract.
+            # Re-run in warn_only mode to measure run-to-run reproducibility of
+            # the fallback kernel (report-only: it may legitimately drift).
             with torch_deterministic(True, warn_only=True):
                 fb = run_collect(builder)
             reproducible = all_bitwise_identical(fb)
