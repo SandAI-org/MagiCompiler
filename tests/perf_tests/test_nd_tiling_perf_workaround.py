@@ -16,8 +16,8 @@
 
 Background
 ----------
-On PyTorch < 2.11.0, Inductor's coalesce tiling analysis bails out on symbolic
-numels (``tiling_utils.extract_normalized_read_writes`` returns ``None``), so
+Inductor's coalesce tiling analysis can bail out on symbolic numels
+(``tiling_utils.extract_normalized_read_writes`` returns ``None``), so
 transpose/permute/channels-last pointwise kernels in a dynamic-shape graph
 degrade to untiled Grid1D. ``ND_TilingWorkaroundPass`` works around this by
 enabling ``triton.prefer_nd_tiling`` (+ ``max_tiles=3`` + ``tile_reductions``)
