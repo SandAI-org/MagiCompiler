@@ -34,6 +34,12 @@ from magi_compiler.config import CompileConfig, CompileMode, CudaGraphMode, indu
 from magi_compiler.magi_depyf.timeline import observe_lifecycle, observe_lifecycle_context
 from magi_compiler.offload.offload_warpper import OffloadWrapper
 from magi_compiler.passes import CustomJointGraphPartitionFn, FullGraphPassManager, PostGradPassManager, pass_context
+from magi_compiler.passes.graph_split import (
+    apply_fsdp_collective_prefetch,
+    bucket_weight_all_gather_coalesced_per_submod,
+    bucket_weight_all_gather_per_submod,
+    lower_prim_redistribute_to_collectives,
+)
 from magi_compiler.utils import compilation_counter, compute_code_hash, compute_hash, magi_logger
 from magi_compiler.utils.visualize import save_fx_graph_visualization
 
@@ -542,6 +548,22 @@ class MagiBackend:
         self.local_magi_cache_path.mkdir(parents=True, exist_ok=True)
         self.compiler_manager.initialize_cache(self.local_magi_cache_path)
 
+    def _enable_inductor_comm_reorder(self) -> None:
+        """Turn on Inductor's comm/compute overlap reorder for piecewise submods.
+
+        ``raise_comms`` hoists each submod's collective launches to the top of
+        the generated code (Inductor otherwise sinks a collective whose result
+        is only a graph output to just before ``return``, defeating prefetch);
+        ``sink_waits`` pushes each ``wait_tensor`` down to just before its first
+        use.  Together they let a weight all-gather overlap the compute that runs
+        before its consumer.  Inductor's default is
+        ``reorder_for_compute_comm_overlap=False``.
+        """
+        self.inductor_compile_config.setdefault("reorder_for_compute_comm_overlap", True)
+        self.inductor_compile_config.setdefault(
+            "reorder_for_compute_comm_overlap_passes", ["raise_comms", "sink_waits"]
+        )
+
     @observe_lifecycle("graph_split")
     def _split_graph(self, graph: fx.GraphModule) -> tuple[fx.GraphModule, list[SplitItem]]:
         # Step 1: resolve the splitting ops
@@ -549,6 +571,17 @@ class MagiBackend:
         resolved_ops: list[torch._ops.OpOverload] = resolve_defined_ops(fx_split_ops)
         magi_logger.info(f"Setting up FX-level graph split with ops: {fx_split_ops=}")
         magi_logger.info(f"Resolved splitting ops for FX-level graph split: {resolved_ops=}")
+
+        # Step 1.5: optionally lower SimpleFSDP weight DTensor prim_redistribute/
+        # prim_to_local into explicit all_gather_into_tensor + wait_tensor nodes.
+        # Must run BEFORE Step 2 builds node_to_subgraph_id (it mutates the graph).
+        # This is what makes the 'collective' prefetch pass fire on the real gaga4
+        # graph (which otherwise only contains opaque prim_redistribute) and lets
+        # the launch be moved across the MoE boundary while the wait stays put.
+        if self.compile_config.fsdp_lower_redistribute_to_collectives:
+            if self.compile_config.cudagraph_mode != CudaGraphMode.NONE:
+                raise ValueError("FSDP redistribute lowering currently requires cudagraph_mode=NONE")
+            lower_prim_redistribute_to_collectives(graph)
 
         # Step 2: split graph by ops, we split graph based on resolved_ops, which becomes the partitioned single graph.
         subgraph_id = 0
@@ -568,6 +601,75 @@ class MagiBackend:
                 subgraph_id += 1
             else:
                 node_to_subgraph_id[node] = subgraph_id
+
+        # Step 2.4: coalesce each submod's lowered weight all-gathers into one
+        # all_gather_into_tensor_coalesced per (submod, group, dtype) -- fewer
+        # launched NCCL kernels.  Must run after node_to_subgraph_id is built and
+        # BEFORE the prefetch pass (so prefetch sees one coalesced launch/submod).
+        if self.compile_config.fsdp_bucket_weight_all_gather:
+            if self.compile_config.cudagraph_mode != CudaGraphMode.NONE:
+                raise ValueError("FSDP all-gather bucketing currently requires cudagraph_mode=NONE")
+            bucket_mode = self.compile_config.fsdp_bucket_mode
+            if bucket_mode == "concat":
+                n_buckets = bucket_weight_all_gather_per_submod(graph, node_to_subgraph_id)
+            elif bucket_mode == "coalesced":
+                n_buckets = bucket_weight_all_gather_coalesced_per_submod(graph, node_to_subgraph_id)
+            else:
+                raise ValueError(
+                    f"Unknown fsdp_bucket_mode={bucket_mode!r}; expected 'concat' or 'coalesced'"
+                )
+            magi_logger.info("FSDP all-gather bucketing (%s) created %d buckets", bucket_mode, n_buckets)
+
+        # Step 2.5: SimpleFSDP weight all-gather prefetch at submod granularity.
+        # Goal: launch a submod's weight all-gather during the *previous* submod's
+        # compute and only wait on it right before the weight is used, so the NCCL
+        # all-gather overlaps compute.
+        #
+        # 'collective' mode (default) operates on the explicit
+        # _c10d_functional.all_gather_into_tensor / wait_tensor nodes and moves
+        # ONLY the launch to the previous submod, leaving the wait at the use
+        # site.  This is what actually produces overlap.  'redistribute' mode is
+        # the legacy pass that moves the opaque DTensor prim_redistribute node;
+        # it is kept for reference but does NOT separate launch from wait (Inductor
+        # lowers a single prim_redistribute into both the all_gather and its wait).
+        if self.compile_config.enable_fsdp_all_gather_prefetch:
+            if self.compile_config.cudagraph_mode != CudaGraphMode.NONE:
+                raise ValueError("FSDP all-gather prefetch currently requires cudagraph_mode=NONE")
+            distance = self.compile_config.fsdp_all_gather_prefetch_distance
+            if self.compile_config.fsdp_prefetch_mode == "collective":
+                moved = apply_fsdp_collective_prefetch(graph, node_to_subgraph_id, distance=distance)
+                magi_logger.info(
+                    "FSDP collective prefetch moved %d all_gather_into_tensor launches by distance=%d",
+                    moved,
+                    distance,
+                )
+                # The prefetch pass puts each hoisted all_gather at the FRONT of
+                # the previous submod's FX graph, but Inductor's per-submod
+                # scheduler re-sinks a collective that has no consumer inside the
+                # submod (its result is only a graph output) back to just before
+                # `return` -- so at runtime the launch is issued AFTER the
+                # submod's compute and cannot overlap.  Enabling Inductor's
+                # comm/compute reorder with `raise_comms` hoists the launch back
+                # to the top of the generated code so it actually runs
+                # concurrently with this submod's compute on the NCCL stream.
+                if moved:
+                    self._enable_inductor_comm_reorder()
+            else:
+                raise ValueError(
+                    f"Unknown fsdp_prefetch_mode={self.compile_config.fsdp_prefetch_mode!r}; "
+                    "expected 'collective' or 'redistribute'"
+                )
+
+        # Standalone Inductor comm/compute overlap reorder.  Unlike the FX
+        # prefetch pass (which only fires when the pre-split graph has explicit
+        # all_gather_into_tensor nodes), this operates on the lowered collectives
+        # inside every submod, so it produces overlap on the real gaga4 SimpleFSDP
+        # graph (whose pre-split form is opaque DTensor prim_redistribute).
+        if self.compile_config.enable_inductor_comm_reorder:
+            if self.compile_config.cudagraph_mode != CudaGraphMode.NONE:
+                raise ValueError("Inductor comm reorder currently requires cudagraph_mode=NONE")
+            self._enable_inductor_comm_reorder()
+            magi_logger.info("Enabled Inductor comm/compute overlap reorder (raise_comms + sink_waits)")
 
         # Step 3: split the graph based on node_to_subgraph_id
         # pytorch might reorder the nodes and the semantics of the graph will change when we have mutations in the graph, if we don't set keep_original_order=True
@@ -593,7 +695,7 @@ class MagiBackend:
 
         # Step 5: visualize the split graph
         if envs.MAGI_ENABLE_FX_GRAPH_VIZ:
-            save_fx_graph_visualization(split_gm.graph, sub_dir="after_split", filename="split_gm_root")
+            # save_fx_graph_visualization(split_gm.graph, sub_dir="after_split", filename="split_gm_root")
             for item in piecewise_graphs:
                 save_fx_graph_visualization(item.graph.graph, sub_dir="after_split", filename=item.submod_name)
 

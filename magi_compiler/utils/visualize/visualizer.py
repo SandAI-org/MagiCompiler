@@ -70,6 +70,27 @@ def build_node_to_code_map(graph: torch.fx.Graph) -> Dict[torch.fx.Node, str]:
     return node_to_code
 
 
+# Graphviz aborts with a "syntax error ... missing endquote? longer than 16384?"
+# when any single quoted string (i.e. a node label) exceeds 16384 characters.
+# Keep labels comfortably below that ceiling.
+_MAX_LABEL_LEN = 8000
+
+
+def _sanitize_label(text: str) -> str:
+    # Graphviz treats backslashes as escapes inside quoted strings. A literal
+    # backslash in a target/meta repr (or one left at the end of a truncated
+    # string) can escape the closing quote and produce
+    # "syntax error in line N". Replace backslashes so the label is inert.
+    return text.replace("\\", "/")
+
+
+def _truncate_label(text: str) -> str:
+    if len(text) <= _MAX_LABEL_LEN:
+        return text
+    omitted = len(text) - _MAX_LABEL_LEN
+    return text[:_MAX_LABEL_LEN] + f"\n...[truncated {omitted} chars]"
+
+
 def extract_fx_graph_structure(graph: torch.fx.Graph, simple_desc: bool = False) -> Tuple[List[Dict], List[Dict]]:
     import textwrap
 
@@ -107,6 +128,7 @@ def extract_fx_graph_structure(graph: torch.fx.Graph, simple_desc: bool = False)
         node_label = f"Op: {node.op}\nTarget: {target_str}\nName: {name_str}\nMeta: {meta_str}\nCode: {node_code}"
         if simple_desc:
             node_label = f"Op: {node.op}\nTarget: {target_str}\nName: {name_str}"
+        node_label = _truncate_label(_sanitize_label(node_label))
 
         nodes.append({"id": node.name, "style": style_info, "node_label": node_label})
 
@@ -223,7 +245,12 @@ def save_fx_graph_visualization(graph: torch.fx.Graph, sub_dir: str = "", filena
 
     file_path = get_fx_graph_path(sub_dir=sub_dir, filename=filename)
 
-    nodes, edges = extract_fx_graph_structure(graph, simple_desc=simple_desc)
-    dot = create_fx_graph_dot(nodes, edges)
-    dot.render(filename=file_path, view=False, cleanup=True)
-    magi_logger.info("FX graph visualization saved to: %s.pdf", file_path)
+    # Visualization is purely diagnostic; never let a render failure abort
+    # compilation/inference.
+    try:
+        nodes, edges = extract_fx_graph_structure(graph, simple_desc=simple_desc)
+        dot = create_fx_graph_dot(nodes, edges)
+        dot.render(filename=file_path, view=False, cleanup=True)
+        magi_logger.info("FX graph visualization saved to: %s.pdf", file_path)
+    except Exception as e:
+        magi_logger.warning("Skipping FX graph visualization (%s): %s", file_path, e)
