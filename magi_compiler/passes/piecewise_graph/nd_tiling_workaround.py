@@ -16,7 +16,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
-from torch.torch_version import TorchVersion
 
 from ...magi_depyf.timeline import emit_pass_lifecycle
 from ..pass_base import MagiInductorPass
@@ -29,19 +28,14 @@ class ND_TilingWorkaroundPass(MagiInductorPass):
         "triton.tile_reductions",
     )
 
-    def __init__(self):
-        super().__init__()
-        self.is_target_torch_version = TorchVersion(torch.__version__) < (2, 11, 0)
-
     @emit_pass_lifecycle
     def __call__(self, graph: torch.fx.Graph):
-        if not self.is_target_torch_version or not self.is_dynamic(graph) or not self.is_conv_heavy(graph):
+        if not self.is_dynamic(graph) or not self.is_conv_heavy(graph):
             return False
 
-        # On PyTorch < 2.11.0, Inductor's coalesce tiling analysis bails out on
-        # symbolic numels, so dynamic-shape transpose/permute/channels-last kernels
-        # degrade to untiled Grid1D. Forcing prefer_nd_tiling restores ND tiling
-        # (WAN 2.2 VAE 540p decode: ~1.45x).
+        # Inductor's coalesce tiling analysis bails out on symbolic numels, so
+        # dynamic-shape transpose/permute/channels-last kernels degrade to untiled Grid1D.
+        # Forcing prefer_nd_tiling restores ND tiling.
         torch._inductor.config.triton.prefer_nd_tiling = True
         torch._inductor.config.triton.max_tiles = 3
         torch._inductor.config.triton.tile_reductions = True

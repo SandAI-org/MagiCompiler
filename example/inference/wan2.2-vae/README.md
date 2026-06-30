@@ -4,39 +4,36 @@ This example uses WAN 2.2 VAE encode/decode as a representative convolution-heav
 
 ## Background
 
-Many generative models contain convolution-heavy submodules, such as video VAEs, image/video decoders, and feature encoders. This example focuses on two common performance issues in PyTorch Inductor generated code:
+Many generative models contain convolution-heavy submodules, such as video VAEs, image/video decoders, and feature encoders. After compilation, these models are usually not executed as convolution kernels alone. The generated workload is commonly a mix of:
 
-1. **Convolution layout overhead**: cuDNN channels-last kernels, such as NHWC/NDHWC, are usually faster on Ampere and newer GPUs. If the compiler does not preserve that layout across convolution boundaries, cuDNN can pay repeated internal NC(D)HW to NHWC/NDHWC conversions.
+- cuDNN convolution kernels for the main convolution computation.
+- Triton fused kernels for memory-heavy operations around convolutions, such as layout changes, reshape, transpose, permute, clone, and elementwise producers.
 
-2. **Dynamic-shape memory-kernel tiling overhead**: with dynamic H/W dimensions, the more severe bottleneck often shifts to Inductor's fused Triton kernels for memory-heavy operations around convolutions, such as transpose, permute, reshape, clone, and elementwise layout producers. Symbolic dimensions can make tiling analysis fall back to conservative 1D schedules, leaving these structured memory-operation kernels under-tiled.
+For this reason, the main bottleneck of a conv-heavy model can change between static-shape and dynamic-shape inference. Static graphs are often limited by repeated cuDNN internal layout conversions, while graphs with dynamic dimensions can become dominated by under-tiled Triton fused memory kernels.
 
 WAN 2.2 VAE is used here as a representative benchmark because its encode/decode paths contain stacked 3D convolutions, residual blocks, temporal up/down-sampling, and spatial resampling.
 
 ## Optimization Principles
 
-MagiCompiler applies post-grad Inductor graph passes for these two cases.
+MagiCompiler optimizes these two cases differently according to where the runtime cost comes from.
 
 ### Static Conv-Heavy Graphs: Channels-Last Layout
 
-`ConvChannelsLastPass` handles static conv-heavy graphs by taking ownership of convolution layout in FX metadata.
+For static shapes, Inductor can usually optimize the surrounding Triton fused memory kernels well because the tensor sizes are known at compile time. In this case, a major remaining cost often comes from repeated layout conversions inside cuDNN convolution calls.
 
-The inserted `aten.clone(memory_format=channels_last)` or `aten.clone(memory_format=channels_last_3d)` is a metadata carrier, not a copy kernel that should survive in the final stream. It lets the pass attach channels-last fake-tensor strides to convolution input and weight nodes.
+cuDNN commonly prefers channels-last layouts, such as NHWC or NDHWC, on Ampere and newer GPUs. If upstream graph nodes produce NC(D)HW tensors, cuDNN may need to convert the input layout internally before running convolution kernels.
 
-Inductor's `aten.convolution` lowering already reads input FX meta strides and applies `require_stride_order` to the producer buffers. After the pass rewrites those meta strides to channels-last, Inductor freezes the producer layout as NHWC/NDHWC before cuDNN sees the convolution.
+MagiCompiler addresses this by arranging channels-last layout on the producer side of the graph. This lets convolution inputs reach cuDNN in the preferred layout, so multiple downstream convolutions can reuse that layout instead of paying repeated internal conversion overhead.
 
-Because the clone lowers as `Pointwise` with `FlexibleLayout`, the stride constraint is normally zero-copy: the producer buffer is allocated directly in channels-last layout instead of emitting an extra clone kernel. With a channels-last input, cuDNN's backend memory-format probe also lets `conv_layout()` infer a channels-last output layout.
+### Dynamic-Shape Graphs: Triton ND-Tiling Workaround
 
-### Dynamic H/W Graphs: Triton ND-Tiling Workaround
+For graphs with dynamic dimensions, the bottleneck often shifts. Symbolic dimensions make it harder for the compiler to choose aggressive multi-dimensional tiling at compile time, so some structured memory operations around convolutions can fall back to more conservative 1D-style schedules.
 
-`ND_TilingWorkaroundPass` targets dynamic H/W graphs where Inductor emits fused Triton kernels for dense memory operations around convolutions.
+In this regime, Triton fused kernels for reshape, transpose, permute, clone, and elementwise layout producers can become a large part of total runtime. Simply moving layout conversions outside cuDNN may increase pressure on these memory-heavy kernels, so the first priority is to improve their tiling behavior.
 
-The goal is to keep these kernels tiled along their natural multi-dimensional structure instead of flattening them into conservative Grid1D-style schedules. The pass enables:
+MagiCompiler addresses this by preserving ND tiling for the memory-heavy kernels around convolutions. This lets reshape, transpose, permute, clone, and elementwise producers execute closer to their natural multi-dimensional tensor structure instead of paying the cost of conservative 1D-style schedules.
 
-- `prefer_nd_tiling=True`
-- `max_tiles=3`
-- `tile_reductions=True`
-
-The pass is guarded so it only applies when the graph is both dynamic and conv-heavy. In this regime, improving Inductor-generated memory-kernel tiling is often more important than further reducing cuDNN layout conversions.
+This optimization is only applied to dynamic conv-heavy graphs, where improving Triton fused memory kernels is often more important than further reducing cuDNN layout conversion overhead.
 
 > This workaround is a targeted fix for the current dynamic-shape behavior. A more general heuristic tiling strategy for these Inductor-generated memory kernels will be added in future work.
 
