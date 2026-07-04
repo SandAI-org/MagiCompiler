@@ -1,0 +1,67 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2025-2026, SandAI
+# This file is distributed under the same license as the MagiCompiler
+# package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2026.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: MagiCompiler \n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-07-04 11:20+0000\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language: zh_CN\n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Generated-By: Babel 2.18.0\n"
+
+#: ../../source/user_guide/install.md:1
+msgid "Installation"
+msgstr ""
+
+#: ../../source/user_guide/install.md:7
+msgid "Requirements"
+msgstr ""
+
+#: ../../source/user_guide/install.md:9
+msgid "Python >= 3.12"
+msgstr ""
+
+#: ../../source/user_guide/install.md:10
+msgid "PyTorch >= 2.9"
+msgstr ""
+
+#: ../../source/user_guide/install.md:11
+msgid "CUDA Toolkit"
+msgstr ""
+
+#: ../../source/user_guide/install.md:14
+msgid ""
+"For reproducibility, we recommend starting from the prebuilt Docker image"
+" first, then running examples inside the container."
+msgstr ""
+
+#: ../../source/user_guide/install.md:18
+msgid "Option A (recommended) — Prebuilt Docker Image"
+msgstr ""
+
+#: ../../source/user_guide/install.md:32
+msgid "Option B — Local Source Installation"
+msgstr ""
+
+#: ../../source/user_guide/install.md:50
+msgid "Optional — Install CUTLASS for matmul epilogue fusion"
+msgstr ""
+
+#: ../../source/user_guide/install.md:52
+msgid ""
+"Required for the CUTLASS-based matmul + epilogue fusion pass (`sm_90` / "
+"`sm_120`). Without CUTLASS the compiler still works but skips this "
+"optimization."
+msgstr ""
+

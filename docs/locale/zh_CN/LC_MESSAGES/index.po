@@ -1,0 +1,53 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2025-2026, SandAI
+# This file is distributed under the same license as the MagiCompiler
+# package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2026.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: MagiCompiler \n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-07-04 11:20+0000\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language: zh_CN\n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Generated-By: Babel 2.18.0\n"
+
+#: ../../source/index.md:13
+msgid "Contents"
+msgstr ""
+
+#: ../../source/index.md:4
+msgid "MagiCompiler documentation"
+msgstr ""
+
+#: ../../source/index.md:7
+msgid "**Overview :**"
+msgstr ""
+
+#: ../../source/index.md:9
+msgid ""
+"MagiCompiler is an advanced compiler and runtime augmentation framework "
+"built on top of `torch.compile`. Designed for large-scale Transformer-"
+"like architectures, it moves beyond traditional local operator "
+"optimization and introduces system-level optimizations—whole-graph "
+"capture, FSDP-aware layer-wise compilation, asynchronous offloading, and "
+"heuristic activation recomputation—to seamlessly accelerate both "
+"**training** and **multi-modality inference** with minimal code "
+"intrusion."
+msgstr ""
+
+#: ../../source/index.md:11
+msgid ""
+"We are committed to continually improving the performance and generality "
+"of MagiCompiler for the broader research community. Stay tuned for "
+"exciting enhancements and new features on the horizon!"
+msgstr ""
+

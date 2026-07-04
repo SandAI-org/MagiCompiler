@@ -1,0 +1,338 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2025-2026, SandAI
+# This file is distributed under the same license as the MagiCompiler
+# package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2026.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: MagiCompiler \n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-07-04 11:20+0000\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language: zh_CN\n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Generated-By: Babel 2.18.0\n"
+
+#: ../../source/blog/auto_cuda_graph_design.md:9
+msgid "AutoCudaGraph Design"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:11
+msgid "Overview"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:12
+msgid ""
+"AutoCudaGraph is a CUDA Graph optimization module integrated into the "
+"MagiCompiler framework, designed to automate CUDA Graph capture, caching,"
+" replay, and tensor memory management for PyTorch-based neural network "
+"inference. It targets Transformer architectures with dynamic sequence "
+"lengths, optimizing kernel execution by reusing pre-captured computation "
+"graphs and static tensor buffers. Core Goals:"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:13
+msgid ""
+"Automate CUDA Graph lifecycle (capture/replay/cache) with minimal code "
+"intrusion"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:14
+msgid "Support dynamic shape adaptation (sequence length expansion)"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:15
+msgid "Optimize memory efficiency via global memory pool and static tensor reuse"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:16
+msgid "Ensure consistency between cached graphs and runtime inputs/outputs"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:18
+msgid "Key Components"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:20
+msgid "CudaGraphMgr (Core Manager)"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:21
+msgid "Singleton class managing all CUDA Graph operations:"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:29
+msgid "**Core Methods**"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md
+msgid "Method"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md
+msgid "Purpose"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md
+msgid "run()"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md
+msgid "Main entry: Replay cached graph or warm up & capture new graph"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md
+msgid "wrapped_graph_capture()"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md
+msgid "Capture CUDA Graph with sliced static input/output tensors"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md
+msgid "wrapped_graph_replay()"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md
+msgid ""
+"Replay cached CUDA Graph with sliced static tensors and output template "
+"wrapping"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md
+msgid "get_expanded_static_tensors()"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md
+msgid "Expand static tensors, reuse buffers if dimensionally compatible"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:37
+msgid "Signature System"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:39
+msgid "StaticSignature"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:46
+msgid "Encodes fixed properties of input tensors (dtype, static dimensions)"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:47
+msgid "Used as primary key for static tensor buffer caching"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:49
+msgid "DynamicSignature"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:56
+msgid "Tracks dynamic dimensions (sequence length) and literal parameters"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:57
+msgid "Secondary key for graph entry lookup"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:59
+msgid "Tensor Management"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:67
+msgid ""
+"Memory Reuse: Reuse existing tensor buffers when possible to avoid "
+"reallocation"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:68
+msgid ""
+"Dynamic Expansion: Only expand static tensors when new input dimensions "
+"exceed current buffer size"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:69
+msgid ""
+"Shape Validation: Ensure static dimensions (non-sequence) match between "
+"cached and new tensors"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:71
+msgid "Graph Management"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:84
+msgid ""
+"Graph State Tracking: GraphEntry tracks CUDA Graph instances and validity"
+" states to control replay eligibility."
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:85
+msgid ""
+"Layer-wise Organization: OutputTemplateEntry maps dynamic signatures to "
+"per-layer GraphEntry for layer-specific graph reuse."
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:86
+msgid ""
+"Output Consistency: output_template preserves output object structure to "
+"ensure consistent result wrapping during replay."
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:88
+msgid "Execution Flow"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:89
+msgid "Inline Replay (Fast Path)"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:90
+msgid "Extract input signatures from runtime arguments"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:91
+msgid ""
+"Look up cached CUDA Graph via StaticSignature + DynamicSignature + layer "
+"number"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:92
+msgid "Validate graph consistency (not inconsistent/invalid)"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:93
+msgid "Reuse static tensors with dynamic slicing"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:94
+msgid "Replay graph and return sliced output"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:95
+msgid "Graph Capture (Slow Path)"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:96
+msgid "Triggered when no valid cached graph exists or tensor expansion is needed:"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:97
+msgid "Execute function to get output tensors"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:98
+msgid "Ensure input signatures match post-warmup"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:99
+msgid "Expand static buffers if new shapes require it"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:100
+msgid "Capture new CUDA Graph with static tensors"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:101
+msgid "Store new graph and update tensor entries"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:102
+msgid "Return warmup execution output as final result"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:103
+msgid "Sequence Length Handling"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:104
+msgid "Only last dimension is static for ND tensors (ND > 1)"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:105
+msgid "All dimension is dynamic for 1D tensors (ND=1)"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:106
+msgid "Automatic buffer expansion for increasing sequence lengths"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:107
+msgid "Invalidates old graphs when tensors are expanded"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:109
+msgid "Examples"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:154
+msgid "Limitations and Constraints"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:155
+msgid "No support for data-dependent control flow in captured functions"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:156
+msgid "Graph capture fails if function contains CPU/GPU synchronization"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:157
+msgid "Only supports CUDA tensors (CPU tensors trigger fallback)"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:158
+msgid "Custom input classes must inherit from InplaceSubstituteFakeClass"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:159
+msgid ""
+"Assumes input tensors of captured graphs are not reused externally (risk "
+"of cross-scenario static tensor reuse)"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:160
+msgid ""
+"Relies on identical function, input tensors shapes, and constants for "
+"valid graph reuse"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:161
+msgid "No support for multi-stream execution scenarios"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:163
+msgid "Best Practices"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:164
+msgid ""
+"Dynamic Dimensions: Tensor use sequence length as dimension 0 where "
+"possible"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:165
+msgid ""
+"Monitor Memory Usage: Track graph_mem_pool_size and tensor_mem_size to "
+"avoid OOM"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:166
+msgid ""
+"Specify Layer IDs: Use layer_number to distinguish graphs across "
+"different models/layers"
+msgstr ""
+
+#: ../../source/blog/auto_cuda_graph_design.md:167
+msgid ""
+"LRU Cache (Future): Implement cache eviction to limit total graph/tensor "
+"count"
+msgstr ""
+

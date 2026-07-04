@@ -1,0 +1,362 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) 2025-2026, SandAI
+# This file is distributed under the same license as the MagiCompiler
+# package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2026.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: MagiCompiler \n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-07-04 11:20+0000\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language: zh_CN\n"
+"Language-Team: zh_CN <LL@li.org>\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Generated-By: Babel 2.18.0\n"
+
+#: ../../source/blog/why_magi_depyf.md:9
+msgid "Why magi_depyf"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:11
+msgid ""
+"`magi_depyf` is the compilation observability layer for `MagiCompiler`. "
+"It answers three practical questions:"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:14
+msgid "**What exactly happened during compilation?**"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:15
+msgid ""
+"**Did the outcome match expectations?** (for example: graph split shape, "
+"cache reuse, retry behavior)"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:16
+msgid "**If something failed, where should I look first?**"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:20
+msgid "1. Positioning: Built-in observability for MagiCompiler"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:22
+msgid ""
+"In a real MagiCompiler pipeline, compilation spans multiple stages: "
+"Dynamo capture, Magi backend graph transforms/splitting, Inductor "
+"codegen, and AOT/JIT reuse. Plain logs are often not enough to reliably "
+"answer:"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:25
+msgid "Did the failure happen at full-graph level or in a specific subgraph?"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:26
+msgid "Did a pass change graph behavior unexpectedly?"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:27
+msgid "Why did this run miss cache?"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:29
+msgid ""
+"`magi_depyf` writes these signals as structured events and artifacts on "
+"disk, so you can replay, compare, and debug deterministically."
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:33
+msgid "2. Primary scenario: `magi_compile`"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:35
+msgid "2.1 Recommended usage model"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:37
+msgid ""
+"For `magi_compile` users, `magi_depyf` is most useful as a built-in "
+"observability layer:"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:39
+msgid "Streams events to `timeline_events/timeline.jsonl` during compilation"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:40
+msgid "Writes event artifacts under `timeline_events/files/`"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:41
+msgid "Exports a structured `compiled_functions/` artifact tree"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:43
+msgid ""
+"In most cases, you do not need to manually wire custom hooks. Run through"
+" the MagiCompiler path and inspect the output directory."
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:45
+msgid "2.2 What you get automatically in the Magi compile path"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:47
+msgid ""
+"For the `magi_compile` scenario, you do **not** need to call "
+"`explain_compilation` manually. As long as the model runs through "
+"MagiCompiler, `magi_depyf` outputs are written automatically."
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:50
+msgid "For example, one real run produced:"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:52
+msgid "`magi_depyf_torch_compile_debug/magi_depyf/run_20260322_192147/model_1_TwoLayerTransformer_rank_0/timeline_events`"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:54
+msgid "In general, the output pattern is:"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:56
+msgid "`<cache_root_dir>/magi_depyf/run_*/model_*_rank_*/timeline_events/`"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:58
+msgid "Key artifacts under this directory:"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:60
+msgid "`timeline.jsonl`: streaming event log written during compilation"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:61
+msgid "`files/0000_*`, `files/0001_*`, ... event folders with attached artifacts"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:62
+msgid "`files/*/attributes.json`: structured metadata for each event folder"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:64
+msgid "Related compiled artifact view is also emitted under:"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:66
+msgid "`<cache_root_dir>/magi_depyf/run_*/model_*_rank_*/compiled_functions/`"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:68
+msgid "See the full runnable example:"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:70
+msgid "`magi_compiler/magi_depyf/example/magi_compile_transformer_example.py`"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:72
+msgid "Typical questions this path answers quickly:"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:74
+msgid "Did fullgraph/subgraph events happen in the expected order?"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:75
+msgid "Which pass changed graph structure?"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:76
+msgid "Did `RestartAnalysis` happen, and was cache load skipped as expected?"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:77
+msgid "Which event folder contains the exact graph/code snapshot for debugging?"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:81
+msgid "3. Secondary scenario: plain `torch.compile` (manual entry)"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:83
+msgid ""
+"`magi_depyf` also works with plain `torch.compile`, but this is a "
+"secondary workflow and requires manual context wrapping:"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:104
+msgid "See the concrete example here:"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:106
+msgid "`magi_compiler/magi_depyf/example/torch_compile_toy_example.py`"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:108
+msgid ""
+"This demo shows the minimal way to use `explain_compilation` in a pure "
+"`torch.compile` setup."
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:112
+msgid "4. Event model (concise)"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:114
+msgid "Each event contains:"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:116
+msgid "`name`: event name (with `fullgraph_` or `subgraph_N_` prefix)"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:117
+msgid ""
+"`attributes`: structured metadata (for example `lifecycle_name`, "
+"`runtime_shape`, `graph_index`, `reason`)"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:118
+msgid "`files`: attached text artifacts (graph code, inductor output, etc.)"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:120
+msgid "4.1 Lifecycle naming pattern"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:122
+msgid "Lifecycle events are normalized into the following pattern:"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:124
+msgid "`*_before_<lifecycle_name>`"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:125
+msgid "`*_after_<lifecycle_name>`"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:126
+msgid "`*_failed_<lifecycle_name>`"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:127
+msgid "`*_skip_<lifecycle_name>`"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:129
+msgid "Where `*` is `fullgraph` or `subgraph_<N>`."
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:131
+msgid "4.2 Representative examples"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:133
+msgid "`fullgraph_before_graph_split`"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:134
+msgid "`fullgraph_after_graph_split`"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:135
+msgid "`fullgraph_before_compiler_manager_compile`"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:136
+msgid "`fullgraph_after_compiler_manager_load`"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:137
+msgid "`subgraph_2_before_postcleanuppass`"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:138
+msgid "`subgraph_2_after_postcleanuppass`"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:142
+msgid "5. Output layout (current implementation)"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:169
+msgid "6. Recommended triage order"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:171
+msgid "When debugging a compile issue, use this order:"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:173
+msgid "`timeline.jsonl`: verify event ordering first"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:174
+msgid ""
+"`*_failed_*` / cache-related lifecycle events (`compiler_manager_load`, "
+"`compiler_manager_cache_store`)"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:175
+msgid ""
+"Graph files attached to relevant events: verify before/after pass graph "
+"state"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:176
+msgid ""
+"`compiled_functions/*/overview.md`: verify final compiled artifact "
+"structure"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:178
+msgid "The key is not just absolute timing. The key is:"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:180
+msgid "what happened,"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:181
+msgid "whether it matched expectations,"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:182
+msgid "and where to drill down when it failed."
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:186
+msgid "7. Compatibility and entry-point summary"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:188
+msgid "**Primary entry**: MagiCompiler main path (`magi_compile`)"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:189
+msgid "**Optional entry**: plain `torch.compile` + manual `explain_compilation`"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:191
+msgid "One-line summary:"
+msgstr ""
+
+#: ../../source/blog/why_magi_depyf.md:193
+msgid ""
+"`magi_depyf` is first and foremost MagiCompiler's internal observability "
+"infrastructure, while still being usable as a manual troubleshooting tool"
+" for plain `torch.compile` when needed."
+msgstr ""
+
