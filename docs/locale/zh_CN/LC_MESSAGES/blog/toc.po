@@ -22,5 +22,5 @@ msgstr ""
 
 #: ../../source/blog/toc.md:1 ../../source/blog/toc.md:7
 msgid "Blogs"
-msgstr ""
+msgstr "博客"
 

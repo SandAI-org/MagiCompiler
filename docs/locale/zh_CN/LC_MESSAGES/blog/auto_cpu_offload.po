@@ -22,7 +22,7 @@ msgstr ""
 
 #: ../../source/blog/auto_cpu_offload.md:9
 msgid "Analysis of Automatic Offloading"
-msgstr ""
+msgstr "自动 Offloading 解析"
 
 #: ../../source/blog/auto_cpu_offload.md:11
 msgid ""
@@ -31,6 +31,8 @@ msgid ""
 "Offloading—moving a portion of model weights to the CPU and dynamically "
 "Prefetching them back to the GPU just before computation."
 msgstr ""
+"在训练或推理超大模型时，GPU 显存容量是首要瓶颈。业界标准的解决方案是 Offloading——"
+"将一部分模型权重转移到 CPU，并在计算前动态地将它们预取（Prefetch）回 GPU。"
 
 #: ../../source/blog/auto_cpu_offload.md:13
 msgid ""
@@ -42,14 +44,18 @@ msgid ""
 "precise, the GPU frequently enters a ``starvation`` state while waiting "
 "for data, resulting in significant pipeline bubbles."
 msgstr ""
+"然而，[daVinci-MagiHuman](https://github.com/GAIR-NLP/daVinci-MagiHuman) base "
+"256p 这类高计算效率模型的出现，对传统 offload 策略提出了挑战。由于这些模型的算子执行"
+"极快，留给 PCIe 数据传输的``重叠窗口``异常短暂。如果预取不够精准，GPU 会频繁进入等待数据的"
+"``饥饿``状态，从而产生显著的流水线气泡。"
 
 #: ../../source/blog/auto_cpu_offload.md:15
 msgid "Base Offload Profile"
-msgstr ""
+msgstr "基础 Offload Profile"
 
 #: ../../source/blog/auto_cpu_offload.md:20
 msgid "Heuristic Offload Profile"
-msgstr ""
+msgstr "启发式 Offload Profile"
 
 #: ../../source/blog/auto_cpu_offload.md:25
 msgid ""
@@ -57,6 +63,8 @@ msgid ""
 "Heuristic Offload eliminating pipeline bubbles and accelerating daVinci-"
 "MagiHuman.*"
 msgstr ""
+"*左：基础 Offload，存在明显的 GPU 饥饿（气泡）。右：启发式 Offload，消除了流水线气泡并"
+"加速了 daVinci-MagiHuman。*"
 
 #: ../../source/blog/auto_cpu_offload.md:27
 msgid ""
@@ -70,10 +78,17 @@ msgid ""
 "deconstruct how it achieves deep overlap between computation and "
 "transmission."
 msgstr ""
+"本文深入 MagiCompiler 的核心源码（[api.py](https://github.com/SandAI-"
+"org/MagiCompiler/blob/main/magi_compiler/api.py)、"
+"[offload_wrapper.py](https://github.com/SandAI-"
+"org/MagiCompiler/blob/main/magi_compiler/offload/offload_warpper.py) 与"
+" [scheduler.py](https://github.com/SandAI-"
+"org/MagiCompiler/blob/main/magi_compiler/offload/scheduler.py)），"
+"剖析它如何实现计算与传输之间的深度重叠。"
 
 #: ../../source/blog/auto_cpu_offload.md:29
 msgid "Architectural Overview: Graph-Based Asynchronous Pipeline"
-msgstr ""
+msgstr "架构概览：基于图的异步流水线"
 
 #: ../../source/blog/auto_cpu_offload.md:30
 msgid ""
@@ -81,6 +96,8 @@ msgid ""
 "Its core logic involves using an independent CUDA Stream to pull weights "
 "for subsequent modules while the current submodule is still computing."
 msgstr ""
+"MagiCompiler 的 Offload 机制构建在 torch.fx 图模式之上。其核心逻辑是：在当前子模块"
+"仍在计算时，使用一条独立的 CUDA Stream 为后续模块拉取权重。"
 
 #: ../../source/blog/auto_cpu_offload.md:32
 msgid ""
@@ -91,6 +108,11 @@ msgid ""
 "Responsible for operator graph parsing, memory lifecycle management, and "
 "execution flow scheduling."
 msgstr ""
+"[OffloadExecutor](https://github.com/SandAI-"
+"org/MagiCompiler/blob/main/magi_compiler/offload/offload_warpper.py) / "
+"[OffloadWrapper](https://github.com/SandAI-"
+"org/MagiCompiler/blob/main/magi_compiler/offload/offload_warpper.py)："
+"负责算子图解析、内存生命周期管理与执行流调度。"
 
 #: ../../source/blog/auto_cpu_offload.md:33
 msgid ""
@@ -99,10 +121,13 @@ msgid ""
 "strategy layer that determines the residency priority of weights and the "
 "precise timing of prefetch triggers."
 msgstr ""
+"[OffloadScheduler](https://github.com/SandAI-"
+"org/MagiCompiler/blob/main/magi_compiler/offload/scheduler.py)：核心策略层，"
+"决定权重的驻留优先级以及预取触发的精确时机。"
 
 #: ../../source/blog/auto_cpu_offload.md:35
 msgid "Low-Level Optimization: Shared & Pinned Memory"
-msgstr ""
+msgstr "底层优化：共享内存与锁页内存"
 
 #: ../../source/blog/auto_cpu_offload.md:36
 msgid ""
@@ -110,6 +135,8 @@ msgid ""
 " During the compilation phase, MagiCompiler implements two critical "
 "configurations for CPU Offload:"
 msgstr ""
+"高效的数据搬运依赖底层的物理内存优化。在编译阶段，MagiCompiler 为 CPU Offload "
+"实现了两项关键配置："
 
 #: ../../source/blog/auto_cpu_offload.md:37
 msgid ""
@@ -120,6 +147,11 @@ msgid ""
 " This effectively reduces CPU overhead and memory fragmentation in multi-"
 "GPU environments."
 msgstr ""
+"分布式共享内存：当启用 [model_cpu_offload](https://github.com"
+"/SandAI-org/MagiCompiler/blob/main/magi_compiler/config.py) 时，"
+"所有权重通过 "
+"[torch.from_file(shared=True)](https://docs.pytorch.org/docs/stable/generated/torch.from_file.html) "
+"在连续内存块中复用。这有效降低了多 GPU 环境下的 CPU 开销与内存碎片。"
 
 #: ../../source/blog/auto_cpu_offload.md:38
 msgid ""
@@ -128,10 +160,12 @@ msgid ""
 "PCIe bandwidth utilization and achieving high-speed Host-to-Device (H2D) "
 "transfers."
 msgstr ""
+"锁页内存：通过 pin_memory_in_place，权重被强制驻留在不可分页的物理内存中。"
+"这是最大化 PCIe 带宽利用率、实现高速主机到设备（H2D）传输的基础。"
 
 #: ../../source/blog/auto_cpu_offload.md:40
 msgid "Operational Mechanism: Fine-Grained Executor Control"
-msgstr ""
+msgstr "运行机制：细粒度的执行器控制"
 
 #: ../../source/blog/auto_cpu_offload.md:41
 msgid ""
@@ -139,6 +173,8 @@ msgid ""
 "calculate reference counts (user_counts) for each node, providing the "
 "basis for ``use-and-discard`` memory release."
 msgstr ""
+"图分析：_analyze_graph 预先遍历 torch.fx.GraphModule，为每个节点计算引用计数"
+"（user_counts），为``用完即弃``的内存释放提供依据。"
 
 #: ../../source/blog/auto_cpu_offload.md:42
 msgid ""
@@ -147,6 +183,8 @@ msgid ""
 "concludes, _finalize_warmup() feeds this empirical data into the "
 "scheduler to generate a static optimal strategy."
 msgstr ""
+"Profiling：在最初的几次运行中，OffloadProfiler 测量每个子模块的计算时间与 H2D 带宽。"
+"预热结束后，_finalize_warmup() 将这些经验数据喂给调度器，生成静态的最优策略。"
 
 #: ../../source/blog/auto_cpu_offload.md:43
 msgid ""
@@ -155,10 +193,12 @@ msgid ""
 "environment based on reference counts, utilizing record_stream to ensure "
 "the memory is physically released only when safe."
 msgstr ""
+"动态内存管理：异步预取在 call_module 之前触发。执行结束后，立即根据引用计数从环境中"
+"清除张量，并借助 record_stream 确保内存只在安全时才被物理释放。"
 
 #: ../../source/blog/auto_cpu_offload.md:45
 msgid "Scheduling Strategies: Heuristics for High-Speed Models (scheduler.py)"
-msgstr ""
+msgstr "调度策略：面向高速模型的启发式方法（scheduler.py）"
 
 #: ../../source/blog/auto_cpu_offload.md:46
 msgid ""
@@ -166,6 +206,8 @@ msgid ""
 "/GAIR-NLP/daVinci-MagiHuman), MagiCompiler offers three evolving "
 "schedulers:"
 msgstr ""
+"为应对 [daVinci-MagiHuman](https://github.com"
+"/GAIR-NLP/daVinci-MagiHuman) 这类快节奏模型，MagiCompiler 提供了三种逐步演进的调度器："
 
 #: ../../source/blog/auto_cpu_offload.md:48
 msgid ""
@@ -173,6 +215,8 @@ msgid ""
 "modules in advance. In scenarios with long sequences or fast operators, "
 "this simple approach often fails to cover the transmission latency."
 msgstr ""
+"**BaseScheduler**：一种基础的前瞻策略，仅提前预取 1–2 个模块。在长序列或快速算子的场景下，"
+"这种简单方法往往无法覆盖传输延迟。"
 
 #: ../../source/blog/auto_cpu_offload.md:50
 msgid ""
@@ -182,14 +226,17 @@ msgid ""
 "primary source of bubbles. Consequently, it allocates the limited GPU "
 "residency quota to these ``transfer-heavy, compute-light`` modules."
 msgstr ""
+"**CostEffectiveScheduler**：该策略纠正了优先照顾``长计算算子``的直觉误区。"
+"它识别出：权重体量巨大但计算极快的模块才是气泡的主要来源。因此，它把有限的 GPU 驻留配额"
+"分配给这些``传输重、计算轻``的模块。"
 
 #: ../../source/blog/auto_cpu_offload.md:52
 msgid "**HeuristicScheduler**："
-msgstr ""
+msgstr "**HeuristicScheduler**："
 
 #: ../../source/blog/auto_cpu_offload.md:54
 msgid "Heuristic Offload"
-msgstr ""
+msgstr "启发式 Offload"
 
 #: ../../source/blog/auto_cpu_offload.md:60
 msgid ""
@@ -200,6 +247,9 @@ msgid ""
 "bloat from queued weights and compresses peak memory usage to its "
 "theoretical minimum."
 msgstr ""
+"JIT（Just-In-Time）最晚加载：最先进的方案。它利用 profiling 数据反推出传输的精确开始时刻，"
+"确保权重在计算前的``最后一刻``抵达 GPU。这避免了排队权重造成的内存膨胀，"
+"并将峰值内存占用压缩到理论最小值。"
 
 #: ../../source/blog/auto_cpu_offload.md:61
 msgid ""
@@ -208,10 +258,12 @@ msgid ""
 "remain resident on the GPU, thereby alleviating pressure on the PCIe "
 "bandwidth."
 msgstr ""
+"权重驻留优化：若检测到有剩余 GPU 显存（依据 gpu_resident_weight_ratio），"
+"它会指定特定权重常驻 GPU，从而缓解 PCIe 带宽的压力。"
 
 #: ../../source/blog/auto_cpu_offload.md:63
 msgid "Performance: Zero-Bubble Experience on RTX 5090"
-msgstr ""
+msgstr "性能：RTX 5090 上的零气泡体验"
 
 #: ../../source/blog/auto_cpu_offload.md:64
 msgid ""
@@ -219,6 +271,9 @@ msgid ""
 "long-video generation inference test with [daVinci-"
 "MagiHuman](https://github.com/GAIR-NLP/daVinci-MagiHuman) base 256p:"
 msgstr ""
+"在 RTX 5090 环境下，采用 CP4 并行策略，使用 [daVinci-"
+"MagiHuman](https://github.com/GAIR-NLP/daVinci-MagiHuman) base 256p 进行 10 秒"
+"长视频生成推理测试："
 
 #: ../../source/blog/auto_cpu_offload.md:66
 #, python-format
@@ -228,6 +283,8 @@ msgid ""
 "remaining 65% of weights are managed via the HeuristicScheduler for "
 "precise JIT prefetching."
 msgstr ""
+"通过将 gpu_resident_weight_ratio 设为 35%，系统把这块``黄金``GPU 显存分配给"
+"大体量、快计算的算子。剩余 65% 的权重则由 HeuristicScheduler 管理，进行精确的 JIT 预取。"
 
 #: ../../source/blog/auto_cpu_offload.md:68
 msgid ""
@@ -237,4 +294,6 @@ msgid ""
 "bubbles, reaching the theoretical limits of both memory efficiency and "
 "system throughput."
 msgstr ""
+"结果：这段 10 秒的视频推理过程实现了 H2D 通信与计算的完全重叠。尽管算子吞吐极高，"
+"GPU 仍保持满负荷运转、零流水线气泡，同时达到了内存效率与系统吞吐的理论极限。"
 

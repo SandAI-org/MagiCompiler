@@ -22,31 +22,33 @@ msgstr ""
 
 #: ../../source/blog/why_magi_depyf.md:9
 msgid "Why magi_depyf"
-msgstr ""
+msgstr "为什么需要 magi_depyf"
 
 #: ../../source/blog/why_magi_depyf.md:11
 msgid ""
 "`magi_depyf` is the compilation observability layer for `MagiCompiler`. "
 "It answers three practical questions:"
 msgstr ""
+"`magi_depyf` 是 `MagiCompiler` 的编译可观测性层。它回答三个实际问题："
 
 #: ../../source/blog/why_magi_depyf.md:14
 msgid "**What exactly happened during compilation?**"
-msgstr ""
+msgstr "**编译过程中究竟发生了什么？**"
 
 #: ../../source/blog/why_magi_depyf.md:15
 msgid ""
 "**Did the outcome match expectations?** (for example: graph split shape, "
 "cache reuse, retry behavior)"
 msgstr ""
+"**结果是否符合预期？**（例如：图切分形状、缓存复用、重试行为）"
 
 #: ../../source/blog/why_magi_depyf.md:16
 msgid "**If something failed, where should I look first?**"
-msgstr ""
+msgstr "**如果出错了，我应该先看哪里？**"
 
 #: ../../source/blog/why_magi_depyf.md:20
 msgid "1. Positioning: Built-in observability for MagiCompiler"
-msgstr ""
+msgstr "1. 定位：MagiCompiler 的内建可观测性"
 
 #: ../../source/blog/why_magi_depyf.md:22
 msgid ""
@@ -55,60 +57,66 @@ msgid ""
 "codegen, and AOT/JIT reuse. Plain logs are often not enough to reliably "
 "answer:"
 msgstr ""
+"在真实的 MagiCompiler 流水线中，编译跨越多个阶段：Dynamo 捕获、Magi 后端图变换/"
+"切分、Inductor 代码生成，以及 AOT/JIT 复用。仅靠普通日志往往难以可靠地回答："
 
 #: ../../source/blog/why_magi_depyf.md:25
 msgid "Did the failure happen at full-graph level or in a specific subgraph?"
-msgstr ""
+msgstr "失败发生在全图层面，还是某个具体的子图中？"
 
 #: ../../source/blog/why_magi_depyf.md:26
 msgid "Did a pass change graph behavior unexpectedly?"
-msgstr ""
+msgstr "某个 pass 是否意外改变了图的行为？"
 
 #: ../../source/blog/why_magi_depyf.md:27
 msgid "Why did this run miss cache?"
-msgstr ""
+msgstr "这次运行为什么没有命中缓存？"
 
 #: ../../source/blog/why_magi_depyf.md:29
 msgid ""
 "`magi_depyf` writes these signals as structured events and artifacts on "
 "disk, so you can replay, compare, and debug deterministically."
 msgstr ""
+"`magi_depyf` 将这些信号以结构化的事件与产物形式写入磁盘，让你可以确定性地回放、"
+"对比与调试。"
 
 #: ../../source/blog/why_magi_depyf.md:33
 msgid "2. Primary scenario: `magi_compile`"
-msgstr ""
+msgstr "2. 主要场景：`magi_compile`"
 
 #: ../../source/blog/why_magi_depyf.md:35
 msgid "2.1 Recommended usage model"
-msgstr ""
+msgstr "2.1 推荐的使用方式"
 
 #: ../../source/blog/why_magi_depyf.md:37
 msgid ""
 "For `magi_compile` users, `magi_depyf` is most useful as a built-in "
 "observability layer:"
 msgstr ""
+"对于 `magi_compile` 用户，`magi_depyf` 作为内建可观测性层最为实用："
 
 #: ../../source/blog/why_magi_depyf.md:39
 msgid "Streams events to `timeline_events/timeline.jsonl` during compilation"
-msgstr ""
+msgstr "在编译期间将事件流式写入 `timeline_events/timeline.jsonl`"
 
 #: ../../source/blog/why_magi_depyf.md:40
 msgid "Writes event artifacts under `timeline_events/files/`"
-msgstr ""
+msgstr "将事件产物写入 `timeline_events/files/` 目录"
 
 #: ../../source/blog/why_magi_depyf.md:41
 msgid "Exports a structured `compiled_functions/` artifact tree"
-msgstr ""
+msgstr "导出结构化的 `compiled_functions/` 产物树"
 
 #: ../../source/blog/why_magi_depyf.md:43
 msgid ""
 "In most cases, you do not need to manually wire custom hooks. Run through"
 " the MagiCompiler path and inspect the output directory."
 msgstr ""
+"大多数情况下你无需手动挂接自定义 hook。走完整的 MagiCompiler 路径，然后查看输出目录即可。"
 
 #: ../../source/blog/why_magi_depyf.md:45
 msgid "2.2 What you get automatically in the Magi compile path"
-msgstr ""
+msgstr "2.2 在 Magi 编译路径下你会自动获得什么"
 
 #: ../../source/blog/why_magi_depyf.md:47
 msgid ""
@@ -116,242 +124,250 @@ msgid ""
 "`explain_compilation` manually. As long as the model runs through "
 "MagiCompiler, `magi_depyf` outputs are written automatically."
 msgstr ""
+"在 `magi_compile` 场景下，你**无需**手动调用 `explain_compilation`。"
+"只要模型走完 MagiCompiler 路径，`magi_depyf` 的输出就会被自动写入。"
 
 #: ../../source/blog/why_magi_depyf.md:50
 msgid "For example, one real run produced:"
-msgstr ""
+msgstr "例如，某次真实运行产生了："
 
 #: ../../source/blog/why_magi_depyf.md:52
 msgid "`magi_depyf_torch_compile_debug/magi_depyf/run_20260322_192147/model_1_TwoLayerTransformer_rank_0/timeline_events`"
-msgstr ""
+msgstr "`magi_depyf_torch_compile_debug/magi_depyf/run_20260322_192147/model_1_TwoLayerTransformer_rank_0/timeline_events`"
 
 #: ../../source/blog/why_magi_depyf.md:54
 msgid "In general, the output pattern is:"
-msgstr ""
+msgstr "一般来说，输出的目录模式为："
 
 #: ../../source/blog/why_magi_depyf.md:56
 msgid "`<cache_root_dir>/magi_depyf/run_*/model_*_rank_*/timeline_events/`"
-msgstr ""
+msgstr "`<cache_root_dir>/magi_depyf/run_*/model_*_rank_*/timeline_events/`"
 
 #: ../../source/blog/why_magi_depyf.md:58
 msgid "Key artifacts under this directory:"
-msgstr ""
+msgstr "该目录下的关键产物："
 
 #: ../../source/blog/why_magi_depyf.md:60
 msgid "`timeline.jsonl`: streaming event log written during compilation"
-msgstr ""
+msgstr "`timeline.jsonl`：编译期间写入的流式事件日志"
 
 #: ../../source/blog/why_magi_depyf.md:61
 msgid "`files/0000_*`, `files/0001_*`, ... event folders with attached artifacts"
-msgstr ""
+msgstr "`files/0000_*`、`files/0001_*`、…… 带附属产物的事件文件夹"
 
 #: ../../source/blog/why_magi_depyf.md:62
 msgid "`files/*/attributes.json`: structured metadata for each event folder"
-msgstr ""
+msgstr "`files/*/attributes.json`：每个事件文件夹的结构化元数据"
 
 #: ../../source/blog/why_magi_depyf.md:64
 msgid "Related compiled artifact view is also emitted under:"
-msgstr ""
+msgstr "相关的编译产物视图还会输出到："
 
 #: ../../source/blog/why_magi_depyf.md:66
 msgid "`<cache_root_dir>/magi_depyf/run_*/model_*_rank_*/compiled_functions/`"
-msgstr ""
+msgstr "`<cache_root_dir>/magi_depyf/run_*/model_*_rank_*/compiled_functions/`"
 
 #: ../../source/blog/why_magi_depyf.md:68
 msgid "See the full runnable example:"
-msgstr ""
+msgstr "完整可运行示例见："
 
 #: ../../source/blog/why_magi_depyf.md:70
 msgid "`magi_compiler/magi_depyf/example/magi_compile_transformer_example.py`"
-msgstr ""
+msgstr "`magi_compiler/magi_depyf/example/magi_compile_transformer_example.py`"
 
 #: ../../source/blog/why_magi_depyf.md:72
 msgid "Typical questions this path answers quickly:"
-msgstr ""
+msgstr "这条路径能快速回答的典型问题："
 
 #: ../../source/blog/why_magi_depyf.md:74
 msgid "Did fullgraph/subgraph events happen in the expected order?"
-msgstr ""
+msgstr "全图/子图事件是否按预期顺序发生？"
 
 #: ../../source/blog/why_magi_depyf.md:75
 msgid "Which pass changed graph structure?"
-msgstr ""
+msgstr "是哪个 pass 改变了图结构？"
 
 #: ../../source/blog/why_magi_depyf.md:76
 msgid "Did `RestartAnalysis` happen, and was cache load skipped as expected?"
-msgstr ""
+msgstr "是否发生了 `RestartAnalysis`，缓存加载是否如预期被跳过？"
 
 #: ../../source/blog/why_magi_depyf.md:77
 msgid "Which event folder contains the exact graph/code snapshot for debugging?"
-msgstr ""
+msgstr "哪个事件文件夹包含用于调试的精确图/代码快照？"
 
 #: ../../source/blog/why_magi_depyf.md:81
 msgid "3. Secondary scenario: plain `torch.compile` (manual entry)"
-msgstr ""
+msgstr "3. 次要场景：纯 `torch.compile`（手动接入）"
 
 #: ../../source/blog/why_magi_depyf.md:83
 msgid ""
 "`magi_depyf` also works with plain `torch.compile`, but this is a "
 "secondary workflow and requires manual context wrapping:"
 msgstr ""
+"`magi_depyf` 同样适用于纯 `torch.compile`，但这是次要工作流，需要手动包裹上下文："
 
 #: ../../source/blog/why_magi_depyf.md:104
 msgid "See the concrete example here:"
-msgstr ""
+msgstr "具体示例见此处："
 
 #: ../../source/blog/why_magi_depyf.md:106
 msgid "`magi_compiler/magi_depyf/example/torch_compile_toy_example.py`"
-msgstr ""
+msgstr "`magi_compiler/magi_depyf/example/torch_compile_toy_example.py`"
 
 #: ../../source/blog/why_magi_depyf.md:108
 msgid ""
 "This demo shows the minimal way to use `explain_compilation` in a pure "
 "`torch.compile` setup."
 msgstr ""
+"该示例展示了在纯 `torch.compile` 场景下使用 `explain_compilation` 的最简方式。"
 
 #: ../../source/blog/why_magi_depyf.md:112
 msgid "4. Event model (concise)"
-msgstr ""
+msgstr "4. 事件模型（简述）"
 
 #: ../../source/blog/why_magi_depyf.md:114
 msgid "Each event contains:"
-msgstr ""
+msgstr "每个事件包含："
 
 #: ../../source/blog/why_magi_depyf.md:116
 msgid "`name`: event name (with `fullgraph_` or `subgraph_N_` prefix)"
-msgstr ""
+msgstr "`name`：事件名称（带 `fullgraph_` 或 `subgraph_N_` 前缀）"
 
 #: ../../source/blog/why_magi_depyf.md:117
 msgid ""
 "`attributes`: structured metadata (for example `lifecycle_name`, "
 "`runtime_shape`, `graph_index`, `reason`)"
 msgstr ""
+"`attributes`：结构化元数据（例如 `lifecycle_name`、`runtime_shape`、`graph_index`、`reason`）"
 
 #: ../../source/blog/why_magi_depyf.md:118
 msgid "`files`: attached text artifacts (graph code, inductor output, etc.)"
-msgstr ""
+msgstr "`files`：附属的文本产物（图代码、inductor 输出等）"
 
 #: ../../source/blog/why_magi_depyf.md:120
 msgid "4.1 Lifecycle naming pattern"
-msgstr ""
+msgstr "4.1 生命周期命名模式"
 
 #: ../../source/blog/why_magi_depyf.md:122
 msgid "Lifecycle events are normalized into the following pattern:"
-msgstr ""
+msgstr "生命周期事件被规范化为以下模式："
 
 #: ../../source/blog/why_magi_depyf.md:124
 msgid "`*_before_<lifecycle_name>`"
-msgstr ""
+msgstr "`*_before_<lifecycle_name>`"
 
 #: ../../source/blog/why_magi_depyf.md:125
 msgid "`*_after_<lifecycle_name>`"
-msgstr ""
+msgstr "`*_after_<lifecycle_name>`"
 
 #: ../../source/blog/why_magi_depyf.md:126
 msgid "`*_failed_<lifecycle_name>`"
-msgstr ""
+msgstr "`*_failed_<lifecycle_name>`"
 
 #: ../../source/blog/why_magi_depyf.md:127
 msgid "`*_skip_<lifecycle_name>`"
-msgstr ""
+msgstr "`*_skip_<lifecycle_name>`"
 
 #: ../../source/blog/why_magi_depyf.md:129
 msgid "Where `*` is `fullgraph` or `subgraph_<N>`."
-msgstr ""
+msgstr "其中 `*` 为 `fullgraph` 或 `subgraph_<N>`。"
 
 #: ../../source/blog/why_magi_depyf.md:131
 msgid "4.2 Representative examples"
-msgstr ""
+msgstr "4.2 代表性示例"
 
 #: ../../source/blog/why_magi_depyf.md:133
 msgid "`fullgraph_before_graph_split`"
-msgstr ""
+msgstr "`fullgraph_before_graph_split`"
 
 #: ../../source/blog/why_magi_depyf.md:134
 msgid "`fullgraph_after_graph_split`"
-msgstr ""
+msgstr "`fullgraph_after_graph_split`"
 
 #: ../../source/blog/why_magi_depyf.md:135
 msgid "`fullgraph_before_compiler_manager_compile`"
-msgstr ""
+msgstr "`fullgraph_before_compiler_manager_compile`"
 
 #: ../../source/blog/why_magi_depyf.md:136
 msgid "`fullgraph_after_compiler_manager_load`"
-msgstr ""
+msgstr "`fullgraph_after_compiler_manager_load`"
 
 #: ../../source/blog/why_magi_depyf.md:137
 msgid "`subgraph_2_before_postcleanuppass`"
-msgstr ""
+msgstr "`subgraph_2_before_postcleanuppass`"
 
 #: ../../source/blog/why_magi_depyf.md:138
 msgid "`subgraph_2_after_postcleanuppass`"
-msgstr ""
+msgstr "`subgraph_2_after_postcleanuppass`"
 
 #: ../../source/blog/why_magi_depyf.md:142
 msgid "5. Output layout (current implementation)"
-msgstr ""
+msgstr "5. 输出布局（当前实现）"
 
 #: ../../source/blog/why_magi_depyf.md:169
 msgid "6. Recommended triage order"
-msgstr ""
+msgstr "6. 推荐的排查顺序"
 
 #: ../../source/blog/why_magi_depyf.md:171
 msgid "When debugging a compile issue, use this order:"
-msgstr ""
+msgstr "调试编译问题时，按以下顺序进行："
 
 #: ../../source/blog/why_magi_depyf.md:173
 msgid "`timeline.jsonl`: verify event ordering first"
-msgstr ""
+msgstr "`timeline.jsonl`：先核对事件顺序"
 
 #: ../../source/blog/why_magi_depyf.md:174
 msgid ""
 "`*_failed_*` / cache-related lifecycle events (`compiler_manager_load`, "
 "`compiler_manager_cache_store`)"
 msgstr ""
+"`*_failed_*` / 缓存相关的生命周期事件（`compiler_manager_load`、`compiler_manager_cache_store`）"
 
 #: ../../source/blog/why_magi_depyf.md:175
 msgid ""
 "Graph files attached to relevant events: verify before/after pass graph "
 "state"
 msgstr ""
+"相关事件附带的图文件：核对 pass 前后的图状态"
 
 #: ../../source/blog/why_magi_depyf.md:176
 msgid ""
 "`compiled_functions/*/overview.md`: verify final compiled artifact "
 "structure"
 msgstr ""
+"`compiled_functions/*/overview.md`：核对最终的编译产物结构"
 
 #: ../../source/blog/why_magi_depyf.md:178
 msgid "The key is not just absolute timing. The key is:"
-msgstr ""
+msgstr "关键不只是绝对耗时，而是："
 
 #: ../../source/blog/why_magi_depyf.md:180
 msgid "what happened,"
-msgstr ""
+msgstr "发生了什么，"
 
 #: ../../source/blog/why_magi_depyf.md:181
 msgid "whether it matched expectations,"
-msgstr ""
+msgstr "是否符合预期，"
 
 #: ../../source/blog/why_magi_depyf.md:182
 msgid "and where to drill down when it failed."
-msgstr ""
+msgstr "以及失败时应深入到哪里排查。"
 
 #: ../../source/blog/why_magi_depyf.md:186
 msgid "7. Compatibility and entry-point summary"
-msgstr ""
+msgstr "7. 兼容性与入口点小结"
 
 #: ../../source/blog/why_magi_depyf.md:188
 msgid "**Primary entry**: MagiCompiler main path (`magi_compile`)"
-msgstr ""
+msgstr "**主入口**：MagiCompiler 主路径（`magi_compile`）"
 
 #: ../../source/blog/why_magi_depyf.md:189
 msgid "**Optional entry**: plain `torch.compile` + manual `explain_compilation`"
-msgstr ""
+msgstr "**可选入口**：纯 `torch.compile` + 手动 `explain_compilation`"
 
 #: ../../source/blog/why_magi_depyf.md:191
 msgid "One-line summary:"
-msgstr ""
+msgstr "一句话总结："
 
 #: ../../source/blog/why_magi_depyf.md:193
 msgid ""
@@ -359,4 +375,6 @@ msgid ""
 "infrastructure, while still being usable as a manual troubleshooting tool"
 " for plain `torch.compile` when needed."
 msgstr ""
+"`magi_depyf` 首先是 MagiCompiler 的内部可观测性基础设施，同时在需要时也可作为纯 "
+"`torch.compile` 的手动排障工具使用。"
 

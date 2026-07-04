@@ -22,5 +22,5 @@ msgstr ""
 
 #: ../../source/user_guide/toc.md:1 ../../source/user_guide/toc.md:3
 msgid "User Guide"
-msgstr ""
+msgstr "用户指南"
 

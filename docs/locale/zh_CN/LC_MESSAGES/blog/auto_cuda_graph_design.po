@@ -22,11 +22,11 @@ msgstr ""
 
 #: ../../source/blog/auto_cuda_graph_design.md:9
 msgid "AutoCudaGraph Design"
-msgstr ""
+msgstr "AutoCudaGraph 设计"
 
 #: ../../source/blog/auto_cuda_graph_design.md:11
 msgid "Overview"
-msgstr ""
+msgstr "概览"
 
 #: ../../source/blog/auto_cuda_graph_design.md:12
 msgid ""
@@ -37,302 +37,320 @@ msgid ""
 "lengths, optimizing kernel execution by reusing pre-captured computation "
 "graphs and static tensor buffers. Core Goals:"
 msgstr ""
+"AutoCudaGraph 是集成在 MagiCompiler 框架中的 CUDA Graph 优化模块，旨在为基于 PyTorch 的"
+"神经网络推理自动完成 CUDA Graph 的捕获、缓存、回放与张量内存管理。它面向具有动态序列长度的"
+" Transformer 架构，通过复用预先捕获的计算图与静态张量缓冲区来优化 kernel 执行。核心目标："
 
 #: ../../source/blog/auto_cuda_graph_design.md:13
 msgid ""
 "Automate CUDA Graph lifecycle (capture/replay/cache) with minimal code "
 "intrusion"
 msgstr ""
+"以最小的代码侵入自动化 CUDA Graph 生命周期（捕获/回放/缓存）"
 
 #: ../../source/blog/auto_cuda_graph_design.md:14
 msgid "Support dynamic shape adaptation (sequence length expansion)"
-msgstr ""
+msgstr "支持动态 shape 适配（序列长度扩展）"
 
 #: ../../source/blog/auto_cuda_graph_design.md:15
 msgid "Optimize memory efficiency via global memory pool and static tensor reuse"
-msgstr ""
+msgstr "通过全局内存池与静态张量复用优化内存效率"
 
 #: ../../source/blog/auto_cuda_graph_design.md:16
 msgid "Ensure consistency between cached graphs and runtime inputs/outputs"
-msgstr ""
+msgstr "确保缓存图与运行时输入/输出之间的一致性"
 
 #: ../../source/blog/auto_cuda_graph_design.md:18
 msgid "Key Components"
-msgstr ""
+msgstr "关键组件"
 
 #: ../../source/blog/auto_cuda_graph_design.md:20
 msgid "CudaGraphMgr (Core Manager)"
-msgstr ""
+msgstr "CudaGraphMgr（核心管理器）"
 
 #: ../../source/blog/auto_cuda_graph_design.md:21
 msgid "Singleton class managing all CUDA Graph operations:"
-msgstr ""
+msgstr "管理所有 CUDA Graph 操作的单例类："
 
 #: ../../source/blog/auto_cuda_graph_design.md:29
 msgid "**Core Methods**"
-msgstr ""
+msgstr "**核心方法**"
 
 #: ../../source/blog/auto_cuda_graph_design.md
 msgid "Method"
-msgstr ""
+msgstr "方法"
 
 #: ../../source/blog/auto_cuda_graph_design.md
 msgid "Purpose"
-msgstr ""
+msgstr "用途"
 
 #: ../../source/blog/auto_cuda_graph_design.md
 msgid "run()"
-msgstr ""
+msgstr "run()"
 
 #: ../../source/blog/auto_cuda_graph_design.md
 msgid "Main entry: Replay cached graph or warm up & capture new graph"
-msgstr ""
+msgstr "主入口：回放缓存图，或预热并捕获新图"
 
 #: ../../source/blog/auto_cuda_graph_design.md
 msgid "wrapped_graph_capture()"
-msgstr ""
+msgstr "wrapped_graph_capture()"
 
 #: ../../source/blog/auto_cuda_graph_design.md
 msgid "Capture CUDA Graph with sliced static input/output tensors"
-msgstr ""
+msgstr "使用切片后的静态输入/输出张量捕获 CUDA Graph"
 
 #: ../../source/blog/auto_cuda_graph_design.md
 msgid "wrapped_graph_replay()"
-msgstr ""
+msgstr "wrapped_graph_replay()"
 
 #: ../../source/blog/auto_cuda_graph_design.md
 msgid ""
 "Replay cached CUDA Graph with sliced static tensors and output template "
 "wrapping"
 msgstr ""
+"使用切片后的静态张量回放缓存的 CUDA Graph，并进行输出模板包装"
 
 #: ../../source/blog/auto_cuda_graph_design.md
 msgid "get_expanded_static_tensors()"
-msgstr ""
+msgstr "get_expanded_static_tensors()"
 
 #: ../../source/blog/auto_cuda_graph_design.md
 msgid "Expand static tensors, reuse buffers if dimensionally compatible"
-msgstr ""
+msgstr "扩展静态张量，在维度兼容时复用缓冲区"
 
 #: ../../source/blog/auto_cuda_graph_design.md:37
 msgid "Signature System"
-msgstr ""
+msgstr "签名系统"
 
 #: ../../source/blog/auto_cuda_graph_design.md:39
 msgid "StaticSignature"
-msgstr ""
+msgstr "StaticSignature"
 
 #: ../../source/blog/auto_cuda_graph_design.md:46
 msgid "Encodes fixed properties of input tensors (dtype, static dimensions)"
-msgstr ""
+msgstr "编码输入张量的固定属性（dtype、静态维度）"
 
 #: ../../source/blog/auto_cuda_graph_design.md:47
 msgid "Used as primary key for static tensor buffer caching"
-msgstr ""
+msgstr "作为静态张量缓冲区缓存的主键"
 
 #: ../../source/blog/auto_cuda_graph_design.md:49
 msgid "DynamicSignature"
-msgstr ""
+msgstr "DynamicSignature"
 
 #: ../../source/blog/auto_cuda_graph_design.md:56
 msgid "Tracks dynamic dimensions (sequence length) and literal parameters"
-msgstr ""
+msgstr "追踪动态维度（序列长度）与字面量参数"
 
 #: ../../source/blog/auto_cuda_graph_design.md:57
 msgid "Secondary key for graph entry lookup"
-msgstr ""
+msgstr "图条目查找的次级键"
 
 #: ../../source/blog/auto_cuda_graph_design.md:59
 msgid "Tensor Management"
-msgstr ""
+msgstr "张量管理"
 
 #: ../../source/blog/auto_cuda_graph_design.md:67
 msgid ""
 "Memory Reuse: Reuse existing tensor buffers when possible to avoid "
 "reallocation"
 msgstr ""
+"内存复用：尽可能复用已有的张量缓冲区，避免重新分配"
 
 #: ../../source/blog/auto_cuda_graph_design.md:68
 msgid ""
 "Dynamic Expansion: Only expand static tensors when new input dimensions "
 "exceed current buffer size"
 msgstr ""
+"动态扩展：仅当新的输入维度超过当前缓冲区大小时才扩展静态张量"
 
 #: ../../source/blog/auto_cuda_graph_design.md:69
 msgid ""
 "Shape Validation: Ensure static dimensions (non-sequence) match between "
 "cached and new tensors"
 msgstr ""
+"Shape 校验：确保缓存张量与新张量之间的静态维度（非序列维度）一致"
 
 #: ../../source/blog/auto_cuda_graph_design.md:71
 msgid "Graph Management"
-msgstr ""
+msgstr "图管理"
 
 #: ../../source/blog/auto_cuda_graph_design.md:84
 msgid ""
 "Graph State Tracking: GraphEntry tracks CUDA Graph instances and validity"
 " states to control replay eligibility."
 msgstr ""
+"图状态追踪：GraphEntry 追踪 CUDA Graph 实例及其有效性状态，以控制是否允许回放。"
 
 #: ../../source/blog/auto_cuda_graph_design.md:85
 msgid ""
 "Layer-wise Organization: OutputTemplateEntry maps dynamic signatures to "
 "per-layer GraphEntry for layer-specific graph reuse."
 msgstr ""
+"分层组织：OutputTemplateEntry 将动态签名映射到各层的 GraphEntry，实现按层的图复用。"
 
 #: ../../source/blog/auto_cuda_graph_design.md:86
 msgid ""
 "Output Consistency: output_template preserves output object structure to "
 "ensure consistent result wrapping during replay."
 msgstr ""
+"输出一致性：output_template 保留输出对象结构，确保回放时结果包装的一致性。"
 
 #: ../../source/blog/auto_cuda_graph_design.md:88
 msgid "Execution Flow"
-msgstr ""
+msgstr "执行流程"
 
 #: ../../source/blog/auto_cuda_graph_design.md:89
 msgid "Inline Replay (Fast Path)"
-msgstr ""
+msgstr "内联回放（快路径）"
 
 #: ../../source/blog/auto_cuda_graph_design.md:90
 msgid "Extract input signatures from runtime arguments"
-msgstr ""
+msgstr "从运行时参数中提取输入签名"
 
 #: ../../source/blog/auto_cuda_graph_design.md:91
 msgid ""
 "Look up cached CUDA Graph via StaticSignature + DynamicSignature + layer "
 "number"
 msgstr ""
+"通过 StaticSignature + DynamicSignature + 层号查找缓存的 CUDA Graph"
 
 #: ../../source/blog/auto_cuda_graph_design.md:92
 msgid "Validate graph consistency (not inconsistent/invalid)"
-msgstr ""
+msgstr "校验图的一致性（非 inconsistent/invalid）"
 
 #: ../../source/blog/auto_cuda_graph_design.md:93
 msgid "Reuse static tensors with dynamic slicing"
-msgstr ""
+msgstr "通过动态切片复用静态张量"
 
 #: ../../source/blog/auto_cuda_graph_design.md:94
 msgid "Replay graph and return sliced output"
-msgstr ""
+msgstr "回放图并返回切片后的输出"
 
 #: ../../source/blog/auto_cuda_graph_design.md:95
 msgid "Graph Capture (Slow Path)"
-msgstr ""
+msgstr "图捕获（慢路径）"
 
 #: ../../source/blog/auto_cuda_graph_design.md:96
 msgid "Triggered when no valid cached graph exists or tensor expansion is needed:"
-msgstr ""
+msgstr "当不存在有效的缓存图，或需要扩展张量时触发："
 
 #: ../../source/blog/auto_cuda_graph_design.md:97
 msgid "Execute function to get output tensors"
-msgstr ""
+msgstr "执行函数以获得输出张量"
 
 #: ../../source/blog/auto_cuda_graph_design.md:98
 msgid "Ensure input signatures match post-warmup"
-msgstr ""
+msgstr "确保预热后输入签名匹配"
 
 #: ../../source/blog/auto_cuda_graph_design.md:99
 msgid "Expand static buffers if new shapes require it"
-msgstr ""
+msgstr "若新 shape 需要则扩展静态缓冲区"
 
 #: ../../source/blog/auto_cuda_graph_design.md:100
 msgid "Capture new CUDA Graph with static tensors"
-msgstr ""
+msgstr "使用静态张量捕获新的 CUDA Graph"
 
 #: ../../source/blog/auto_cuda_graph_design.md:101
 msgid "Store new graph and update tensor entries"
-msgstr ""
+msgstr "存储新图并更新张量条目"
 
 #: ../../source/blog/auto_cuda_graph_design.md:102
 msgid "Return warmup execution output as final result"
-msgstr ""
+msgstr "将预热执行的输出作为最终结果返回"
 
 #: ../../source/blog/auto_cuda_graph_design.md:103
 msgid "Sequence Length Handling"
-msgstr ""
+msgstr "序列长度处理"
 
 #: ../../source/blog/auto_cuda_graph_design.md:104
 msgid "Only last dimension is static for ND tensors (ND > 1)"
-msgstr ""
+msgstr "对于 ND 张量（ND > 1），仅最后一维为静态"
 
 #: ../../source/blog/auto_cuda_graph_design.md:105
 msgid "All dimension is dynamic for 1D tensors (ND=1)"
-msgstr ""
+msgstr "对于 1D 张量（ND=1），所有维度均为动态"
 
 #: ../../source/blog/auto_cuda_graph_design.md:106
 msgid "Automatic buffer expansion for increasing sequence lengths"
-msgstr ""
+msgstr "随序列长度增长自动扩展缓冲区"
 
 #: ../../source/blog/auto_cuda_graph_design.md:107
 msgid "Invalidates old graphs when tensors are expanded"
-msgstr ""
+msgstr "当张量被扩展时使旧图失效"
 
 #: ../../source/blog/auto_cuda_graph_design.md:109
 msgid "Examples"
-msgstr ""
+msgstr "示例"
 
 #: ../../source/blog/auto_cuda_graph_design.md:154
 msgid "Limitations and Constraints"
-msgstr ""
+msgstr "局限与约束"
 
 #: ../../source/blog/auto_cuda_graph_design.md:155
 msgid "No support for data-dependent control flow in captured functions"
-msgstr ""
+msgstr "不支持被捕获函数中依赖数据的控制流"
 
 #: ../../source/blog/auto_cuda_graph_design.md:156
 msgid "Graph capture fails if function contains CPU/GPU synchronization"
-msgstr ""
+msgstr "若函数包含 CPU/GPU 同步，图捕获会失败"
 
 #: ../../source/blog/auto_cuda_graph_design.md:157
 msgid "Only supports CUDA tensors (CPU tensors trigger fallback)"
-msgstr ""
+msgstr "仅支持 CUDA 张量（CPU 张量会触发回退）"
 
 #: ../../source/blog/auto_cuda_graph_design.md:158
 msgid "Custom input classes must inherit from InplaceSubstituteFakeClass"
-msgstr ""
+msgstr "自定义输入类必须继承自 InplaceSubstituteFakeClass"
 
 #: ../../source/blog/auto_cuda_graph_design.md:159
 msgid ""
 "Assumes input tensors of captured graphs are not reused externally (risk "
 "of cross-scenario static tensor reuse)"
 msgstr ""
+"假设被捕获图的输入张量不会在外部被复用（存在跨场景静态张量复用的风险）"
 
 #: ../../source/blog/auto_cuda_graph_design.md:160
 msgid ""
 "Relies on identical function, input tensors shapes, and constants for "
 "valid graph reuse"
 msgstr ""
+"依赖相同的函数、输入张量 shape 与常量才能有效复用图"
 
 #: ../../source/blog/auto_cuda_graph_design.md:161
 msgid "No support for multi-stream execution scenarios"
-msgstr ""
+msgstr "不支持多 stream 执行场景"
 
 #: ../../source/blog/auto_cuda_graph_design.md:163
 msgid "Best Practices"
-msgstr ""
+msgstr "最佳实践"
 
 #: ../../source/blog/auto_cuda_graph_design.md:164
 msgid ""
 "Dynamic Dimensions: Tensor use sequence length as dimension 0 where "
 "possible"
 msgstr ""
+"动态维度：尽可能让张量以序列长度作为第 0 维"
 
 #: ../../source/blog/auto_cuda_graph_design.md:165
 msgid ""
 "Monitor Memory Usage: Track graph_mem_pool_size and tensor_mem_size to "
 "avoid OOM"
 msgstr ""
+"监控内存占用：追踪 graph_mem_pool_size 与 tensor_mem_size 以避免 OOM"
 
 #: ../../source/blog/auto_cuda_graph_design.md:166
 msgid ""
 "Specify Layer IDs: Use layer_number to distinguish graphs across "
 "different models/layers"
 msgstr ""
+"指定层 ID：使用 layer_number 区分不同模型/层的图"
 
 #: ../../source/blog/auto_cuda_graph_design.md:167
 msgid ""
 "LRU Cache (Future): Implement cache eviction to limit total graph/tensor "
 "count"
 msgstr ""
+"LRU 缓存（未来）：实现缓存淘汰以限制图/张量的总数量"
 

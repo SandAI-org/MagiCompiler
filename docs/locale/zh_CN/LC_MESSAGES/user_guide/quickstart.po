@@ -22,11 +22,11 @@ msgstr ""
 
 #: ../../source/user_guide/quickstart.md:1
 msgid "QuickStart"
-msgstr ""
+msgstr "快速开始"
 
 #: ../../source/user_guide/quickstart.md:7
 msgid "One Decorator to Rule Them All (`@magi_compile`)"
-msgstr ""
+msgstr "一个装饰器搮定一切（`@magi_compile`）"
 
 #: ../../source/user_guide/quickstart.md:9
 msgid ""
@@ -34,10 +34,12 @@ msgid ""
 "Decorate your core Transformer block once for automatic full-graph "
 "capture and dynamic shape support (defaulting to dim 0)."
 msgstr ""
+"无需再到处散落地写 `torch.compile` 或 `torch.compiler.disable`。"
+"只需对核心 Transformer 块装饰一次，即可自动获得全图捕获与动态 shape 支持（默认第 0 维）。"
 
 #: ../../source/user_guide/quickstart.md:38
 msgid "Bridge Custom Kernels (`@magi_register_custom_op`)"
-msgstr ""
+msgstr "桥接自定义 Kernel（`@magi_register_custom_op`）"
 
 #: ../../source/user_guide/quickstart.md:40
 msgid ""
@@ -45,20 +47,24 @@ msgid ""
 " Don't disable compilation. Wrap them to teach the compiler how to handle"
 " them during graph partitioning and recomputation."
 msgstr ""
+"使用会破坏 FX tracing 的自定义 kernel（FlashAttention、MoE router）？"
+"不要禁用编译。将它们包装起来，告诉编译器在图划分与重计算时如何处理它们。"
 
 #: ../../source/user_guide/quickstart.md:57
 msgid "Advanced Configurations"
-msgstr ""
+msgstr "高级配置"
 
 #: ../../source/user_guide/quickstart.md:59
 msgid ""
 "Explore `magi_compiler/config.py` for power-user features like custom "
 "backend toggles and fine-grained memory management."
 msgstr ""
+"在 `magi_compiler/config.py` 中探索面向高级用户的功能，例如自定义后端开关与细粒度内存管理。"
 
 #: ../../source/user_guide/quickstart.md:63
 msgid ""
 "Comprehensive guides for popular training/inference frameworks are coming"
 " soon."
 msgstr ""
+"面向主流训练/推理框架的完整指南即将推出。"
 

@@ -22,15 +22,15 @@ msgstr ""
 
 #: ../../source/index.md:13
 msgid "Contents"
-msgstr ""
+msgstr "目录"
 
 #: ../../source/index.md:4
 msgid "MagiCompiler documentation"
-msgstr ""
+msgstr "MagiCompiler 文档"
 
 #: ../../source/index.md:7
 msgid "**Overview :**"
-msgstr ""
+msgstr "**概览：**"
 
 #: ../../source/index.md:9
 msgid ""
@@ -43,6 +43,10 @@ msgid ""
 "**training** and **multi-modality inference** with minimal code "
 "intrusion."
 msgstr ""
+"MagiCompiler 是一个构建在 `torch.compile` 之上的先进编译与运行时增强框架。"
+"它面向大规模 Transformer 类架构设计，超越了传统的局部算子优化，引入了系统级优化——"
+"全图捕获、FSDP 感知的分层编译、异步 offloading 以及启发式激活重计算——"
+"以极小的代码侵入无缝加速**训练**与**多模态推理**。"
 
 #: ../../source/index.md:11
 msgid ""
@@ -50,4 +54,6 @@ msgid ""
 "of MagiCompiler for the broader research community. Stay tuned for "
 "exciting enhancements and new features on the horizon!"
 msgstr ""
+"我们致力于为更广泛的研究社区持续提升 MagiCompiler 的性能与通用性。"
+"敬请期待即将到来的激动人心的增强功能与新特性！"
 

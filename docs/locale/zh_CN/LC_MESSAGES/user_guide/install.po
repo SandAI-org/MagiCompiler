@@ -22,41 +22,42 @@ msgstr ""
 
 #: ../../source/user_guide/install.md:1
 msgid "Installation"
-msgstr ""
+msgstr "安装"
 
 #: ../../source/user_guide/install.md:7
 msgid "Requirements"
-msgstr ""
+msgstr "环境要求"
 
 #: ../../source/user_guide/install.md:9
 msgid "Python >= 3.12"
-msgstr ""
+msgstr "Python >= 3.12"
 
 #: ../../source/user_guide/install.md:10
 msgid "PyTorch >= 2.9"
-msgstr ""
+msgstr "PyTorch >= 2.9"
 
 #: ../../source/user_guide/install.md:11
 msgid "CUDA Toolkit"
-msgstr ""
+msgstr "CUDA Toolkit"
 
 #: ../../source/user_guide/install.md:14
 msgid ""
 "For reproducibility, we recommend starting from the prebuilt Docker image"
 " first, then running examples inside the container."
 msgstr ""
+"为了可复现性，我们建议先从预构建的 Docker 镜像开始，然后在容器内运行示例。"
 
 #: ../../source/user_guide/install.md:18
 msgid "Option A (recommended) — Prebuilt Docker Image"
-msgstr ""
+msgstr "方式 A（推荐）— 预构建 Docker 镜像"
 
 #: ../../source/user_guide/install.md:32
 msgid "Option B — Local Source Installation"
-msgstr ""
+msgstr "方式 B — 本地源码安装"
 
 #: ../../source/user_guide/install.md:50
 msgid "Optional — Install CUTLASS for matmul epilogue fusion"
-msgstr ""
+msgstr "可选 — 安装 CUTLASS 以启用 matmul epilogue 融合"
 
 #: ../../source/user_guide/install.md:52
 msgid ""
@@ -64,4 +65,6 @@ msgid ""
 "`sm_120`). Without CUTLASS the compiler still works but skips this "
 "optimization."
 msgstr ""
+"基于 CUTLASS 的 matmul + epilogue 融合 pass（`sm_90` / `sm_120`）需要它。"
+"不安装 CUTLASS 编译器仍可正常工作，只是会跳过该项优化。"
 
