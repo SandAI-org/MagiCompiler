@@ -1,0 +1,10 @@
+sphinx
+pydata-sphinx-theme
+myst_parser
+sphinx-copybutton
+ablog
+sphinxcontrib-bibtex
+sphinx-subfigure
+sphinx_design
+sphinx-intl
+babel==2.18.0
