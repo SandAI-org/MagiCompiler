@@ -1,0 +1,38 @@
+name: sphinx deploy
+
+on:
+  push:
+    branches:
+      - main
+permissions:
+  contents: write
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rsync
+          cd docs
+          pip install -r requirements.txt
+      - name: Build docs
+        run: |
+          cd docs
+          make clean
+          # English at root (backward-compatible URLs)
+          DOCS_LANGUAGE=en sphinx-build -b html source/ build/html/
+          # Chinese under zh_CN/
+          DOCS_LANGUAGE=zh_CN sphinx-build -b html source/ build/html/zh_CN/
+      - name: Deploy to GitHub Pages
+        uses: JamesIves/github-pages-deploy-action@v4
+        if: ${{ github.event_name == 'push' }}
+        with:
+          branch: gh-pages
+          folder: docs/build/html
+          target-folder: docs/main
