@@ -1,10 +1,10 @@
-sphinx
-pydata-sphinx-theme
-myst_parser
-sphinx-copybutton
 ablog
-sphinxcontrib-bibtex
+babel==2.18.0
+myst_parser
+pydata-sphinx-theme
+sphinx
+sphinx-copybutton
+sphinx-intl
 sphinx-subfigure
 sphinx_design
-sphinx-intl
-babel==2.18.0
+sphinxcontrib-bibtex

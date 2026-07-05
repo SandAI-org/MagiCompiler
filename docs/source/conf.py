@@ -65,12 +65,7 @@ suppress_warnings = ["bibtex.duplicate_label"]  # duplicate numbers for each blo
 
 # -- Doc configuration ---------------------------------------------------
 
-myst_enable_extensions = [
-    "colon_fence",
-    "deflist",
-    "html_image",
-    "tasklist",
-]
+myst_enable_extensions = ["colon_fence", "deflist", "html_image", "tasklist"]
 
 myst_tasklist_checkbox = True
 myst_tasklist_exclude_colon = True
@@ -111,10 +106,7 @@ todo_include_todos = True
 templates_path = ["_templates"]
 exclude_patterns = []  # type: ignore
 
-source_suffix = {
-    ".rst": "restructuredtext",
-    ".md": "markdown",
-}
+source_suffix = {".rst": "restructuredtext", ".md": "markdown"}
 
 master_doc = "index"
 
@@ -137,28 +129,15 @@ html_theme_options = {
     "show_toc_level": 3,
     "navigation_depth": 4,
     "collapse_navigation": False,
-    "logo": {
-        "text": "MagiCompiler",
-    },
+    "logo": {"text": "MagiCompiler"},
     "show_prev_next": False,
     "navbar_start": ["navbar-logo"],
     "navbar_center": ["navbar-nav"],
     "navbar_end": ["theme-switcher", "language-switcher", "navbar-icon-links"],
-    "icon_links": [
-        {
-            "name": "Github",
-            "url": "https://github.com/SandAI-org/MagiCompiler",
-            "icon": "fa-brands fa-github",
-        },
-    ],
+    "icon_links": [{"name": "Github", "url": "https://github.com/SandAI-org/MagiCompiler", "icon": "fa-brands fa-github"}],
 }
 
-html_context = {
-    "supported_doc_languages": [
-        {"code": "en", "label": "English"},
-        {"code": "zh_CN", "label": "简体中文"},
-    ]
-}
+html_context = {"supported_doc_languages": [{"code": "en", "label": "English"}, {"code": "zh_CN", "label": "简体中文"}]}
 
 html_sidebars = {
     "blog/**": [
@@ -170,10 +149,7 @@ html_sidebars = {
         "ablog/authors.html",
         "ablog/locations.html",
     ],
-    "user_guide/**": [
-        "sidebar-nav-bs",
-        "sidebar-ethical-ads",
-    ],
+    "user_guide/**": ["sidebar-nav-bs", "sidebar-ethical-ads"],
 }
 
 
