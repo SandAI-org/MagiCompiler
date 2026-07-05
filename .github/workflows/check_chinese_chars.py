@@ -42,6 +42,8 @@ CHINESE_CHAR_PATTERN = re.compile(
     "]"
 )
 
+EXEMPT_DOCUMENT_NAMES: List[str] = ["docs/README_zh.md"]
+
 BINARY_EXTENSIONS = frozenset(
     {
         ".png",
@@ -130,7 +132,12 @@ def _check_diff(base_sha: str, head_sha: str) -> List[Tuple[str, int, str]]:
         if line.startswith("+"):
             line_num += 1
             content = line[1:]
-            if current_file and not _is_binary(current_file) and CHINESE_CHAR_PATTERN.search(content):
+            if (
+                current_file
+                and current_file not in EXEMPT_DOCUMENT_NAMES
+                and not _is_binary(current_file)
+                and CHINESE_CHAR_PATTERN.search(content)
+            ):
                 findings.append((current_file, line_num, content))
         elif not line.startswith("-"):
             line_num += 1
@@ -150,7 +157,7 @@ def _check_all_files() -> List[Tuple[str, int, str]]:
 
     findings: List[Tuple[str, int, str]] = []
     for filepath in tracked:
-        if not filepath or _is_binary(filepath) or not os.path.isfile(filepath):
+        if not filepath or filepath in EXEMPT_DOCUMENT_NAMES or _is_binary(filepath) or not os.path.isfile(filepath):
             continue
         try:
             with open(filepath, encoding="utf-8", errors="ignore") as fh:

@@ -110,7 +110,7 @@ Triggered when no valid cached graph exists or tensor expansion is needed:
 ```python
 import torch
 import torch.nn as nn
-from magi_compiler.cuda_graph_mgr import cuda_graph_mgr, cuda_graph_enable_if
+from magi_compiler.magi_backend.cuda_graph_mgr import cuda_graph_mgr, cuda_graph_enable_if
 
 class SimpleTransformerLayer(nn.Module):
     def __init__(self, hidden_dim: int = 1024, num_heads: int = 8):
