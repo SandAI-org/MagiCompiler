@@ -1,0 +1,1065 @@
+
+<!DOCTYPE html>
+
+
+<html lang="zh-CN" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>AutoCudaGraph 设计 &#8212; MagiCompiler main 文档</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=3ee1c6c6" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=6fe42dbf" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+
+    <script src="../_static/documentation_options.js?v=b4ae3449"></script>
+    <script src="../_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=fd10adb8"></script>
+    <script src="../_static/translations.js?v=540d3cec"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blog/auto_cuda_graph_design';</script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+    <link rel="canonical" href="https://sandai-org.github.io/MagiCompiler/docs/blog/auto_cuda_graph_design.html" />
+    <link rel="index" title="索引" href="../genindex.html" />
+    <link rel="search" title="搜索" href="../search.html" />
+    <link rel="prev" title="自动 Offloading 解析" href="auto_cpu_offload.html" /> 
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="zh-CN"/>
+  <meta name="docsearch:version" content="" />
+  
+    
+    <script src="../_static/searchtools.js"></script>
+    <script src="../_static/language_data.js"></script>
+    <script src="../searchindex.js"></script>
+     
+  </head>
+  <body data-default-mode="">
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">跳转至主要内容</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>回到顶部</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="版本警告"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="网页导航">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+  
+    <p class="title logo__title">MagiCompiler</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+<nav>
+  <ul class="bd-navbar-elements navbar-nav">
+    
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../user_guide/toc.html">
+    用户指南
+  </a>
+</li>
+
+
+<li class="nav-item current active">
+  <a class="nav-link nav-internal" href="toc.html">
+    博客
+  </a>
+</li>
+
+  </ul>
+</nav></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="搜索" aria-label="搜索" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">搜索</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="亮色"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="暗色"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>亮色</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>暗色</button></li>
+  </ul>
+</div></div>
+      
+        <div class="navbar-item">
+
+
+<div
+  class="dropdown"
+  id="doc-language-switcher-root"
+  data-pagename="blog/auto_cuda_graph_design"
+  data-is-chinese="true"
+  data-zh-segment="zh_CN"
+>
+  <button
+    class="btn btn-sm btn-outline-primary dropdown-toggle"
+    type="button"
+    id="doc-language-switcher"
+    data-bs-toggle="dropdown"
+    aria-expanded="false"
+  >
+    简体中文
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="doc-language-switcher">
+    
+      <li>
+        <a class="dropdown-item doc-lang-link" href="#" data-lang="en">
+          English
+        </a>
+      </li>
+    
+      <li>
+        <a class="dropdown-item doc-lang-link" href="#" data-lang="zh_CN">
+          简体中文
+        </a>
+      </li>
+    
+  </ul>
+</div>
+<script>
+  (function () {
+    // English lives at the root (no language prefix).
+    // Chinese lives under zh_CN/ inside the same site root.
+    // URL examples:
+    //   English: <site-root>/user_guide/install.html
+    //   Chinese: <site-root>/zh_CN/user_guide/install.html
+    //
+    // The site root is derived from the current page's own `pagename`
+    // (known at build time) instead of a hard-coded "/docs/" marker, so the
+    // switcher works identically when served online (e.g. under
+    // "/MagiCompiler/docs/main/") and when the built HTML is downloaded and
+    // opened locally via file:// URLs.
+    //
+    // NOTE: build-time values (pagename / is_chinese) are passed through
+    // `data-*` attributes rather than inlined into JS, so this script stays
+    // valid, lint-clean JavaScript with no template syntax mixed in.
+    var root = document.getElementById("doc-language-switcher-root");
+    if (!root) return;
+
+    var ZH_SEGMENT = root.getAttribute("data-zh-segment") || "zh_CN";
+    var PAGENAME = root.getAttribute("data-pagename") || "";
+    var IS_CHINESE = root.getAttribute("data-is-chinese") === "true";
+
+    function currentRoot() {
+      // Strip the trailing "<pagename>.html" from the current URL to obtain
+      // the site root for the *current* language build (always ends with "/").
+      var url = window.location.href;
+      var hashIdx = url.indexOf("#");
+      if (hashIdx !== -1) url = url.slice(0, hashIdx);
+      var qIdx = url.indexOf("?");
+      if (qIdx !== -1) url = url.slice(0, qIdx);
+      var suffix = PAGENAME + ".html";
+      if (url.slice(-suffix.length) === suffix) {
+        return url.slice(0, url.length - suffix.length);
+      }
+      // Fallback: directory of the current file.
+      return url.slice(0, url.lastIndexOf("/") + 1);
+    }
+
+    function enRoot() {
+      // Normalise to the English (top-level) site root.
+      var currRoot = currentRoot();
+      var zhSuffix = ZH_SEGMENT + "/";
+      if (IS_CHINESE && currRoot.slice(-zhSuffix.length) === zhSuffix) {
+        return currRoot.slice(0, currRoot.length - zhSuffix.length);
+      }
+      return currRoot;
+    }
+
+    function resolvePath(targetLang) {
+      var query = window.location.search || "";
+      var hash = window.location.hash || "";
+      var base = enRoot();  // English site root, ends with "/"
+      var target = (targetLang === "en") ? base : base + ZH_SEGMENT + "/";
+      return target + PAGENAME + ".html" + query + hash;
+    }
+
+    var links = document.querySelectorAll(".doc-lang-link");
+    for (var i = 0; i < links.length; i++) {
+      var targetLang = links[i].getAttribute("data-lang");
+      links[i].setAttribute("href", resolvePath(targetLang));
+    }
+  })();
+</script></div>
+      
+        <div class="navbar-item"><ul class="navbar-icon-links"
+    aria-label="Icon Links">
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://github.com/SandAI-org/MagiCompiler" title="Github" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-github fa-lg" aria-hidden="true"></i><span class="visually-hidden">Github</span></a>
+        </li>
+</ul></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="搜索" aria-label="搜索" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">搜索</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="当前页面">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+<nav>
+  <ul class="bd-navbar-elements navbar-nav">
+    
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../user_guide/toc.html">
+    用户指南
+  </a>
+</li>
+
+
+<li class="nav-item current active">
+  <a class="nav-link nav-internal" href="toc.html">
+    博客
+  </a>
+</li>
+
+  </ul>
+</nav></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="亮色"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="暗色"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>亮色</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>暗色</button></li>
+  </ul>
+</div></div>
+        
+          <div class="navbar-item">
+
+
+<div
+  class="dropdown"
+  id="doc-language-switcher-root"
+  data-pagename="blog/auto_cuda_graph_design"
+  data-is-chinese="true"
+  data-zh-segment="zh_CN"
+>
+  <button
+    class="btn btn-sm btn-outline-primary dropdown-toggle"
+    type="button"
+    id="doc-language-switcher"
+    data-bs-toggle="dropdown"
+    aria-expanded="false"
+  >
+    简体中文
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="doc-language-switcher">
+    
+      <li>
+        <a class="dropdown-item doc-lang-link" href="#" data-lang="en">
+          English
+        </a>
+      </li>
+    
+      <li>
+        <a class="dropdown-item doc-lang-link" href="#" data-lang="zh_CN">
+          简体中文
+        </a>
+      </li>
+    
+  </ul>
+</div>
+<script>
+  (function () {
+    // English lives at the root (no language prefix).
+    // Chinese lives under zh_CN/ inside the same site root.
+    // URL examples:
+    //   English: <site-root>/user_guide/install.html
+    //   Chinese: <site-root>/zh_CN/user_guide/install.html
+    //
+    // The site root is derived from the current page's own `pagename`
+    // (known at build time) instead of a hard-coded "/docs/" marker, so the
+    // switcher works identically when served online (e.g. under
+    // "/MagiCompiler/docs/main/") and when the built HTML is downloaded and
+    // opened locally via file:// URLs.
+    //
+    // NOTE: build-time values (pagename / is_chinese) are passed through
+    // `data-*` attributes rather than inlined into JS, so this script stays
+    // valid, lint-clean JavaScript with no template syntax mixed in.
+    var root = document.getElementById("doc-language-switcher-root");
+    if (!root) return;
+
+    var ZH_SEGMENT = root.getAttribute("data-zh-segment") || "zh_CN";
+    var PAGENAME = root.getAttribute("data-pagename") || "";
+    var IS_CHINESE = root.getAttribute("data-is-chinese") === "true";
+
+    function currentRoot() {
+      // Strip the trailing "<pagename>.html" from the current URL to obtain
+      // the site root for the *current* language build (always ends with "/").
+      var url = window.location.href;
+      var hashIdx = url.indexOf("#");
+      if (hashIdx !== -1) url = url.slice(0, hashIdx);
+      var qIdx = url.indexOf("?");
+      if (qIdx !== -1) url = url.slice(0, qIdx);
+      var suffix = PAGENAME + ".html";
+      if (url.slice(-suffix.length) === suffix) {
+        return url.slice(0, url.length - suffix.length);
+      }
+      // Fallback: directory of the current file.
+      return url.slice(0, url.lastIndexOf("/") + 1);
+    }
+
+    function enRoot() {
+      // Normalise to the English (top-level) site root.
+      var currRoot = currentRoot();
+      var zhSuffix = ZH_SEGMENT + "/";
+      if (IS_CHINESE && currRoot.slice(-zhSuffix.length) === zhSuffix) {
+        return currRoot.slice(0, currRoot.length - zhSuffix.length);
+      }
+      return currRoot;
+    }
+
+    function resolvePath(targetLang) {
+      var query = window.location.search || "";
+      var hash = window.location.hash || "";
+      var base = enRoot();  // English site root, ends with "/"
+      var target = (targetLang === "en") ? base : base + ZH_SEGMENT + "/";
+      return target + PAGENAME + ".html" + query + hash;
+    }
+
+    var links = document.querySelectorAll(".doc-lang-link");
+    for (var i = 0; i < links.length; i++) {
+      var targetLang = links[i].getAttribute("data-lang");
+      links[i].setAttribute("href", resolvePath(targetLang));
+    }
+  })();
+</script></div>
+        
+          <div class="navbar-item"><ul class="navbar-icon-links"
+    aria-label="Icon Links">
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://github.com/SandAI-org/MagiCompiler" title="Github" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-github fa-lg" aria-hidden="true"></i><span class="visually-hidden">Github</span></a>
+        </li>
+</ul></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+<div class="ablog-sidebar-item ablog__postcard">
+   
+  <h2>
+     
+    <i class="fa fa-calendar"></i>
+    
+    <span>23 March 2026</span>
+    
+  </h2>
+  <ul>
+    <div class="ablog-sidebar-item ablog__postcard2">
+   
+  <li id="ablog-sidebar-item author ablog__author">
+    <span>
+      
+      <i class="fa-fw fa fa-user"></i>
+      
+    </span>
+     
+    <a href="author/zhiyao-cen.html">Zhiyao Cen</a>
+      
+  </li>
+     
+  <li id="ablog-sidebar-item category ablog__category">
+    <span>
+      
+      <i class="fa-fw fa fa-folder-open"></i>
+      
+    </span>
+     
+    <a href="category/design.html">Design</a>
+      
+  </li>
+   
+  <li id="ablog-sidebar-item tags ablog__tags">
+    <span>
+       
+      <i class="fa-fw fa fa-tags"></i>
+       
+    </span>
+     
+    <a href="tag/cuda-graph.html">cuda-graph</a>
+        
+    <a href="tag/inference.html">inference</a>
+        
+    <a href="tag/memory.html">memory</a>
+      
+  </li>
+   
+</div>
+  </ul>
+</div>
+</div>
+        <div class="sidebar-primary-item">
+<div class="ablog-sidebar-item ablog__recentposts">
+  <h3>
+    <a href="../blog.html">Recent Posts</a>
+  </h3>
+  <ul>
+     
+    <li>
+      <a href="auto_cpu_offload.html">
+        23 March - 自动 Offloading 解析
+      </a>
+    </li>
+    
+    <li>
+      <a href="why_magi_depyf.html">
+        23 March - 为什么需要 magi_depyf
+      </a>
+    </li>
+    
+  </ul>
+</div>
+</div>
+        <div class="sidebar-primary-item">
+<div class="ablog-sidebar-item ablog__tagcloud">
+  <link
+    rel="stylesheet"
+    href="../_static/ablog/tagcloud.css"
+    type="text/css"
+  />
+  <h3><a href="tag.html">Tags</a></h3>
+  <ul class="ablog-cloud">
+     
+    <li class="ablog-cloud ablog-cloud-1">
+      <a href="tag/cuda-graph.html">cuda-graph</a>
+    </li>
+      
+    <li class="ablog-cloud ablog-cloud-1">
+      <a href="tag/debugging.html">debugging</a>
+    </li>
+      
+    <li class="ablog-cloud ablog-cloud-1">
+      <a href="tag/inference.html">inference</a>
+    </li>
+      
+    <li class="ablog-cloud ablog-cloud-1">
+      <a href="tag/magi_depyf.html">magi_depyf</a>
+    </li>
+      
+    <li class="ablog-cloud ablog-cloud-5">
+      <a href="tag/memory.html">memory</a>
+    </li>
+      
+    <li class="ablog-cloud ablog-cloud-1">
+      <a href="tag/observability.html">observability</a>
+    </li>
+      
+    <li class="ablog-cloud ablog-cloud-1">
+      <a href="tag/offload.html">offload</a>
+    </li>
+      
+    <li class="ablog-cloud ablog-cloud-1">
+      <a href="tag/scheduling.html">scheduling</a>
+    </li>
+     
+  </ul>
+</div>
+</div>
+        <div class="sidebar-primary-item">
+<div class="ablog-sidebar-item ablog__categories">
+  <h3>
+    <a href="category.html">Categories</a>
+  </h3>
+  <ul>
+     
+    <li>
+      <a href="category/design.html">Design (3)</a>
+    </li>
+     
+  </ul>
+</div>
+</div>
+        <div class="sidebar-primary-item">
+<div class="ablog-sidebar-item ablog__archives">
+  <h3>
+    <a href="archive.html">Archives</a>
+  </h3>
+  <ul>
+     
+    <li>
+      <a href="2026.html">2026 (3)</a>
+    </li>
+     
+  </ul>
+</div>
+</div>
+        <div class="sidebar-primary-item">
+<div class="ablog-sidebar-item ablog__authors">
+  <h3>
+    <a href="author.html">Authors</a>
+  </h3>
+  <ul>
+     
+    <li>
+      <a href="author/magicompiler-team.html">MagiCompiler Team (1)</a>
+    </li>
+      
+    <li>
+      <a href="author/taoran-wang.html">Taoran Wang (1)</a>
+    </li>
+      
+    <li>
+      <a href="author/zhiyao-cen.html">Zhiyao Cen (1)</a>
+    </li>
+     
+  </ul>
+</div>
+</div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="初始页面">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    
+    <li class="breadcrumb-item"><a href="toc.html" class="nav-link">博客</a></li>
+    
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">AutoCudaGraph 设计</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                   <section id="autocudagraph-design">
+<h1>AutoCudaGraph 设计<a class="headerlink" href="#autocudagraph-design" title="链接到此标题。">#</a></h1>
+<section id="overview">
+<h2>概览<a class="headerlink" href="#overview" title="链接到此标题。">#</a></h2>
+<p>AutoCudaGraph 是集成在 MagiCompiler 框架中的 CUDA Graph 优化模块，旨在为基于 PyTorch 的神经网络推理自动完成 CUDA Graph 的捕获、缓存、回放与张量内存管理。它面向具有动态序列长度的 Transformer 架构，通过复用预先捕获的计算图与静态张量缓冲区来优化 kernel 执行。核心目标：</p>
+<ul class="simple">
+<li><p>以最小的代码侵入自动化 CUDA Graph 生命周期（捕获/回放/缓存）</p></li>
+<li><p>支持动态 shape 适配（序列长度扩展）</p></li>
+<li><p>通过全局内存池与静态张量复用优化内存效率</p></li>
+<li><p>确保缓存图与运行时输入/输出之间的一致性</p></li>
+</ul>
+</section>
+<section id="key-components">
+<h2>关键组件<a class="headerlink" href="#key-components" title="链接到此标题。">#</a></h2>
+<section id="cudagraphmgr-core-manager">
+<h3>CudaGraphMgr（核心管理器）<a class="headerlink" href="#cudagraphmgr-core-manager" title="链接到此标题。">#</a></h3>
+<p>管理所有 CUDA Graph 操作的单例类：</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">CudaGraphMgr</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">cache</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="n">StaticSignature</span><span class="p">,</span> <span class="n">StaticTensorEntry</span><span class="p">]</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">graph_mem_pool</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">graph_pool_handle</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+</pre></div>
+</div>
+<p><strong>核心方法</strong></p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>方法</p></th>
+<th class="head"><p>用途</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>run()</p></td>
+<td><p>主入口：回放缓存图，或预热并捕获新图</p></td>
+</tr>
+<tr class="row-odd"><td><p>wrapped_graph_capture()</p></td>
+<td><p>使用切片后的静态输入/输出张量捕获 CUDA Graph</p></td>
+</tr>
+<tr class="row-even"><td><p>wrapped_graph_replay()</p></td>
+<td><p>使用切片后的静态张量回放缓存的 CUDA Graph，并进行输出模板包装</p></td>
+</tr>
+<tr class="row-odd"><td><p>get_expanded_static_tensors()</p></td>
+<td><p>扩展静态张量，在维度兼容时复用缓冲区</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="signature-system">
+<h3>签名系统<a class="headerlink" href="#signature-system" title="链接到此标题。">#</a></h3>
+<p>StaticSignature</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span><span class="p">(</span><span class="n">unsafe_hash</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">StaticSignature</span><span class="p">(</span><span class="n">HashableDataclass</span><span class="p">):</span>
+    <span class="n">func_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span>
+    <span class="n">tensor_static_infos</span><span class="p">:</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">TensorStaticInfo</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">()</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>编码输入张量的固定属性（dtype、静态维度）</p></li>
+<li><p>作为静态张量缓冲区缓存的主键</p></li>
+</ul>
+<p>DynamicSignature</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span><span class="p">(</span><span class="n">unsafe_hash</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">DynamicSignature</span><span class="p">(</span><span class="n">HashableDataclass</span><span class="p">):</span>
+    <span class="n">tensor_dynamic_infos</span><span class="p">:</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">TensorDynamicInfo</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">()</span>
+    <span class="n">literals_info</span><span class="p">:</span> <span class="n">LiteralsInfo</span> <span class="o">=</span> <span class="kc">None</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>追踪动态维度（序列长度）与字面量参数</p></li>
+<li><p>图条目查找的次级键</p></li>
+</ul>
+</section>
+<section id="tensor-management">
+<h3>张量管理<a class="headerlink" href="#tensor-management" title="链接到此标题。">#</a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">StaticTensorEntry</span><span class="p">:</span>
+    <span class="n">input_tensors</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">output_tensors</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">template_entry_dict</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="n">DynamicSignature</span><span class="p">,</span> <span class="n">OutputTemplateEntry</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>内存复用：尽可能复用已有的张量缓冲区，避免重新分配</p></li>
+<li><p>动态扩展：仅当新的输入维度超过当前缓冲区大小时才扩展静态张量</p></li>
+<li><p>Shape 校验：确保缓存张量与新张量之间的静态维度（非序列维度）一致</p></li>
+</ul>
+</section>
+<section id="graph-management">
+<h3>图管理<a class="headerlink" href="#graph-management" title="链接到此标题。">#</a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">GraphEntry</span><span class="p">:</span>
+    <span class="n">graph</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">CUDAGraph</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">inconsistent</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">invalid</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">OutputTemplateEntry</span><span class="p">:</span>
+    <span class="n">graph_entry_dict</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">GraphEntry</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">output_template</span><span class="p">:</span> <span class="n">Any</span> <span class="o">=</span> <span class="kc">None</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>图状态追踪：GraphEntry 追踪 CUDA Graph 实例及其有效性状态，以控制是否允许回放。</p></li>
+<li><p>分层组织：OutputTemplateEntry 将动态签名映射到各层的 GraphEntry，实现按层的图复用。</p></li>
+<li><p>输出一致性：output_template 保留输出对象结构，确保回放时结果包装的一致性。</p></li>
+</ul>
+</section>
+</section>
+<section id="execution-flow">
+<h2>执行流程<a class="headerlink" href="#execution-flow" title="链接到此标题。">#</a></h2>
+<section id="inline-replay-fast-path">
+<h3>内联回放（快路径）<a class="headerlink" href="#inline-replay-fast-path" title="链接到此标题。">#</a></h3>
+<ul class="simple">
+<li><p>从运行时参数中提取输入签名</p></li>
+<li><p>通过 StaticSignature + DynamicSignature + 层号查找缓存的 CUDA Graph</p></li>
+<li><p>校验图的一致性（非 inconsistent/invalid）</p></li>
+<li><p>通过动态切片复用静态张量</p></li>
+<li><p>回放图并返回切片后的输出</p></li>
+</ul>
+</section>
+<section id="graph-capture-slow-path">
+<h3>图捕获（慢路径）<a class="headerlink" href="#graph-capture-slow-path" title="链接到此标题。">#</a></h3>
+<p>当不存在有效的缓存图，或需要扩展张量时触发：</p>
+<ul class="simple">
+<li><p>执行函数以获得输出张量</p></li>
+<li><p>确保预热后输入签名匹配</p></li>
+<li><p>若新 shape 需要则扩展静态缓冲区</p></li>
+<li><p>使用静态张量捕获新的 CUDA Graph</p></li>
+<li><p>存储新图并更新张量条目</p></li>
+<li><p>将预热执行的输出作为最终结果返回</p></li>
+</ul>
+</section>
+<section id="sequence-length-handling">
+<h3>序列长度处理<a class="headerlink" href="#sequence-length-handling" title="链接到此标题。">#</a></h3>
+<ul class="simple">
+<li><p>对于 ND 张量（ND &gt; 1），仅最后一维为静态</p></li>
+<li><p>对于 1D 张量（ND=1），所有维度均为动态</p></li>
+<li><p>随序列长度增长自动扩展缓冲区</p></li>
+<li><p>当张量被扩展时使旧图失效</p></li>
+</ul>
+</section>
+</section>
+<section id="examples">
+<h2>示例<a class="headerlink" href="#examples" title="链接到此标题。">#</a></h2>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">nn</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">magi_compiler.magi_backend.cuda_graph_mgr</span><span class="w"> </span><span class="kn">import</span> <span class="n">cuda_graph_mgr</span><span class="p">,</span> <span class="n">cuda_graph_enable_if</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">SimpleTransformerLayer</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1024</span><span class="p">,</span> <span class="n">num_heads</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">8</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">self_attn</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">MultiheadAttention</span><span class="p">(</span><span class="n">hidden_dim</span><span class="p">,</span> <span class="n">num_heads</span><span class="p">,</span> <span class="n">batch_first</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">linear</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="n">hidden_dim</span><span class="p">,</span> <span class="n">hidden_dim</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">layer_norm</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">LayerNorm</span><span class="p">(</span><span class="n">hidden_dim</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">layer_number</span> <span class="o">=</span> <span class="mi">0</span>
+
+    <span class="nd">@cuda_graph_enable_if</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">())</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
+        <span class="n">attn_out</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">self_attn</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">x</span><span class="p">)</span>
+        <span class="n">out</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">linear</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layer_norm</span><span class="p">(</span><span class="n">x</span> <span class="o">+</span> <span class="n">attn_out</span><span class="p">))</span>
+        <span class="k">return</span> <span class="n">out</span>
+
+<span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">&quot;cuda&quot;</span> <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">()</span> <span class="k">else</span> <span class="s2">&quot;cpu&quot;</span><span class="p">)</span>
+<span class="n">model</span> <span class="o">=</span> <span class="n">SimpleTransformerLayer</span><span class="p">(</span><span class="n">hidden_dim</span><span class="o">=</span><span class="mi">1024</span><span class="p">,</span> <span class="n">num_heads</span><span class="o">=</span><span class="mi">8</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">eval</span><span class="p">()</span>
+<span class="n">graph_mgr</span> <span class="o">=</span> <span class="n">cuda_graph_mgr</span><span class="p">()</span>
+
+<span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+    <span class="n">input_1</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">512</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+    <span class="n">output_1</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">input_1</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;First run (graph capture): Output shape = </span><span class="si">{</span><span class="n">output_1</span><span class="o">.</span><span class="n">shape</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Cached graphs count: </span><span class="si">{</span><span class="n">graph_mgr</span><span class="o">.</span><span class="n">graph_count</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="n">input_2</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">512</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+    <span class="n">output_2</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">input_2</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Second run (graph replay): Output shape = </span><span class="si">{</span><span class="n">output_2</span><span class="o">.</span><span class="n">shape</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Cached graphs count: </span><span class="si">{</span><span class="n">graph_mgr</span><span class="o">.</span><span class="n">graph_count</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="n">input_3</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+    <span class="n">output_3</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">input_3</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Third run (tensor expansion): Output shape = </span><span class="si">{</span><span class="n">output_3</span><span class="o">.</span><span class="n">shape</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Cached graphs count: </span><span class="si">{</span><span class="n">graph_mgr</span><span class="o">.</span><span class="n">graph_count</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Static tensor memory usage: </span><span class="si">{</span><span class="n">graph_mgr</span><span class="o">.</span><span class="n">tensor_mem_size</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> MB&quot;</span><span class="p">)</span>
+
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">CUDA Graph Cache Details:&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="n">graph_mgr</span><span class="o">.</span><span class="n">formatted_cache_str</span><span class="p">())</span>
+</pre></div>
+</div>
+</section>
+<section id="limitations-and-constraints">
+<h2>局限与约束<a class="headerlink" href="#limitations-and-constraints" title="链接到此标题。">#</a></h2>
+<ul class="simple">
+<li><p>不支持被捕获函数中依赖数据的控制流</p></li>
+<li><p>若函数包含 CPU/GPU 同步，图捕获会失败</p></li>
+<li><p>仅支持 CUDA 张量（CPU 张量会触发回退）</p></li>
+<li><p>自定义输入类必须继承自 InplaceSubstituteFakeClass</p></li>
+<li><p>假设被捕获图的输入张量不会在外部被复用（存在跨场景静态张量复用的风险）</p></li>
+<li><p>依赖相同的函数、输入张量 shape 与常量才能有效复用图</p></li>
+<li><p>不支持多 stream 执行场景</p></li>
+</ul>
+</section>
+<section id="best-practices">
+<h2>最佳实践<a class="headerlink" href="#best-practices" title="链接到此标题。">#</a></h2>
+<ul class="simple">
+<li><p>动态维度：尽可能让张量以序列长度作为第 0 维</p></li>
+<li><p>监控内存占用：追踪 graph_mem_pool_size 与 tensor_mem_size 以避免 OOM</p></li>
+<li><p>指定层 ID：使用 layer_number 区分不同模型/层的图</p></li>
+<li><p>LRU 缓存（未来）：实现缓存淘汰以限制图/张量的总数量</p></li>
+</ul>
+</section>
+</section>
+
+<div class="section ablog__blog_comments">
+     
+<div class="section ablog__prev-next">
+  <span class="ablog__prev">
+    
+  </span>
+  <span class="ablog__spacer">&nbsp;</span>
+  <span class="ablog__next">
+     
+    <a href="why_magi_depyf.html">
+      <span>为什么需要 magi_depyf</span>
+      
+      <i class="fa fa-arrow-circle-right"></i>
+      
+    </a>
+    
+  </span>
+</div>
+  
+</div>
+
+                </article>
+              
+              
+              
+              
+              
+            </div>
+            
+            
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> 当前页面
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">概览</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#key-components">关键组件</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cudagraphmgr-core-manager">CudaGraphMgr（核心管理器）</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#signature-system">签名系统</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-management">张量管理</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#graph-management">图管理</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#execution-flow">执行流程</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#inline-replay-fast-path">内联回放（快路径）</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#graph-capture-slow-path">图捕获（慢路径）</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#sequence-length-handling">序列长度处理</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#examples">示例</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#limitations-and-constraints">局限与约束</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#best-practices">最佳实践</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+
+  <p class="copyright">
+    
+      © Copyright 2025-2026, SandAI.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+
+  <p class="sphinx-version">
+    由 <a href="https://www.sphinx-doc.org/">Sphinx</a> 9.1.0创建。
+    <br/>
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+    <div class="footer-items__end">
+      
+        <div class="footer-item">
+<p class="theme-version">
+  <!-- # L10n: Setting the PST URL as an argument as this does not need to be localized -->
+  使用 <a href="https://pydata-sphinx-theme.readthedocs.io/en/stable/index.html">PyData Sphinx Theme</a> 0.19.0构建.
+</p></div>
+      
+    </div>
+  
+</div>
+
+  </footer>
+  </body>
+</html>

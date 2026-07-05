@@ -1,0 +1,1071 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>AutoCudaGraph Design &#8212; MagiCompiler main documentation</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=3ee1c6c6" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=6fe42dbf" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+
+    <script src="../_static/documentation_options.js?v=a8da1a53"></script>
+    <script src="../_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=fd10adb8"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blog/auto_cuda_graph_design';</script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+    <link rel="canonical" href="https://sandai-org.github.io/MagiCompiler/docs/blog/auto_cuda_graph_design.html" />
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="prev" title="Analysis of Automatic Offloading" href="auto_cpu_offload.html" /> 
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="" />
+  
+    
+    <script src="../_static/searchtools.js"></script>
+    <script src="../_static/language_data.js"></script>
+    <script src="../searchindex.js"></script>
+     
+  </head>
+  <body data-default-mode="">
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+  
+    <p class="title logo__title">MagiCompiler</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+<nav>
+  <ul class="bd-navbar-elements navbar-nav">
+    
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../user_guide/toc.html">
+    User Guide
+  </a>
+</li>
+
+
+<li class="nav-item current active">
+  <a class="nav-link nav-internal" href="toc.html">
+    Blogs
+  </a>
+</li>
+
+  </ul>
+</nav></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+      
+        <div class="navbar-item">
+
+
+<div
+  class="dropdown"
+  id="doc-language-switcher-root"
+  data-pagename="blog/auto_cuda_graph_design"
+  data-is-chinese="false"
+  data-zh-segment="zh_CN"
+>
+  <button
+    class="btn btn-sm btn-outline-primary dropdown-toggle"
+    type="button"
+    id="doc-language-switcher"
+    data-bs-toggle="dropdown"
+    aria-expanded="false"
+  >
+    English
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="doc-language-switcher">
+    
+      <li>
+        <a class="dropdown-item doc-lang-link" href="#" data-lang="en">
+          English
+        </a>
+      </li>
+    
+      <li>
+        <a class="dropdown-item doc-lang-link" href="#" data-lang="zh_CN">
+          简体中文
+        </a>
+      </li>
+    
+  </ul>
+</div>
+<script>
+  (function () {
+    // English lives at the root (no language prefix).
+    // Chinese lives under zh_CN/ inside the same site root.
+    // URL examples:
+    //   English: <site-root>/user_guide/install.html
+    //   Chinese: <site-root>/zh_CN/user_guide/install.html
+    //
+    // The site root is derived from the current page's own `pagename`
+    // (known at build time) instead of a hard-coded "/docs/" marker, so the
+    // switcher works identically when served online (e.g. under
+    // "/MagiCompiler/docs/main/") and when the built HTML is downloaded and
+    // opened locally via file:// URLs.
+    //
+    // NOTE: build-time values (pagename / is_chinese) are passed through
+    // `data-*` attributes rather than inlined into JS, so this script stays
+    // valid, lint-clean JavaScript with no template syntax mixed in.
+    var root = document.getElementById("doc-language-switcher-root");
+    if (!root) return;
+
+    var ZH_SEGMENT = root.getAttribute("data-zh-segment") || "zh_CN";
+    var PAGENAME = root.getAttribute("data-pagename") || "";
+    var IS_CHINESE = root.getAttribute("data-is-chinese") === "true";
+
+    function currentRoot() {
+      // Strip the trailing "<pagename>.html" from the current URL to obtain
+      // the site root for the *current* language build (always ends with "/").
+      var url = window.location.href;
+      var hashIdx = url.indexOf("#");
+      if (hashIdx !== -1) url = url.slice(0, hashIdx);
+      var qIdx = url.indexOf("?");
+      if (qIdx !== -1) url = url.slice(0, qIdx);
+      var suffix = PAGENAME + ".html";
+      if (url.slice(-suffix.length) === suffix) {
+        return url.slice(0, url.length - suffix.length);
+      }
+      // Fallback: directory of the current file.
+      return url.slice(0, url.lastIndexOf("/") + 1);
+    }
+
+    function enRoot() {
+      // Normalise to the English (top-level) site root.
+      var currRoot = currentRoot();
+      var zhSuffix = ZH_SEGMENT + "/";
+      if (IS_CHINESE && currRoot.slice(-zhSuffix.length) === zhSuffix) {
+        return currRoot.slice(0, currRoot.length - zhSuffix.length);
+      }
+      return currRoot;
+    }
+
+    function resolvePath(targetLang) {
+      var query = window.location.search || "";
+      var hash = window.location.hash || "";
+      var base = enRoot();  // English site root, ends with "/"
+      var target = (targetLang === "en") ? base : base + ZH_SEGMENT + "/";
+      return target + PAGENAME + ".html" + query + hash;
+    }
+
+    var links = document.querySelectorAll(".doc-lang-link");
+    for (var i = 0; i < links.length; i++) {
+      var targetLang = links[i].getAttribute("data-lang");
+      links[i].setAttribute("href", resolvePath(targetLang));
+    }
+  })();
+</script></div>
+      
+        <div class="navbar-item"><ul class="navbar-icon-links"
+    aria-label="Icon Links">
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://github.com/SandAI-org/MagiCompiler" title="Github" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-github fa-lg" aria-hidden="true"></i><span class="visually-hidden">Github</span></a>
+        </li>
+</ul></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+<nav>
+  <ul class="bd-navbar-elements navbar-nav">
+    
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../user_guide/toc.html">
+    User Guide
+  </a>
+</li>
+
+
+<li class="nav-item current active">
+  <a class="nav-link nav-internal" href="toc.html">
+    Blogs
+  </a>
+</li>
+
+  </ul>
+</nav></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+        
+          <div class="navbar-item">
+
+
+<div
+  class="dropdown"
+  id="doc-language-switcher-root"
+  data-pagename="blog/auto_cuda_graph_design"
+  data-is-chinese="false"
+  data-zh-segment="zh_CN"
+>
+  <button
+    class="btn btn-sm btn-outline-primary dropdown-toggle"
+    type="button"
+    id="doc-language-switcher"
+    data-bs-toggle="dropdown"
+    aria-expanded="false"
+  >
+    English
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="doc-language-switcher">
+    
+      <li>
+        <a class="dropdown-item doc-lang-link" href="#" data-lang="en">
+          English
+        </a>
+      </li>
+    
+      <li>
+        <a class="dropdown-item doc-lang-link" href="#" data-lang="zh_CN">
+          简体中文
+        </a>
+      </li>
+    
+  </ul>
+</div>
+<script>
+  (function () {
+    // English lives at the root (no language prefix).
+    // Chinese lives under zh_CN/ inside the same site root.
+    // URL examples:
+    //   English: <site-root>/user_guide/install.html
+    //   Chinese: <site-root>/zh_CN/user_guide/install.html
+    //
+    // The site root is derived from the current page's own `pagename`
+    // (known at build time) instead of a hard-coded "/docs/" marker, so the
+    // switcher works identically when served online (e.g. under
+    // "/MagiCompiler/docs/main/") and when the built HTML is downloaded and
+    // opened locally via file:// URLs.
+    //
+    // NOTE: build-time values (pagename / is_chinese) are passed through
+    // `data-*` attributes rather than inlined into JS, so this script stays
+    // valid, lint-clean JavaScript with no template syntax mixed in.
+    var root = document.getElementById("doc-language-switcher-root");
+    if (!root) return;
+
+    var ZH_SEGMENT = root.getAttribute("data-zh-segment") || "zh_CN";
+    var PAGENAME = root.getAttribute("data-pagename") || "";
+    var IS_CHINESE = root.getAttribute("data-is-chinese") === "true";
+
+    function currentRoot() {
+      // Strip the trailing "<pagename>.html" from the current URL to obtain
+      // the site root for the *current* language build (always ends with "/").
+      var url = window.location.href;
+      var hashIdx = url.indexOf("#");
+      if (hashIdx !== -1) url = url.slice(0, hashIdx);
+      var qIdx = url.indexOf("?");
+      if (qIdx !== -1) url = url.slice(0, qIdx);
+      var suffix = PAGENAME + ".html";
+      if (url.slice(-suffix.length) === suffix) {
+        return url.slice(0, url.length - suffix.length);
+      }
+      // Fallback: directory of the current file.
+      return url.slice(0, url.lastIndexOf("/") + 1);
+    }
+
+    function enRoot() {
+      // Normalise to the English (top-level) site root.
+      var currRoot = currentRoot();
+      var zhSuffix = ZH_SEGMENT + "/";
+      if (IS_CHINESE && currRoot.slice(-zhSuffix.length) === zhSuffix) {
+        return currRoot.slice(0, currRoot.length - zhSuffix.length);
+      }
+      return currRoot;
+    }
+
+    function resolvePath(targetLang) {
+      var query = window.location.search || "";
+      var hash = window.location.hash || "";
+      var base = enRoot();  // English site root, ends with "/"
+      var target = (targetLang === "en") ? base : base + ZH_SEGMENT + "/";
+      return target + PAGENAME + ".html" + query + hash;
+    }
+
+    var links = document.querySelectorAll(".doc-lang-link");
+    for (var i = 0; i < links.length; i++) {
+      var targetLang = links[i].getAttribute("data-lang");
+      links[i].setAttribute("href", resolvePath(targetLang));
+    }
+  })();
+</script></div>
+        
+          <div class="navbar-item"><ul class="navbar-icon-links"
+    aria-label="Icon Links">
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://github.com/SandAI-org/MagiCompiler" title="Github" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-github fa-lg" aria-hidden="true"></i><span class="visually-hidden">Github</span></a>
+        </li>
+</ul></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+<div class="ablog-sidebar-item ablog__postcard">
+   
+  <h2>
+     
+    <i class="fa fa-calendar"></i>
+    
+    <span>23 March 2026</span>
+    
+  </h2>
+  <ul>
+    <div class="ablog-sidebar-item ablog__postcard2">
+   
+  <li id="ablog-sidebar-item author ablog__author">
+    <span>
+      
+      <i class="fa-fw fa fa-user"></i>
+      
+    </span>
+     
+    <a href="author/zhiyao-cen.html">Zhiyao Cen</a>
+      
+  </li>
+     
+  <li id="ablog-sidebar-item category ablog__category">
+    <span>
+      
+      <i class="fa-fw fa fa-folder-open"></i>
+      
+    </span>
+     
+    <a href="category/design.html">Design</a>
+      
+  </li>
+   
+  <li id="ablog-sidebar-item tags ablog__tags">
+    <span>
+       
+      <i class="fa-fw fa fa-tags"></i>
+       
+    </span>
+     
+    <a href="tag/cuda-graph.html">cuda-graph</a>
+        
+    <a href="tag/inference.html">inference</a>
+        
+    <a href="tag/memory.html">memory</a>
+      
+  </li>
+   
+</div>
+  </ul>
+</div>
+</div>
+        <div class="sidebar-primary-item">
+<div class="ablog-sidebar-item ablog__recentposts">
+  <h3>
+    <a href="../blog.html">Recent Posts</a>
+  </h3>
+  <ul>
+     
+    <li>
+      <a href="why_magi_depyf.html">
+        23 March - Why magi_depyf
+      </a>
+    </li>
+    
+    <li>
+      <a href="auto_cpu_offload.html">
+        23 March - Analysis of Automatic Offloading
+      </a>
+    </li>
+    
+  </ul>
+</div>
+</div>
+        <div class="sidebar-primary-item">
+<div class="ablog-sidebar-item ablog__tagcloud">
+  <link
+    rel="stylesheet"
+    href="../_static/ablog/tagcloud.css"
+    type="text/css"
+  />
+  <h3><a href="tag.html">Tags</a></h3>
+  <ul class="ablog-cloud">
+     
+    <li class="ablog-cloud ablog-cloud-1">
+      <a href="tag/cuda-graph.html">cuda-graph</a>
+    </li>
+      
+    <li class="ablog-cloud ablog-cloud-1">
+      <a href="tag/debugging.html">debugging</a>
+    </li>
+      
+    <li class="ablog-cloud ablog-cloud-1">
+      <a href="tag/inference.html">inference</a>
+    </li>
+      
+    <li class="ablog-cloud ablog-cloud-1">
+      <a href="tag/magi_depyf.html">magi_depyf</a>
+    </li>
+      
+    <li class="ablog-cloud ablog-cloud-5">
+      <a href="tag/memory.html">memory</a>
+    </li>
+      
+    <li class="ablog-cloud ablog-cloud-1">
+      <a href="tag/observability.html">observability</a>
+    </li>
+      
+    <li class="ablog-cloud ablog-cloud-1">
+      <a href="tag/offload.html">offload</a>
+    </li>
+      
+    <li class="ablog-cloud ablog-cloud-1">
+      <a href="tag/scheduling.html">scheduling</a>
+    </li>
+     
+  </ul>
+</div>
+</div>
+        <div class="sidebar-primary-item">
+<div class="ablog-sidebar-item ablog__categories">
+  <h3>
+    <a href="category.html">Categories</a>
+  </h3>
+  <ul>
+     
+    <li>
+      <a href="category/design.html">Design (3)</a>
+    </li>
+     
+  </ul>
+</div>
+</div>
+        <div class="sidebar-primary-item">
+<div class="ablog-sidebar-item ablog__archives">
+  <h3>
+    <a href="archive.html">Archives</a>
+  </h3>
+  <ul>
+     
+    <li>
+      <a href="2026.html">2026 (3)</a>
+    </li>
+     
+  </ul>
+</div>
+</div>
+        <div class="sidebar-primary-item">
+<div class="ablog-sidebar-item ablog__authors">
+  <h3>
+    <a href="author.html">Authors</a>
+  </h3>
+  <ul>
+     
+    <li>
+      <a href="author/magicompiler-team.html">MagiCompiler Team (1)</a>
+    </li>
+      
+    <li>
+      <a href="author/taoran-wang.html">Taoran Wang (1)</a>
+    </li>
+      
+    <li>
+      <a href="author/zhiyao-cen.html">Zhiyao Cen (1)</a>
+    </li>
+     
+  </ul>
+</div>
+</div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    
+    <li class="breadcrumb-item"><a href="toc.html" class="nav-link">Blogs</a></li>
+    
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">AutoCudaGraph Design</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                   <section id="autocudagraph-design">
+<h1>AutoCudaGraph Design<a class="headerlink" href="#autocudagraph-design" title="Link to this heading">#</a></h1>
+<section id="overview">
+<h2>Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h2>
+<p>AutoCudaGraph is a CUDA Graph optimization module integrated into the MagiCompiler framework, designed to automate CUDA Graph capture, caching, replay, and tensor memory management for PyTorch-based neural network inference. It targets Transformer architectures with dynamic sequence lengths, optimizing kernel execution by reusing pre-captured computation graphs and static tensor buffers. Core Goals:</p>
+<ul class="simple">
+<li><p>Automate CUDA Graph lifecycle (capture/replay/cache) with minimal code intrusion</p></li>
+<li><p>Support dynamic shape adaptation (sequence length expansion)</p></li>
+<li><p>Optimize memory efficiency via global memory pool and static tensor reuse</p></li>
+<li><p>Ensure consistency between cached graphs and runtime inputs/outputs</p></li>
+</ul>
+</section>
+<section id="key-components">
+<h2>Key Components<a class="headerlink" href="#key-components" title="Link to this heading">#</a></h2>
+<section id="cudagraphmgr-core-manager">
+<h3>CudaGraphMgr (Core Manager)<a class="headerlink" href="#cudagraphmgr-core-manager" title="Link to this heading">#</a></h3>
+<p>Singleton class managing all CUDA Graph operations:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">CudaGraphMgr</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">cache</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="n">StaticSignature</span><span class="p">,</span> <span class="n">StaticTensorEntry</span><span class="p">]</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">graph_mem_pool</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">graph_pool_handle</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+</pre></div>
+</div>
+<p><strong>Core Methods</strong></p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Method</p></th>
+<th class="head"><p>Purpose</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>run()</p></td>
+<td><p>Main entry: Replay cached graph or warm up &amp; capture new graph</p></td>
+</tr>
+<tr class="row-odd"><td><p>wrapped_graph_capture()</p></td>
+<td><p>Capture CUDA Graph with sliced static input/output tensors</p></td>
+</tr>
+<tr class="row-even"><td><p>wrapped_graph_replay()</p></td>
+<td><p>Replay cached CUDA Graph with sliced static tensors and output template wrapping</p></td>
+</tr>
+<tr class="row-odd"><td><p>get_expanded_static_tensors()</p></td>
+<td><p>Expand static tensors, reuse buffers if dimensionally compatible</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="signature-system">
+<h3>Signature System<a class="headerlink" href="#signature-system" title="Link to this heading">#</a></h3>
+<p>StaticSignature</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span><span class="p">(</span><span class="n">unsafe_hash</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">StaticSignature</span><span class="p">(</span><span class="n">HashableDataclass</span><span class="p">):</span>
+    <span class="n">func_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span>
+    <span class="n">tensor_static_infos</span><span class="p">:</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">TensorStaticInfo</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">()</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>Encodes fixed properties of input tensors (dtype, static dimensions)</p></li>
+<li><p>Used as primary key for static tensor buffer caching</p></li>
+</ul>
+<p>DynamicSignature</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span><span class="p">(</span><span class="n">unsafe_hash</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">DynamicSignature</span><span class="p">(</span><span class="n">HashableDataclass</span><span class="p">):</span>
+    <span class="n">tensor_dynamic_infos</span><span class="p">:</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">TensorDynamicInfo</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">()</span>
+    <span class="n">literals_info</span><span class="p">:</span> <span class="n">LiteralsInfo</span> <span class="o">=</span> <span class="kc">None</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>Tracks dynamic dimensions (sequence length) and literal parameters</p></li>
+<li><p>Secondary key for graph entry lookup</p></li>
+</ul>
+</section>
+<section id="tensor-management">
+<h3>Tensor Management<a class="headerlink" href="#tensor-management" title="Link to this heading">#</a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">StaticTensorEntry</span><span class="p">:</span>
+    <span class="n">input_tensors</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">output_tensors</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">template_entry_dict</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="n">DynamicSignature</span><span class="p">,</span> <span class="n">OutputTemplateEntry</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>Memory Reuse: Reuse existing tensor buffers when possible to avoid reallocation</p></li>
+<li><p>Dynamic Expansion: Only expand static tensors when new input dimensions exceed current buffer size</p></li>
+<li><p>Shape Validation: Ensure static dimensions (non-sequence) match between cached and new tensors</p></li>
+</ul>
+</section>
+<section id="graph-management">
+<h3>Graph Management<a class="headerlink" href="#graph-management" title="Link to this heading">#</a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">GraphEntry</span><span class="p">:</span>
+    <span class="n">graph</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">CUDAGraph</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">inconsistent</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="n">invalid</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">OutputTemplateEntry</span><span class="p">:</span>
+    <span class="n">graph_entry_dict</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">GraphEntry</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">output_template</span><span class="p">:</span> <span class="n">Any</span> <span class="o">=</span> <span class="kc">None</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p>Graph State Tracking: GraphEntry tracks CUDA Graph instances and validity states to control replay eligibility.</p></li>
+<li><p>Layer-wise Organization: OutputTemplateEntry maps dynamic signatures to per-layer GraphEntry for layer-specific graph reuse.</p></li>
+<li><p>Output Consistency: output_template preserves output object structure to ensure consistent result wrapping during replay.</p></li>
+</ul>
+</section>
+</section>
+<section id="execution-flow">
+<h2>Execution Flow<a class="headerlink" href="#execution-flow" title="Link to this heading">#</a></h2>
+<section id="inline-replay-fast-path">
+<h3>Inline Replay (Fast Path)<a class="headerlink" href="#inline-replay-fast-path" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p>Extract input signatures from runtime arguments</p></li>
+<li><p>Look up cached CUDA Graph via StaticSignature + DynamicSignature + layer number</p></li>
+<li><p>Validate graph consistency (not inconsistent/invalid)</p></li>
+<li><p>Reuse static tensors with dynamic slicing</p></li>
+<li><p>Replay graph and return sliced output</p></li>
+</ul>
+</section>
+<section id="graph-capture-slow-path">
+<h3>Graph Capture (Slow Path)<a class="headerlink" href="#graph-capture-slow-path" title="Link to this heading">#</a></h3>
+<p>Triggered when no valid cached graph exists or tensor expansion is needed:</p>
+<ul class="simple">
+<li><p>Execute function to get output tensors</p></li>
+<li><p>Ensure input signatures match post-warmup</p></li>
+<li><p>Expand static buffers if new shapes require it</p></li>
+<li><p>Capture new CUDA Graph with static tensors</p></li>
+<li><p>Store new graph and update tensor entries</p></li>
+<li><p>Return warmup execution output as final result</p></li>
+</ul>
+</section>
+<section id="sequence-length-handling">
+<h3>Sequence Length Handling<a class="headerlink" href="#sequence-length-handling" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p>Only last dimension is static for ND tensors (ND &gt; 1)</p></li>
+<li><p>All dimension is dynamic for 1D tensors (ND=1)</p></li>
+<li><p>Automatic buffer expansion for increasing sequence lengths</p></li>
+<li><p>Invalidates old graphs when tensors are expanded</p></li>
+</ul>
+</section>
+</section>
+<section id="examples">
+<h2>Examples<a class="headerlink" href="#examples" title="Link to this heading">#</a></h2>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">nn</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">magi_compiler.magi_backend.cuda_graph_mgr</span><span class="w"> </span><span class="kn">import</span> <span class="n">cuda_graph_mgr</span><span class="p">,</span> <span class="n">cuda_graph_enable_if</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">SimpleTransformerLayer</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1024</span><span class="p">,</span> <span class="n">num_heads</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">8</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">self_attn</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">MultiheadAttention</span><span class="p">(</span><span class="n">hidden_dim</span><span class="p">,</span> <span class="n">num_heads</span><span class="p">,</span> <span class="n">batch_first</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">linear</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="n">hidden_dim</span><span class="p">,</span> <span class="n">hidden_dim</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">layer_norm</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">LayerNorm</span><span class="p">(</span><span class="n">hidden_dim</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">layer_number</span> <span class="o">=</span> <span class="mi">0</span>
+
+    <span class="nd">@cuda_graph_enable_if</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">())</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
+        <span class="n">attn_out</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">self_attn</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">x</span><span class="p">)</span>
+        <span class="n">out</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">linear</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">layer_norm</span><span class="p">(</span><span class="n">x</span> <span class="o">+</span> <span class="n">attn_out</span><span class="p">))</span>
+        <span class="k">return</span> <span class="n">out</span>
+
+<span class="n">device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">&quot;cuda&quot;</span> <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">is_available</span><span class="p">()</span> <span class="k">else</span> <span class="s2">&quot;cpu&quot;</span><span class="p">)</span>
+<span class="n">model</span> <span class="o">=</span> <span class="n">SimpleTransformerLayer</span><span class="p">(</span><span class="n">hidden_dim</span><span class="o">=</span><span class="mi">1024</span><span class="p">,</span> <span class="n">num_heads</span><span class="o">=</span><span class="mi">8</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span><span class="o">.</span><span class="n">eval</span><span class="p">()</span>
+<span class="n">graph_mgr</span> <span class="o">=</span> <span class="n">cuda_graph_mgr</span><span class="p">()</span>
+
+<span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+    <span class="n">input_1</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">512</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+    <span class="n">output_1</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">input_1</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;First run (graph capture): Output shape = </span><span class="si">{</span><span class="n">output_1</span><span class="o">.</span><span class="n">shape</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Cached graphs count: </span><span class="si">{</span><span class="n">graph_mgr</span><span class="o">.</span><span class="n">graph_count</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="n">input_2</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">512</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+    <span class="n">output_2</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">input_2</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Second run (graph replay): Output shape = </span><span class="si">{</span><span class="n">output_2</span><span class="o">.</span><span class="n">shape</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Cached graphs count: </span><span class="si">{</span><span class="n">graph_mgr</span><span class="o">.</span><span class="n">graph_count</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="n">input_3</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+    <span class="n">output_3</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">input_3</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Third run (tensor expansion): Output shape = </span><span class="si">{</span><span class="n">output_3</span><span class="o">.</span><span class="n">shape</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Cached graphs count: </span><span class="si">{</span><span class="n">graph_mgr</span><span class="o">.</span><span class="n">graph_count</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Static tensor memory usage: </span><span class="si">{</span><span class="n">graph_mgr</span><span class="o">.</span><span class="n">tensor_mem_size</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2"> MB&quot;</span><span class="p">)</span>
+
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">CUDA Graph Cache Details:&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="n">graph_mgr</span><span class="o">.</span><span class="n">formatted_cache_str</span><span class="p">())</span>
+</pre></div>
+</div>
+</section>
+<section id="limitations-and-constraints">
+<h2>Limitations and Constraints<a class="headerlink" href="#limitations-and-constraints" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>No support for data-dependent control flow in captured functions</p></li>
+<li><p>Graph capture fails if function contains CPU/GPU synchronization</p></li>
+<li><p>Only supports CUDA tensors (CPU tensors trigger fallback)</p></li>
+<li><p>Custom input classes must inherit from InplaceSubstituteFakeClass</p></li>
+<li><p>Assumes input tensors of captured graphs are not reused externally (risk of cross-scenario static tensor reuse)</p></li>
+<li><p>Relies on identical function, input tensors shapes, and constants for valid graph reuse</p></li>
+<li><p>No support for multi-stream execution scenarios</p></li>
+</ul>
+</section>
+<section id="best-practices">
+<h2>Best Practices<a class="headerlink" href="#best-practices" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>Dynamic Dimensions: Tensor use sequence length as dimension 0 where possible</p></li>
+<li><p>Monitor Memory Usage: Track graph_mem_pool_size and tensor_mem_size to avoid OOM</p></li>
+<li><p>Specify Layer IDs: Use layer_number to distinguish graphs across different models/layers</p></li>
+<li><p>LRU Cache (Future): Implement cache eviction to limit total graph/tensor count</p></li>
+</ul>
+</section>
+</section>
+
+<div class="section ablog__blog_comments">
+     
+<div class="section ablog__prev-next">
+  <span class="ablog__prev">
+     
+    <a href="auto_cpu_offload.html">
+      
+      <i class="fa fa-arrow-circle-left"></i>
+      
+      <span>Analysis of Automatic Offloading</span>
+    </a>
+    
+  </span>
+  <span class="ablog__spacer">&nbsp;</span>
+  <span class="ablog__next">
+     
+    <a href="why_magi_depyf.html">
+      <span>Why magi_depyf</span>
+      
+      <i class="fa fa-arrow-circle-right"></i>
+      
+    </a>
+    
+  </span>
+</div>
+  
+</div>
+
+                </article>
+              
+              
+              
+              
+              
+            </div>
+            
+            
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#key-components">Key Components</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cudagraphmgr-core-manager">CudaGraphMgr (Core Manager)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#signature-system">Signature System</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-management">Tensor Management</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#graph-management">Graph Management</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#execution-flow">Execution Flow</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#inline-replay-fast-path">Inline Replay (Fast Path)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#graph-capture-slow-path">Graph Capture (Slow Path)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#sequence-length-handling">Sequence Length Handling</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#examples">Examples</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#limitations-and-constraints">Limitations and Constraints</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#best-practices">Best Practices</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+
+  <p class="copyright">
+    
+      © Copyright 2025-2026, SandAI.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+
+  <p class="sphinx-version">
+    Created using <a href="https://www.sphinx-doc.org/">Sphinx</a> 9.1.0.
+    <br/>
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+    <div class="footer-items__end">
+      
+        <div class="footer-item">
+<p class="theme-version">
+  <!-- # L10n: Setting the PST URL as an argument as this does not need to be localized -->
+  Built with the <a href="https://pydata-sphinx-theme.readthedocs.io/en/stable/index.html">PyData Sphinx Theme</a> 0.19.0.
+</p></div>
+      
+    </div>
+  
+</div>
+
+  </footer>
+  </body>
+</html>

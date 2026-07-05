@@ -1,0 +1,1036 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Why magi_depyf &#8212; MagiCompiler main documentation</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=3ee1c6c6" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=6fe42dbf" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+
+    <script src="../_static/documentation_options.js?v=a8da1a53"></script>
+    <script src="../_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=fd10adb8"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blog/why_magi_depyf';</script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+    <link rel="canonical" href="https://sandai-org.github.io/MagiCompiler/docs/blog/why_magi_depyf.html" />
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Analysis of Automatic Offloading" href="auto_cpu_offload.html" />
+    <link rel="prev" title="Blogs" href="toc.html" /> 
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="" />
+  
+    
+    <script src="../_static/searchtools.js"></script>
+    <script src="../_static/language_data.js"></script>
+    <script src="../searchindex.js"></script>
+     
+  </head>
+  <body data-default-mode="">
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+  
+    <p class="title logo__title">MagiCompiler</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+<nav>
+  <ul class="bd-navbar-elements navbar-nav">
+    
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../user_guide/toc.html">
+    User Guide
+  </a>
+</li>
+
+
+<li class="nav-item current active">
+  <a class="nav-link nav-internal" href="toc.html">
+    Blogs
+  </a>
+</li>
+
+  </ul>
+</nav></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+      
+        <div class="navbar-item">
+
+
+<div
+  class="dropdown"
+  id="doc-language-switcher-root"
+  data-pagename="blog/why_magi_depyf"
+  data-is-chinese="false"
+  data-zh-segment="zh_CN"
+>
+  <button
+    class="btn btn-sm btn-outline-primary dropdown-toggle"
+    type="button"
+    id="doc-language-switcher"
+    data-bs-toggle="dropdown"
+    aria-expanded="false"
+  >
+    English
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="doc-language-switcher">
+    
+      <li>
+        <a class="dropdown-item doc-lang-link" href="#" data-lang="en">
+          English
+        </a>
+      </li>
+    
+      <li>
+        <a class="dropdown-item doc-lang-link" href="#" data-lang="zh_CN">
+          简体中文
+        </a>
+      </li>
+    
+  </ul>
+</div>
+<script>
+  (function () {
+    // English lives at the root (no language prefix).
+    // Chinese lives under zh_CN/ inside the same site root.
+    // URL examples:
+    //   English: <site-root>/user_guide/install.html
+    //   Chinese: <site-root>/zh_CN/user_guide/install.html
+    //
+    // The site root is derived from the current page's own `pagename`
+    // (known at build time) instead of a hard-coded "/docs/" marker, so the
+    // switcher works identically when served online (e.g. under
+    // "/MagiCompiler/docs/main/") and when the built HTML is downloaded and
+    // opened locally via file:// URLs.
+    //
+    // NOTE: build-time values (pagename / is_chinese) are passed through
+    // `data-*` attributes rather than inlined into JS, so this script stays
+    // valid, lint-clean JavaScript with no template syntax mixed in.
+    var root = document.getElementById("doc-language-switcher-root");
+    if (!root) return;
+
+    var ZH_SEGMENT = root.getAttribute("data-zh-segment") || "zh_CN";
+    var PAGENAME = root.getAttribute("data-pagename") || "";
+    var IS_CHINESE = root.getAttribute("data-is-chinese") === "true";
+
+    function currentRoot() {
+      // Strip the trailing "<pagename>.html" from the current URL to obtain
+      // the site root for the *current* language build (always ends with "/").
+      var url = window.location.href;
+      var hashIdx = url.indexOf("#");
+      if (hashIdx !== -1) url = url.slice(0, hashIdx);
+      var qIdx = url.indexOf("?");
+      if (qIdx !== -1) url = url.slice(0, qIdx);
+      var suffix = PAGENAME + ".html";
+      if (url.slice(-suffix.length) === suffix) {
+        return url.slice(0, url.length - suffix.length);
+      }
+      // Fallback: directory of the current file.
+      return url.slice(0, url.lastIndexOf("/") + 1);
+    }
+
+    function enRoot() {
+      // Normalise to the English (top-level) site root.
+      var currRoot = currentRoot();
+      var zhSuffix = ZH_SEGMENT + "/";
+      if (IS_CHINESE && currRoot.slice(-zhSuffix.length) === zhSuffix) {
+        return currRoot.slice(0, currRoot.length - zhSuffix.length);
+      }
+      return currRoot;
+    }
+
+    function resolvePath(targetLang) {
+      var query = window.location.search || "";
+      var hash = window.location.hash || "";
+      var base = enRoot();  // English site root, ends with "/"
+      var target = (targetLang === "en") ? base : base + ZH_SEGMENT + "/";
+      return target + PAGENAME + ".html" + query + hash;
+    }
+
+    var links = document.querySelectorAll(".doc-lang-link");
+    for (var i = 0; i < links.length; i++) {
+      var targetLang = links[i].getAttribute("data-lang");
+      links[i].setAttribute("href", resolvePath(targetLang));
+    }
+  })();
+</script></div>
+      
+        <div class="navbar-item"><ul class="navbar-icon-links"
+    aria-label="Icon Links">
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://github.com/SandAI-org/MagiCompiler" title="Github" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-github fa-lg" aria-hidden="true"></i><span class="visually-hidden">Github</span></a>
+        </li>
+</ul></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+<nav>
+  <ul class="bd-navbar-elements navbar-nav">
+    
+<li class="nav-item ">
+  <a class="nav-link nav-internal" href="../user_guide/toc.html">
+    User Guide
+  </a>
+</li>
+
+
+<li class="nav-item current active">
+  <a class="nav-link nav-internal" href="toc.html">
+    Blogs
+  </a>
+</li>
+
+  </ul>
+</nav></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+        
+          <div class="navbar-item">
+
+
+<div
+  class="dropdown"
+  id="doc-language-switcher-root"
+  data-pagename="blog/why_magi_depyf"
+  data-is-chinese="false"
+  data-zh-segment="zh_CN"
+>
+  <button
+    class="btn btn-sm btn-outline-primary dropdown-toggle"
+    type="button"
+    id="doc-language-switcher"
+    data-bs-toggle="dropdown"
+    aria-expanded="false"
+  >
+    English
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="doc-language-switcher">
+    
+      <li>
+        <a class="dropdown-item doc-lang-link" href="#" data-lang="en">
+          English
+        </a>
+      </li>
+    
+      <li>
+        <a class="dropdown-item doc-lang-link" href="#" data-lang="zh_CN">
+          简体中文
+        </a>
+      </li>
+    
+  </ul>
+</div>
+<script>
+  (function () {
+    // English lives at the root (no language prefix).
+    // Chinese lives under zh_CN/ inside the same site root.
+    // URL examples:
+    //   English: <site-root>/user_guide/install.html
+    //   Chinese: <site-root>/zh_CN/user_guide/install.html
+    //
+    // The site root is derived from the current page's own `pagename`
+    // (known at build time) instead of a hard-coded "/docs/" marker, so the
+    // switcher works identically when served online (e.g. under
+    // "/MagiCompiler/docs/main/") and when the built HTML is downloaded and
+    // opened locally via file:// URLs.
+    //
+    // NOTE: build-time values (pagename / is_chinese) are passed through
+    // `data-*` attributes rather than inlined into JS, so this script stays
+    // valid, lint-clean JavaScript with no template syntax mixed in.
+    var root = document.getElementById("doc-language-switcher-root");
+    if (!root) return;
+
+    var ZH_SEGMENT = root.getAttribute("data-zh-segment") || "zh_CN";
+    var PAGENAME = root.getAttribute("data-pagename") || "";
+    var IS_CHINESE = root.getAttribute("data-is-chinese") === "true";
+
+    function currentRoot() {
+      // Strip the trailing "<pagename>.html" from the current URL to obtain
+      // the site root for the *current* language build (always ends with "/").
+      var url = window.location.href;
+      var hashIdx = url.indexOf("#");
+      if (hashIdx !== -1) url = url.slice(0, hashIdx);
+      var qIdx = url.indexOf("?");
+      if (qIdx !== -1) url = url.slice(0, qIdx);
+      var suffix = PAGENAME + ".html";
+      if (url.slice(-suffix.length) === suffix) {
+        return url.slice(0, url.length - suffix.length);
+      }
+      // Fallback: directory of the current file.
+      return url.slice(0, url.lastIndexOf("/") + 1);
+    }
+
+    function enRoot() {
+      // Normalise to the English (top-level) site root.
+      var currRoot = currentRoot();
+      var zhSuffix = ZH_SEGMENT + "/";
+      if (IS_CHINESE && currRoot.slice(-zhSuffix.length) === zhSuffix) {
+        return currRoot.slice(0, currRoot.length - zhSuffix.length);
+      }
+      return currRoot;
+    }
+
+    function resolvePath(targetLang) {
+      var query = window.location.search || "";
+      var hash = window.location.hash || "";
+      var base = enRoot();  // English site root, ends with "/"
+      var target = (targetLang === "en") ? base : base + ZH_SEGMENT + "/";
+      return target + PAGENAME + ".html" + query + hash;
+    }
+
+    var links = document.querySelectorAll(".doc-lang-link");
+    for (var i = 0; i < links.length; i++) {
+      var targetLang = links[i].getAttribute("data-lang");
+      links[i].setAttribute("href", resolvePath(targetLang));
+    }
+  })();
+</script></div>
+        
+          <div class="navbar-item"><ul class="navbar-icon-links"
+    aria-label="Icon Links">
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://github.com/SandAI-org/MagiCompiler" title="Github" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-github fa-lg" aria-hidden="true"></i><span class="visually-hidden">Github</span></a>
+        </li>
+</ul></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+<div class="ablog-sidebar-item ablog__postcard">
+   
+  <h2>
+     
+    <i class="fa fa-calendar"></i>
+    
+    <span>23 March 2026</span>
+    
+  </h2>
+  <ul>
+    <div class="ablog-sidebar-item ablog__postcard2">
+   
+  <li id="ablog-sidebar-item author ablog__author">
+    <span>
+      
+      <i class="fa-fw fa fa-user"></i>
+      
+    </span>
+     
+    <a href="author/magicompiler-team.html">MagiCompiler Team</a>
+      
+  </li>
+     
+  <li id="ablog-sidebar-item category ablog__category">
+    <span>
+      
+      <i class="fa-fw fa fa-folder-open"></i>
+      
+    </span>
+     
+    <a href="category/design.html">Design</a>
+      
+  </li>
+   
+  <li id="ablog-sidebar-item tags ablog__tags">
+    <span>
+       
+      <i class="fa-fw fa fa-tags"></i>
+       
+    </span>
+     
+    <a href="tag/magi_depyf.html">magi_depyf</a>
+        
+    <a href="tag/observability.html">observability</a>
+        
+    <a href="tag/debugging.html">debugging</a>
+      
+  </li>
+   
+</div>
+  </ul>
+</div>
+</div>
+        <div class="sidebar-primary-item">
+<div class="ablog-sidebar-item ablog__recentposts">
+  <h3>
+    <a href="../blog.html">Recent Posts</a>
+  </h3>
+  <ul>
+     
+    <li>
+      <a href="auto_cuda_graph_design.html">
+        23 March - AutoCudaGraph Design
+      </a>
+    </li>
+    
+    <li>
+      <a href="auto_cpu_offload.html">
+        23 March - Analysis of Automatic Offloading
+      </a>
+    </li>
+    
+  </ul>
+</div>
+</div>
+        <div class="sidebar-primary-item">
+<div class="ablog-sidebar-item ablog__tagcloud">
+  <link
+    rel="stylesheet"
+    href="../_static/ablog/tagcloud.css"
+    type="text/css"
+  />
+  <h3><a href="tag.html">Tags</a></h3>
+  <ul class="ablog-cloud">
+     
+    <li class="ablog-cloud ablog-cloud-1">
+      <a href="tag/cuda-graph.html">cuda-graph</a>
+    </li>
+      
+    <li class="ablog-cloud ablog-cloud-1">
+      <a href="tag/debugging.html">debugging</a>
+    </li>
+      
+    <li class="ablog-cloud ablog-cloud-1">
+      <a href="tag/inference.html">inference</a>
+    </li>
+      
+    <li class="ablog-cloud ablog-cloud-1">
+      <a href="tag/magi_depyf.html">magi_depyf</a>
+    </li>
+      
+    <li class="ablog-cloud ablog-cloud-5">
+      <a href="tag/memory.html">memory</a>
+    </li>
+      
+    <li class="ablog-cloud ablog-cloud-1">
+      <a href="tag/observability.html">observability</a>
+    </li>
+      
+    <li class="ablog-cloud ablog-cloud-1">
+      <a href="tag/offload.html">offload</a>
+    </li>
+      
+    <li class="ablog-cloud ablog-cloud-1">
+      <a href="tag/scheduling.html">scheduling</a>
+    </li>
+     
+  </ul>
+</div>
+</div>
+        <div class="sidebar-primary-item">
+<div class="ablog-sidebar-item ablog__categories">
+  <h3>
+    <a href="category.html">Categories</a>
+  </h3>
+  <ul>
+     
+    <li>
+      <a href="category/design.html">Design (3)</a>
+    </li>
+     
+  </ul>
+</div>
+</div>
+        <div class="sidebar-primary-item">
+<div class="ablog-sidebar-item ablog__archives">
+  <h3>
+    <a href="archive.html">Archives</a>
+  </h3>
+  <ul>
+     
+    <li>
+      <a href="2026.html">2026 (3)</a>
+    </li>
+     
+  </ul>
+</div>
+</div>
+        <div class="sidebar-primary-item">
+<div class="ablog-sidebar-item ablog__authors">
+  <h3>
+    <a href="author.html">Authors</a>
+  </h3>
+  <ul>
+     
+    <li>
+      <a href="author/magicompiler-team.html">MagiCompiler Team (1)</a>
+    </li>
+      
+    <li>
+      <a href="author/taoran-wang.html">Taoran Wang (1)</a>
+    </li>
+      
+    <li>
+      <a href="author/zhiyao-cen.html">Zhiyao Cen (1)</a>
+    </li>
+     
+  </ul>
+</div>
+</div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    
+    <li class="breadcrumb-item"><a href="toc.html" class="nav-link">Blogs</a></li>
+    
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Why magi_depyf</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                   <section id="why-magi-depyf">
+<h1>Why magi_depyf<a class="headerlink" href="#why-magi-depyf" title="Link to this heading">#</a></h1>
+<p><code class="docutils literal notranslate"><span class="pre">magi_depyf</span></code> is the compilation observability layer for <code class="docutils literal notranslate"><span class="pre">MagiCompiler</span></code>.
+It answers three practical questions:</p>
+<ol class="arabic simple">
+<li><p><strong>What exactly happened during compilation?</strong></p></li>
+<li><p><strong>Did the outcome match expectations?</strong> (for example: graph split shape, cache reuse, retry behavior)</p></li>
+<li><p><strong>If something failed, where should I look first?</strong></p></li>
+</ol>
+<hr class="docutils" />
+<section id="positioning-built-in-observability-for-magicompiler">
+<h2>1. Positioning: Built-in observability for MagiCompiler<a class="headerlink" href="#positioning-built-in-observability-for-magicompiler" title="Link to this heading">#</a></h2>
+<p>In a real MagiCompiler pipeline, compilation spans multiple stages: Dynamo capture, Magi backend graph transforms/splitting, Inductor codegen, and AOT/JIT reuse.
+Plain logs are often not enough to reliably answer:</p>
+<ul class="simple">
+<li><p>Did the failure happen at full-graph level or in a specific subgraph?</p></li>
+<li><p>Did a pass change graph behavior unexpectedly?</p></li>
+<li><p>Why did this run miss cache?</p></li>
+</ul>
+<p><code class="docutils literal notranslate"><span class="pre">magi_depyf</span></code> writes these signals as structured events and artifacts on disk, so you can replay, compare, and debug deterministically.</p>
+</section>
+<hr class="docutils" />
+<section id="primary-scenario-magi-compile">
+<h2>2. Primary scenario: <code class="docutils literal notranslate"><span class="pre">magi_compile</span></code><a class="headerlink" href="#primary-scenario-magi-compile" title="Link to this heading">#</a></h2>
+<section id="recommended-usage-model">
+<h3>2.1 Recommended usage model<a class="headerlink" href="#recommended-usage-model" title="Link to this heading">#</a></h3>
+<p>For <code class="docutils literal notranslate"><span class="pre">magi_compile</span></code> users, <code class="docutils literal notranslate"><span class="pre">magi_depyf</span></code> is most useful as a built-in observability layer:</p>
+<ul class="simple">
+<li><p>Streams events to <code class="docutils literal notranslate"><span class="pre">timeline_events/timeline.jsonl</span></code> during compilation</p></li>
+<li><p>Writes event artifacts under <code class="docutils literal notranslate"><span class="pre">timeline_events/files/</span></code></p></li>
+<li><p>Exports a structured <code class="docutils literal notranslate"><span class="pre">compiled_functions/</span></code> artifact tree</p></li>
+</ul>
+<p>In most cases, you do not need to manually wire custom hooks. Run through the MagiCompiler path and inspect the output directory.</p>
+</section>
+<section id="what-you-get-automatically-in-the-magi-compile-path">
+<h3>2.2 What you get automatically in the Magi compile path<a class="headerlink" href="#what-you-get-automatically-in-the-magi-compile-path" title="Link to this heading">#</a></h3>
+<p>For the <code class="docutils literal notranslate"><span class="pre">magi_compile</span></code> scenario, you do <strong>not</strong> need to call <code class="docutils literal notranslate"><span class="pre">explain_compilation</span></code> manually.
+As long as the model runs through MagiCompiler, <code class="docutils literal notranslate"><span class="pre">magi_depyf</span></code> outputs are written automatically.</p>
+<p>For example, one real run produced:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">magi_depyf_torch_compile_debug/magi_depyf/run_20260322_192147/model_1_TwoLayerTransformer_rank_0/timeline_events</span></code></p></li>
+</ul>
+<p>In general, the output pattern is:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">&lt;cache_root_dir&gt;/magi_depyf/run_*/model_*_rank_*/timeline_events/</span></code></p></li>
+</ul>
+<p>Key artifacts under this directory:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">timeline.jsonl</span></code>: streaming event log written during compilation</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">files/0000_*</span></code>, <code class="docutils literal notranslate"><span class="pre">files/0001_*</span></code>, … event folders with attached artifacts</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">files/*/attributes.json</span></code>: structured metadata for each event folder</p></li>
+</ul>
+<p>Related compiled artifact view is also emitted under:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">&lt;cache_root_dir&gt;/magi_depyf/run_*/model_*_rank_*/compiled_functions/</span></code></p></li>
+</ul>
+<p>See the full runnable example:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">magi_compiler/magi_depyf/example/magi_compile_transformer_example.py</span></code></p></li>
+</ul>
+<p>Typical questions this path answers quickly:</p>
+<ul class="simple">
+<li><p>Did fullgraph/subgraph events happen in the expected order?</p></li>
+<li><p>Which pass changed graph structure?</p></li>
+<li><p>Did <code class="docutils literal notranslate"><span class="pre">RestartAnalysis</span></code> happen, and was cache load skipped as expected?</p></li>
+<li><p>Which event folder contains the exact graph/code snapshot for debugging?</p></li>
+</ul>
+</section>
+</section>
+<hr class="docutils" />
+<section id="secondary-scenario-plain-torch-compile-manual-entry">
+<h2>3. Secondary scenario: plain <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> (manual entry)<a class="headerlink" href="#secondary-scenario-plain-torch-compile-manual-entry" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">magi_depyf</span></code> also works with plain <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>, but this is a secondary workflow and requires manual context wrapping:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">magi_compiler.magi_depyf.inspect</span><span class="w"> </span><span class="kn">import</span> <span class="n">explain_compilation</span>
+
+
+<span class="nd">@torch</span><span class="o">.</span><span class="n">compile</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">toy_example</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">):</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="n">a</span> <span class="o">/</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">abs</span><span class="p">(</span><span class="n">a</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">b</span><span class="o">.</span><span class="n">sum</span><span class="p">()</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="n">b</span> <span class="o">=</span> <span class="o">-</span><span class="n">b</span>
+    <span class="k">return</span> <span class="n">x</span> <span class="o">*</span> <span class="n">b</span>
+
+
+<span class="k">with</span> <span class="n">explain_compilation</span><span class="p">(</span><span class="s2">&quot;./magi_depyf_torch_compile_debug&quot;</span><span class="p">):</span>
+    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">10</span><span class="p">):</span>
+        <span class="n">toy_example</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">10</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">10</span><span class="p">))</span>
+</pre></div>
+</div>
+<p>See the concrete example here:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">magi_compiler/magi_depyf/example/torch_compile_toy_example.py</span></code></p></li>
+</ul>
+<p>This demo shows the minimal way to use <code class="docutils literal notranslate"><span class="pre">explain_compilation</span></code> in a pure <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> setup.</p>
+</section>
+<hr class="docutils" />
+<section id="event-model-concise">
+<h2>4. Event model (concise)<a class="headerlink" href="#event-model-concise" title="Link to this heading">#</a></h2>
+<p>Each event contains:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">name</span></code>: event name (with <code class="docutils literal notranslate"><span class="pre">fullgraph_</span></code> or <code class="docutils literal notranslate"><span class="pre">subgraph_N_</span></code> prefix)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">attributes</span></code>: structured metadata (for example <code class="docutils literal notranslate"><span class="pre">lifecycle_name</span></code>, <code class="docutils literal notranslate"><span class="pre">runtime_shape</span></code>, <code class="docutils literal notranslate"><span class="pre">graph_index</span></code>, <code class="docutils literal notranslate"><span class="pre">reason</span></code>)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">files</span></code>: attached text artifacts (graph code, inductor output, etc.)</p></li>
+</ul>
+<section id="lifecycle-naming-pattern">
+<h3>4.1 Lifecycle naming pattern<a class="headerlink" href="#lifecycle-naming-pattern" title="Link to this heading">#</a></h3>
+<p>Lifecycle events are normalized into the following pattern:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">*_before_&lt;lifecycle_name&gt;</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">*_after_&lt;lifecycle_name&gt;</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">*_failed_&lt;lifecycle_name&gt;</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">*_skip_&lt;lifecycle_name&gt;</span></code></p></li>
+</ul>
+<p>Where <code class="docutils literal notranslate"><span class="pre">*</span></code> is <code class="docutils literal notranslate"><span class="pre">fullgraph</span></code> or <code class="docutils literal notranslate"><span class="pre">subgraph_&lt;N&gt;</span></code>.</p>
+</section>
+<section id="representative-examples">
+<h3>4.2 Representative examples<a class="headerlink" href="#representative-examples" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">fullgraph_before_graph_split</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">fullgraph_after_graph_split</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">fullgraph_before_compiler_manager_compile</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">fullgraph_after_compiler_manager_load</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">subgraph_2_before_postcleanuppass</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">subgraph_2_after_postcleanuppass</span></code></p></li>
+</ul>
+</section>
+</section>
+<hr class="docutils" />
+<section id="output-layout-current-implementation">
+<h2>5. Output layout (current implementation)<a class="headerlink" href="#output-layout-current-implementation" title="Link to this heading">#</a></h2>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>debug_output/
+  timeline_events/
+    timeline.jsonl
+    files/
+      0000_fullgraph_.../
+        attributes.json
+        *.py / *.txt
+      0001_subgraph_.../
+        submod_&lt;N&gt;/
+          attributes.json
+          *.py / *.txt
+
+  compiled_functions/
+    &lt;function_name&gt;/
+      overview.md
+      decompiled_code.py
+      entry_0/
+        guards.txt
+        compiled_fns/
+        piecewise_subgraphs/
+</pre></div>
+</div>
+</section>
+<hr class="docutils" />
+<section id="recommended-triage-order">
+<h2>6. Recommended triage order<a class="headerlink" href="#recommended-triage-order" title="Link to this heading">#</a></h2>
+<p>When debugging a compile issue, use this order:</p>
+<ol class="arabic simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">timeline.jsonl</span></code>: verify event ordering first</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">*_failed_*</span></code> / cache-related lifecycle events (<code class="docutils literal notranslate"><span class="pre">compiler_manager_load</span></code>, <code class="docutils literal notranslate"><span class="pre">compiler_manager_cache_store</span></code>)</p></li>
+<li><p>Graph files attached to relevant events: verify before/after pass graph state</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">compiled_functions/*/overview.md</span></code>: verify final compiled artifact structure</p></li>
+</ol>
+<p>The key is not just absolute timing. The key is:</p>
+<ul class="simple">
+<li><p>what happened,</p></li>
+<li><p>whether it matched expectations,</p></li>
+<li><p>and where to drill down when it failed.</p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="compatibility-and-entry-point-summary">
+<h2>7. Compatibility and entry-point summary<a class="headerlink" href="#compatibility-and-entry-point-summary" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><strong>Primary entry</strong>: MagiCompiler main path (<code class="docutils literal notranslate"><span class="pre">magi_compile</span></code>)</p></li>
+<li><p><strong>Optional entry</strong>: plain <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> + manual <code class="docutils literal notranslate"><span class="pre">explain_compilation</span></code></p></li>
+</ul>
+<p>One-line summary:</p>
+<p><code class="docutils literal notranslate"><span class="pre">magi_depyf</span></code> is first and foremost MagiCompiler’s internal observability infrastructure, while still being usable as a manual troubleshooting tool for plain <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> when needed.</p>
+</section>
+</section>
+
+<div class="section ablog__blog_comments">
+     
+<div class="section ablog__prev-next">
+  <span class="ablog__prev">
+     
+    <a href="auto_cuda_graph_design.html">
+      
+      <i class="fa fa-arrow-circle-left"></i>
+      
+      <span>AutoCudaGraph Design</span>
+    </a>
+    
+  </span>
+  <span class="ablog__spacer">&nbsp;</span>
+  <span class="ablog__next">
+    
+  </span>
+</div>
+  
+</div>
+
+                </article>
+              
+              
+              
+              
+              
+            </div>
+            
+            
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#positioning-built-in-observability-for-magicompiler">1. Positioning: Built-in observability for MagiCompiler</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#primary-scenario-magi-compile">2. Primary scenario: <code class="docutils literal notranslate"><span class="pre">magi_compile</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#recommended-usage-model">2.1 Recommended usage model</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#what-you-get-automatically-in-the-magi-compile-path">2.2 What you get automatically in the Magi compile path</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#secondary-scenario-plain-torch-compile-manual-entry">3. Secondary scenario: plain <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> (manual entry)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#event-model-concise">4. Event model (concise)</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#lifecycle-naming-pattern">4.1 Lifecycle naming pattern</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#representative-examples">4.2 Representative examples</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#output-layout-current-implementation">5. Output layout (current implementation)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#recommended-triage-order">6. Recommended triage order</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#compatibility-and-entry-point-summary">7. Compatibility and entry-point summary</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+
+  <p class="copyright">
+    
+      © Copyright 2025-2026, SandAI.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+
+  <p class="sphinx-version">
+    Created using <a href="https://www.sphinx-doc.org/">Sphinx</a> 9.1.0.
+    <br/>
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+    <div class="footer-items__end">
+      
+        <div class="footer-item">
+<p class="theme-version">
+  <!-- # L10n: Setting the PST URL as an argument as this does not need to be localized -->
+  Built with the <a href="https://pydata-sphinx-theme.readthedocs.io/en/stable/index.html">PyData Sphinx Theme</a> 0.19.0.
+</p></div>
+      
+    </div>
+  
+</div>
+
+  </footer>
+  </body>
+</html>
