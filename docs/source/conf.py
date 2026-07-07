@@ -121,7 +121,7 @@ gettext_compact = False
 
 html_theme = "pydata_sphinx_theme"
 html_static_path = ["_static"]
-html_baseurl = "https://sandai-org.github.io/MagiCompiler/docs/"
+html_baseurl = "https://sandai-org.github.io/MagiCompiler/docs/main/"
 html_show_sourcelink = False
 
 html_theme_options = {
@@ -131,9 +131,13 @@ html_theme_options = {
     "collapse_navigation": False,
     "logo": {"text": "MagiCompiler"},
     "show_prev_next": False,
-    "navbar_start": ["navbar-logo"],
+    "navbar_start": ["navbar-logo", "version-switcher"],
     "navbar_center": ["navbar-nav"],
     "navbar_end": ["theme-switcher", "language-switcher", "navbar-icon-links"],
+    "switcher": {
+        "json_url": ("https://raw.githubusercontent.com/SandAI-org/MagiCompiler/" "refs/heads/gh-pages/docs/versions.json"),
+        "version_match": release,
+    },
     "icon_links": [{"name": "Github", "url": "https://github.com/SandAI-org/MagiCompiler", "icon": "fa-brands fa-github"}],
 }
 
