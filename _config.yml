@@ -1,0 +1,7 @@
+include:
+  - _static
+  - _sources
+  - docs/main/_static
+  - docs/main/_sources
+  - docs/main/zh_CN/_static
+  - docs/main/zh_CN/_sources
