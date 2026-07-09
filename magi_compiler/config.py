@@ -263,81 +263,59 @@ class CompileConfig(BaseSettings):
             "Each sub-graph between two splitting ops is compiled independently by Inductor."
         ),
     )
-    enable_fsdp_all_gather_prefetch: bool = Field(
+    disable_graph_split: bool = Field(
         False,
         description=(
-            "Enable one-submod-ahead prefetch for SimpleFSDP/DTensor weight all-gather. "
-            "Before split_module, MagiCompiler moves prim_redistribute to the beginning of the previous submod "
-            "and leaves prim_to_local at the original weight-use point."
+            "Skip FX-level splitting at the custom subgraph-boundary ops (splitting_ops) and hand the "
+            "WHOLE graph to Inductor as a single piecewise submodule. The boundary custom ops (e.g. "
+            "gaga4_mh_moe / attention) stay in the graph as opaque extern calls that Inductor emits "
+            "verbatim -- there is exactly one compiled submod instead of one per compute region between "
+            "boundaries. Useful for comparing whole-graph Inductor codegen against the piecewise path. "
+            "Overrides splitting_ops (they are ignored). Incompatible with cudagraph_mode=PIECEWISE."
         ),
     )
-    fsdp_all_gather_prefetch_distance: int = Field(
-        1,
+    enable_fsdp_fullgraph_overlap: bool = Field(
+        False,
+        description=(
+            "Whole-graph FSDP weight all-gather / compute overlap (requires disable_graph_split=True, "
+            "cudagraph_mode=NONE). Before Inductor, lower SimpleFSDP weight prim_redistribute to explicit "
+            "collectives and optionally bucket them per compute-region (fsdp_fullgraph_bucket_mode). Then "
+            "install a scheduler-level 'latest-safe-launch' reorder pass (replaces raise_comms/sink_waits): "
+            "each weight all-gather launch is placed at the LATEST position whose downstream compute still "
+            "hides the collective (compute_window >= comm_runtime + slack), instead of PyTorch's earliest. "
+            "Per-snode compute/comm time comes from a profiling estimator installed at config.estimate_op_runtime "
+            "(the analytical roofline is unusable -- 0 for custom ops, 60x low for fused pointwise, 1500x high "
+            "for matmul; see scripts/demo/research_estimate_op_runtime_findings.md)."
+        ),
+    )
+    fsdp_fullgraph_bucket_mode: str = Field(
+        "none",
+        description=(
+            "Bucketing strategy for enable_fsdp_fullgraph_overlap: 'none' (N individual all_gather + N waits) "
+            "or 'coalesced' (per region: one all_gather_into_tensor_coalesced -> ONE launch, N getitems, N "
+            "waits). Regions are "
+            "delimited by the model's subgraph-boundary ops (splitting_ops) so weights coalesce per compute "
+            "region, not across the whole model."
+        ),
+    )
+    fsdp_fullgraph_bucket_size_mib: int = Field(
+        0,
         ge=0,
-        description="How many submods ahead to launch SimpleFSDP weight all-gather; the initial supported value is 1.",
-    )
-    fsdp_prefetch_mode: str = Field(
-        "collective",
         description=(
-            "Which FSDP all-gather prefetch pass to use when enable_fsdp_all_gather_prefetch is set. "
-            "'collective' (default): operate on explicit _c10d_functional.all_gather_into_tensor/wait_tensor "
-            "nodes, moving ONLY the launch to the previous submod and leaving the wait at the use site "
-            "(this is the one that actually overlaps). 'redistribute': legacy pass that moves the DTensor "
-            "prim_redistribute node (kept for reference; does not separate launch from wait). "
-            "NOTE: the 'collective' FX pass only fires when the pre-split graph already contains explicit "
-            "all_gather_into_tensor nodes. The real gaga4 SimpleFSDP graph instead contains opaque DTensor "
-            "prim_redistribute, so that pass is a no-op there; for real overlap on gaga4 use "
-            "enable_inductor_comm_reorder below (the within-submod Inductor reorder works regardless of "
-            "how the collectives originate)."
+            "Optional per-bucket size cap (MiB of local shard) for enable_fsdp_fullgraph_overlap bucketing. "
+            "0 (default) = no cap: coalesce every same-(group,dtype) weight in a region into ONE all_gather "
+            "(current behavior). >0 = within a region, walk the weight all-gathers in PROGRAM ORDER and start a "
+            "NEW bucket whenever the dtype changes OR adding the next weight's local-shard size would exceed "
+            "this cap; each bucket becomes one all_gather. Only same-dtype, program-adjacent weights coalesce "
+            "(a different-dtype weight in between breaks the run). Bounds the size of each coalesced collective."
         ),
     )
-    fsdp_lower_redistribute_to_collectives: bool = Field(
-        False,
+    fsdp_overlap_slack_ns: float = Field(
+        5000.0,
+        ge=0.0,
         description=(
-            "Before the collective prefetch pass, decompose each SimpleFSDP weight DTensor "
-            "prim_redistribute/prim_to_local into explicit _c10d_functional.all_gather_into_tensor + "
-            "wait_tensor FX nodes. The real gaga4 graph only has opaque prim_redistribute (no explicit "
-            "collectives), so this is required for the collective prefetch pass to fire and to let the "
-            "all_gather launch be moved across the MoE boundary while the wait stays at the use site. "
-            "Shard(0) only; requires cudagraph_mode=NONE."
-        ),
-    )
-    fsdp_bucket_weight_all_gather: bool = Field(
-        False,
-        description=(
-            "After lowering SimpleFSDP weight prim_redistribute to explicit collectives, coalesce each "
-            "submod's weight all-gathers into one all_gather_into_tensor_coalesced per (submod, group, "
-            "dtype) -- fewer launched NCCL kernels. Waits are kept separate (one per weight) so the "
-            "collective prefetch can still hoist the coalesced launch across the MoE boundary while each "
-            "wait stays at its use site. Requires fsdp_lower_redistribute_to_collectives=True and cudagraph NONE."
-        ),
-    )
-    fsdp_bucket_mode: str = Field(
-        "concat",
-        description=(
-            "Which bucketing implementation to use when fsdp_bucket_weight_all_gather is set. "
-            "'concat' (default): flatten each weight's local shard, cat them, do ONE "
-            "all_gather_into_tensor on the concatenated buffer, then reshape + split_with_sizes back to "
-            "each weight. The gathered buffer is rank-major while weights are weight-major, so the split "
-            "is lowered as a clone into a fresh buffer per weight (transient ~2x memory + a multi-GB cat "
-            "on the compute stream). 'coalesced': fuse the N launches into a single "
-            "all_gather_into_tensor_coalesced (one NCCL group, one weight-major output buffer per input), "
-            "then unpack each member with operator.getitem (zero-copy, no cat/clone/2x spike) and keep a "
-            "separate wait per member. The coalesced op returns a Tensor[] that cannot cross a piecewise "
-            "submod boundary, so the launch and its getitems are kept together in the launch submod; only "
-            "the unpacked single tensors cross. Requires fsdp_bucket_weight_all_gather=True and cudagraph NONE."
-        ),
-    )
-    enable_inductor_comm_reorder: bool = Field(
-        False,
-        description=(
-            "Enable Inductor's comm/compute overlap reorder for every piecewise submod "
-            "(reorder_for_compute_comm_overlap=True with passes raise_comms + sink_waits). This hoists each "
-            "submod's weight all-gather launches to the top of the generated code and sinks each wait to just "
-            "before its use, so a gather overlaps the compute that precedes its consumer. Works on lowered "
-            "_c10d_functional collectives inside each submod, so it applies to gaga4 SimpleFSDP regardless of "
-            "the prefetch pass. The collective prefetch pass also turns this on automatically when it moves a "
-            "launch across a submod boundary. Requires cudagraph_mode=NONE."
+            "Extra headroom (ns) added to each collective's runtime when the fullgraph overlap reorder pass "
+            "sizes the compute window, absorbing estimator error + kernel-launch latency so the wait rarely stalls."
         ),
     )
 

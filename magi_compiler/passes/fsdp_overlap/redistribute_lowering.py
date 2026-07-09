@@ -1,3 +1,17 @@
+# Copyright (c) 2026 SandAI. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import math
@@ -126,11 +140,23 @@ def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
             # Pad the local shard up to `chunk` rows when this rank owns fewer
             # (uneven Shard(0): trailing ranks get remainder/empty).
             #
-            # NOTE: meta example_values MUST be created via FakeTensor ops
-            # (``local.new_empty``), NOT ``torch.empty(..., device=cuda)``.  A
-            # FakeTensor's ``.device`` is a real ``cuda:N``, so ``torch.empty``
-            # allocates a REAL full-size buffer per weight; across all weights
-            # that leaks ~the whole unsharded model (tens of GB) and OOMs.
+            # NOTE (multi-rank): this `if L < chunk` branch makes trailing ranks' graphs
+            # STRUCTURALLY DIFFERENT (extra constant_pad_nd nodes) from full-chunk ranks.
+            # That per-rank structure does NOT by itself break the FSDP-overlap reorder,
+            # AS LONG AS the reorder's cost model is rank-deterministic (analytical) so it
+            # places gathers identically regardless of the pad-node count -- verified on
+            # 8-GPU gaga4: analytical cost -> gather placement identical across ranks
+            # (4==4 before the 1st attention) and runs clean 4/4, even though rank0 has 0
+            # pads and rank4 has 1170.  (Emitting the pad unconditionally does NOT help:
+            # Inductor DCEs the zero-width pad on full-chunk ranks, so the structure
+            # diverges again post-lowering anyway.)  PER-RANK PROFILING is the thing that
+            # breaks it -- its per-rank costs make the placement diverge (7 vs 5) and
+            # deadlock; MagiBackend therefore uses analytical cost for world_size > 1.
+            #
+            # meta example_values MUST be created via FakeTensor ops (``local.new_empty``),
+            # NOT ``torch.empty(..., device=cuda)``: a FakeTensor's ``.device`` is a real
+            # ``cuda:N`` so torch.empty allocates a REAL full-size buffer per weight
+            # (~the whole unsharded model across all weights) and OOMs.
             if L < chunk:
                 pad = [0, 0] * (local.dim() - 1) + [0, chunk - L]
                 padded = graph.graph.call_function(_PAD, (cur, pad, 0.0))
