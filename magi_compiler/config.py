@@ -385,11 +385,19 @@ class CompileConfig(BaseSettings):
 
 
 def model_rank_dir_name(model_idx: int, model_tag: str | None) -> str:
-    """Directory name for a model instance: ``model_{idx}[_{tag}]_rank_{rank}``."""
+    """Directory name for a model instance: ``model_{idx}[_{tag}]_rank_{rank}_ws{world_size}``.
+
+    world_size is included because runtime model behavior (e.g. MoE EP head
+    padding, tensor strides in custom-op meta functions) can differ across
+    world sizes.  Without it, switching between e.g. EP=6 and EP=8 would
+    silently reuse stale compiled artifacts and trigger stride-mismatch
+    assertions at runtime.
+    """
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
     if model_tag:
-        return f"model_{model_idx}_{model_tag}_rank_{rank}"
-    return f"model_{model_idx}_rank_{rank}"
+        return f"model_{model_idx}_{model_tag}_rank_{rank}_ws{world_size}"
+    return f"model_{model_idx}_rank_{rank}_ws{world_size}"
 
 
 def debug_dump_path(cache_root_dir: str, model_idx: int, model_tag: str | None = None) -> Path:

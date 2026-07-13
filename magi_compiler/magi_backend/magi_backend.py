@@ -128,12 +128,11 @@ class CompilerManager:
 
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         magi_logger.info("Using cache directory: %s for MagiCompiler", cache_dir)
+        self.cache = {}
+
         if self.cache_file_path.exists():
-            # load the cache from the file
             with self.cache_file_path.open() as f:
-                # Parse Python literals using ast.literal_eval, which is a safe alternative to eval().
                 raw = ast.literal_eval(f.read())
-                self.cache = {}
                 for entry, handle in raw.items():
                     cache_entry = CacheEntry(*entry)
                     cache_handle = CacheHandle(*handle)
@@ -160,6 +159,13 @@ class CompilerManager:
             return None
 
         cache_handle = self.cache[cache_entry]
+
+        artifact_dir = Path(cache_handle.path)
+        if not artifact_dir.exists():
+            magi_logger.warning("Stale cache entry removed (artifact dir missing): %s", cache_handle.path)
+            del self.cache[cache_entry]
+            return None
+
         if cache_entry.graph_index not in self._remaining_restart_skips:
             self._remaining_restart_skips[cache_entry.graph_index] = cache_handle.restart_analysis_count
         remaining = self._remaining_restart_skips[cache_entry.graph_index]
@@ -224,6 +230,7 @@ class CompilerManager:
         if self.disable_cache:
             return False
         if cache_handle is None:
+            self.cache.pop(cache_entry, None)
             return False
 
         prev_handle = self.cache.get(cache_entry)
