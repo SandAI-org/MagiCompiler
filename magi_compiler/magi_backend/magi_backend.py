@@ -561,8 +561,6 @@ class MagiBackend:
         from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder, lower_and_bucket_full_graph
         from magi_compiler.profiling import ProfilingRuntimeEstimator
 
-        # The model's true subgraph-boundary ops delimit bucketing regions even
-        # though disable_graph_split emptied fx_split_ops.
         boundary_ops = resolve_defined_ops(
             [] if self.compile_config.disable_graph_split else [] or self.compile_config.splitting_ops
         )
@@ -580,72 +578,15 @@ class MagiBackend:
             n_buckets,
         )
 
-        # Cost model for the reorder's placement sweep.
-        #
-        # MULTI-RANK CORRECTNESS (critical): the reorder decides how far to hoist each
-        # weight all-gather from accumulated per-node costs.  If those costs differ
-        # across ranks, the sweep places a different number of gathers before the eager
-        # CP all_to_all inside the attention op -> weight-PG vs CP-PG collectives
-        # interleave in rank-divergent order -> NCCL deadlock (verified on 8-GPU gaga4:
-        # per-rank profiling -> post-reorder graph `0037` differs across ranks -> hang
-        # at SeqNum=12).  Costs must be rank-IDENTICAL.  Three modes (env
-        # MAGI_COMPILE_FSDP_OVERLAP_COST_MODE = analytical | profile_sync | profile):
-        #   * "analytical"   : Inductor roofline (shapes+device only -> rank-identical).
-        #                      Deterministic, zero overhead, but less accurate.
-        #   * "profile_sync" : REAL per-op profiling, re-measured in rank-lockstep
-        #                      (barrier + fixed iters) and MAX-reduced over gloo so the
-        #                      table is identical on every rank -- accurate AND safe.
-        #                      Requires the identical-graph precondition (guaranteed by
-        #                      the unconditional-pad lowering fix).
-        #   * "profile"      : plain per-rank profiling, NO sync.  Rank-nondeterministic
-        #                      -> WILL deadlock multi-rank; only for world_size==1.
-        # Default: world_size>1 -> "profile_sync" (accurate + safe); ==1 -> "profile".
-        # Back-compat: MAGI_COMPILE_FSDP_OVERLAP_ANALYTICAL_COST=1 forces "analytical".
-
-        # DEFAULT: multi-rank -> "profile_sync"; single-rank -> "profile".
-        # profile_sync gives REAL measured costs AND a rank-identical schedule, which is
-        # now SAFE because the model builder replicates uneven-Shard(0) params
-        # (_replicate_uneven_shard_params in simple_fsdp.py) so the compiled graph is
-        # structurally identical on every rank -> same structural-key set -> the
-        # rank-lockstep warm_and_sync max-reduce fully reconciles costs.  (An earlier
-        # attempt without the replicate fix hung even with profile_sync, because trailing
-        # ranks had extra constant_pad_nd nodes from uneven shards -> divergent placement
-        # that cost-sync couldn't fix; replicating those tiny params removes the source.)
-        # "analytical" (Inductor roofline, shapes+device only) is the deadlock-free
-        # FALLBACK if a model still has per-rank graph divergence -- rank-deterministic
-        # but less accurate.  MAGI_COMPILE_FSDP_OVERLAP_COST_MODE=analytical|profile_sync|
-        # profile overrides; back-compat MAGI_COMPILE_FSDP_OVERLAP_ANALYTICAL_COST=1
-        # forces analytical.
         _mode = self.compile_config.fsdp_overlap_cost_mode
         if _mode == "analytical":
             self._fsdp_overlap_estimator = None
             cost_fn = None  # reorder pass defaults to Inductor's analytical estimate
         else:
-            # Pass the estimator DIRECTLY to the reorder pass rather than installing it
-            # globally at inductor_config.estimate_op_runtime -- the global hook is
-            # consulted by Inductor's own scheduling/caching in ways that specialize
-            # dynamic shapes.  In "profile_sync" the reorder detects warm_and_sync and
-            # reconciles costs across ranks; "profile" leaves them per-rank (single
-            # rank only).  We set a flag the reorder reads to decide whether to sync.
             self._fsdp_overlap_estimator = ProfilingRuntimeEstimator()
             self._fsdp_overlap_estimator._sync_across_ranks = _mode == "profile_sync"
             cost_fn = self._fsdp_overlap_estimator
 
-        # Our reorder pass is the ONLY reorder pass.  It moves each weight
-        # all-gather LAUNCH earlier -- into the upstream compute of the PREVIOUS
-        # region (a bounded distance~=1 prefetch) -- so the compute between the new
-        # launch position and the gather's (unmoved) wait hides the collective.
-        # We deliberately do NOT append Inductor's builtin ``sink_waits``: it defers
-        # every wait unconditionally, which lets every launch (they depend only on
-        # the param shards, so all are "ready" at graph start) float to the graph
-        # top -> all layers' weights resident at once -> OOM on real 8-way FSDP.
-        # The pass instead moves launches a bounded amount (only far enough that the
-        # accumulated upstream compute covers comm), so ~2 layers' weights are
-        # resident at a time.  Crucially it ignores the artificial WeakDep ordering
-        # between collectives (FSDP gathers are independent) when computing each
-        # launch's earliest-legal position, else the WeakDep would pin the launch
-        # right after the previous gather and block the move.  See
-        # scripts/demo/research_exposed_allgather_before_attn.md.
         reorder = FsdpOverlapReorder(
             slack_ns=self.compile_config.fsdp_overlap_slack_ns,
             cost_fn=cost_fn,
@@ -731,7 +672,7 @@ class MagiBackend:
 
         # Step 5: visualize the split graph
         if envs.MAGI_ENABLE_FX_GRAPH_VIZ:
-            # save_fx_graph_visualization(split_gm.graph, sub_dir="after_split", filename="split_gm_root")
+            save_fx_graph_visualization(split_gm.graph, sub_dir="after_split", filename="split_gm_root")
             for item in piecewise_graphs:
                 save_fx_graph_visualization(item.graph.graph, sub_dir="after_split", filename=item.submod_name)
 

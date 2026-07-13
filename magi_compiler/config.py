@@ -267,11 +267,7 @@ class CompileConfig(BaseSettings):
         False,
         description=(
             "Skip FX-level splitting at the custom subgraph-boundary ops (splitting_ops) and hand the "
-            "WHOLE graph to Inductor as a single piecewise submodule. The boundary custom ops (e.g. "
-            "gaga4_mh_moe / attention) stay in the graph as opaque extern calls that Inductor emits "
-            "verbatim -- there is exactly one compiled submod instead of one per compute region between "
-            "boundaries. Useful for comparing whole-graph Inductor codegen against the piecewise path. "
-            "Overrides splitting_ops (they are ignored). Incompatible with cudagraph_mode=PIECEWISE."
+            "WHOLE graph to Inductor as a single piecewise submodule."
         ),
     )
     enable_fsdp_fullgraph_overlap: bool = Field(
@@ -284,8 +280,6 @@ class CompileConfig(BaseSettings):
             "each weight all-gather launch is placed at the LATEST position whose downstream compute still "
             "hides the collective (compute_window >= comm_runtime + slack), instead of PyTorch's earliest. "
             "Per-snode compute/comm time comes from a profiling estimator installed at config.estimate_op_runtime "
-            "(the analytical roofline is unusable -- 0 for custom ops, 60x low for fused pointwise, 1500x high "
-            "for matmul; see scripts/demo/research_estimate_op_runtime_findings.md)."
         ),
     )
     fsdp_fullgraph_bucket_mode: str = Field(

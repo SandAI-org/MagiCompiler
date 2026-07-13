@@ -16,15 +16,15 @@
 
 Some opaque boundary custom ops cannot be replayed for timing from generic
 size-hinted tensors alone, because they carry VALUE-DEPENDENT metadata that must
-be self-consistent (not just right-shaped) or they raise -- e.g.
-``gaga4_fa3_with_sink_cp`` takes a ``cp_split_sizes`` tensor whose values must sum
-to the sequence length and equal the per-rank seqlen, else its internal CP
-all_to_all asserts and the op falls back to a 0 cost estimate.
+be self-consistent (not just right-shaped) or they raise -- e.g. a context-parallel
+attention op taking a split-sizes tensor whose values must sum to the sequence
+length, else its internal all_to_all asserts and the op falls back to a 0 cost
+estimate.
 
-The owning code (which knows the op's semantics -- e.g. athena's gaga4 model)
-registers a hook here that builds a VALID, RANK-DETERMINISTIC set of replay inputs.
-MagiCompiler stays free of model-specific knowledge: ``_measure_extern`` just looks
-up the op by name and, if a hook exists, uses it instead of the generic realizer.
+The owning code (the model package that defines the custom op) registers a hook
+here that builds a VALID, RANK-DETERMINISTIC set of replay inputs.  MagiCompiler
+stays free of model-specific knowledge: ``_measure_extern`` just looks up the op
+by name and, if a hook exists, uses it instead of the generic realizer.
 
 A hook is ``fn(fx_node, realize) -> (args, kwargs) | None``:
   * ``fx_node``   -- the ``torch.fx.Node`` for the op (read its ``args``/``kwargs``
@@ -38,13 +38,39 @@ A hook is ``fn(fx_node, realize) -> (args, kwargs) | None``:
 Hooks MUST produce rank-identical inputs (derive everything from shapes / static
 sizes, no per-rank timing or state) so the rank-lockstep ``warm_and_sync`` measure
 issues any internal collective in lockstep across ranks.
+
+Example -- a custom attention op ``mylib::attn_cp(q, k, v, split_sizes, scale)``
+whose internal all_to_all requires ``split_sizes`` values to sum to the sequence
+length (a zero-filled tensor from the generic realizer would make it raise)::
+
+    from magi_compiler.profiling import register_benchmark_inputs
+
+    def _attn_cp_benchmark_inputs(fx_node, realize):
+        q_node, k_node, v_node, _split_node, scale = fx_node.args
+        q = realize(q_node)          # plain tensor args: reuse the generic realizer
+        k = realize(k_node)
+        v = realize(v_node)
+        # Rebuild the VALUE-dependent arg from SHAPE hints only (rank-identical):
+        # a uniform split summing to the per-rank seqlen.
+        seq, group_size = q.shape[0], 4
+        split_sizes = torch.full((group_size,), seq // group_size, dtype=torch.int32, device=q.device)
+        split_sizes[-1] += seq - int(split_sizes.sum())
+        return (q, k, v, split_sizes, float(scale)), {}
+
+    register_benchmark_inputs(
+        "mylib::attn_cp", _attn_cp_benchmark_inputs, has_internal_collective=True
+    )
+
+Register at import time of the module that defines the op (so the hook exists
+before any compile).  Returning ``None`` from the hook falls back to the generic
+realizer for that call.
 """
 
 from __future__ import annotations
 
 from typing import Callable
 
-# op name (``torch.ops.ns.op`` overload string, e.g. "athena::gaga4_fa3_with_sink_cp")
+# op name (``torch.ops.ns.op`` overload string, e.g. "mylib::attn_cp")
 # -> hook.  Also records which ops issue an internal collective (need fixed-iter
 # lockstep replay) -- so MagiCompiler no longer hardcodes model-specific op names.
 _BENCHMARK_INPUT_HOOKS: dict[str, Callable] = {}

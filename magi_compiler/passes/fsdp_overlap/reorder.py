@@ -189,14 +189,13 @@ class FsdpOverlapReorder:
         # This placement sweep MUST produce an IDENTICAL schedule on every rank, else
         # the weight all-gathers (weight PG) interleave with the eager CP all_to_all
         # (CP PG, inside the attention boundary op) in a rank-divergent order ->
-        # cross-PG NCCL collective-order mismatch -> deadlock (verified via flight
-        # recorder on 8-GPU gaga4: hang at SeqNum=12, rank0 races weight-PG ahead
-        # while peers block on the CP all_to_all).  Rank-consistency needs BOTH:
+        # cross-PG NCCL collective-order mismatch -> deadlock
+        # Rank-consistency needs BOTH:
         #   1. IDENTICAL INPUT GRAPH per rank -- guaranteed by the FSDP redistribute
         #      lowering now emitting the pad node UNCONDITIONALLY (zero-width no-op on
         #      full-chunk ranks), so uneven Shard(0) params no longer give trailing
         #      ranks extra constant_pad_nd nodes (different snode-list length ->
-        #      divergent placement).  Verified: stage `0008` byte-identical across ranks.
+        #      divergent placement).
         #   2. RANK-DETERMINISTIC COSTS -- the sweep accumulates `_cost` to decide how
         #      far to hoist each launch.  Profiling benchmarks PER RANK (timing noise +
         #      replays the attention op's internal CP all_to_all per rank), so with
@@ -250,24 +249,6 @@ class FsdpOverlapReorder:
             lower = self._earliest_legal_index(group, order, index_of, buf_to_snode, op_to_snode)
             plans.append((launch, group, fc_idx, comm_runtime, lower))
 
-        # ---- Sweep the compute pointer backward (UPSTREAM-of-launch scan) ----
-        # For each gather (LATEST first) accumulate the compute that sits IMMEDIATELY
-        # BEFORE its launch, walking backward, until the accumulated compute covers
-        # comm; move the launch to just before that compute block.  Because this pass
-        # moves ONLY the launch (never the wait) and lowering emits ``all_gather;
-        # wait`` back-to-back (wait at launch+1), the compute we walk past ends up in
-        # the [new_launch, wait] window and therefore actually overlaps the gather.
-        # Scanning UPSTREAM (from the launch) -- not downstream from the consumer --
-        # is the fix: the old downstream scan counted compute that runs AFTER the
-        # (unmoved) wait and can never overlap, so single-weight gathers were judged
-        # "covered" and left glued to their wait -> fully exposed.
-        #
-        # A SINGLE compute pointer walks backward CONTINUOUSLY and is NEVER reset per
-        # gather (each gather resumes from where the previous, later gather stopped),
-        # so no two gathers claim the same compute -- this serializes the single NCCL
-        # stream and keeps collectives in their original relative order (targets only
-        # decrease).  A gather with no upstream compute before `lower` (e.g. the
-        # graph's first gather) can't move and stays where it is (structural bubble).
         targets: dict = {}  # launch -> target index (in original order space)
         compute_idx = len(order)  # scan compute strictly below this
         for launch, group, fc_idx, comm_runtime, lower in reversed(plans):
