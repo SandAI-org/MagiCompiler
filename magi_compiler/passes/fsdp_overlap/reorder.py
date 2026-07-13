@@ -114,8 +114,14 @@ def _is_multi_output(snode: BaseSchedulerNode) -> bool:
 class FsdpOverlapReorder:
     """Callable reorder pass (see module docstring)."""
 
-    def __init__(self, slack_ns: float = _DEFAULT_SLACK_NS, cost_fn=None) -> None:
+    def __init__(self, slack_ns: float = _DEFAULT_SLACK_NS, cost_fn=None, comm_contention_factor: float = 1.0) -> None:
         self.slack_ns = slack_ns
+        # Scales each gather's estimated comm when sizing its compute window
+        # (need = comm * factor + slack).  The estimator measures collectives in
+        # ISOLATION; in-situ they contend with the very compute that hides them
+        # (~1.4-1.5x slower measured on 8xH100).  See CompileConfig.
+        # fsdp_overlap_comm_contention_factor.
+        self.comm_contention_factor = comm_contention_factor
         # cost_fn: snode -> ns.  Default uses Inductor's estimate_op_runtime hook,
         # which MagiBackend points at the profiling estimator.
         if cost_fn is None:
@@ -136,6 +142,7 @@ class FsdpOverlapReorder:
         # by reference (it is itself deepcopy-safe: see ProfilingRuntimeEstimator).
         new = FsdpOverlapReorder.__new__(FsdpOverlapReorder)
         new.slack_ns = self.slack_ns
+        new.comm_contention_factor = self.comm_contention_factor
         new._cost_fn = self._cost_fn
         new._cost_cache = {}
         memo[id(self)] = new
@@ -268,7 +275,11 @@ class FsdpOverlapReorder:
             # Start just before the launch, but no later than where the previous
             # (later) gather already consumed compute down to.
             compute_idx = min(compute_idx, cur)
-            need = comm_runtime + self.slack_ns
+            # comm is measured in isolation but runs concurrent with the compute
+            # that hides it -> scale by the contention factor before adding slack.
+            # Under-reserving exposes the collective's tail (the wait stalls);
+            # over-reserving just launches earlier on an otherwise-idle comm stream.
+            need = comm_runtime * self.comm_contention_factor + self.slack_ns
             acc = 0.0
             t = compute_idx
             while t > lower:
@@ -285,15 +296,28 @@ class FsdpOverlapReorder:
             target = max(lower, t)
             targets[launch] = (target, group)
             compute_idx = target  # next (earlier) gather resumes from actual placement
+            # Per-gather placement decision, the record that answers "why didn't
+            # this gather move earlier":
+            #   cur       = original program index of the launch
+            #   target    = where it was placed (== cur means NOT moved)
+            #   lower     = earliest LEGAL index (real-dep floor) it could move to
+            #   fc_idx    = first real consumer (the wait's user)
+            #   comm      = the gather's runtime it needs to hide
+            #   acc_upstream = compute actually found in [target, cur] to hide it
+            #   verdict   = hidden (acc>=need) | COMPUTE-LIMITED (ran out of upstream
+            #               compute before covering comm -- i.e. hit `lower` or the
+            #               previous gather's placement first)
             if _debug_enabled():
                 magi_logger.debug(
-                    "FSDP overlap: launch cur=%d -> target=%d fc=%d lower=%d | comm=%.1fus " "acc_upstream=%.1fus %s",
+                    "FSDP overlap placement: launch cur=%d -> target=%d fc=%d lower=%d | "
+                    "comm=%.1fus acc_upstream=%.1fus need=%.1fus %s",
                     cur,
                     target,
                     fc_idx,
                     lower,
                     comm_runtime / 1e3,
                     acc / 1e3,
+                    need / 1e3,
                     "hidden" if acc >= need else "COMPUTE-LIMITED",
                 )
 
@@ -365,22 +389,9 @@ class FsdpOverlapReorder:
             measured,
             cache_hits,
         )
-        # Full op->time table at DEBUG, or to a file when MAGI_COMPILE_FSDP_OVERLAP_DUMP
-        # is set (so the estimate table can be captured WITHOUT global DEBUG logging,
-        # which can trip torch's PT2_COMPILE chromium-event assertion on some builds).
-        if hasattr(self._cost_fn, "summary"):
-            import os as _os
-
-            if _debug_enabled():
-                magi_logger.debug("FSDP overlap %s", self._cost_fn.summary())
-            dump = _os.environ.get("MAGI_COMPILE_FSDP_OVERLAP_DUMP")
-            if dump:
-                try:
-                    rank = _os.environ.get("RANK", "0")
-                    with open(f"{dump}.rank{rank}", "a") as f:
-                        f.write(self._cost_fn.summary() + "\n")
-                except Exception as exc:  # noqa: BLE001
-                    magi_logger.warning("FSDP overlap: could not write cost dump: %s", exc)
+        # Full op->time table at DEBUG.
+        if _debug_enabled() and hasattr(self._cost_fn, "summary"):
+            magi_logger.debug("FSDP overlap %s", self._cost_fn.summary())
         return order
 
     # -- group detection --------------------------------------------------

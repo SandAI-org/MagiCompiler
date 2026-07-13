@@ -102,7 +102,6 @@ def main() -> None:
     dev = torch.cuda.current_device()
     torch.manual_seed(0)
 
-    os.environ["MAGI_COMPILE_FSDP_OVERLAP_COST_MODE"] = args.cost_mode
     # Surface the backend's INFO logs (redistribute lowering / bucketing / reorder
     # "repositioned N/M") to stderr so the pytest driver can assert the chain ran.
     # These come back through torch's logging even from standalone_compile.
@@ -136,6 +135,7 @@ def main() -> None:
         cfg.disable_graph_split = True
         cfg.enable_fsdp_fullgraph_overlap = True
         cfg.fsdp_fullgraph_bucket_mode = "coalesced"
+        cfg.fsdp_overlap_cost_mode = args.cost_mode
         return cfg
 
     # dim 0 of the input (token count) is the dynamic dim.

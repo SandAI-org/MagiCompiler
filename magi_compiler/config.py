@@ -310,12 +310,42 @@ class CompileConfig(BaseSettings):
             "(a different-dtype weight in between breaks the run). Bounds the size of each coalesced collective."
         ),
     )
+    fsdp_overlap_cost_mode: Literal["profile_sync", "analytical", "profile"] = Field(
+        "profile_sync",
+        description=(
+            "Cost model the enable_fsdp_fullgraph_overlap reorder pass uses to size each weight "
+            "all-gather's compute window. The costs MUST be rank-identical multi-rank, else gathers "
+            "interleave with the CP all_to_all in rank-divergent order -> NCCL deadlock.\n"
+            "  * 'profile_sync' (default): REAL per-op profiling re-measured in rank-lockstep (barrier + "
+            "fixed iters, MAX-reduced over gloo) -> accurate AND rank-identical. Requires the compiled "
+            "graph to be structurally identical on every rank (guaranteed for gaga4 by replicating "
+            "uneven-Shard(0) params).\n"
+            "  * 'analytical': Inductor roofline (shapes+device only) -> rank-deterministic, zero overhead, "
+            "less accurate. Deadlock-free FALLBACK for a model that still shows per-rank graph divergence.\n"
+            "  * 'profile': plain per-rank profiling, NO cross-rank sync -> rank-nondeterministic, WILL "
+            "deadlock multi-rank; single-rank (world_size==1) only."
+        ),
+    )
     fsdp_overlap_slack_ns: float = Field(
         5000.0,
         ge=0.0,
         description=(
             "Extra headroom (ns) added to each collective's runtime when the fullgraph overlap reorder pass "
             "sizes the compute window, absorbing estimator error + kernel-launch latency so the wait rarely stalls."
+        ),
+    )
+    fsdp_overlap_comm_contention_factor: float = Field(
+        1.5,
+        ge=1.0,
+        description=(
+            "Multiplier on each collective's estimated runtime when the fullgraph overlap reorder pass sizes "
+            "its compute window (need = comm * factor + slack). The profile_sync measurement is taken in "
+            "ISOLATION (rank-lockstep, nothing else running), but in the compiled graph the all-gather runs "
+            "CONCURRENT with the compute it hides and they contend for SMs/bandwidth -- measured in-situ NCCL "
+            "all-gathers run ~1.4-1.5x their isolated time (8xH100 NVSwitch, RING_LL, NCCL_MAX_CTAS=12; nsys "
+            "2026-07-12: ws2 2x[384,256,1280] 4540us vs 3205us isolated, ws8 2x[6144,3072] 2748us vs 1897us). "
+            "Under-reserving exposes the whole tail of the collective (the wait stalls); over-reserving merely "
+            "launches a few hundred us earlier on an otherwise-idle comm stream, so err high."
         ),
     )
 

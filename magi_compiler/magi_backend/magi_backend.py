@@ -552,17 +552,20 @@ class MagiBackend:
         3. Install the latest-safe-launch reorder pass, REPLACING PyTorch's builtin
            raise_comms/sink_waits, and enable reorder_for_compute_comm_overlap.
         """
-        pass
-
-        from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder, lower_and_bucket_full_graph
-        from magi_compiler.profiling import ProfilingRuntimeEstimator
+        if not self.compile_config.disable_graph_split:
+            raise ValueError("enable_fsdp_fullgraph_overlap requires disable_graph_split=True")
 
         if self.compile_config.cudagraph_mode != CudaGraphMode.NONE:
             raise ValueError("enable_fsdp_fullgraph_overlap requires cudagraph_mode=NONE")
 
+        from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder, lower_and_bucket_full_graph
+        from magi_compiler.profiling import ProfilingRuntimeEstimator
+
         # The model's true subgraph-boundary ops delimit bucketing regions even
         # though disable_graph_split emptied fx_split_ops.
-        boundary_ops = resolve_defined_ops(self.compile_config.splitting_ops or [])
+        boundary_ops = resolve_defined_ops(
+            [] if self.compile_config.disable_graph_split else [] or self.compile_config.splitting_ops
+        )
         bucket_size_bytes = int(self.compile_config.fsdp_fullgraph_bucket_size_mib) * 1024 * 1024
         n_buckets = lower_and_bucket_full_graph(
             graph,
@@ -598,9 +601,6 @@ class MagiBackend:
         #                      -> WILL deadlock multi-rank; only for world_size==1.
         # Default: world_size>1 -> "profile_sync" (accurate + safe); ==1 -> "profile".
         # Back-compat: MAGI_COMPILE_FSDP_OVERLAP_ANALYTICAL_COST=1 forces "analytical".
-        import os as _os
-
-        import torch.distributed as _dist
 
         # DEFAULT: multi-rank -> "profile_sync"; single-rank -> "profile".
         # profile_sync gives REAL measured costs AND a rank-identical schedule, which is
@@ -616,18 +616,10 @@ class MagiBackend:
         # but less accurate.  MAGI_COMPILE_FSDP_OVERLAP_COST_MODE=analytical|profile_sync|
         # profile overrides; back-compat MAGI_COMPILE_FSDP_OVERLAP_ANALYTICAL_COST=1
         # forces analytical.
-        _world = _dist.get_world_size() if (_dist.is_available() and _dist.is_initialized()) else 1
-        _mode = _os.environ.get("MAGI_COMPILE_FSDP_OVERLAP_COST_MODE")
-        if _mode is None:
-            if _os.environ.get("MAGI_COMPILE_FSDP_OVERLAP_ANALYTICAL_COST") == "1":
-                _mode = "analytical"
-            else:
-                _mode = "profile_sync" if _world > 1 else "profile"
-
+        _mode = self.compile_config.fsdp_overlap_cost_mode
         if _mode == "analytical":
             self._fsdp_overlap_estimator = None
             cost_fn = None  # reorder pass defaults to Inductor's analytical estimate
-            magi_logger.info("FSDP fullgraph overlap: ANALYTICAL cost (world_size=%d)", _world)
         else:
             # Pass the estimator DIRECTLY to the reorder pass rather than installing it
             # globally at inductor_config.estimate_op_runtime -- the global hook is
@@ -638,7 +630,6 @@ class MagiBackend:
             self._fsdp_overlap_estimator = ProfilingRuntimeEstimator()
             self._fsdp_overlap_estimator._sync_across_ranks = _mode == "profile_sync"
             cost_fn = self._fsdp_overlap_estimator
-            magi_logger.info("FSDP fullgraph overlap: %s cost (world_size=%d)", _mode.upper(), _world)
 
         # Our reorder pass is the ONLY reorder pass.  It moves each weight
         # all-gather LAUNCH earlier -- into the upstream compute of the PREVIOUS
@@ -655,7 +646,11 @@ class MagiBackend:
         # launch's earliest-legal position, else the WeakDep would pin the launch
         # right after the previous gather and block the move.  See
         # scripts/demo/research_exposed_allgather_before_attn.md.
-        reorder = FsdpOverlapReorder(slack_ns=self.compile_config.fsdp_overlap_slack_ns, cost_fn=cost_fn)
+        reorder = FsdpOverlapReorder(
+            slack_ns=self.compile_config.fsdp_overlap_slack_ns,
+            cost_fn=cost_fn,
+            comm_contention_factor=self.compile_config.fsdp_overlap_comm_contention_factor,
+        )
         self.inductor_compile_config["reorder_for_compute_comm_overlap"] = True
         self.inductor_compile_config["reorder_for_compute_comm_overlap_passes"] = [reorder]
 

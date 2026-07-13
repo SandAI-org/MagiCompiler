@@ -131,6 +131,16 @@ def _snode_label(snode: BaseSchedulerNode, max_shapes: int = 3) -> str:
     return f"{target}[{','.join(shapes)}]" if shapes else target
 
 
+def _is_multi_output_unpack(snode: BaseSchedulerNode) -> bool:
+    """True for a ``MultiOutput`` snode -- the zero-cost getitem that unpacks one
+    output of a multi-output extern (FallbackKernel).  It shares its origin fx
+    node with the parent extern, so it must never go through the structural-key
+    table (the key collides with the parent's and returns the parent's runtime)."""
+    from torch._inductor.ir import MultiOutput
+
+    return type(getattr(snode, "node", None)) is MultiOutput
+
+
 def _structural_key(snode: BaseSchedulerNode) -> tuple | None:
     """A cache key that is identical for isomorphic kernels (same op set + same
     input shapes/dtypes) so repeated layers share one measurement.  Returns None
@@ -545,6 +555,18 @@ class ProfilingRuntimeEstimator:
         # attributed to the launch); keep it analytical (returns 0).
         if contains_wait(snode) and not contains_collective(snode):
             return _safe_analytical(snode)
+
+        # A MultiOutput unpack (getitem off a multi-output extern, e.g. attention's
+        # (out, lse) FallbackKernel) launches NO kernel -- it is 0-cost.  It MUST be
+        # short-circuited BEFORE the op->time table: it shares its origin fx node
+        # with the parent extern, so ``_structural_key`` COLLIDES with the parent's
+        # key and the table would return the parent's full runtime (measured: the
+        # fa3 attention MultiOutput was costed 45.7ms; the FSDP-overlap reorder then
+        # believed a weight all-gather placed between the attention kernel and its
+        # unpack node was hidden by 45.7ms of "compute" -- one slot short of the
+        # real attention window -> the gather ran fully exposed before the MoE).
+        if _is_multi_output_unpack(snode):
+            return 0.0
 
         # COLLECTIVES: never benchmark a real collective HERE.  The Inductor reorder
         # pass runs per-rank during independent, non-co-scheduled compilation, so
