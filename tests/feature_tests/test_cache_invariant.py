@@ -23,11 +23,9 @@ invariant that the code *should* maintain.  On unfixed code they FAIL.
 from __future__ import annotations
 
 import pprint
-import sys
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
 import torch
 import torch.fx as fx
 
@@ -36,23 +34,8 @@ from magi_compiler.magi_backend._cache_data_cls import CacheEntry, CacheHandle
 from magi_compiler.magi_backend.magi_backend import CompilerManager
 
 
-@pytest.fixture(autouse=True)
-def cleanup_cache():
-    """Override the global autouse cleanup_cache fixture from conftest.py.
-
-    These tests use tmp_path and don't need global cache cleanup, which can
-    hang when cache_root_dir points to a large or network-mounted directory.
-    """
-    yield
-
-
 def _make_cm(tmp_path: Path) -> CompilerManager:
-    saved_argv = sys.argv
-    try:
-        sys.argv = ["test"]
-        cfg = CompileConfig(cache_root_dir=str(tmp_path), backend="eager")
-    finally:
-        sys.argv = saved_argv
+    cfg = CompileConfig(cache_root_dir=str(tmp_path), backend="eager", _cli_parse_args=False)
     return CompilerManager(cfg)
 
 
@@ -138,9 +121,6 @@ def test_store_none_handle_removes_stale_entry(tmp_path: Path) -> None:
 # injected between the two calls.
 #
 # Expected after fix: self.cache is always reset to {}.
-# Note: _remaining_restart_skips is NOT reset by initialize_cache because
-# it is runtime consumption state that must survive across Dynamo
-# RestartAnalysis retries (which re-call initialize_cache).
 # ---------------------------------------------------------------------------
 
 
@@ -159,7 +139,8 @@ def test_reinit_without_indices_clears_memory(tmp_path: Path) -> None:
 
     assert not (cache_dir / "subgraph_indices.py").exists(), "precondition: no index file"
 
-    # Re-initialize same directory — should clear cache dict.
+    # Re-initialize same directory — should clear everything.
     cm.initialize_cache(cache_dir)
 
     assert entry not in cm.cache, "ghost handle must be cleared on re-init"
+    assert 0 not in cm._remaining_restart_skips, "restart skips must be cleared when no index"

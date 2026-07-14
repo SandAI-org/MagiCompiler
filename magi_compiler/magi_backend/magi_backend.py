@@ -129,6 +129,7 @@ class CompilerManager:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         magi_logger.info("Using cache directory: %s for MagiCompiler", cache_dir)
         self.cache = {}
+        self._remaining_restart_skips = {}
 
         if self.cache_file_path.exists():
             with self.cache_file_path.open() as f:
