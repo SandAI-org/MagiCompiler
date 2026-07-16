@@ -12,18 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-op runtime cost model (profiling) -- general infrastructure, not a pass.
-
-Provides:
-* :class:`.runtime_estimator.ProfilingRuntimeEstimator` -- a ``snode -> nanoseconds``
-  cost model that MEASURES each scheduler node's real kernel time (Triton via
-  ``benchmark_fused_nodes``, extern/custom via eager replay, collectives via a
-  rank-lockstep replay), replacing Inductor's unreliable analytical roofline. Any
-  pass that needs accurate per-op timing (e.g. the FSDP-overlap reorder) uses it.
-* :mod:`.benchmark_inputs` -- a model-agnostic registry so the owning code (e.g.
-  athena's gaga4) can supply valid replay inputs / lockstep flags for opaque custom
-  ops that can't be replayed from generic size-hinted tensors alone.
-"""
 
 from .benchmark_inputs import get_benchmark_inputs_hook, op_has_internal_collective, register_benchmark_inputs
 from .runtime_estimator import ProfilingRuntimeEstimator

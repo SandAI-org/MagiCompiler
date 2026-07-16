@@ -17,13 +17,14 @@ SimpleFSDP-style model, and print machine-checkable markers to stdout for the py
 driver (tests/feature_tests/test_fsdp_overlap_e2e.py).
 
 Chain under test (magi_backend._apply_fsdp_fullgraph_overlap):
-  redistribute lowering  ->  per-region bucketing (coalesced)  ->  FsdpOverlapReorder
+  redistribute lowering  ->  whole-graph bucketing (coalesced)  ->  FsdpOverlapReorder
 
 Model: two Linear layers whose params are Shard(0) DTensors (via torchtitan
-``data_parallel(mode="fully_shard")`` -- the same mechanism gaga4 uses), with an
+``data_parallel(mode="fully_shard")``), with an
 opaque ``@magi_register_custom_op(is_subgraph_boundary=True)`` op between them so the
-graph has a real subgraph boundary (delimits bucketing regions) and the weight
-``prim_redistribute`` nodes the lowering pass rewrites.
+graph contains an opaque extern call alongside the
+weight ``prim_redistribute`` nodes the lowering pass rewrites.  Bucketing is
+whole-graph: the boundary op does NOT split buckets.
 
 Run: torchrun --nproc_per_node=N tests/feature_tests/fsdp_overlap_helper/e2e_helper.py
      [--cost-mode analytical|profile_sync]
@@ -49,18 +50,18 @@ from magi_compiler import magi_compile, magi_register_custom_op
 from magi_compiler.config import CompileMode, CudaGraphMode
 
 
-# An opaque boundary op: forces a real subgraph boundary in the graph (delimits the
-# bucketing regions).  Elementwise so it is trivially correct.
+# An opaque boundary op: stays in the graph as an opaque extern call
+# Elementwise so it is trivially correct.
 @magi_register_custom_op(name="fsdp_e2e::boundary_gelu", is_subgraph_boundary=True)
 def boundary_gelu(x: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.gelu(x)
 
 
 class Block(nn.Module):
-    """One transformer-ish block: two Linears with an opaque subgraph-boundary op
-    between them.  Multiple blocks give the graph MULTIPLE boundary-delimited regions,
-    each with several weight all-gathers -- so the bucketing pass coalesces per region
-    and the reorder pass has real cross-region compute to hide gathers behind."""
+    """One transformer-ish block: two Linears with an opaque extern op between them.
+    Multiple blocks give the graph many Shard(0) weight all-gathers interleaved with
+    compute -- so the bucketing pass coalesces them whole-graph and the reorder pass
+    has real compute to hide gathers behind."""
 
     def __init__(self, hidden: int):
         super().__init__()
@@ -75,8 +76,8 @@ class Block(nn.Module):
 
 
 class TinyModel(nn.Module):
-    """A multi-layer stack of Blocks (default 4) -> many Shard(0) weights across
-    several regions, exercising the full lower->bucket->reorder chain at scale."""
+    """A multi-layer stack of Blocks (default 4) -> many Shard(0) weights,
+    exercising the full lower->bucket->reorder chain at scale."""
 
     def __init__(self, hidden: int, n_layers: int = 4):
         super().__init__()
@@ -90,7 +91,7 @@ class TinyModel(nn.Module):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cost-mode", default="analytical", choices=["analytical", "profile_sync", "profile"])
+    ap.add_argument("--cost-mode", default="analytical", choices=["analytical", "profile_sync"])
     ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--n-layers", type=int, default=4)
     args = ap.parse_args()
@@ -133,9 +134,9 @@ def main() -> None:
         cfg.compile_mode = CompileMode.MAGI_COMPILE
         cfg.cudagraph_mode = CudaGraphMode.NONE
         cfg.disable_graph_split = True
-        cfg.enable_fsdp_fullgraph_overlap = True
-        cfg.fsdp_fullgraph_bucket_mode = "coalesced"
-        cfg.fsdp_overlap_cost_mode = args.cost_mode
+        cfg.fsdp_config.enable_fullgraph_overlap = True
+        cfg.fsdp_config.bucket_mode = "coalesced"
+        cfg.fsdp_config.cost_mode = args.cost_mode
         return cfg
 
     # dim 0 of the input (token count) is the dynamic dim.

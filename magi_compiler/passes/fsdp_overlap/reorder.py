@@ -16,50 +16,27 @@ from __future__ import annotations
 
 """Latest-safe-launch FSDP all-gather / compute overlap reorder pass.
 
-Installed into ``torch._inductor.config.reorder_for_compute_comm_overlap_passes``
-as a callable ``list[BaseSchedulerNode] -> list[BaseSchedulerNode]``.  Runs on the
-WHOLE Inductor graph (MagiCompiler ``disable_graph_split=True``), replacing
-PyTorch's builtin ``raise_comms``/``sink_waits``.
-
-Objective (opposite of ``raise_comms``, which schedules comms as EARLY as
-possible): for each FSDP weight ``all_gather`` launch, find its wait / first real
-consumer and place the launch at the LATEST position whose downstream compute
-still hides the collective, i.e. the latest slot where::
+Installed as the only ``reorder_for_compute_comm_overlap_passes`` entry (replaces
+``raise_comms``/``sink_waits``); runs on the whole Inductor graph
+(``disable_graph_split=True``).  For each FSDP weight all-gather launch, place it
+at the LATEST position whose downstream compute still hides the collective::
 
     sum(compute runtime between launch and first-consumer) >= comm_runtime + slack
 
-If there is not enough upstream compute, fall back to as-early-as-legal (so we
-overlap what we can; never worse than raise_comms).
+Not enough upstream compute -> as-early-as-legal (never worse than raise_comms).
 
-TWO-POINTER back-to-front sweep (like the offload HeuristicScheduler's reverse
-walk for "latest start of transmission", offload/scheduler.py:319):
-  * comm pointer  -- weight all-gathers in REVERSE original order (last first);
-  * compute pointer -- a SINGLE index that walks backward CONTINUOUSLY over the
-    whole graph and is NEVER reset per gather.
-Each gather consumes a contiguous run of compute nodes (accumulating their cost)
-until it covers its (scaled) comm; its launch target is that stopping point.  The
-NEXT (earlier) gather resumes the compute pointer from where it stopped -- NOT
-from just before its own consumer -- so no two gathers claim the same compute
-(this serializes the single NCCL stream) and the collectives keep their original
-relative order automatically (targets only decrease).  All moves are then applied
-in one stable-sort rebuild and validated once (``_validate_full``).
+Algorithm: two-pointer back-to-front sweep.  Gathers are visited in reverse
+program order; a single compute pointer walks backward continuously and is never
+reset, so each gather claims a disjoint run of compute (serializing the single
+NCCL stream) and targets only decrease.  All moves are applied in one stable-sort
+rebuild and validated once (``_validate_full``) -- the Inductor driver does NOT
+repair the returned order, so it must be a valid topological order.
 
-The Inductor driver (``comms.reorder_compute_and_comm_for_overlap``) does NOT
-validate or repair the returned order and does NOT re-sink collectives, so the
-returned list MUST be a valid topological order.  We guarantee that by only ever
-inserting a launch group inside ``[earliest-legal, first-consumer)`` and
-asserting the move keeps every producer before / every consumer after the group
-(else we abort the move and leave the launch in place).
-
-Handles two graph-level forms produced by
-``fsdp_overlap.lower_and_bucket.lower_and_bucket_full_graph``:
-* no-bucket   : 1 all_gather -> 1 wait -> 1 consumer;
-* coalesced   : 1 packed all_gather_into_tensor_coalesced (MultiOutputLayout)
-                -> N MultiOutput members -> N waits -> N consumers.  The launch is
-                ONE snode with N waits; the packed collective + its N MultiOutput
-                members move together as one contiguous block, before any wait.
+Handles both lowering forms: plain all_gather (1 launch / 1 wait) and coalesced
+(1 packed launch + N MultiOutput members moved together as one block + N waits).
 """
 
+import hashlib
 from collections import defaultdict
 
 import torch
@@ -111,35 +88,54 @@ def _is_multi_output(snode: BaseSchedulerNode) -> bool:
     return type(node) is MultiOutput
 
 
+def _graph_fingerprint(order: list[BaseSchedulerNode]) -> str:
+    """Rank-comparable digest of the snode sequence: type + op identity + output
+    sizes + sorted origin fx TARGETS.  Origins are required -- a fused pointwise
+    kernel is one ComputedBuffer whose class/size hide its contents (relu vs
+    relu+sin look identical without them).  Targets only, not node names: names
+    carry per-rank numbering noise."""
+    h = hashlib.sha256()
+    for s in order:
+        h.update(type(s).__name__.encode())
+        for sub in getattr(s, "snodes", None) or (s,):
+            n = getattr(sub, "node", None)
+            if n is None:
+                continue
+            op = getattr(n, "op_overload", None) or getattr(n, "python_kernel_name", None) or type(n).__name__
+            h.update(str(op).encode())
+            try:
+                h.update(repr(n.get_size()).encode())
+            except Exception:  # noqa: BLE001
+                pass
+            origins = getattr(n, "origins", None)
+            if origins:
+                h.update("|".join(sorted(str(getattr(o, "target", o)) for o in origins)).encode())
+    return h.hexdigest()
+
+
 class FsdpOverlapReorder:
-    """Callable reorder pass (see module docstring)."""
+    """Callable reorder pass."""
 
     def __init__(self, slack_ns: float = _DEFAULT_SLACK_NS, cost_fn=None, comm_contention_factor: float = 1.0) -> None:
         self.slack_ns = slack_ns
-        # Scales each gather's estimated comm when sizing its compute window
-        # (need = comm * factor + slack).  The estimator measures collectives in
-        # ISOLATION; in-situ they contend with the very compute that hides them
-        # (~1.4-1.5x slower measured on 8xH100).  See CompileConfig.
-        # fsdp_overlap_comm_contention_factor.
+        # need = comm * factor + slack: collectives are measured in isolation but
+        # run concurrent with the compute that hides them (~1.4-1.5x slower on
+        # 8xH100).  See CompileConfig.fsdp_config.comm_contention_factor.
         self.comm_contention_factor = comm_contention_factor
-        # cost_fn: snode -> ns.  Default uses Inductor's estimate_op_runtime hook,
-        # which MagiBackend points at the profiling estimator.
+        # cost_fn: snode -> ns (default: Inductor's estimate_op_runtime hook).
         if cost_fn is None:
             from torch._inductor.comms import estimate_op_runtime
 
             cost_fn = estimate_op_runtime
         self._cost_fn = cost_fn
-        # Per-call cost cache keyed by snode.  Reset at the start of every
-        # __call__ (snodes are unique per compile).  NEVER let it survive into a
-        # deepcopy: Inductor serializes config.reorder_for_compute_comm_overlap_passes
-        # into the fx-graph cache key via deepcopy, and snode keys hold FakeTensors
-        # whose data_ptr access raises.  __deepcopy__ below returns a clean instance.
+        # Per-compile cost cache.  Must never survive into a deepcopy: Inductor
+        # deepcopies this pass into the fx-graph cache key, and snode keys hold
+        # FakeTensors whose data_ptr access raises.
         self._cost_cache: dict[BaseSchedulerNode, float] = {}
 
     def __deepcopy__(self, memo):
-        # Return a fresh, cache-free instance so config serialization (fx-graph
-        # cache key) never deepcopies snode/FakeTensor state.  cost_fn is shared
-        # by reference (it is itself deepcopy-safe: see ProfilingRuntimeEstimator).
+        # Fresh, cache-free instance (see _cost_cache note); cost_fn shared by
+        # reference -- it is itself deepcopy-safe.
         new = FsdpOverlapReorder.__new__(FsdpOverlapReorder)
         new.slack_ns = self.slack_ns
         new.comm_contention_factor = self.comm_contention_factor
@@ -185,40 +181,41 @@ class FsdpOverlapReorder:
 
         index_of = {s: i for i, s in enumerate(order)}
 
-        # ---- MULTI-RANK DETERMINISM (why this schedule is rank-identical) ----
-        # This placement sweep MUST produce an IDENTICAL schedule on every rank, else
-        # the weight all-gathers (weight PG) interleave with the eager CP all_to_all
-        # (CP PG, inside the attention boundary op) in a rank-divergent order ->
-        # cross-PG NCCL collective-order mismatch -> deadlock
-        # Rank-consistency needs BOTH:
-        #   1. IDENTICAL INPUT GRAPH per rank -- guaranteed by the FSDP redistribute
-        #      lowering now emitting the pad node UNCONDITIONALLY (zero-width no-op on
-        #      full-chunk ranks), so uneven Shard(0) params no longer give trailing
-        #      ranks extra constant_pad_nd nodes (different snode-list length ->
-        #      divergent placement).
-        #   2. RANK-DETERMINISTIC COSTS -- the sweep accumulates `_cost` to decide how
-        #      far to hoist each launch.  Profiling benchmarks PER RANK (timing noise +
-        #      replays the attention op's internal CP all_to_all per rank), so with
-        #      identical graphs the post-reorder `0037` STILL diverged (rank0=7 vs
-        #      rank4=5 gathers before the 1st attention) and hung.  Two ways to make
-        #      costs rank-identical, both supported (MagiBackend selects via cost_fn):
-        #        (a) ANALYTICAL cost_fn (roofline, shapes+device only) -- deterministic
-        #            by construction, zero overhead, but less accurate;
-        #        (b) SYNCHRONIZED PROFILING -- the estimator exposes `warm_and_sync`,
-        #            which re-measures every op in rank-lockstep (barrier + fixed iters)
-        #            and MAX-reduces over gloo, giving REAL costs that are still
-        #            identical on every rank.  Safe now that the graph is identical
-        #            (same key set on all ranks -> symmetric barriers/all_gather).
-        #      Below: if the cost_fn supports warm_and_sync, warm the table on all
-        #      compute nodes then sync it; on failure, bail (leave graph unchanged =
-        #      overlap off, no hang).  Analytical cost_fn has no warm_and_sync -> skip.
+        # Fail-fast: the index-based sweep (and the lockstep profiling below) both
+        # require structurally IDENTICAL per-rank graphs, else the weight gathers
+        # interleave with other collectives in rank-divergent order -> NCCL
+        # deadlock.  Verify with one symmetric all_gather of a graph digest; every
+        # rank sees the same result, so all ranks take the same branch.
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            from magi_compiler.profiling.runtime_estimator import _get_cost_sync_group
+
+            fp = (_graph_fingerprint(order), len(order), len(launches))
+            world = dist.get_world_size()
+            all_fp: list = [None] * world
+            dist.all_gather_object(all_fp, fp, group=_get_cost_sync_group())
+            if any(f != all_fp[0] for f in all_fp[1:]):
+                magi_logger.warning(
+                    "FSDP overlap reorder: per-rank graphs are NOT structurally identical "
+                    "((digest, n_snodes, n_weight_gathers) per rank: %s). Reordering would "
+                    "produce rank-divergent collective order -> NCCL deadlock; leaving the "
+                    "graph unchanged (overlap OFF for this graph). Likely cause: uneven "
+                    "Shard(0) params -- replicate them or use chunk-padded uniform shards.",
+                    [(f[0][:12], f[1], f[2]) if f else None for f in all_fp],
+                )
+                return order
+
+        # profile_sync: warm the estimator table on every node, then re-measure in
+        # rank-lockstep (warm_and_sync) so costs are rank-identical.  On failure,
+        # leave the graph unchanged (overlap off, no hang).
         if hasattr(self._cost_fn, "warm_and_sync") and getattr(self._cost_fn, "_sync_across_ranks", False):
             try:
                 for s in order:
                     if self._is_compute(s) or contains_collective(s):
-                        self._cost(s)  # populate estimator._table (per structural key)
+                        self._cost(s)
                 n_changed = self._cost_fn.warm_and_sync()
-                self._cost_cache = {}  # drop pass-local cache -> re-read synced costs
+                self._cost_cache = {}  # re-read synced costs
                 magi_logger.info(
                     "FSDP overlap reorder: rank-synchronized profiling done (%d cost entries reconciled)", n_changed
                 )
@@ -226,19 +223,9 @@ class FsdpOverlapReorder:
                 magi_logger.warning("FSDP overlap reorder: synchronized profiling failed (%s); leaving graph unchanged", exc)
                 return order
 
-        # ---- TWO-POINTER back-to-front sweep (like offload HeuristicScheduler) ----
-        # comm pointer: weight all-gathers in REVERSE original order (last first).
-        # compute pointer: a SINGLE index that walks backward CONTINUOUSLY across the
-        # whole graph and is NEVER reset per gather -- each gather consumes a
-        # contiguous run of compute nodes to cover its (scaled) comm, and the next
-        # (earlier) gather resumes from where the pointer stopped (NOT from just
-        # before the consumer again).  This (a) serializes the single NCCL stream --
-        # no two gathers claim the same compute -- and (b) keeps collectives in their
-        # original relative order automatically (targets only decrease).  Mirrors
-        # offload/scheduler.py's reverse `i` walk for "latest start of transmission".
+        # ---- two-pointer back-to-front sweep (see module docstring) ----
         launches_in_order = sorted(launches, key=lambda s: index_of[s])  # original program order
 
-        # Per-gather static facts (on the STABLE original order).
         plans = []  # (launch, group, fc_idx, comm_runtime, lower)
         for launch in launches_in_order:
             group = self._launch_group(launch, order, buf_to_snode, users)
@@ -256,10 +243,6 @@ class FsdpOverlapReorder:
             # Start just before the launch, but no later than where the previous
             # (later) gather already consumed compute down to.
             compute_idx = min(compute_idx, cur)
-            # comm is measured in isolation but runs concurrent with the compute
-            # that hides it -> scale by the contention factor before adding slack.
-            # Under-reserving exposes the collective's tail (the wait stalls);
-            # over-reserving just launches earlier on an otherwise-idle comm stream.
             need = comm_runtime * self.comm_contention_factor + self.slack_ns
             acc = 0.0
             t = compute_idx
@@ -270,10 +253,8 @@ class FsdpOverlapReorder:
                 t -= 1
                 if acc >= need:
                     break
-            # `t` is the earliest position whose downstream compute (up to the launch)
-            # covers comm.  target < cur moves the launch earlier; target == cur means
-            # no upstream compute was available (graph head / previous gather took it)
-            # -> leave in place.  target >= lower always (producers stay before it).
+            # target == cur means no upstream compute left (graph head or previous
+            # gather claimed it); target >= lower keeps real producers before it.
             target = max(lower, t)
             targets[launch] = (target, group)
             compute_idx = target  # next (earlier) gather resumes from actual placement
@@ -302,25 +283,12 @@ class FsdpOverlapReorder:
                     "hidden" if acc >= need else "COMPUTE-LIMITED",
                 )
 
-        # ---- CROSS-RANK DETERMINISM: enforce weight-gather relative order ----
-        # CRITICAL for multi-rank correctness.  All FSDP weight all-gathers run on
-        # the SAME process group, so NCCL matches the Nth all-gather call across
-        # ranks positionally -- the ranks MUST issue them in an identical relative
-        # order or they deadlock (observed: "Watchdog caught collective operation
-        # timeout ... SeqNum=7 COALESCED").  The reverse sweep's ``target =
-        # max(lower, t)`` can INVERT two gathers' order: a later gather may move far
-        # up (small target, derived from PER-RANK profiled compute costs), while an
-        # earlier gather is pinned by its real-dep floor ``lower`` to a LARGER target
-        # -> the earlier gather sorts after the later one.  Because the targets
-        # depend on per-rank kernel timings (ProfilingRuntimeEstimator benchmarks on
-        # each rank independently), whether the inversion happens differs per rank ->
-        # divergent collective order -> hang.  Fix: clamp targets to be
-        # NON-DECREASING in original program index (a graph property, identical on
-        # every rank).  Walk launches in original order with a running max; a gather
-        # can never be placed before an earlier-issued gather.  This preserves the
-        # original weight-gather subsequence on all ranks regardless of cost jitter,
-        # at the cost of occasionally not moving a launch as early as its compute
-        # window would allow (it clusters just after the prior gather instead).
+        # Clamp targets NON-DECREASING in original program order.  NCCL matches the
+        # Nth call on a PG positionally across ranks, so the gathers' relative order
+        # must be rank-identical; `max(lower, t)` can invert two gathers and whether
+        # the inversion happens depends on per-rank cost jitter -> deadlock.  The
+        # clamp pins the original subsequence at the cost of occasionally placing a
+        # launch later than its compute window would allow.
         running = -1
         for launch in launches_in_order:
             if launch not in targets:
@@ -331,14 +299,10 @@ class FsdpOverlapReorder:
             targets[launch] = (target, group)
             running = target
 
-        # ---- apply all moves in ONE rebuild (targets are in the ORIGINAL index
-        # space; applying moves incrementally would shift those indices).  Assign a
-        # sort key per node: non-group nodes keep their original index; each launch
-        # group is inserted just before the node originally at `target` (key
-        # target-0.5), members ordered among themselves by original index.  A stable
-        # sort then realizes every move at once while preserving all other nodes'
-        # relative order and each group's internal order.  Collective order is kept
-        # because targets are monotonic (the two-pointer only decreases). ----
+        # Apply all moves in ONE stable-sort rebuild (targets live in the original
+        # index space; incremental moves would shift them).  Each launch group sorts
+        # to key target-0.5 (just before the node originally at `target`), members
+        # keep their internal order, everything else keeps its original index.
         group_members: dict = {}
         for launch, (target, group) in targets.items():
             for m in group:
@@ -451,22 +415,15 @@ class FsdpOverlapReorder:
 
     # -- repositioning ----------------------------------------------------
     def _earliest_legal_index(self, group, order, index_of, buf_to_snode, op_to_snode) -> int:
-        """1 + max index of any REAL (data-dependency) producer the group needs.
+        """1 + max index of any REAL (non-fake buffer) producer the group needs.
 
-        Uses ONLY non-fake buffer dependencies, walked transitively.  We must NOT
-        use ``snode.ancestors``: that transitive-closure set is polluted by the
-        artificial ``WeakDep`` edges Inductor inserts between collectives to
-        serialize them onto one comm stream (verified: a single-weight qkv/o gather
-        lists the PREVIOUS layer's coalesced all-gather as an ancestor via a
-        ``WeakDep`` on its output buffer -- but it does NOT read that buffer).  FSDP
-        weight all-gathers gather INDEPENDENT param shards; there is no real
-        gather->gather data dependency.  Counting the WeakDep pinned ``lower`` right
-        after the previous collective, which wrongly forbade moving the launch up
-        past the (real, hideable) compute between the two gathers -- the exact reason
-        the attention gathers stayed exposed.  A gather's only real producer is its
-        own weight-shard placeholder (+ any to_local/pad/cast chain), so real
-        ``lower`` is ~0; the launch is then free to move up into earlier compute.
-        """
+        Deliberately NOT ``snode.ancestors``: that set is polluted by the fake
+        ``WeakDep`` edges Inductor inserts between collectives for comm-stream
+        serialization.  Weight gathers read independent param shards -- there is no
+        real gather->gather dependency -- so counting the WeakDep would pin the
+        launch right after the previous collective and forbid the very hoist this
+        pass exists for.  A gather's only real producer is its weight-shard
+        placeholder (+ to_local/pad/cast chain), so real ``lower`` is ~0."""
         group_set = set(group)
         lo = 0
         for s in group:
@@ -480,22 +437,13 @@ class FsdpOverlapReorder:
         return lo
 
     def _validate_full(self, new_order, op_to_snode, buf_to_snode, users) -> bool:
-        """Check the rebuilt order is a valid topological order w.r.t. REAL data
-        dependencies: every node's non-fake buffer producers precede it (the
-        Inductor driver does NOT repair the order, so a real-dep violation would
-        silently miscompile).  O(nodes * deps).
-
-        We deliberately do NOT validate against ``snode.ancestors``: that set is the
-        transitive closure of ALL deps including the artificial ``WeakDep`` ordering
-        edges Inductor inserts between collectives (see ``_earliest_legal_index``).
-        Our pass intentionally reorders a weight all-gather across such a WeakDep
-        (there is no real gather->gather data dependency), so an ancestors-based
-        check would false-reject that legal move and no-op the whole reorder.  The
-        per-node real-buffer-dep check below is itself a complete topological
-        validation over the real data-dependency DAG: if every node's direct real
-        producers precede it, the order is a valid real-dep topological order.
-        WeakDep ordering is advisory (stream serialization / memory) and is NOT a
-        correctness constraint, so violating it is safe."""
+        """Valid topological order w.r.t. REAL data deps: every node's non-fake
+        buffer producers precede it (the driver does not repair the order, so a
+        violation would silently miscompile).  Checking direct producers per node
+        is a complete validation of the real-dep DAG.  ``snode.ancestors`` is NOT
+        used -- it includes the fake WeakDep edges this pass intentionally crosses
+        (see ``_earliest_legal_index``); an ancestors check would false-reject
+        every legal hoist.  WeakDep is advisory, not a correctness constraint."""
         pos = {s: i for i, s in enumerate(new_order)}
         for s in new_order:
             sp = pos[s]

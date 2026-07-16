@@ -61,12 +61,7 @@ def _gathers_a_weight(node: fx.Node) -> bool:
 
 
 def _is_weight_all_gather(node: fx.Node) -> bool:
-    """A SimpleFSDP weight ``all_gather_into_tensor`` launch.
-
-    Recognized either by the ``magi_fsdp_weight_ag`` tag (set by the redistribute
-    lowering pass on the real gaga4 graph) OR structurally, when the gathered
-    source traces back to a weight/param placeholder (covers untagged graphs such
-    as the demo)."""
+    """A SimpleFSDP weight ``all_gather_into_tensor`` launch."""
     if node.op != "call_function" or node.target is not _ALL_GATHER:
         return False
     if node.meta.get("magi_fsdp_weight_ag"):
@@ -84,10 +79,10 @@ def _local_shard_bytes(ag: fx.Node) -> int:
     return int(m.numel()) * int(m.element_size())
 
 
-def _split_region_by_dtype_and_size(
+def _split_by_dtype_and_size(
     ag_nodes: list[fx.Node], node_index: dict[fx.Node, int], bucket_size_bytes: int
 ) -> list[list[fx.Node]]:
-    """Split a region's weight all-gathers into buckets by PROGRAM-ADJACENCY (plan B).
+    """Split a run of weight all-gathers into buckets by PROGRAM-ADJACENCY (plan B).
 
     Walk ``ag_nodes`` in program order and start a NEW bucket whenever:
       * the dtype changes (a different-dtype weight physically breaks the run -- so
@@ -139,13 +134,7 @@ def _producer_chain(node: fx.Node) -> list[fx.Node]:
     return chain
 
 
-def _coalesce_one_bucket(
-    graph: fx.GraphModule,
-    node_to_subgraph_id: dict[fx.Node, int],
-    node_index: dict[fx.Node, int],
-    sid: int,
-    ag_nodes: list[fx.Node],
-) -> None:
+def _coalesce_one_bucket(graph: fx.GraphModule, node_index: dict[fx.Node, int], ag_nodes: list[fx.Node]) -> None:
     """Merge ONE bucket of same-dtype weight all_gathers into a single
     ``all_gather_into_tensor_coalesced`` (launch + per-member getitem + per-member
     wait).  ``ag_nodes`` must be same (group, dtype); caller guarantees len >= 2."""
@@ -164,105 +153,73 @@ def _coalesce_one_bucket(
         chain = [loc, *_producer_chain(loc)] if loc.op in ("call_function", "call_method") else _producer_chain(loc)
         for prod in sorted(chain, key=lambda n: node_index[n]):
             first_ag.prepend(prod)
-            node_to_subgraph_id[prod] = sid
 
     with graph.graph.inserting_before(first_ag):
         coalesced = graph.graph.call_function(_ALL_GATHER_COALESCED, (list(locals_), world, group_name))
         coalesced.meta["example_value"] = list(ag_metas)
         coalesced.meta["magi_fsdp_weight_ag"] = True
         coalesced.meta["magi_fsdp_weight_ag_coalesced"] = True
-        node_to_subgraph_id[coalesced] = sid
 
         outs = []
         for i, am in enumerate(ag_metas):
             gi = graph.graph.call_function(operator.getitem, (coalesced, i))
             gi.meta["example_value"] = am
-            node_to_subgraph_id[gi] = sid
             outs.append(gi)
 
     for out_i, old_wait, am in zip(outs, waits, ag_metas):
         with graph.graph.inserting_before(old_wait):
             wait_i = graph.graph.call_function(_WAIT, (out_i,))
             wait_i.meta["example_value"] = am
-            node_to_subgraph_id[wait_i] = node_to_subgraph_id.get(old_wait, sid)
         old_wait.replace_all_uses_with(wait_i)
 
     for ag_old, wait_old in zip(ag_nodes, waits):
-        node_to_subgraph_id.pop(wait_old, None)
-        node_to_subgraph_id.pop(ag_old, None)
         graph.graph.erase_node(wait_old)
         graph.graph.erase_node(ag_old)
 
 
-def bucket_weight_all_gather_coalesced_per_region(
-    graph: fx.GraphModule, node_to_subgraph_id: dict[fx.Node, int], bucket_size_bytes: int = 0
-) -> int:
-    """Coalesce, per compute region, the SimpleFSDP weight all-gathers into ONE
-    ``all_gather_into_tensor_coalesced`` per ``(region_id, group_name, dtype)``
-    (or into several buckets when ``bucket_size_bytes > 0``).
+def bucket_weight_all_gather_coalesced(graph: fx.GraphModule, bucket_size_bytes: int = 0) -> int:
+    """Coalesce the SimpleFSDP weight all-gathers over the WHOLE graph: per process
+    group, walk them in program order and cut a new bucket at every dtype change or
+    when the accumulated local-shard bytes would exceed ``bucket_size_bytes``
+    (0 = no cap).  Each bucket of >= 2 gathers becomes::
 
-    When ``bucket_size_bytes > 0``, a region is further split into multiple buckets:
-    the weight all_gathers are walked in PROGRAM ORDER and a new bucket starts
-    whenever the dtype changes or the accumulated local-shard bytes would exceed the
-    cap (see :func:`_split_region_by_dtype_and_size`).  So only same-dtype,
-    program-adjacent weights within the byte budget coalesce; each bucket is one
-    ``all_gather_into_tensor_coalesced``.  ``bucket_size_bytes == 0`` (default) keeps
-    the original behavior (one bucket per (region, group, dtype), no size cap).
+        coalesced = all_gather_into_tensor_coalesced([local_0..local_{N-1}], W, group)
+        out_i     = getitem(coalesced, i)   # same shape as the member's old output
+        wait_i    = wait_tensor(out_i)      # one wait per member, left at its consumer
 
-    This does NOT cat the shards into one buffer.  ``all_gather_into_tensor_coalesced``
-    fuses the N launches into a single NCCL group while returning one
-    *weight-major* output buffer per input, so each member is recovered with a
-    zero-copy ``operator.getitem`` -- no ``cat`` on the compute stream, no
-    ``split_with_sizes`` clone, and no transient ~2x memory spike.
+    ``all_gather_into_tensor_coalesced`` fuses N launches into one NCCL group but
+    returns one buffer per input, so members are recovered by zero-copy getitem --
+    no cat/split on the compute stream, no transient memory spike.  Downstream users
+    are re-pointed from each old wait to ``wait_i``; the launch + getitems stay
+    together so ``FsdpOverlapReorder`` later moves them as one unit.
 
-    For a group of N weight gathers (each a single ``all_gather_into_tensor`` whose
-    input is the padded local shard ``(chunk_i, *rest_i)``) this builds::
-
-        # launch side (the coalesced launch + its getitems stay together):
-        coalesced = all_gather_into_tensor_coalesced([local_0, ..., local_{N-1}], W, group)
-        out_i     = getitem(coalesced, i)          # (W*chunk_i, *rest_i), weight-major
-        # use side (one wait per member, left at its consumer):
-        wait_i    = wait_tensor(out_i)
-
-    ``out_i`` has exactly the shape of the member's old ``all_gather`` output, so
-    each member's existing downstream (slice / real use) is simply re-pointed from
-    its old ``wait_tensor`` to ``wait_i``.  The ``coalesced`` launch and its
-    ``getitem`` nodes stay together; the scheduler-level ``FsdpOverlapReorder`` pass
-    later moves the launch as one unit for compute/comm overlap.
-
-    Runs AFTER redistribute lowering (called from ``lower_and_bucket_full_graph``).
+    Runs after redistribute lowering (via ``lower_and_bucket_full_graph``).
     Returns the number of coalesced buckets created.
     """
     node_index = {n: i for i, n in enumerate(graph.graph.nodes)}
 
-    # Group by (region, group_name) ONLY -- dtype is NOT part of the key.  Program
-    # order + the dtype-change rule in _split_region_by_dtype_and_size decide the
-    # actual buckets, so a different-dtype weight physically breaks a same-dtype run
-    # (plan B / strict program-adjacency).  With bucket_size_bytes==0 this reduces to
-    # one bucket per (region, group, dtype) run.
-    groups: dict[tuple[int, str], list[fx.Node]] = defaultdict(list)
+    # Key by group_name only; dtype breaks buckets positionally inside
+    # _split_by_dtype_and_size (strict program-adjacency).
+    groups: dict[str, list[fx.Node]] = defaultdict(list)
     for node in graph.graph.nodes:
         if not _is_weight_all_gather(node):
             continue
-        sid = node_to_subgraph_id.get(node)
-        if sid is None:
-            continue
         _, _world, group_name = node.args
-        groups[(sid, group_name)].append(node)
+        groups[group_name].append(node)
 
     buckets = 0
-    for (sid, group_name), ag_nodes in groups.items():
-        for sub in _split_region_by_dtype_and_size(ag_nodes, node_index, bucket_size_bytes):
+    for group_name, ag_nodes in groups.items():
+        for sub in _split_by_dtype_and_size(ag_nodes, node_index, bucket_size_bytes):
             if len(sub) < 2:
                 continue  # single weight -> keep its own all_gather (nothing to coalesce)
-            _coalesce_one_bucket(graph, node_to_subgraph_id, node_index, sid, sub)
+            _coalesce_one_bucket(graph, node_index, sub)
             buckets += 1
 
     if buckets:
         graph.graph.lint()
         graph.recompile()
     magi_logger.info(
-        "FSDP weight all-gather bucketing (coalesced): created %d coalesced buckets across submods " "(bucket_size_bytes=%d)",
+        "FSDP weight all-gather bucketing (coalesced): created %d coalesced buckets (bucket_size_bytes=%d)",
         buckets,
         bucket_size_bytes,
     )

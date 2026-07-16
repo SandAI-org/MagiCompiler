@@ -182,6 +182,64 @@ class OffloadConfig(BaseModel):
     bandwidth_safety_factor: float = Field(0.9, description="The safety factor for the H2D bandwidth.")
 
 
+class FSDPConfig(BaseModel):
+    """Whole-graph FSDP weight all-gather / compute overlap (SimpleFSDP models
+    compiled with ``disable_graph_split=True``).
+    """
+
+    enable_fullgraph_overlap: bool = Field(
+        False,
+        description=(
+            "Lower SimpleFSDP weight prim_redistribute to explicit collectives, bucket them (bucket_mode), "
+            "and install the latest-safe-launch reorder pass that hoists each all-gather launch just far "
+            "enough upstream for compute to hide it. Requires disable_graph_split=True and cudagraph_mode=NONE."
+        ),
+    )
+    bucket_mode: str = Field(
+        "none",
+        description=(
+            "'none' = one all_gather + wait per weight; 'coalesced' = one all_gather_into_tensor_coalesced "
+            "per bucket (single launch, N getitems/waits). Buckets are whole-graph, broken only by "
+            "program-order dtype changes and the bucket_size_mib cap."
+        ),
+    )
+    bucket_size_mib: int = Field(
+        0,
+        ge=0,
+        description=(
+            "Per-bucket cap on accumulated local-shard MiB for coalesced bucketing. 0 = no cap "
+            "(one bucket per (group, dtype) run)."
+        ),
+    )
+    cost_mode: Literal["profile_sync", "analytical"] = Field(
+        "profile_sync",
+        description=(
+            "Cost model for the reorder placement; must be rank-identical multi-rank (else NCCL deadlock). "
+            "'profile_sync' (default): real per-op profiling, re-measured in rank-lockstep and max-reduced; "
+            "requires structurally identical per-rank graphs (verified at runtime, degrades safely on "
+            "mismatch). 'analytical': Inductor roofline -- rank-deterministic, less accurate, deadlock-free "
+            "fallback."
+        ),
+    )
+    slack_ns: float = Field(
+        5000.0,
+        ge=0.0,
+        description=(
+            "Extra headroom (ns) added to each collective's runtime when sizing its compute window, "
+            "absorbing estimator error + launch latency."
+        ),
+    )
+    comm_contention_factor: float = Field(
+        1.5,
+        ge=1.0,
+        description=(
+            "Multiplier on each collective's estimated runtime when sizing its compute window "
+            "(need = comm * factor + slack): collectives are measured in isolation but run concurrent "
+            "with the compute that hides them (~1.4-1.5x slower in-situ on 8xH100)."
+        ),
+    )
+
+
 def _find_cutlass_root() -> str:
     """Return the CUTLASS source root, or empty string if not found."""
     path = os.environ.get("MAGI_CUTLASS_ROOT", "/usr/local/cutlass")
@@ -270,76 +328,12 @@ class CompileConfig(BaseSettings):
             "WHOLE graph to Inductor as a single piecewise submodule."
         ),
     )
-    enable_fsdp_fullgraph_overlap: bool = Field(
-        False,
+    # ---- Whole-graph FSDP overlap ----
+    fsdp_config: FSDPConfig = Field(
+        FSDPConfig(),
         description=(
-            "Whole-graph FSDP weight all-gather / compute overlap (requires disable_graph_split=True, "
-            "cudagraph_mode=NONE). Before Inductor, lower SimpleFSDP weight prim_redistribute to explicit "
-            "collectives and optionally bucket them per compute-region (fsdp_fullgraph_bucket_mode). Then "
-            "install a scheduler-level 'latest-safe-launch' reorder pass (replaces raise_comms/sink_waits): "
-            "each weight all-gather launch is placed at the LATEST position whose downstream compute still "
-            "hides the collective (compute_window >= comm_runtime + slack), instead of PyTorch's earliest. "
-            "Per-snode compute/comm time comes from a profiling estimator installed at config.estimate_op_runtime "
-        ),
-    )
-    fsdp_fullgraph_bucket_mode: str = Field(
-        "none",
-        description=(
-            "Bucketing strategy for enable_fsdp_fullgraph_overlap: 'none' (N individual all_gather + N waits) "
-            "or 'coalesced' (per region: one all_gather_into_tensor_coalesced -> ONE launch, N getitems, N "
-            "waits). Regions are "
-            "delimited by the model's subgraph-boundary ops (splitting_ops) so weights coalesce per compute "
-            "region, not across the whole model."
-        ),
-    )
-    fsdp_fullgraph_bucket_size_mib: int = Field(
-        0,
-        ge=0,
-        description=(
-            "Optional per-bucket size cap (MiB of local shard) for enable_fsdp_fullgraph_overlap bucketing. "
-            "0 (default) = no cap: coalesce every same-(group,dtype) weight in a region into ONE all_gather "
-            "(current behavior). >0 = within a region, walk the weight all-gathers in PROGRAM ORDER and start a "
-            "NEW bucket whenever the dtype changes OR adding the next weight's local-shard size would exceed "
-            "this cap; each bucket becomes one all_gather. Only same-dtype, program-adjacent weights coalesce "
-            "(a different-dtype weight in between breaks the run). Bounds the size of each coalesced collective."
-        ),
-    )
-    fsdp_overlap_cost_mode: Literal["profile_sync", "analytical", "profile"] = Field(
-        "profile_sync",
-        description=(
-            "Cost model the enable_fsdp_fullgraph_overlap reorder pass uses to size each weight "
-            "all-gather's compute window. The costs MUST be rank-identical multi-rank, else gathers "
-            "interleave with the CP all_to_all in rank-divergent order -> NCCL deadlock.\n"
-            "  * 'profile_sync' (default): REAL per-op profiling re-measured in rank-lockstep (barrier + "
-            "fixed iters, MAX-reduced over gloo) -> accurate AND rank-identical. Requires the compiled "
-            "graph to be structurally identical on every rank (guaranteed for gaga4 by replicating "
-            "uneven-Shard(0) params).\n"
-            "  * 'analytical': Inductor roofline (shapes+device only) -> rank-deterministic, zero overhead, "
-            "less accurate. Deadlock-free FALLBACK for a model that still shows per-rank graph divergence.\n"
-            "  * 'profile': plain per-rank profiling, NO cross-rank sync -> rank-nondeterministic, WILL "
-            "deadlock multi-rank; single-rank (world_size==1) only."
-        ),
-    )
-    fsdp_overlap_slack_ns: float = Field(
-        5000.0,
-        ge=0.0,
-        description=(
-            "Extra headroom (ns) added to each collective's runtime when the fullgraph overlap reorder pass "
-            "sizes the compute window, absorbing estimator error + kernel-launch latency so the wait rarely stalls."
-        ),
-    )
-    fsdp_overlap_comm_contention_factor: float = Field(
-        1.5,
-        ge=1.0,
-        description=(
-            "Multiplier on each collective's estimated runtime when the fullgraph overlap reorder pass sizes "
-            "its compute window (need = comm * factor + slack). The profile_sync measurement is taken in "
-            "ISOLATION (rank-lockstep, nothing else running), but in the compiled graph the all-gather runs "
-            "CONCURRENT with the compute it hides and they contend for SMs/bandwidth -- measured in-situ NCCL "
-            "all-gathers run ~1.4-1.5x their isolated time (8xH100 NVSwitch, RING_LL, NCCL_MAX_CTAS=12; nsys "
-            "2026-07-12: ws2 2x[384,256,1280] 4540us vs 3205us isolated, ws8 2x[6144,3072] 2748us vs 1897us). "
-            "Under-reserving exposes the whole tail of the collective (the wait stalls); over-reserving merely "
-            "launches a few hundred us earlier on an otherwise-idle comm stream, so err high."
+            "Whole-graph FSDP weight all-gather / compute overlap (lowering + bucketing + reorder + cost "
+            "model). Fields reachable via MAGI_COMPILE_FSDP_CONFIG__<FIELD> env vars."
         ),
     )
 

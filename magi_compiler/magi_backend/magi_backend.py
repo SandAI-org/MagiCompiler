@@ -546,51 +546,42 @@ class MagiBackend:
         """Whole-graph FSDP all-gather / compute overlap (disable_graph_split path).
 
         1. Lower SimpleFSDP weight prim_redistribute -> explicit collectives and
-           optionally bucket them per compute-region.
+           optionally bucket them over the whole graph (no region partitioning;
+           buckets break only at dtype changes and the size cap).
         2. Install the profiling runtime estimator at ``config.estimate_op_runtime``
            (the analytical roofline is unusable for our sizing decisions).
         3. Install the latest-safe-launch reorder pass, REPLACING PyTorch's builtin
            raise_comms/sink_waits, and enable reorder_for_compute_comm_overlap.
         """
+        fsdp_cfg = self.compile_config.fsdp_config
         if not self.compile_config.disable_graph_split:
-            raise ValueError("enable_fsdp_fullgraph_overlap requires disable_graph_split=True")
+            raise ValueError("fsdp_config.enable_fullgraph_overlap requires disable_graph_split=True")
 
         if self.compile_config.cudagraph_mode != CudaGraphMode.NONE:
-            raise ValueError("enable_fsdp_fullgraph_overlap requires cudagraph_mode=NONE")
+            raise ValueError("fsdp_config.enable_fullgraph_overlap requires cudagraph_mode=NONE")
 
         from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder, lower_and_bucket_full_graph
         from magi_compiler.profiling import ProfilingRuntimeEstimator
 
-        boundary_ops = resolve_defined_ops(
-            [] if self.compile_config.disable_graph_split else [] or self.compile_config.splitting_ops
-        )
-        bucket_size_bytes = int(self.compile_config.fsdp_fullgraph_bucket_size_mib) * 1024 * 1024
-        n_buckets = lower_and_bucket_full_graph(
-            graph,
-            self.compile_config.fsdp_fullgraph_bucket_mode,
-            boundary_ops=boundary_ops,
-            bucket_size_bytes=bucket_size_bytes,
-        )
+        bucket_size_bytes = int(fsdp_cfg.bucket_size_mib) * 1024 * 1024
+        n_buckets = lower_and_bucket_full_graph(graph, fsdp_cfg.bucket_mode, bucket_size_bytes=bucket_size_bytes)
         magi_logger.info(
             "FSDP fullgraph overlap: bucket_mode=%s bucket_size=%d MiB created %d buckets",
-            self.compile_config.fsdp_fullgraph_bucket_mode,
-            self.compile_config.fsdp_fullgraph_bucket_size_mib,
+            fsdp_cfg.bucket_mode,
+            fsdp_cfg.bucket_size_mib,
             n_buckets,
         )
 
-        _mode = self.compile_config.fsdp_overlap_cost_mode
-        if _mode == "analytical":
+        if fsdp_cfg.cost_mode == "analytical":
             self._fsdp_overlap_estimator = None
             cost_fn = None  # reorder pass defaults to Inductor's analytical estimate
-        else:
+        else:  # "profile_sync" -- the default for BOTH single- and multi-rank
             self._fsdp_overlap_estimator = ProfilingRuntimeEstimator()
-            self._fsdp_overlap_estimator._sync_across_ranks = _mode == "profile_sync"
+            self._fsdp_overlap_estimator._sync_across_ranks = True
             cost_fn = self._fsdp_overlap_estimator
 
         reorder = FsdpOverlapReorder(
-            slack_ns=self.compile_config.fsdp_overlap_slack_ns,
-            cost_fn=cost_fn,
-            comm_contention_factor=self.compile_config.fsdp_overlap_comm_contention_factor,
+            slack_ns=fsdp_cfg.slack_ns, cost_fn=cost_fn, comm_contention_factor=fsdp_cfg.comm_contention_factor
         )
         self.inductor_compile_config["reorder_for_compute_comm_overlap"] = True
         self.inductor_compile_config["reorder_for_compute_comm_overlap_passes"] = [reorder]
@@ -598,11 +589,6 @@ class MagiBackend:
     @observe_lifecycle("graph_split")
     def _split_graph(self, graph: fx.GraphModule) -> tuple[fx.GraphModule, list[SplitItem]]:
         # Step 1: resolve the splitting ops.
-        # When disable_graph_split is set, we deliberately resolve to NO splitting
-        # ops so Step 2 assigns every node to a single subgraph_id -> the whole
-        # graph becomes one piecewise submod handed to Inductor as a unit (the
-        # boundary custom ops remain in the graph as opaque extern calls). The
-        # PIECEWISE cudagraph path assumes >=1 split; forbid the combination.
         if self.compile_config.disable_graph_split:
             if self.compile_config.cudagraph_mode == CudaGraphMode.PIECEWISE:
                 raise ValueError("disable_graph_split is incompatible with cudagraph_mode=PIECEWISE")
@@ -616,17 +602,8 @@ class MagiBackend:
         magi_logger.info(f"Setting up FX-level graph split with ops: {fx_split_ops=}")
         magi_logger.info(f"Resolved splitting ops for FX-level graph split: {resolved_ops=}")
 
-        # Step 1.4: whole-graph FSDP overlap. Lower SimpleFSDP weight redistribute
-        # to explicit collectives and (optionally) bucket them per compute-region,
-        # then install the latest-safe-launch scheduler reorder pass + profiling
-        # runtime estimator.  Regions are delimited by the model's real
-        # subgraph-boundary ops (the resolved splitting ops) even though
-        # disable_graph_split has emptied fx_split_ops -- the graph itself stays
-        # unsplit (Step 2 assigns every node one sid -> a single submod), so we
-        # pass the model's true boundary ops explicitly for region bucketing.
-        # The piecewise Steps 1.5/2.4/2.5 stay OFF (their config flags default
-        # False) so they never interfere with this path.
-        if self.compile_config.enable_fsdp_fullgraph_overlap:
+        # Step 1.4: whole-graph FSDP overlap.
+        if self.compile_config.fsdp_config.enable_fullgraph_overlap:
             self._apply_fsdp_fullgraph_overlap(graph)
 
         # Step 2: split graph by ops, we split graph based on resolved_ops, which becomes the partitioned single graph.

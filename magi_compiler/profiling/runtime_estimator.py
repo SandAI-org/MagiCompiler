@@ -444,8 +444,7 @@ class ProfilingRuntimeEstimator:
         schedule on every rank -- else weight-PG gathers interleave with the eager CP
         all_to_all in rank-divergent order -> deadlock).
 
-        PRECONDITION (caller guarantees): the graph is structurally IDENTICAL on all
-        ranks (the unconditional-pad lowering fix ensures this).  Therefore every rank
+        PRECONDITION: the graph is structurally IDENTICAL on all ranks, so every rank
         has exactly the same set of ``_structural_key`` keys already populated in the
         table by the reorder pass's warm-up loop, so:
           * the key iteration order (sorted) is identical on every rank;
@@ -453,12 +452,23 @@ class ProfilingRuntimeEstimator:
             the same step, so the barrier-wrapped fixed-iteration replay issues the
             op's internal CP all_to_all in lockstep (no NCCL count mismatch);
           * the max-reduce over gloo is symmetric.
+        The precondition is VERIFIED (not assumed): the key sets are all_gather'd and
+        compared BEFORE the barrier loop.  On any mismatch (per-rank shapes from
+        uneven Shard(0) padding, a ``_structural_key``/``_collective_spec`` failure on
+        one rank, ...) entering the loop would deadlock -- rank A's Nth barrier pairs
+        with rank B's all_gather (gloo count mismatch), or both ranks measure a
+        DIFFERENT collective-containing op at the same step (NCCL mismatch inside
+        ``_measure_one``).  Instead we warn and DEGRADE to the analytical estimate for
+        every entry this compile measured per-rank: analytical is a pure shape+device
+        function, so the resulting cost table is rank-deterministic and the reorder
+        stays deadlock-free (same guarantee as fsdp_config.cost_mode=analytical).
 
-        Steps: for each key in sorted order, barrier -> (re)measure locally with FIXED
-        iters -> barrier; then all_gather_object the {key: ns} maps and take the MAX.
-        Fixed-iteration timing (``_measure_one``) is mandatory -- a duration-adaptive
-        benchmark would run a per-rank iteration count and desync the internal
-        collective.  Returns the number of table entries whose cost changed."""
+        Steps: verify key sets match across ranks; then for each key in sorted order,
+        barrier -> (re)measure locally with FIXED iters -> barrier; then
+        all_gather_object the {key: ns} maps and take the MAX.  Fixed-iteration timing
+        (``_measure_one``) is mandatory -- a duration-adaptive benchmark would run a
+        per-rank iteration count and desync the internal collective.  Returns the
+        number of table entries whose cost changed."""
         import torch.distributed as dist
 
         if not (dist.is_available() and dist.is_initialized()):
@@ -473,6 +483,43 @@ class ProfilingRuntimeEstimator:
         # Re-measure each in a rank-uniform (sorted) order under barriers so any
         # internal collective is issued in lockstep across ranks.
         keys = sorted(self._table.keys(), key=repr)
+
+        # FAIL-FAST precondition check: the barrier loop below is only lockstep-safe
+        # if every rank iterates the SAME key sequence.  all_gather_object is a single
+        # symmetric collective (safe regardless of key sets), and every rank sees the
+        # same gathered result, so all ranks take the same branch.
+        key_reprs = [repr(k) for k in keys]
+        all_key_reprs: list = [None] * world
+        dist.all_gather_object(all_key_reprs, key_reprs, group=group)
+        if any(kr != all_key_reprs[0] for kr in all_key_reprs[1:]):
+            ref = set(all_key_reprs[0] or [])
+            mine = set(key_reprs)
+            missing = sorted(ref - mine)[:3]
+            extra = sorted(mine - ref)[:3]
+            magi_logger.warning(
+                "warm_and_sync: cross-rank profiling key sets DIFFER (counts per rank: %s; "
+                "this rank vs rank0 -- missing %d e.g. %s, extra %d e.g. %s). The per-rank "
+                "graphs are not structurally identical, so rank-lockstep measurement would "
+                "deadlock. Falling back to the ANALYTICAL cost estimate for this graph "
+                "(rank-deterministic, less accurate). Consider fsdp_config.cost_mode=analytical.",
+                [len(kr or []) for kr in all_key_reprs],
+                len(ref - mine),
+                missing,
+                len(mine - ref),
+                extra,
+            )
+            n = 0
+            for k, snode in self._key_snode.items():
+                e = self._table.get(k)
+                if e is None:
+                    continue
+                ns = _safe_analytical(snode)
+                if ns != e.ns:
+                    n += 1
+                e.ns = ns
+                e.measured = False
+            self._key_snode.clear()
+            return n
         local_ns: dict = {}
         for k in keys:
             snode = self._key_snode.get(k)
@@ -556,28 +603,9 @@ class ProfilingRuntimeEstimator:
         if contains_wait(snode) and not contains_collective(snode):
             return _safe_analytical(snode)
 
-        # A MultiOutput unpack (getitem off a multi-output extern, e.g. attention's
-        # (out, lse) FallbackKernel) launches NO kernel -- it is 0-cost.  It MUST be
-        # short-circuited BEFORE the op->time table: it shares its origin fx node
-        # with the parent extern, so ``_structural_key`` COLLIDES with the parent's
-        # key and the table would return the parent's full runtime (measured: the
-        # fa3 attention MultiOutput was costed 45.7ms; the FSDP-overlap reorder then
-        # believed a weight all-gather placed between the attention kernel and its
-        # unpack node was hidden by 45.7ms of "compute" -- one slot short of the
-        # real attention window -> the gather ran fully exposed before the MoE).
         if _is_multi_output_unpack(snode):
             return 0.0
 
-        # COLLECTIVES: never benchmark a real collective HERE.  The Inductor reorder
-        # pass runs per-rank during independent, non-co-scheduled compilation, so
-        # issuing an NCCL op in __call__ desyncs ranks -> watchdog hang (observed on
-        # 8-GPU gaga4: rank0 raced to FSDP seqNum~194 while peers never matched).
-        # SEED the cost with Inductor's static analytical NCCL estimate (a pure
-        # function of shapes+device -> rank-deterministic).  In profile_sync mode we
-        # ALSO stash the snode so the rank-lockstep warm_and_sync() later OVERRIDES
-        # this seed with a REAL measured time (the only multi-rank-safe place to touch
-        # NCCL) -- which is where the accuracy comes from.  Collectives enter the same
-        # op->time table as compute so warm_and_sync can find them.
         if contains_collective(snode):
             cnode = _leaf_collective(snode)
             spec = _collective_spec(cnode) if cnode is not None else None

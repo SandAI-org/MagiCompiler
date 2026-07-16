@@ -370,4 +370,6 @@ def test_collective_profile_accuracy_multi_rank():
     assert p.returncode == 0, f"helper failed:\n{out[-3000:]}"
     assert "COLL_ACCURATE ok=True" in p.stdout, out[-3000:]
     assert "COLL_WARMSYNC" in p.stdout and "ok=True" in p.stdout, out[-3000:]
+    # key-set mismatch fail-fast: no deadlock + degraded to analytical on all ranks
+    assert "COLL_MISMATCH ok=True" in p.stdout, out[-3000:]
     assert "COLL_PASS" in p.stdout, out[-3000:]

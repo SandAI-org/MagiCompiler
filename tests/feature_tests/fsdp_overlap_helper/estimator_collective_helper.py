@@ -23,7 +23,11 @@ iters, rank-lockstep).  Here we:
   3. INDEPENDENTLY time the same all_gather with CUDA events (rank-lockstep);
   4. assert the estimate is within a tolerance band of the independent measurement.
 Also exercises ``ProfilingRuntimeEstimator.warm_and_sync`` (the profile_sync entry) to
-confirm it runs rank-lockstep without deadlock and reconciles a collective entry.
+confirm it runs rank-lockstep without deadlock and reconciles a collective entry, and
+the KEY-SET MISMATCH fail-fast: when one rank's table has an extra key (simulating a
+per-rank structural divergence), warm_and_sync must NOT enter the barrier loop (which
+would deadlock) -- it must detect the mismatch on every rank, warn, and degrade every
+stashed entry to the analytical estimate (measured=False).
 
 Run: torchrun --nproc_per_node=2 .../estimator_collective_helper.py
 
@@ -31,6 +35,7 @@ Markers (rank 0):
   COLL_MEASURED est_us=<f> real_us=<f> ratio=<f>
   COLL_ACCURATE ok=<bool>
   COLL_WARMSYNC reconciled=<n> ok=<bool>
+  COLL_MISMATCH ok=<bool>
   COLL_PASS / COLL_FAIL
 """
 
@@ -44,7 +49,7 @@ import torch.distributed as dist
 from torch._inductor.utils import contains_collective
 
 from magi_compiler.profiling import ProfilingRuntimeEstimator
-from magi_compiler.profiling.runtime_estimator import _measure_collective_op
+from magi_compiler.profiling.runtime_estimator import ProfileEntry, _measure_collective_op
 
 _AG = torch.ops._c10d_functional.all_gather_into_tensor.default
 _WAIT = torch.ops._c10d_functional.wait_tensor.default
@@ -142,8 +147,24 @@ def main() -> None:
     coll_entries = [e for e in est.table.values() if e.kind == "collective"]
     warmsync_ok = len(coll_entries) >= 1 and all(e.measured for e in coll_entries)
 
+    # 5. key-set MISMATCH fail-fast: rank 1 injects an extra table entry so the
+    #    cross-rank key sets differ.  warm_and_sync must detect this on EVERY rank
+    #    (symmetric all_gather_object), skip the per-key barrier loop entirely (which
+    #    would deadlock on the count mismatch), and degrade this compile's entries to
+    #    the analytical estimate (measured=False).  Completing at all proves no hang.
+    est2 = ProfilingRuntimeEstimator()
+    est2._sync_across_ranks = True
+    est2(coll_snode)  # both ranks: seed the shared collective entry
+    if rank == 1:
+        fake_key = ("mismatch_only_on_rank1",)
+        est2._table[fake_key] = ProfileEntry(ns=1.0, kind="extern", label="fake", measured=True)
+        est2._key_snode[fake_key] = coll_snode
+    est2.warm_and_sync()
+    mismatch_ok = all(not e.measured for e in est2.table.values()) and not est2._key_snode
+    dist.barrier()
+
     # gather agreement across ranks
-    ok_local = accurate and warmsync_ok
+    ok_local = accurate and warmsync_ok and mismatch_ok
     t = torch.tensor([1 if ok_local else 0], device=dev)
     dist.all_reduce(t)
     all_ok = int(t.item()) == world
@@ -152,6 +173,7 @@ def main() -> None:
         print(f"COLL_MEASURED est_us={est_ns/1e3:.1f} real_us={real_ns/1e3:.1f} ratio={ratio:.2f}", flush=True)
         print(f"COLL_ACCURATE ok={accurate}", flush=True)
         print(f"COLL_WARMSYNC reconciled={n_reconciled} ok={warmsync_ok}", flush=True)
+        print(f"COLL_MISMATCH ok={mismatch_ok}", flush=True)
         print("COLL_PASS" if all_ok else "COLL_FAIL", flush=True)
         rc = 0 if all_ok else 1
     else:

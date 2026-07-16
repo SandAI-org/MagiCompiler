@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """End-to-end FSDP-overlap chain test: a small SimpleFSDP-sharded model through
-``magi_compile`` with ``enable_fsdp_fullgraph_overlap`` -- exercising the whole
+``magi_compile`` with ``fsdp_config.enable_fullgraph_overlap`` -- exercising the whole
 chain (redistribute lowering -> bucketing -> FsdpOverlapReorder) in one real compile.
 
 Driven via a ``torchrun`` subprocess helper (fsdp_overlap_helper/e2e_helper.py); we
@@ -88,7 +88,7 @@ def test_e2e_multi_rank_full_chain():
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires >=2 GPUs")
 def test_e2e_multi_rank_profile_sync():
     """world=2 with profile_sync cost mode: exercises warm_and_sync's rank-lockstep
-    real measurement path end to end (the gaga4 default)."""
+    real measurement path end to end."""
     p = _run(2, "profile_sync", "29643")
     out = p.stdout + p.stderr
     assert p.returncode == 0, f"helper failed:\n{out[-4000:]}"

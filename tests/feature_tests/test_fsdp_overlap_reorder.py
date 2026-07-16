@@ -34,11 +34,11 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requir
 requires_torchrun = pytest.mark.skipif(shutil.which("torchrun") is None, reason="requires torchrun")
 
 
-def _run(nproc: int) -> subprocess.CompletedProcess:
+def _run(nproc: int, *extra: str, port: str = "29631") -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env["MAGI_LOGGING_LEVEL"] = env.get("MAGI_LOGGING_LEVEL", "info")
     return subprocess.run(
-        ["torchrun", f"--nproc_per_node={nproc}", "--master_port=29631", str(_HELPER)],
+        ["torchrun", f"--nproc_per_node={nproc}", f"--master_port={port}", str(_HELPER), *extra],
         env=env,
         capture_output=True,
         text=True,
@@ -67,4 +67,19 @@ def test_reorder_multi_rank():
     p = _run(2)
     out = p.stdout + p.stderr
     assert p.returncode == 0, f"helper failed:\n{out[-3000:]}"
+    assert "REORDER_PASS" in p.stdout, out[-3000:]
+
+
+@requires_cuda
+@requires_torchrun
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires >=2 GPUs")
+def test_reorder_graph_mismatch_fail_fast():
+    """world=2 with rank1 compiling a structurally DIFFERENT graph: the cross-rank
+    graph-fingerprint check must fire on both ranks (warning), leave the schedule
+    unchanged, and complete without deadlock."""
+    p = _run(2, "--mismatch", port="29632")
+    out = p.stdout + p.stderr
+    assert p.returncode == 0, f"helper failed:\n{out[-3000:]}"
+    assert "REORDER_MISMATCH unchanged=True" in p.stdout, out[-3000:]
+    assert "REORDER_WARNED" in p.stdout, out[-3000:]  # the fail-fast warning fired
     assert "REORDER_PASS" in p.stdout, out[-3000:]
