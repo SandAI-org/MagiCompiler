@@ -14,76 +14,39 @@
 
 """Per-op benchmark-input hooks for the profiling runtime estimator.
 
-Some opaque boundary custom ops cannot be replayed for timing from generic
-size-hinted tensors alone, because they carry VALUE-DEPENDENT metadata that must
-be self-consistent (not just right-shaped) or they raise -- e.g. a context-parallel
-attention op taking a split-sizes tensor whose values must sum to the sequence
-length, else its internal all_to_all asserts and the op falls back to a 0 cost
-estimate.
+Some custom ops cannot be replayed from generic size-hinted tensors: they carry
+VALUE-DEPENDENT metadata that must be self-consistent or they raise (e.g. a CP
+attention op whose split-sizes must sum to the sequence length) -- and would fall
+back to a 0 cost.  The model package that defines such an op registers a hook
+here that builds valid replay inputs; MagiCompiler stays free of model-specific
+op knowledge.
 
-The owning code (the model package that defines the custom op) registers a hook
-here that builds a VALID, RANK-DETERMINISTIC set of replay inputs.  MagiCompiler
-stays free of model-specific knowledge: ``_measure_extern`` just looks up the op
-by name and, if a hook exists, uses it instead of the generic realizer.
+Hook: ``fn(fx_node, realize) -> (args, kwargs) | None`` -- ``fx_node`` is the op's
+``torch.fx.Node`` (shapes in ``meta['val']``), ``realize`` is the generic arg
+realizer to reuse for plain tensor args; return None to fall back to the generic
+path.  Register at import time of the op-defining module, e.g.::
 
-A hook is ``fn(fx_node, realize) -> (args, kwargs) | None``:
-  * ``fx_node``   -- the ``torch.fx.Node`` for the op (read its ``args``/``kwargs``
-                     and their ``meta['val']`` for shapes);
-  * ``realize``   -- MagiCompiler's default arg realizer (fx.Node/SymInt/container
-                     -> concrete tensor/int), so a hook can reuse it for the plain
-                     tensor args and only special-case the metadata ones;
-  * returns ``(args, kwargs)`` of real objects to call the op with, or ``None`` to
-    fall back to the generic path.
+    register_benchmark_inputs("mylib::attn_cp", _attn_cp_inputs, has_internal_collective=True)
 
-Hooks MUST produce rank-identical inputs (derive everything from shapes / static
-sizes, no per-rank timing or state) so the rank-lockstep ``warm_and_sync`` measure
-issues any internal collective in lockstep across ranks.
-
-Example -- a custom attention op ``mylib::attn_cp(q, k, v, split_sizes, scale)``
-whose internal all_to_all requires ``split_sizes`` values to sum to the sequence
-length (a zero-filled tensor from the generic realizer would make it raise)::
-
-    from magi_compiler.profiling import register_benchmark_inputs
-
-    def _attn_cp_benchmark_inputs(fx_node, realize):
-        q_node, k_node, v_node, _split_node, scale = fx_node.args
-        q = realize(q_node)          # plain tensor args: reuse the generic realizer
-        k = realize(k_node)
-        v = realize(v_node)
-        # Rebuild the VALUE-dependent arg from SHAPE hints only (rank-identical):
-        # a uniform split summing to the per-rank seqlen.
-        seq, group_size = q.shape[0], 4
-        split_sizes = torch.full((group_size,), seq // group_size, dtype=torch.int32, device=q.device)
-        split_sizes[-1] += seq - int(split_sizes.sum())
-        return (q, k, v, split_sizes, float(scale)), {}
-
-    register_benchmark_inputs(
-        "mylib::attn_cp", _attn_cp_benchmark_inputs, has_internal_collective=True
-    )
-
-Register at import time of the module that defines the op (so the hook exists
-before any compile).  Returning ``None`` from the hook falls back to the generic
-realizer for that call.
+Hooks MUST produce rank-identical inputs (derive everything from shapes, no
+per-rank state) so the rank-lockstep ``warm_and_sync`` measurement issues any
+internal collective in lockstep.
 """
 
 from __future__ import annotations
 
 from typing import Callable
 
-# op name (``torch.ops.ns.op`` overload string, e.g. "mylib::attn_cp")
-# -> hook.  Also records which ops issue an internal collective (need fixed-iter
-# lockstep replay) -- so MagiCompiler no longer hardcodes model-specific op names.
+# op name (OpOverload string, e.g. "mylib::attn_cp") -> hook; plus the set of ops
+# that issue an internal collective (need fixed-iter lockstep replay).
 _BENCHMARK_INPUT_HOOKS: dict[str, Callable] = {}
 _INTERNAL_COLLECTIVE_OPS: set[str] = set()
 
 
 def register_benchmark_inputs(op_name: str, fn: Callable, *, has_internal_collective: bool = False) -> None:
     """Register a replay-input builder for ``op_name`` (see module docstring).
-
-    ``has_internal_collective``: mark this op as issuing an internal collective, so
-    the estimator replays it with a FIXED iteration count under barriers (keeps every
-    rank in lockstep -- a duration-adaptive count would desync the internal NCCL op).
-    """
+    ``has_internal_collective``: replay with a fixed iteration count under barriers
+    (an adaptive count would desync the internal NCCL op across ranks)."""
     _BENCHMARK_INPUT_HOOKS[op_name] = fn
     if has_internal_collective:
         _INTERNAL_COLLECTIVE_OPS.add(op_name)

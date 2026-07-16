@@ -14,56 +14,26 @@
 
 from __future__ import annotations
 
-"""Profiling-based ``estimate_op_runtime`` replacement.
+"""Profiling-based ``estimate_op_runtime`` replacement (the reorder pass's cost_fn).
 
-Inductor's default ``BaseSchedulerNode.get_estimated_runtime`` is a pure
-analytical roofline.  It is unreliable for exactly the nodes our FSDP overlap
-reorder pass must size:
+Inductor's analytical roofline is unreliable for exactly the nodes the FSDP
+overlap reorder must size: fused pointwise (~60x under), matmul (~1500x over on
+this box), custom ops (silently 0).  So we MEASURE:
+fused Triton snodes via ``scheduler.benchmark_fused_nodes``, extern snodes
+(matmul / custom op) by replaying the aten op on inputs rebuilt from fx meta.
 
-* fused pointwise/reduction kernels -> ``estimate_flops()`` is None, so the
-  estimate degrades to ``bytes / dram_bw`` and IGNORES the compute fused into the
-  kernel (measured 60x under-estimate for a 32-deep fusion);
-* matmul -> the device TFLOPS table is wrong on this box (0.5 vs ~990), giving a
-  ~1500x over-estimate;
-* custom ops (Triton / flash-attn) -> ``ExternKernelSchedulerNode`` with
-  ``MultiOutputLayout`` -> dtype is None -> the estimate is silently 0.
+Collectives are never benchmarked in ``__call__`` (per-rank compile-time NCCL
+desyncs ranks -> hang); they are seeded with the analytical estimate and
+re-measured for real in the rank-lockstep ``warm_and_sync``.
 
-Full write-up + demos: ``scripts/demo/research_estimate_op_runtime_findings.md``.
+The op->time table (``self._table``) is keyed by STRUCTURAL identity
+(op + input shapes/dtypes, ``_structural_key``) -- not the per-node name -- so
+isomorphic ops across layers share one measurement: O(#distinct kernels), not
+O(#nodes).  ``summary()`` dumps the table (DEBUG).
 
-Instead we MEASURE each scheduler node's real kernel time:
-* Triton (pointwise/reduction/template) snodes -> ``scheduler.benchmark_fused_nodes``,
-  which codegens the SAME fused kernel production emits and ``do_bench``es it
-  (verified 0.995-1.15x of the compiled-graph kernel);
-* extern snodes (matmul / custom op) -> replay the aten/custom op on real inputs
-  rebuilt from the fx fake-tensor meta, timed with the Inductor benchmarker.
-
-COLLECTIVES are NOT benchmarked here -- they always use the analytical
-``estimate_nccl_collective_runtime``.  Benchmarking a real collective during compile
-is not multi-rank-safe: the reorder pass runs per-rank during independent,
-non-co-scheduled compilation, so issuing an NCCL op desyncs ranks -> watchdog hang
-(seen on 8-GPU gaga4: rank0 raced to FSDP seqNum~194 while peers never matched).
-For real measured comm, calibrate OUTSIDE compile at a synchronized point.  How far
-the analytical estimate is from reality is measured by
-``scripts/demo/verify_collective_estimate.py`` (a standalone, properly-synchronized
-harness -- not the compile path).
-
-Op -> time table
-----------------
-The estimator maintains ``self._table: dict[key -> ProfileEntry]`` -- the
-persistent op->time structure for COMPUTE nodes.  The KEY is the op's STRUCTURAL
-identity ``(target op, tuple[(input shape, dtype)])`` (``_structural_key``), NOT the
-snode's unique name (``buf0``/``op42`` are unique per node and would defeat reuse).
-Each distinct key is benchmarked ONCE on first encounter; every later isomorphic
-snode (same op + same input shapes, e.g. the same matmul in every layer) reuses the
-entry (``reuse_count++``).  A 40-layer model thus measures O(#distinct kernels), not
-O(#nodes).  ``ProfileEntry`` carries ``(ns, kind, label, measured, reuse_count)``;
-``estimator.summary()`` prints the whole table (see it at DEBUG log level).
-
-Passed to the reorder pass as ``cost_fn`` (a callable ``snode -> nanoseconds``).
-The extern measurement path is ShapeEnv-isolated (real tensors from
-size_hints, eager call) so they run on the dynamic base compile; only benchmark_fused_nodes
-(fused Triton) would specialize the dynamic dim, so that path stays analytical while
-free symbols exist.
+Extern measurement is ShapeEnv-isolated so it is safe on the dynamic base
+compile; ``benchmark_fused_nodes`` would specialize the dynamic dim, so fused
+Triton stays analytical while free symbols exist.
 """
 
 import dataclasses
@@ -79,10 +49,8 @@ from magi_compiler.utils import magi_logger
 
 from .benchmark_inputs import get_benchmark_inputs_hook, op_has_internal_collective
 
-# Dedicated GLOO (CPU) group for exchanging profile metadata across ranks (built
-# once, cached).  A CPU/gloo group keeps the cost sync off the NCCL process groups
-# the forward uses, so it can never interleave with / desync the weight-gather or
-# CP collectives.
+# Dedicated GLOO (CPU) group for the cost sync, built once -- keeps it off the
+# NCCL process groups the forward uses (cannot desync weight-gather / CP comms).
 _COST_SYNC_GROUP = "uninit"
 
 
@@ -112,10 +80,8 @@ class ProfileEntry:
 
 
 def _snode_label(snode: BaseSchedulerNode, max_shapes: int = 3) -> str:
-    """Short human-readable identity of an snode for the profile table / logs:
-    the op target plus its first few input shapes.  (The snode's own NAME, e.g.
-    'op123', is deliberately NOT the cache key -- it is unique per node and would
-    defeat cross-layer reuse; the key is the structural identity below.)"""
+    """Human-readable identity for the profile table: op target + first few input
+    shapes (for logs only; the cache key is ``_structural_key``)."""
     node = getattr(snode, "node", None)
     origin = node.get_origin_node() if (node is not None and hasattr(node, "get_origin_node")) else None
     target = str(getattr(origin, "target", type(node).__name__ if node is not None else "?"))
@@ -132,10 +98,9 @@ def _snode_label(snode: BaseSchedulerNode, max_shapes: int = 3) -> str:
 
 
 def _is_multi_output_unpack(snode: BaseSchedulerNode) -> bool:
-    """True for a ``MultiOutput`` snode -- the zero-cost getitem that unpacks one
-    output of a multi-output extern (FallbackKernel).  It shares its origin fx
-    node with the parent extern, so it must never go through the structural-key
-    table (the key collides with the parent's and returns the parent's runtime)."""
+    """Zero-cost MultiOutput getitem.  Must never hit the structural-key table:
+    it shares its origin fx node with the parent extern, so the key collides and
+    would return the parent's full runtime."""
     from torch._inductor.ir import MultiOutput
 
     return type(getattr(snode, "node", None)) is MultiOutput
@@ -191,15 +156,10 @@ def _concrete_size(s, fallback: int = 1) -> int:
 
 
 def _realize_arg(v):
-    """Turn an fx arg into a concrete replay input (rank-deterministic).
-
-    fx.Node(tensor) -> right-shaped tensor from size-hints; fx.Node/bare SymInt ->
-    concrete int; list/tuple/dict -> recursively realized PLAIN container.  The
-    container de-immutabilization matters: FX stores list args as
-    torch.fx.immutable_collections.immutable_list, and the custom-op C++ arg parser
-    requires a plain List[int] for a ``SymInt[]`` arg -- an immutable_list of still-
-    symbolic / nested elements is rejected ("Expected List[int] ... found
-    immutable_list"), making the op fall back to a 0 cost."""
+    """fx arg -> concrete replay input: Node(tensor) -> right-shaped tensor from
+    size-hints; SymInt -> concrete int; containers -> recursively realized PLAIN
+    list/tuple/dict.  Plain matters: the custom-op C++ parser rejects an fx
+    immutable_list where ``SymInt[]`` expects List[int] (op would cost 0)."""
     if isinstance(v, torch.fx.Node):
         ev = v.meta.get("val")
         if isinstance(ev, torch.Tensor):
@@ -223,16 +183,13 @@ def _realize_arg(v):
 def _measure_extern(snode: ExternKernelSchedulerNode, fixed_iters: bool = False) -> float:
     """Time an extern (matmul / custom-op) snode by replaying its aten op.
 
-    ``fixed_iters``: when True, time a CONSTANT number of iterations with CUDA events
-    instead of the duration-adaptive ``benchmark_gpu``.  REQUIRED for ops that issue
-    an INTERNAL collective (e.g. the CP ``all_to_all`` inside gaga4_fa3_with_sink_cp):
-    the adaptive benchmarker runs a rank-dependent iteration count, so different ranks
-    would issue different numbers of that internal collective -> NCCL count mismatch ->
-    deadlock.  A fixed count keeps every rank in lockstep (mirrors _measure_collective_op).
+    ``fixed_iters=True``: constant iteration count with CUDA events instead of the
+    duration-adaptive benchmarker.  Required for ops with an INTERNAL collective
+    (CP all_to_all inside attention/MoE): adaptive iteration counts differ per rank
+    -> NCCL count mismatch -> deadlock.
 
-    Ops whose replay needs VALUE-CONSISTENT metadata (not just right-shaped tensors)
-    can register a hook via ``benchmark_inputs.register_benchmark_inputs`` that builds
-    a valid ``(args, kwargs)``; otherwise args come from the generic ``_realize_arg``."""
+    Ops whose replay needs value-consistent metadata register a hook via
+    ``benchmark_inputs.register_benchmark_inputs``; otherwise ``_realize_arg``."""
     fx_node = snode.node.get_origin_node()
     if fx_node is None:
         return 0.0
@@ -246,17 +203,11 @@ def _measure_extern(snode: ExternKernelSchedulerNode, fixed_iters: bool = False)
         args = tuple(_realize_arg(a) for a in fx_node.args)
         kwargs = {k: _realize_arg(v) for k, v in fx_node.kwargs.items()}
 
-    # Replay EAGERLY, decoupled from the enclosing compile:
-    # * torch._dynamo.disable(): _measure_extern runs while the OUTER graph is being
-    #   compiled (Dynamo/Inductor active).  A custom boundary op whose impl contains
-    #   torch.compile'd regions (e.g. gaga4_fa3_with_sink_cp's sink-correction path)
-    #   would otherwise RE-ENTER Dynamo on these concrete tensors, re-trace with
-    #   DYNAMIC shapes (symbolic s*), and blow up ("Dynamo failed to run FX node ...
-    #   broadcast" / "can't pickle cyclic objects") -> the op fell back to a 0 cost.
-    #   We want the EAGER kernel time, so disable Dynamo for the replay.
-    # * no_grad: the compiled forward runs under inference_mode; some ops branch on
-    #   torch.is_grad_enabled() (fa3 takes a training-only flash-attn wrapper path when
-    #   grad is on, incompatible with the installed flash-attn).  Match inference.
+    # Replay eagerly, decoupled from the enclosing compile:
+    # * dynamo.disable: an op whose impl contains torch.compile'd regions would
+    #   re-enter Dynamo mid-compile and blow up; we want the eager kernel time.
+    # * no_grad: match the inference forward -- some ops branch on
+    #   torch.is_grad_enabled() into incompatible paths.
     @torch._dynamo.disable
     def _call():
         return target(*args, **kwargs)
@@ -296,10 +247,9 @@ def _op_name(target) -> str:
 
 
 def _extern_has_internal_collective(snode: BaseSchedulerNode) -> bool:
-    """True for opaque boundary ops that issue collectives internally (CP attention /
-    MoE), so we must measure them with fixed iterations under a barrier.  The set of
-    such ops is declared by the owning code via ``register_benchmark_inputs(...,
-    has_internal_collective=True)`` -- MagiCompiler holds no model-specific op names."""
+    """Ops that issue collectives internally (declared via
+    ``register_benchmark_inputs(..., has_internal_collective=True)``) must be
+    measured with fixed iterations under a barrier."""
     node = getattr(snode, "node", None)
     origin = node.get_origin_node() if (node is not None and hasattr(node, "get_origin_node")) else None
     target = getattr(origin, "target", None) if origin is not None else None
@@ -377,10 +327,8 @@ def _measure_collective_op(snode: BaseSchedulerNode) -> float:
         def fn():
             _WAIT(_AG(ins[0], group_size, group_name))
 
-    # FIXED iteration counts across ALL ranks.  A duration-based benchmarker
-    # (e.g. benchmark_gpu shrinks benchmark_iters by per-rank estimated runtime)
-    # would issue a DIFFERENT number of collectives on different ranks ->
-    # NCCL count mismatch -> deadlock.  A constant loop keeps every rank in lockstep.
+    # Fixed iteration count on all ranks -- an adaptive benchmarker would issue
+    # different numbers of collectives per rank -> NCCL count mismatch -> deadlock.
     _WARMUP, _ITERS = 3, 10
     for _ in range(_WARMUP):
         fn()
@@ -396,37 +344,24 @@ def _measure_collective_op(snode: BaseSchedulerNode) -> float:
 
 
 class ProfilingRuntimeEstimator:
-    """Callable ``snode -> ns`` for ``config.estimate_op_runtime``.
-
-    Measures compute nodes with real kernels (memoized); defers collectives and
-    waits to the analytical ``get_estimated_runtime`` (the reorder pass sizes
-    comm separately via ``estimate_nccl_collective_runtime`` or a calibrated
-    value).  Never raises -- on any failure returns the analytical estimate (or
-    0), so it degrades to today's behaviour rather than breaking compilation.
-    """
+    """Callable ``snode -> ns`` (see module docstring).  Never raises -- any
+    measurement failure falls back to the analytical estimate."""
 
     def __init__(self) -> None:
-        # The op -> time table.  Key is the STRUCTURAL identity of the op
-        # (target op + input shapes/dtypes for compute, or (coll, group, group_size,
-        # in-shapes) for collectives) -- NOT the snode's unique name, so isomorphic
-        # ops across repeated layers share ONE measurement.  Each distinct key is
-        # profiled once on first encounter; later encounters reuse the entry.
+        # op -> time table, keyed by structural identity (see module docstring).
         self._table: dict[tuple, ProfileEntry] = {}
         self.n_measured = 0
         self.n_cache_hits = 0
-        # Set True by MagiBackend for multi-rank runs: the reorder pass then calls
-        # warm_and_sync() to reconcile costs across ranks (rank-identical schedule).
+        # True (profile_sync): the reorder pass calls warm_and_sync() to reconcile
+        # costs across ranks.
         self._sync_across_ranks = False
-        # Transient {structural_key -> representative snode}, used ONLY by
-        # warm_and_sync() to re-measure in rank-lockstep order.  Kept OFF the
-        # ProfileEntry (which Inductor pickles into the fx-graph cache key) because
-        # snodes hold FakeTensors that are unpicklable / cyclic.  Never serialized.
+        # Transient {key -> representative snode} for warm_and_sync re-measurement.
+        # Kept OFF ProfileEntry: snodes hold unpicklable FakeTensors and the entry
+        # is pickled into the fx-graph cache key.
         self._key_snode: dict = {}
 
     def __deepcopy__(self, memo):
-        # Shared by reference from the reorder pass; when config serialization
-        # deepcopies the pass list, return a clean instance (the memoized
-        # measurements are transient and hold no tensors, but avoid copying them).
+        # Config serialization deepcopies the pass list; return a clean instance.
         new = ProfilingRuntimeEstimator()
         new._sync_across_ranks = self._sync_across_ranks
         memo[id(self)] = new
@@ -438,37 +373,18 @@ class ProfilingRuntimeEstimator:
         return self._table
 
     def warm_and_sync(self) -> int:
-        """Rank-LOCKSTEP profiling of every distinct op, so multi-rank runs get REAL
-        measured costs (more accurate than the analytical roofline) AND a rank-
-        identical cost table (required so the FSDP-overlap reorder produces the same
-        schedule on every rank -- else weight-PG gathers interleave with the eager CP
-        all_to_all in rank-divergent order -> deadlock).
+        """Rank-lockstep re-measurement of every table entry, giving REAL costs
+        that are also rank-identical (required for a rank-identical reorder
+        schedule).  Steps: verify key sets match across ranks; per sorted key,
+        barrier -> measure with FIXED iters -> barrier; finally all_gather the
+        {key: ns} maps and take the max.  Returns #entries whose cost changed.
 
-        PRECONDITION: the graph is structurally IDENTICAL on all ranks, so every rank
-        has exactly the same set of ``_structural_key`` keys already populated in the
-        table by the reorder pass's warm-up loop, so:
-          * the key iteration order (sorted) is identical on every rank;
-          * for a collective-containing op (attention/MoE), every rank measures it at
-            the same step, so the barrier-wrapped fixed-iteration replay issues the
-            op's internal CP all_to_all in lockstep (no NCCL count mismatch);
-          * the max-reduce over gloo is symmetric.
-        The precondition is VERIFIED (not assumed): the key sets are all_gather'd and
-        compared BEFORE the barrier loop.  On any mismatch (per-rank shapes from
-        uneven Shard(0) padding, a ``_structural_key``/``_collective_spec`` failure on
-        one rank, ...) entering the loop would deadlock -- rank A's Nth barrier pairs
-        with rank B's all_gather (gloo count mismatch), or both ranks measure a
-        DIFFERENT collective-containing op at the same step (NCCL mismatch inside
-        ``_measure_one``).  Instead we warn and DEGRADE to the analytical estimate for
-        every entry this compile measured per-rank: analytical is a pure shape+device
-        function, so the resulting cost table is rank-deterministic and the reorder
-        stays deadlock-free (same guarantee as fsdp_config.cost_mode=analytical).
-
-        Steps: verify key sets match across ranks; then for each key in sorted order,
-        barrier -> (re)measure locally with FIXED iters -> barrier; then
-        all_gather_object the {key: ns} maps and take the MAX.  Fixed-iteration timing
-        (``_measure_one``) is mandatory -- a duration-adaptive benchmark would run a
-        per-rank iteration count and desync the internal collective.  Returns the
-        number of table entries whose cost changed."""
+        The key-set check is a hard precondition: with divergent key sequences the
+        barrier loop deadlocks (barrier/all_gather count mismatch on gloo, or two
+        ranks lockstep-measuring DIFFERENT internal-collective ops -> NCCL
+        mismatch).  On mismatch we warn and degrade this compile's entries to the
+        analytical estimate -- rank-deterministic, same guarantee as
+        fsdp_config.cost_mode=analytical."""
         import torch.distributed as dist
 
         if not (dist.is_available() and dist.is_initialized()):
@@ -478,16 +394,11 @@ class ProfilingRuntimeEstimator:
             return 0
         group = _get_cost_sync_group()
 
-        # The reorder warm-up already populated self._table (one entry per distinct
-        # structural key) and self._key_snode (a representative snode per key).
-        # Re-measure each in a rank-uniform (sorted) order under barriers so any
-        # internal collective is issued in lockstep across ranks.
         keys = sorted(self._table.keys(), key=repr)
 
-        # FAIL-FAST precondition check: the barrier loop below is only lockstep-safe
-        # if every rank iterates the SAME key sequence.  all_gather_object is a single
-        # symmetric collective (safe regardless of key sets), and every rank sees the
-        # same gathered result, so all ranks take the same branch.
+        # Fail-fast key-set check (see docstring).  all_gather_object is a single
+        # symmetric collective and every rank sees the same result, so all ranks
+        # take the same branch.
         key_reprs = [repr(k) for k in keys]
         all_key_reprs: list = [None] * world
         dist.all_gather_object(all_key_reprs, key_reprs, group=group)
@@ -530,9 +441,7 @@ class ProfilingRuntimeEstimator:
                 local_ns[k] = self._table[k].ns  # no cached snode -> keep prior measurement
             dist.barrier(group=group)
 
-        # keys re-measured on THIS rank (had a representative snode) -- gather across
-        # ranks so a key measured on any rank is flagged measured (the graph is
-        # identical, so this is the same set everywhere; the union is just defensive).
+        # Union of measured keys across ranks -> flag entries measured=True.
         measured_here = set(self._key_snode.keys())
 
         gathered: list = [None] * world
@@ -559,10 +468,8 @@ class ProfilingRuntimeEstimator:
         return n
 
     def _measure_one(self, snode: BaseSchedulerNode) -> float:
-        """Measure a single snode with FIXED iterations (lockstep-safe), never raising
-        -- falls back to the analytical estimate.  Collective-containing externs
-        (attention / MoE) use fixed-iter replay so every rank issues the same number
-        of internal collectives."""
+        """Lockstep-safe single measurement (fixed iters for anything containing a
+        collective); never raises -- falls back to the analytical estimate."""
         try:
             if contains_collective(snode):
                 return _measure_collective_op(snode)
@@ -578,11 +485,9 @@ class ProfilingRuntimeEstimator:
             return _safe_analytical(snode)
 
     def summary(self) -> str:
-        """One line per distinct profiled op: kind, label, per-call time, #calls,
-        aggregate time (per-call * #calls).  Each op also gets a machine-parseable
-        ``ESTLINE`` tag (kind|label|per_call_us|calls|total_us|measured) so a run's
-        estimates can be diffed against the real nsys kernel trace -- see
-        scripts/demo/compare_estimate_vs_nsys.py."""
+        """One line per distinct op + a machine-parseable ``ESTLINE`` tag
+        (kind|label|per_call_us|calls|total_us|measured) for diffing against an
+        nsys trace."""
         lines = []
         for e in sorted(self._table.values(), key=lambda e: -e.ns * (e.reuse_count + 1)):
             calls = e.reuse_count + 1  # first encounter + reuses
@@ -626,17 +531,13 @@ class ProfilingRuntimeEstimator:
 
         is_extern = isinstance(snode, ExternKernelSchedulerNode)
 
-        # Benchmark compute nodes on the dynamic graph without specializing the
-        # dynamic dim.  Extern (matmul / custom op) is ShapeEnv-isolated (replays the
-        # aten op on size-hinted real tensors) so it is safe even with free symbols.
-        # Fused Triton pointwise/reduction goes through benchmark_fused_nodes which
-        # re-enters Inductor codegen bound to the live ShapeEnv and WOULD specialize,
-        # so that path stays analytical while the graph is dynamic.  Matmul/attention/
-        # MoE (the dominant costs, and the source of the bogus roofline) are extern.
+        # Extern replay is ShapeEnv-isolated -> safe with free symbols; fused
+        # Triton (benchmark_fused_nodes) would specialize the dynamic dim, so it
+        # stays analytical while the graph is dynamic.
         if not is_extern and _graph_has_free_symbols():
             return _safe_analytical(snode)
 
-        # --- op -> time table: profile a distinct key ONCE, reuse afterwards ---
+        # op -> time table: profile a distinct key once, reuse afterwards.
         key = _structural_key(snode)
         if key is not None:
             entry = self._table.get(key)
@@ -645,9 +546,8 @@ class ProfilingRuntimeEstimator:
                 self.n_cache_hits += 1
                 return entry.ns
 
-        # First encounter of this key -> measure it.  Measuring must NEVER break
-        # compilation: any failure (unbenchmarkable extern, FakeTensor deepcopy in
-        # the benchmark harness, ...) falls back to the analytical estimate.
+        # First encounter -> measure; any failure falls back to analytical
+        # (measuring must never break compilation).
         measured = True
         try:
             ns = self._measure_extern_safe(snode) if is_extern else self._measure(snode)
@@ -660,9 +560,7 @@ class ProfilingRuntimeEstimator:
             kind = "extern" if is_extern else "compute"
             label = _snode_label(snode)
             self._table[key] = ProfileEntry(ns=ns, kind=kind, label=label, measured=measured)
-            # Remember a representative snode (transient, unpicklable) so
-            # warm_and_sync() can re-measure this key in rank-lockstep order.
-            if self._sync_across_ranks:
+            if self._sync_across_ranks:  # stash a representative snode for warm_and_sync
                 self._key_snode[key] = snode
             magi_logger.debug(
                 "profile[%s] %s -> %.2fus%s", kind, label, ns / 1e3, "" if measured else " (analytical fallback)"
@@ -676,11 +574,9 @@ class ProfilingRuntimeEstimator:
         return ns
 
     def _measure(self, snode: BaseSchedulerNode) -> float:
-        # Benchmarking runs real kernels at concrete (hinted) shapes.  Under
-        # dynamic-shape compilation that would add ``Eq(sym, hint)`` guards and
-        # replacements into the ShapeEnv and SPECIALIZE the dynamic dim (breaking
-        # the compile for other seq lens).  Suppress guard creation AND snapshot /
-        # restore the ShapeEnv's mutable specialization state so nothing leaks.
+        # Benchmarking at hinted concrete shapes must not leak Eq(sym, hint)
+        # guards/replacements into the live ShapeEnv (would specialize the dynamic
+        # dim): suppress guards + snapshot/restore the mutable state.
         with _shapeenv_sandbox(), _suppress_guards():
             return self._measure_inner(snode)
 
@@ -707,10 +603,8 @@ def _safe_analytical(snode: BaseSchedulerNode) -> float:
 
 
 def _graph_has_free_symbols() -> bool:
-    """True if the graph being compiled still has symbolic (dynamic) shapes.
-
-    Benchmarking real kernels is only safe when everything is concrete; a
-    dynamic-shape compile has free symbols and must use the analytical estimate."""
+    """True if the compile still has dynamic (symbolic) shapes -- any symbol with
+    a non-singleton range that is not yet a constant replacement."""
     try:
         shape_env = V.graph.sizevars.shape_env
     except Exception:  # noqa: BLE001
@@ -718,9 +612,6 @@ def _graph_has_free_symbols() -> bool:
     if shape_env is None:
         return False
     try:
-        # A fully-static graph has no unbacked/free symbols with a non-singleton
-        # range.  If ANY symbol has a range wider than one value and is not yet a
-        # constant replacement, the graph is dynamic and must not be benchmarked.
         replacements = getattr(shape_env, "replacements", {})
         for sym, vr in shape_env.var_to_range.items():
             if sym in replacements:
@@ -740,9 +631,8 @@ def _graph_has_free_symbols() -> bool:
 
 
 def _suppress_guards():
-    """Context manager that suppresses ShapeEnv guard creation while we run real
-    benchmark kernels at hinted shapes, so measurement never specializes a
-    dynamic dim.  Falls back to a no-op when no ShapeEnv is active."""
+    """Suppress ShapeEnv guard creation during benchmarking (no-op without a
+    live ShapeEnv)."""
     from contextlib import nullcontext
 
     try:
@@ -754,8 +644,8 @@ def _suppress_guards():
     return nullcontext()
 
 
-# ShapeEnv mutable fields that benchmarking could pollute with a `s -> hint`
-# specialization; snapshot/restore them so a measurement never persists a guard.
+# ShapeEnv mutable fields a benchmark could pollute with an `s -> hint`
+# specialization; snapshotted/restored by _shapeenv_sandbox.
 _SHAPEENV_STATE_FIELDS = (
     "guards",
     "axioms",
@@ -769,10 +659,8 @@ _SHAPEENV_STATE_FIELDS = (
 
 
 class _shapeenv_sandbox:
-    """Snapshot the live ShapeEnv's specialization state on enter, restore it on
-    exit.  Shallow-copies the mutable dict/list fields (their *contents* are
-    replaced wholesale by the compile, never mutated in place after we restore),
-    so benchmarking a kernel at a hinted concrete shape cannot leak an
+    """Snapshot the live ShapeEnv's specialization state on enter, restore on
+    exit, so a benchmark at hinted concrete shapes cannot leak an
     ``Eq(sym, hint)`` replacement/guard into the real compile."""
 
     def __init__(self) -> None:
