@@ -109,7 +109,7 @@ def main() -> None:
 
     FsdpOverlapReorder.__call__ = spy
 
-    reorder = FsdpOverlapReorder(slack_ns=5000.0)  # default cost_fn (Inductor analytical)
+    reorder = FsdpOverlapReorder(comm_overlap_window_margin_ns=5000.0)  # default cost_fn (Inductor analytical)
     prev_flag = inductor_config.reorder_for_compute_comm_overlap
     prev_passes = inductor_config.reorder_for_compute_comm_overlap_passes
     prev_cache = inductor_config.force_disable_caches

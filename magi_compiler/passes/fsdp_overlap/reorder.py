@@ -21,7 +21,7 @@ Installed as the only ``reorder_for_compute_comm_overlap_passes`` entry (replace
 (``disable_graph_split=True``).  For each FSDP weight all-gather launch, place it
 at the LATEST position whose downstream compute still hides the collective::
 
-    sum(compute runtime between launch and first-consumer) >= comm_runtime + slack
+    sum(compute runtime between launch and first-consumer) >= comm * scale + margin
 
 Not enough upstream compute -> as-early-as-legal (never worse than raise_comms).
 
@@ -47,14 +47,6 @@ from torch._inductor.utils import contains_collective, contains_wait, is_collect
 
 from magi_compiler.utils import magi_logger
 
-
-def _debug_enabled() -> bool:
-    """MagiLogger has no isEnabledFor; check the underlying std logger."""
-    import logging
-
-    return logging.getLogger("magi_compiler").isEnabledFor(logging.DEBUG)
-
-
 _AG = torch.ops._c10d_functional.all_gather_into_tensor.default
 _AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
 _WEIGHT_AG_OPS = (_AG, _AG_COALESCED)
@@ -62,7 +54,7 @@ _WEIGHT_AG_OPS = (_AG, _AG_COALESCED)
 # Default extra headroom (ns) added to each collective's runtime when sizing the
 # compute window, absorbing estimator error + kernel-launch latency so the wait
 # rarely stalls.  Overridable via the reorder pass constructor.
-_DEFAULT_SLACK_NS = 5_000.0
+_DEFAULT_WINDOW_MARGIN_NS = 5_000.0
 
 
 def _leaf_collective_node(snode: BaseSchedulerNode):
@@ -116,12 +108,17 @@ def _graph_fingerprint(order: list[BaseSchedulerNode]) -> str:
 class FsdpOverlapReorder:
     """Callable reorder pass."""
 
-    def __init__(self, slack_ns: float = _DEFAULT_SLACK_NS, cost_fn=None, comm_contention_factor: float = 1.0) -> None:
-        self.slack_ns = slack_ns
-        # need = comm * factor + slack: collectives are measured in isolation but
+    def __init__(
+        self,
+        comm_overlap_window_margin_ns: float = _DEFAULT_WINDOW_MARGIN_NS,
+        cost_fn=None,
+        comm_overlap_window_scale: float = 1.0,
+    ) -> None:
+        self.comm_overlap_window_margin_ns = comm_overlap_window_margin_ns
+        # need = comm * scale + margin: collectives are measured in isolation but
         # run concurrent with the compute that hides them (~1.4-1.5x slower on
-        # 8xH100).  See CompileConfig.fsdp_config.comm_contention_factor.
-        self.comm_contention_factor = comm_contention_factor
+        # 8xH100).  See CompileConfig.fsdp_config.comm_overlap_window_scale.
+        self.comm_overlap_window_scale = comm_overlap_window_scale
         # cost_fn: snode -> ns (default: Inductor's estimate_op_runtime hook).
         if cost_fn is None:
             from torch._inductor.comms import estimate_op_runtime
@@ -137,8 +134,8 @@ class FsdpOverlapReorder:
         # Fresh, cache-free instance (see _cost_cache note); cost_fn shared by
         # reference -- it is itself deepcopy-safe.
         new = FsdpOverlapReorder.__new__(FsdpOverlapReorder)
-        new.slack_ns = self.slack_ns
-        new.comm_contention_factor = self.comm_contention_factor
+        new.comm_overlap_window_margin_ns = self.comm_overlap_window_margin_ns
+        new.comm_overlap_window_scale = self.comm_overlap_window_scale
         new._cost_fn = self._cost_fn
         new._cost_cache = {}
         memo[id(self)] = new
@@ -243,7 +240,7 @@ class FsdpOverlapReorder:
             # Start just before the launch, but no later than where the previous
             # (later) gather already consumed compute down to.
             compute_idx = min(compute_idx, cur)
-            need = comm_runtime * self.comm_contention_factor + self.slack_ns
+            need = comm_runtime * self.comm_overlap_window_scale + self.comm_overlap_window_margin_ns
             acc = 0.0
             t = compute_idx
             while t > lower:
@@ -269,19 +266,18 @@ class FsdpOverlapReorder:
             #   verdict   = hidden (acc>=need) | COMPUTE-LIMITED (ran out of upstream
             #               compute before covering comm -- i.e. hit `lower` or the
             #               previous gather's placement first)
-            if _debug_enabled():
-                magi_logger.debug(
-                    "FSDP overlap placement: launch cur=%d -> target=%d fc=%d lower=%d | "
-                    "comm=%.1fus acc_upstream=%.1fus need=%.1fus %s",
-                    cur,
-                    target,
-                    fc_idx,
-                    lower,
-                    comm_runtime / 1e3,
-                    acc / 1e3,
-                    need / 1e3,
-                    "hidden" if acc >= need else "COMPUTE-LIMITED",
-                )
+            magi_logger.debug(
+                "FSDP overlap placement: launch cur=%d -> target=%d fc=%d lower=%d | "
+                "comm=%.1fus acc_upstream=%.1fus need=%.1fus %s",
+                cur,
+                target,
+                fc_idx,
+                lower,
+                comm_runtime / 1e3,
+                acc / 1e3,
+                need / 1e3,
+                "hidden" if acc >= need else "COMPUTE-LIMITED",
+            )
 
         # Clamp targets NON-DECREASING in original program order.  NCCL matches the
         # Nth call on a PG positionally across ranks, so the gathers' relative order
@@ -334,8 +330,9 @@ class FsdpOverlapReorder:
             measured,
             cache_hits,
         )
-        # Full op->time table at DEBUG.
-        if _debug_enabled() and hasattr(self._cost_fn, "summary"):
+        # Full op->time table at DEBUG.  The guard is load-bearing here: summary()
+        # builds the whole table string eagerly, unlike lazy %-format args.
+        if hasattr(self._cost_fn, "summary"):
             magi_logger.debug("FSDP overlap %s", self._cost_fn.summary())
         return order
 
@@ -454,14 +451,13 @@ class FsdpOverlapReorder:
                 if prod is s:  # fused snode may name its own internal buffers
                     continue
                 if prod is not None and pos.get(prod, -1) >= sp:
-                    if _debug_enabled():
-                        magi_logger.debug(
-                            "validate fail: %s@%d needs buffer-dep %s@%d (buf %s)",
-                            s.get_name(),
-                            sp,
-                            prod.get_name(),
-                            pos.get(prod, -1),
-                            d.name,
-                        )
+                    magi_logger.debug(
+                        "validate fail: %s@%d needs buffer-dep %s@%d (buf %s)",
+                        s.get_name(),
+                        sp,
+                        prod.get_name(),
+                        pos.get(prod, -1),
+                        d.name,
+                    )
                     return False
         return True

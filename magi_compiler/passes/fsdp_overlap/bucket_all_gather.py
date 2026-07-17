@@ -82,7 +82,7 @@ def _local_shard_bytes(ag: fx.Node) -> int:
 def _split_by_dtype_and_size(
     ag_nodes: list[fx.Node], node_index: dict[fx.Node, int], bucket_size_bytes: int
 ) -> list[list[fx.Node]]:
-    """Split a run of weight all-gathers into buckets by PROGRAM-ADJACENCY (plan B).
+    """Split a run of weight all-gathers into buckets by PROGRAM-ADJACENCY.
 
     Walk ``ag_nodes`` in program order and start a NEW bucket whenever:
       * the dtype changes (a different-dtype weight physically breaks the run -- so

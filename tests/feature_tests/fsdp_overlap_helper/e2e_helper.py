@@ -134,7 +134,7 @@ def main() -> None:
         cfg.compile_mode = CompileMode.MAGI_COMPILE
         cfg.cudagraph_mode = CudaGraphMode.NONE
         cfg.disable_graph_split = True
-        cfg.fsdp_config.enable_fullgraph_overlap = True
+        cfg.fsdp_config.enable_fsdp = True
         cfg.fsdp_config.bucket_mode = "coalesced"
         cfg.fsdp_config.cost_mode = args.cost_mode
         return cfg

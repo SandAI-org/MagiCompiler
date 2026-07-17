@@ -2,4 +2,5 @@
 diffusers==0.32.2
 fairscale
 timm==1.0.15
+torchtitan==0.2.0
 transformers==4.48.3

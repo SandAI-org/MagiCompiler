@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """End-to-end FSDP-overlap chain test: a small SimpleFSDP-sharded model through
-``magi_compile`` with ``fsdp_config.enable_fullgraph_overlap`` -- exercising the whole
+``magi_compile`` with ``fsdp_config.enable_fsdp`` -- exercising the whole
 chain (redistribute lowering -> bucketing -> FsdpOverlapReorder) in one real compile.
 
 Driven via a ``torchrun`` subprocess helper (fsdp_overlap_helper/e2e_helper.py); we

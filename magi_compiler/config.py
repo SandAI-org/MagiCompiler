@@ -187,7 +187,7 @@ class FSDPConfig(BaseModel):
     compiled with ``disable_graph_split=True``).
     """
 
-    enable_fullgraph_overlap: bool = Field(
+    enable_fsdp: bool = Field(
         False,
         description=(
             "Lower SimpleFSDP weight prim_redistribute to explicit collectives, bucket them (bucket_mode), "
@@ -221,7 +221,7 @@ class FSDPConfig(BaseModel):
             "fallback."
         ),
     )
-    slack_ns: float = Field(
+    comm_overlap_window_margin_ns: float = Field(
         5000.0,
         ge=0.0,
         description=(
@@ -229,12 +229,12 @@ class FSDPConfig(BaseModel):
             "absorbing estimator error + launch latency."
         ),
     )
-    comm_contention_factor: float = Field(
+    comm_overlap_window_scale: float = Field(
         1.5,
         ge=1.0,
         description=(
             "Multiplier on each collective's estimated runtime when sizing its compute window "
-            "(need = comm * factor + slack): collectives are measured in isolation but run concurrent "
+            "(need = comm * scale + margin): collectives are measured in isolation but run concurrent "
             "with the compute that hides them (~1.4-1.5x slower in-situ on 8xH100)."
         ),
     )

@@ -554,11 +554,12 @@ class MagiBackend:
            raise_comms/sink_waits, and enable reorder_for_compute_comm_overlap.
         """
         fsdp_cfg = self.compile_config.fsdp_config
-        if not self.compile_config.disable_graph_split:
-            raise ValueError("fsdp_config.enable_fullgraph_overlap requires disable_graph_split=True")
-
-        if self.compile_config.cudagraph_mode != CudaGraphMode.NONE:
-            raise ValueError("fsdp_config.enable_fullgraph_overlap requires cudagraph_mode=NONE")
+        assert (
+            self.compile_config.disable_graph_split
+        ), "fsdp_config.enable_fullgraph_overlap requires disable_graph_split=True"
+        assert (
+            self.compile_config.cudagraph_mode == CudaGraphMode.NONE
+        ), "fsdp_config.enable_fullgraph_overlap requires cudagraph_mode=NONE"
 
         from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder, lower_and_bucket_full_graph
         from magi_compiler.profiling import ProfilingRuntimeEstimator
@@ -581,7 +582,9 @@ class MagiBackend:
             cost_fn = self._fsdp_overlap_estimator
 
         reorder = FsdpOverlapReorder(
-            slack_ns=fsdp_cfg.slack_ns, cost_fn=cost_fn, comm_contention_factor=fsdp_cfg.comm_contention_factor
+            comm_overlap_window_margin_ns=fsdp_cfg.comm_overlap_window_margin_ns,
+            cost_fn=cost_fn,
+            comm_overlap_window_scale=fsdp_cfg.comm_overlap_window_scale,
         )
         self.inductor_compile_config["reorder_for_compute_comm_overlap"] = True
         self.inductor_compile_config["reorder_for_compute_comm_overlap_passes"] = [reorder]
@@ -603,7 +606,7 @@ class MagiBackend:
         magi_logger.info(f"Resolved splitting ops for FX-level graph split: {resolved_ops=}")
 
         # Step 1.4: whole-graph FSDP overlap.
-        if self.compile_config.fsdp_config.enable_fullgraph_overlap:
+        if self.compile_config.fsdp_config.enable_fsdp:
             self._apply_fsdp_fullgraph_overlap(graph)
 
         # Step 2: split graph by ops, we split graph based on resolved_ops, which becomes the partitioned single graph.

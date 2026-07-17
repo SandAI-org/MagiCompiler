@@ -22,8 +22,9 @@ this box), custom ops (silently 0).  So we MEASURE:
 fused Triton snodes via ``scheduler.benchmark_fused_nodes``, extern snodes
 (matmul / custom op) by replaying the aten op on inputs rebuilt from fx meta.
 
-Collectives are never benchmarked in ``__call__`` (per-rank compile-time NCCL
-desyncs ranks -> hang); they are seeded with the analytical estimate and
+Collectives -- and, in sync mode, externs with an INTERNAL collective (CP
+attention / MoE) -- are never benchmarked in ``__call__`` (per-rank compile-time
+NCCL desyncs ranks -> hang); they are seeded with the analytical estimate and
 re-measured for real in the rank-lockstep ``warm_and_sync``.
 
 The op->time table (``self._table``) is keyed by STRUCTURAL identity
@@ -545,6 +546,18 @@ class ProfilingRuntimeEstimator:
                 entry.reuse_count += 1
                 self.n_cache_hits += 1
                 return entry.ns
+
+        # Extern with an INTERNAL collective (CP attention / MoE): in sync mode,
+        # never measure it here -- the warm-up runs per-rank WITHOUT barriers, and
+        # the adaptive benchmarker would issue rank-dependent numbers of the
+        # internal NCCL op -> count mismatch -> hang.  Seed analytical + stash the
+        # snode; warm_and_sync re-measures it in rank-lockstep (fixed iters).
+        if is_extern and self._sync_across_ranks and _extern_has_internal_collective(snode):
+            ns = _safe_analytical(snode)
+            if key is not None:
+                self._table[key] = ProfileEntry(ns=ns, kind="extern", label=_snode_label(snode), measured=False)
+                self._key_snode[key] = snode
+            return ns
 
         # First encounter -> measure; any failure falls back to analytical
         # (measuring must never break compilation).

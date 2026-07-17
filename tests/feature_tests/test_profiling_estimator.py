@@ -162,6 +162,70 @@ def test_measure_extern_matmul_positive():
     assert ns > 0.0
 
 
+# ---------------------------------------------------------------------------
+# internal-collective extern: __call__ must NOT measure it in sync mode
+# ---------------------------------------------------------------------------
+def _make_fake_extern_snode():
+    """A stub recognized as ExternKernelSchedulerNode by __call__ (init skipped)."""
+    from torch._inductor.scheduler import ExternKernelSchedulerNode as _EKSN
+
+    class _FakeExtern(_EKSN):
+        def __init__(self, fx_node):
+            self.node = _FakeIR(fx_node)
+
+        def get_name(self):
+            return "op_fake"
+
+        def get_nodes(self):
+            return [self]
+
+        def get_estimated_runtime(self):
+            return 123.0
+
+    g = fx.Graph()
+    a = g.placeholder("a")
+    a.meta["val"] = torch.empty(4, 4)
+    mm = g.call_function(torch.ops.aten.mm.default, (a, a))
+    mm.meta["val"] = torch.empty(4, 4)
+    return _FakeExtern(mm)
+
+
+@pytest.mark.parametrize("sync", [True, False])
+def test_internal_collective_extern_not_measured_in_sync_warmup(monkeypatch, sync):
+    """An extern registered with has_internal_collective=True must NOT be measured
+    by __call__ in sync mode (the warm-up runs per-rank without barriers; the
+    adaptive benchmarker would issue rank-dependent numbers of the internal NCCL op
+    -> hang).  It is seeded analytical + stashed for warm_and_sync.  In non-sync
+    mode the normal measurement path still runs."""
+    from magi_compiler.profiling import register_benchmark_inputs
+    from magi_compiler.profiling import runtime_estimator as re_mod
+    from magi_compiler.profiling.benchmark_inputs import _BENCHMARK_INPUT_HOOKS, _INTERNAL_COLLECTIVE_OPS
+
+    measured = {"called": False}
+
+    def _boom(*a, **k):
+        measured["called"] = True
+        raise AssertionError("must not be measured in sync warm-up")
+
+    register_benchmark_inputs("aten::mm", lambda fx_node, realize: None, has_internal_collective=True)
+    monkeypatch.setattr(re_mod, "_measure_extern", _boom)
+    try:
+        est = ProfilingRuntimeEstimator()
+        est._sync_across_ranks = sync
+        ns = est(_make_fake_extern_snode())
+        assert ns == 123.0  # analytical seed (sync) / analytical fallback after _boom (non-sync)
+        [entry] = est.table.values()
+        assert entry.measured is False and entry.kind == "extern"
+        if sync:
+            assert measured["called"] is False  # deferred to warm_and_sync
+            assert len(est._key_snode) == 1  # stashed for lockstep re-measurement
+        else:
+            assert measured["called"] is True  # non-sync: measurement path still taken
+    finally:
+        _BENCHMARK_INPUT_HOOKS.pop("aten::mm", None)
+        _INTERNAL_COLLECTIVE_OPS.discard("aten::mm")
+
+
 import torch._inductor.config as inductor_config  # noqa: E402
 
 # ===========================================================================
