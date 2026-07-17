@@ -593,8 +593,9 @@ class MagiBackend:
     def _split_graph(self, graph: fx.GraphModule) -> tuple[fx.GraphModule, list[SplitItem]]:
         # Step 1: resolve the splitting ops.
         if self.compile_config.disable_graph_split:
-            if self.compile_config.cudagraph_mode == CudaGraphMode.PIECEWISE:
-                raise ValueError("disable_graph_split is incompatible with cudagraph_mode=PIECEWISE")
+            assert (
+                self.compile_config.cudagraph_mode != CudaGraphMode.PIECEWISE
+            ), "disable_graph_split is incompatible with cudagraph_mode=PIECEWISE"
             fx_split_ops = []
             magi_logger.info(
                 "disable_graph_split=True: skipping FX-level graph split; compiling the whole graph as one submod"
