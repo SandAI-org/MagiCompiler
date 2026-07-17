@@ -91,11 +91,6 @@ def _boundary(x: torch.Tensor) -> torch.Tensor:
 
 class _NegatedConstantAcrossBoundaryBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Mirrors the FP8 quant clamp: ``clamp(x, -448.0, 448.0)`` reused on both
-        # sides of a piecewise boundary.  Dynamo may recapture ``-448.0`` as an
-        # ``operator.neg(448.0)`` node; without constant folding this node is
-        # promoted to a subgraph output by ``split_module`` and Inductor rejects
-        # the bare Python float output.
         x = x.float().clamp(-_FP8_MAX_VALUE, _FP8_MAX_VALUE)
         x = _boundary(x)
         return x.float().clamp(-_FP8_MAX_VALUE, _FP8_MAX_VALUE)
