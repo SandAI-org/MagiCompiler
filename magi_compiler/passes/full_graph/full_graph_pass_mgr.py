@@ -15,6 +15,7 @@
 import torch
 
 from ...magi_depyf.timeline import observe_lifecycle
+from .fold_python_scalar_constants import FoldPythonScalarConstantsPass
 from .remove_item import RemoveItemPass
 from .remove_useless_ops import EliminateIdentityViewCastPass
 from .replace_sage_atten import ReplaceSageAttentionPass
@@ -31,6 +32,7 @@ class FullGraphPassManager:
         if self.pass_config.enable_sage_attn:
             self.passes.append(ReplaceSageAttentionPass())
         self.passes.append(RemoveItemPass())
+        self.passes.append(FoldPythonScalarConstantsPass())
         self.passes.append(EliminateIdentityViewCastPass())
 
     @observe_lifecycle("full_graph_manager")
