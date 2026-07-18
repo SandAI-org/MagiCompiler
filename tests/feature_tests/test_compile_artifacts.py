@@ -297,9 +297,8 @@ class TestGraphPicklerPatchUtils:
         assert desc_cleared.base is not None
         assert desc_cleared.base.fake_mode is fake_mode  # still the live object!
 
-    def test_view_tensor_old_reducer_fails(self):
-        """Reproduce: serializing view tensor with FakeTensorMode→None
-        breaks deserialization with AssertionError."""
+    def test_view_tensor_reducer_restores_session_fake_mode(self):
+        """PyTorch 2.12 restores view tensors into the session FakeTensorMode."""
         from unittest.mock import patch
 
         from torch._subclasses import FakeTensorMode
@@ -319,11 +318,12 @@ class TestGraphPicklerPatchUtils:
         with patch.object(GraphPickler, "reducer_override", bad_reducer):
             data = GraphPickler.dumps(ft_view, Options(ops_filter=None))
 
-        # Deserialization fails because base.fake_mode=None → fast path fails
         env2 = ShapeEnv()
         fm2 = FakeTensorMode(shape_env=env2)
-        with pytest.raises(AssertionError):
-            GraphPickler.loads(data, fm2)
+        ft_loaded = GraphPickler.loads(data, fm2)
+
+        assert ft_loaded.fake_mode is fm2
+        assert ft_loaded.shape == ft_view.shape
 
     def test_view_tensor_fixed_reducer_succeeds(self):
         """The fix: FakeTensorMode → _restore_fake_mode(unpickle_state)

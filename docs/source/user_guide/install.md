@@ -7,7 +7,7 @@
 ## Requirements
 
 - Python >= 3.12
-- PyTorch >= 2.9
+- PyTorch 2.12.x
 - CUDA Toolkit
 
 :::{tip}

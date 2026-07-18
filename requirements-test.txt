@@ -1,6 +1,9 @@
 # Test-only dependencies (not required for magi_compiler itself)
 diffusers==0.32.2
 fairscale
+ninja
+pytest
 timm==1.0.15
 torchtitan==0.2.0
+torchvision==0.27.1
 transformers==4.48.3

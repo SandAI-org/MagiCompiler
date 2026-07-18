@@ -26,6 +26,8 @@ from torch._dynamo.utils import counters
 
 from tests.model_definition import TransformerConfig, create_transformer_model_with_initial_params
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Inductor cache reuse")
+
 
 @dataclass(frozen=True)
 class CounterDelta:
@@ -39,7 +41,7 @@ class CounterDelta:
 
 # NOTE: may be different on different machines, and this config is suitable for CI machine
 EXPECTED = {
-    "train": CounterDelta(autograd_hit=31, autograd_miss=1, inductor_hit=0, inductor_miss=0),
+    "train": CounterDelta(autograd_hit=31, autograd_miss=2, inductor_hit=0, inductor_miss=0),
     "eval": CounterDelta(autograd_hit=31, autograd_miss=1, inductor_hit=0, inductor_miss=0),
 }
 

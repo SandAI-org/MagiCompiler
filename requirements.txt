@@ -1,8 +1,7 @@
 # System dependencies (install manually):
 #   sudo apt update && sudo apt install graphviz
-cuda-python
 depyf
 graphviz
 pydantic-settings
 seaborn
-triton==3.5.0
+triton==3.7.1

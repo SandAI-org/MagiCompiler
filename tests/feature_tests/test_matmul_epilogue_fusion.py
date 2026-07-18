@@ -47,19 +47,23 @@ from magi_compiler.config import get_compile_config
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
+_HAS_CUTLASS = get_compile_config().has_cutlass
+
 _SM120_ONLY = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 12,
-    reason="CUTLASS EVT path targets sm_120 (Blackwell consumer)",
+    not torch.cuda.is_available() or not _HAS_CUTLASS or torch.cuda.get_device_capability()[0] < 12,
+    reason="CUTLASS EVT path requires CUTLASS and targets sm_120 (Blackwell consumer)",
 )
 
 _SM90_ONLY = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0), reason="SM90 EVT path targets Hopper (H100)"
+    not torch.cuda.is_available() or not _HAS_CUTLASS or torch.cuda.get_device_capability() != (9, 0),
+    reason="SM90 EVT path requires CUTLASS and targets Hopper (H100)",
 )
 
 _EVT_CAPABLE = pytest.mark.skipif(
     not torch.cuda.is_available()
+    or not _HAS_CUTLASS
     or (torch.cuda.get_device_capability() != (9, 0) and torch.cuda.get_device_capability()[0] < 12),
-    reason="EVT path targets sm_90 (Hopper) or sm_120+ (Blackwell)",
+    reason="CUTLASS EVT path requires CUTLASS and targets sm_90 (Hopper) or sm_120+ (Blackwell)",
 )
 
 
