@@ -114,16 +114,16 @@ def _make_inputs(seq_len: int, modality_sizes: list[int], device: str):
     return x, modality_mapping
 
 
-def test_unbacked_symbol_guard_error():
-    """The original view(k.shape[0], NUM_HEADS, -1) MUST raise GuardOnDataDependentSymNode."""
+def test_unbacked_symbol_guard_legacy_view_compiles_on_torch_212():
+    """PyTorch 2.12 compiles the original view(k.shape[0], NUM_HEADS, -1)."""
     torch._dynamo.reset()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = BuggyModel().to(device)
     compiled = torch.compile(model, dynamic=True, fullgraph=False)
 
     x, mm = _make_inputs(150, [100, 30, 20], device)
-    with pytest.raises(torch._inductor.exc.InductorError, match="GuardOnDataDependentSymNode"):
-        compiled(x, mm)
+    out = compiled(x, mm)
+    assert out.shape == ()
 
 
 def test_unbacked_symbol_guard_fixed():

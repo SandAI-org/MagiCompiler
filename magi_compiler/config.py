@@ -87,7 +87,7 @@ class PassConfig(BaseModel):
             "Triton ND-tiling workaround (prefer_nd_tiling + max_tiles=3 + tile_reductions) "
             "for Inductor's coalesce tiling bailing out under dynamic shapes. "
             "True (default): register the pass and let its internal heuristics decide whether to "
-            "apply (currently: torch < 2.11.0 AND dynamic shapes AND conv-heavy). "
+            "apply under dynamic shapes and conv-heavy graphs. "
             "False: do not register the pass at all. "
             "Env var: MAGI_COMPILE_PASS_CONFIG__ENABLE_ND_TILING_WORKAROUND (1/0/true/false)."
         ),

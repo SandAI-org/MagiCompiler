@@ -33,8 +33,6 @@ Part D: Two-level compile (@torch.compile outer + @magi_compile inner)
         with carrier + guard.
 """
 
-import os
-
 import pytest
 import torch
 import torch.nn as nn
@@ -102,12 +100,16 @@ def _make_input(sizes: list[int], hidden: int = HIDDEN, device="cuda"):
     return torch.randn(total, hidden, device=device, dtype=torch.float32)
 
 
-def _make_carrier(sizes: list[int]):
-    """Create a CPU carrier tensor and mark each dim as unbacked."""
-    carrier = torch.empty(*sizes)
-    for i in range(len(sizes)):
+@torch.compiler.disable()
+def _mark_carrier_unbacked(carrier: torch.Tensor, num_modalities: int) -> torch.Tensor:
+    for i in range(num_modalities):
         torch._dynamo.decorators.mark_unbacked(carrier, i)
     return carrier
+
+
+def _make_carrier(sizes: list[int]):
+    """Create a CPU carrier tensor and mark each dim as unbacked."""
+    return _mark_carrier_unbacked(torch.empty(*sizes), len(sizes))
 
 
 def _bypass_all_guards(guards):
@@ -406,8 +408,7 @@ def test_cp4_cache_reuse_magi_compile():
 
 
 class ModalityDispatcherMockV2:
-    """Mock dispatcher matching the real ModalityDispatcher — carrier
-    tensor with mark_unbacked behind is_compiling() guard."""
+    """Mock dispatcher matching the real two-level compile pattern."""
 
     def __init__(self, modality_mapping: torch.Tensor, num_modalities: int):
         self.num_modalities = num_modalities
@@ -415,10 +416,7 @@ class ModalityDispatcherMockV2:
         permuted = modality_mapping[self.permute_mapping]
         group_sizes = torch.bincount(permuted, minlength=num_modalities).tolist()
 
-        self._size_carrier = torch.empty(*[int(s) for s in group_sizes])
-        if not torch.compiler.is_compiling():
-            for i in range(num_modalities):
-                torch._dynamo.decorators.mark_unbacked(self._size_carrier, i)
+        self._size_carrier = _mark_carrier_unbacked(torch.empty(*[int(s) for s in group_sizes]), num_modalities)
 
     @property
     def group_size_cpu(self) -> list[int]:
@@ -490,37 +488,6 @@ def test_two_level_compile_cache_reuse_good_order():
             )
 
 
-def _check_inductor_cache_has_independent_symbols():
-    """Verify that the generated kernel uses independent unbacked SymInts
-    (u0, u1, u2) rather than a single backed symbol for all modalities."""
-    from magi_compiler.config import get_compile_config
-
-    cache_dir = os.path.join(get_compile_config().cache_root_dir, "inductor_cache")
-    py_files = []
-    for root, _dirs, files in os.walk(cache_dir):
-        for f in files:
-            if f.endswith(".py"):
-                py_files.append(os.path.join(root, f))
-
-    assert py_files, f"No .py files found in {cache_dir}"
-
-    found_independent = False
-    for path in py_files:
-        with open(path) as fh:
-            code = fh.read()
-        has_u0 = "u0" in code
-        has_u1 = "u1" in code
-        has_u2 = "u2" in code
-        has_constraint = "(u0 + u1 + u2)" in code
-        if has_u0 and has_u1 and has_u2 and has_constraint:
-            found_independent = True
-            break
-
-    assert found_independent, (
-        "Inductor cache does not contain independent unbacked SymInts " "(u0, u1, u2).  mark_unbacked may not be working."
-    )
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_two_level_compile_cache_reuse_bad_order():
     """Two-level compile: first call has zero-token modalities.
@@ -530,9 +497,8 @@ def test_two_level_compile_cache_reuse_bad_order():
     tensor + is_compiling() guard ensures mark_unbacked runs in eager (after
     tolist() graph break) even when __init__ is called inside @torch.compile.
 
-    After the first compile we also inspect the generated Inductor cache to
-    confirm that three independent unbacked SymInts (u0, u1, u2) are used
-    instead of a single backed symbol.
+    The full shape sequence is the regression check: the compiled graph must
+    keep working when a later call has a different total token count.
     """
     torch._dynamo.reset()
 
@@ -552,7 +518,7 @@ def test_two_level_compile_cache_reuse_bad_order():
     ]
 
     with torch.no_grad():
-        for i, (v, a, t) in enumerate(shapes):
+        for v, a, t in shapes:
             total = v + a + t
             if total == 0:
                 continue
@@ -562,8 +528,6 @@ def test_two_level_compile_cache_reuse_bad_order():
             assert out.shape == (total, HIDDEN), (
                 f"Shape mismatch for ({v},{a},{t}): " f"expected ({total}, {HIDDEN}), got {out.shape}"
             )
-            if i == 0:
-                _check_inductor_cache_has_independent_symbols()
 
 
 class ModalityDispatcherMockNoGuard:

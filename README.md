@@ -9,7 +9,7 @@
   <a href="https://github.com/SandAI-org/MagiCompiler/releases"><img alt="license" src="https://img.shields.io/badge/Release-v1.0.0-blue"></a>
   <a href="https://github.com/SandAI-org/MagiCompiler/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green" alt="License"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-%3E%3D3.12-blue?logo=python" alt="Python"></a>
-  <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-%3E%3D2.9-orange?logo=pytorch" alt="PyTorch"></a>
+  <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.12.x-orange?logo=pytorch" alt="PyTorch"></a>
 </p>
 
 <p align="center">
@@ -77,7 +77,7 @@ Meet **magi_depyf**, MagiCompiler’s native introspection toolkit. Compilation 
 
 **Requirements:**
 - Python >= 3.12
-- PyTorch >= 2.9
+- PyTorch 2.12.x
 - CUDA Toolkit
 
 > **Recommended for reproducibility:** start from the prebuilt Docker image first, then run examples inside the container.
