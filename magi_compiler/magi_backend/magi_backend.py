@@ -132,7 +132,9 @@ class CompilerManager:
         self._remaining_restart_skips = {}
 
         if self.cache_file_path.exists():
+            # load the cache from the file
             with self.cache_file_path.open() as f:
+                # Parse Python literals using ast.literal_eval, which is a safe alternative to eval().
                 raw = ast.literal_eval(f.read())
                 for entry, handle in raw.items():
                     cache_entry = CacheEntry(*entry)

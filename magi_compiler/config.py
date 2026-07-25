@@ -384,20 +384,37 @@ class CompileConfig(BaseSettings):
         return self.__str__(indent=indent)
 
 
-def model_rank_dir_name(model_idx: int, model_tag: str | None) -> str:
-    """Directory name for a model instance: ``model_{idx}[_{tag}]_rank_{rank}_ws{world_size}``.
+def _get_parallel_topology() -> str:
+    """Return a compact topology string for compile-cache keying.
 
-    world_size is included because runtime model behavior (e.g. MoE EP head
-    padding, tensor strides in custom-op meta functions) can differ across
-    world sizes.  Without it, switching between e.g. EP=6 and EP=8 would
-    silently reuse stale compiled artifacts and trigger stride-mismatch
-    assertions at runtime.
+    Delegates to PSM.topology_key() which encodes all leaf parallel dimensions
+    (tp, cp, ep, dp, pp, etc.) -- different topologies produce different tensor
+    strides in custom-op meta functions and must not share cached artifacts.
+    """
+    if not torch.distributed.is_initialized():
+        return "ws1"
+    try:
+        from athena.distributed import psm
+
+        if psm.is_initialized():
+            return psm.topology_key()
+    except (ImportError, AttributeError, RuntimeError):
+        pass
+    return f"ws{torch.distributed.get_world_size()}"
+
+
+def model_rank_dir_name(model_idx: int, model_tag: str | None) -> str:
+    """Directory name: ``model_{idx}[_{tag}]_rank_{rank}_{topology}``.
+
+    Topology encodes all parallel dimension sizes via PSM.topology_key().
+    Different topologies produce different tensor strides in custom-op meta
+    functions; without isolation, stale artifacts trigger stride-mismatch assertions.
     """
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+    topo = _get_parallel_topology()
     if model_tag:
-        return f"model_{model_idx}_{model_tag}_rank_{rank}_ws{world_size}"
-    return f"model_{model_idx}_rank_{rank}_ws{world_size}"
+        return f"model_{model_idx}_{model_tag}_rank_{rank}_{topo}"
+    return f"model_{model_idx}_rank_{rank}_{topo}"
 
 
 def debug_dump_path(cache_root_dir: str, model_idx: int, model_tag: str | None = None) -> Path:
