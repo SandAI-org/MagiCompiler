@@ -129,7 +129,6 @@ class CompilerManager:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         magi_logger.info("Using cache directory: %s for MagiCompiler", cache_dir)
         self.cache = {}
-        self._remaining_restart_skips = {}
 
         if self.cache_file_path.exists():
             # load the cache from the file
@@ -140,6 +139,10 @@ class CompilerManager:
                     cache_entry = CacheEntry(*entry)
                     cache_handle = CacheHandle(*handle)
                     self.cache[cache_entry] = cache_handle
+        else:
+            # No persisted cache on disk -- clear any ghost restart-skip state
+            # left by a prior (incomplete) compilation in the same process.
+            self._remaining_restart_skips = {}
 
         self.compiler.initialize_cache(cache_dir=self.cache_dir)
 
