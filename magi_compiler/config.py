@@ -387,19 +387,19 @@ class CompileConfig(BaseSettings):
 def _get_parallel_topology() -> str:
     """Return a compact topology string for compile-cache keying.
 
-    Delegates to PSM.topology_key() which encodes all leaf parallel dimensions
-    (tp, cp, ep, dp, pp, etc.) -- different topologies produce different tensor
-    strides in custom-op meta functions and must not share cached artifacts.
+    Different parallel topologies produce different tensor strides in custom-op
+    meta functions and must not share cached artifacts.
+
+    Resolution order:
+    1. ``MAGI_COMPILE_TOPOLOGY_KEY`` env var (set by the host framework, e.g. athena)
+    2. ``ws{world_size}`` when torch.distributed is initialized
+    3. ``ws1`` (single-process default)
     """
+    topo = os.environ.get("MAGI_COMPILE_TOPOLOGY_KEY")
+    if topo:
+        return topo
     if not torch.distributed.is_initialized():
         return "ws1"
-    try:
-        from athena.distributed import psm
-
-        if psm.is_initialized():
-            return psm.topology_key()
-    except (ImportError, AttributeError, RuntimeError):
-        pass
     return f"ws{torch.distributed.get_world_size()}"
 
 

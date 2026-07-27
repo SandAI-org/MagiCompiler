@@ -65,14 +65,27 @@ class TestTopologyCacheIsolation:
             topo = _get_parallel_topology()
         assert topo == "ws1"
 
-    def test_dist_without_psm_uses_world_size(self):
-        """With dist but no PSM, falls back to ws{world_size}."""
+    def test_dist_without_env_uses_world_size(self):
+        """With dist but no MAGI_COMPILE_TOPOLOGY_KEY, falls back to ws{world_size}."""
         p1, p2, p3 = _patch_dist(is_init=True, rank=0, world_size=8)
-        with p1, p2, p3, patch.dict("sys.modules", {"athena": None, "athena.distributed": None}):
+        with p1, p2, p3, patch.dict("os.environ", {}, clear=False):
+            # Ensure env var is NOT set
+            import os
+
+            os.environ.pop("MAGI_COMPILE_TOPOLOGY_KEY", None)
             topo = _get_parallel_topology()
             name = model_rank_dir_name(0, None)
         assert topo == "ws8"
         assert "ws8" in name
+
+    def test_env_var_takes_priority(self):
+        """MAGI_COMPILE_TOPOLOGY_KEY env var overrides all other resolution."""
+        p1, p2, p3 = _patch_dist(is_init=True, rank=0, world_size=8)
+        with p1, p2, p3, patch.dict("os.environ", {"MAGI_COMPILE_TOPOLOGY_KEY": "ep6_cp2_dp1"}):
+            topo = _get_parallel_topology()
+            name = model_rank_dir_name(0, None)
+        assert topo == "ep6_cp2_dp1"
+        assert "ep6_cp2_dp1" in name
 
     def test_same_topology_same_path(self):
         p1, p2, p3 = _patch_dist(is_init=False)
