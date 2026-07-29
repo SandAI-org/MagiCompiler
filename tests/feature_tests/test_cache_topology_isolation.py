@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 import torch
 
-from magi_compiler._api import get_attr_name_for_state
+from magi_compiler._api import get_attr_name_for_state, get_attr_name_for_wrapper_installed_flag
 from magi_compiler.config import _get_parallel_topology, magi_cache_dump_path, model_rank_dir_name
 
 
@@ -169,3 +169,23 @@ class TestCompileStateIsolation:
                     probe.forward(torch.zeros(2))
 
         assert reached == ["_magi_state_for_forward__cp4_dp2"], reached
+
+    def test_the_class_decorator_still_patches_every_instance(self):
+        """A mark on the class must not answer for an instance.
+
+        magi_compile on a class marks the class and patches each instance from __init__.
+        Reading that inherited mark to decide whether an instance was patched made every
+        instance skip it: forward stayed the class's own and ran eagerly, and no state was
+        ever attached -- which is invisible except as timings that match eager.
+        """
+        from magi_compiler import magi_compile
+
+        @magi_compile(dynamic_arg_dims={"x": 0})
+        class Block(torch.nn.Module):
+            def forward(self, x):
+                return x
+
+        block = Block()
+
+        assert getattr(Block, get_attr_name_for_wrapper_installed_flag(), False), "the class went unmarked"
+        assert "forward" in vars(block), "the instance kept the class's forward, so nothing was compiled"

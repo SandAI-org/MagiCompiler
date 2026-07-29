@@ -76,6 +76,17 @@ def get_attr_name_for_wrapper_installed_flag() -> str:
     return "_magi_wrapper_installed"
 
 
+def get_attr_name_for_bound_wrapper_flag(entry_name: str) -> str:
+    """Name the marker saying *entry_name* has already been patched on this instance.
+
+    Deliberately not the class-level flag: the class decorator sets that one and then
+    patches each new instance from __init__, and an instance inherits it, so reading it
+    here would skip the patching it is supposed to guard. Per method, so an instance can
+    carry more than one entry point.
+    """
+    return f"_magi_wrapper_installed_for_{entry_name}"
+
+
 def get_attr_name_for_state(entry_name: str) -> str:
     """Name the attribute holding an entry point's compile state, one per topology.
 
@@ -224,7 +235,8 @@ def _magi_compile_bound_method(
     if not callable(getattr(instance, method_name, None)):
         raise AttributeError(f"{instance.__class__.__name__} instance has no callable method '{method_name}'")
 
-    if getattr(instance, get_attr_name_for_wrapper_installed_flag(), False):
+    installed_attr = get_attr_name_for_bound_wrapper_flag(method_name)
+    if getattr(instance, installed_attr, False):
         return instance
 
     old_method = getattr(instance, method_name)
@@ -250,7 +262,7 @@ def _magi_compile_bound_method(
         return _run_orchestration(state, args, kwargs)
 
     setattr(instance, method_name, new_call)
-    setattr(instance, get_attr_name_for_wrapper_installed_flag(), True)
+    setattr(instance, installed_attr, True)
     return instance
 
 
