@@ -3,16 +3,24 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-"""Verify that different parallel topologies produce isolated cache directories,
-preventing EP/CP cross-contamination of compiled artifacts."""
+"""Verify that different parallel topologies stay isolated, on disk and in memory.
+
+Compiled artifacts have the ProcessGroup they traced with baked in, so a runtime that
+changes CP/DP between calls -- adaptive DP reacting to queue depth -- must not reuse one
+topology's artifacts under another. Two things have to be keyed by topology for that:
+the cache directory, and the compile state held on the instance.
+"""
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
+from magi_compiler._api import get_attr_name_for_state
 from magi_compiler.config import _get_parallel_topology, magi_cache_dump_path, model_rank_dir_name
 
 
@@ -94,3 +102,70 @@ class TestTopologyCacheIsolation:
                 name1 = model_rank_dir_name(0, None)
                 name2 = model_rank_dir_name(0, None)
         assert name1 == name2
+
+
+class TestCompileStateIsolation:
+    """The compile state on an instance is the in-memory counterpart of the cache dir.
+
+    It owns the bytecode and AOT artifacts that the fast paths in _run_orchestration replay
+    directly, without going through dynamo's guards -- so if two topologies share one state,
+    the second silently runs the first one's graph, on the first one's process group.
+    """
+
+    def test_a_shared_state_is_what_lets_one_graph_serve_two_topologies(self):
+        """The failure mode: with the key pinned, both topologies land on one attribute."""
+        with patch.dict(os.environ, {"MAGI_COMPILE_TOPOLOGY_KEY": "pinned"}):
+            under_cp8 = get_attr_name_for_state("forward")
+            under_cp4 = get_attr_name_for_state("forward")
+        assert under_cp8 == under_cp4
+
+    def test_each_topology_gets_its_own_state(self):
+        with patch.dict(os.environ, {"MAGI_COMPILE_TOPOLOGY_KEY": "cp8_dp1"}):
+            under_cp8 = get_attr_name_for_state("forward")
+        with patch.dict(os.environ, {"MAGI_COMPILE_TOPOLOGY_KEY": "cp4_dp2"}):
+            under_cp4 = get_attr_name_for_state("forward")
+        assert under_cp8 != under_cp4
+        assert "cp8_dp1" in under_cp8 and "cp4_dp2" in under_cp4
+
+    def test_a_single_fixed_topology_keeps_the_plain_name(self):
+        """No key means no adaptive runtime, and the attribute must not change shape."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MAGI_COMPILE_TOPOLOGY_KEY", None)
+            assert get_attr_name_for_state("forward") == "_magi_state_for_forward"
+
+    def test_the_topology_at_call_time_decides_not_the_one_at_wrap_time(self):
+        """The regression this guards.
+
+        The attribute used to be resolved once while wrapping the instance, so a model built
+        under cp=8 kept reaching for the cp=8 state no matter what the runtime switched to
+        afterwards -- which made keying by topology inert.
+        """
+        from magi_compiler._api import _magi_compile_bound_method
+
+        reached = []
+
+        def fake_init(holder, target, dims, conf, tag, method, state_attr):
+            reached.append(state_attr)
+            setattr(
+                holder,
+                state_attr,
+                SimpleNamespace(
+                    compile_config=SimpleNamespace(offload_config=SimpleNamespace(model_cpu_offload=False)),
+                    jit_compiled_code=None,
+                ),
+            )
+
+        class Probe(torch.nn.Module):
+            def forward(self, x):
+                return x
+
+        probe = Probe()
+        with patch.dict(os.environ, {"MAGI_COMPILE_TOPOLOGY_KEY": "cp8_dp1"}):
+            _magi_compile_bound_method(probe, {"x": 0}, SimpleNamespace(), "probe", method_name="forward")
+
+        with patch.dict(os.environ, {"MAGI_COMPILE_TOPOLOGY_KEY": "cp4_dp2"}):
+            with patch("magi_compiler._api._lazy_init_magi_state", side_effect=fake_init):
+                with patch("magi_compiler._api._run_orchestration", return_value=None):
+                    probe.forward(torch.zeros(2))
+
+        assert reached == ["_magi_state_for_forward__cp4_dp2"], reached
