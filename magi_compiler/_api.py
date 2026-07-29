@@ -77,7 +77,22 @@ def get_attr_name_for_wrapper_installed_flag() -> str:
 
 
 def get_attr_name_for_state(entry_name: str) -> str:
-    return f"_magi_state_for_{entry_name}"
+    """Name the attribute holding an entry point's compile state, one per topology.
+
+    The state owns the captured bytecode and AOT artifacts that _run_orchestration's fast
+    paths replay directly, without going through dynamo's guards. Those artifacts have the
+    ProcessGroup they traced with baked in, because a ProcessGroup is not something dynamo
+    can turn into a graph input. So a runtime that changes CP/DP between calls -- what
+    adaptive DP does between requests -- needs one state per topology; a shared one would
+    replay the first topology's graph under every later one. Keyed this way each topology
+    compiles once and is reused whenever the runtime returns to it.
+
+    MAGI_COMPILE_TOPOLOGY_KEY is set by the runtime on every mesh change; empty means a
+    single fixed topology, i.e. the plain name.
+    """
+    topology = os.environ.get("MAGI_COMPILE_TOPOLOGY_KEY", "")
+    suffix = f"__{topology}" if topology else ""
+    return f"_magi_state_for_{entry_name}{suffix}"
 
 
 def _run_orchestration(state: MagiCompileState, args, kwargs):
@@ -209,14 +224,17 @@ def _magi_compile_bound_method(
     if not callable(getattr(instance, method_name, None)):
         raise AttributeError(f"{instance.__class__.__name__} instance has no callable method '{method_name}'")
 
-    state_attr = get_attr_name_for_state(method_name)
-    if getattr(instance, state_attr, None) is not None:
+    if getattr(instance, get_attr_name_for_wrapper_installed_flag(), False):
         return instance
 
     old_method = getattr(instance, method_name)
 
     @torch.compiler.disable()
     def new_call(*args, **kwargs):
+        # Per call, not per wrap: the name carries the topology, and adaptive DP changes
+        # topology between calls. Binding it at construction pinned every later call to
+        # the topology that happened to be live back then.
+        state_attr = get_attr_name_for_state(method_name)
         state = getattr(instance, state_attr, None)
         if state is None:
             _lazy_init_magi_state(instance, instance, dynamic_arg_dims, conf, model_tag, method_name, state_attr)
@@ -238,13 +256,13 @@ def _magi_compile_bound_method(
 
 def _magi_compile_function(func: Callable, dynamic_arg_dims: dict[str, int | list[int]], conf: CompileConfig, model_tag: str):
     """Wrap a function entry with compiled routing."""
-    state_attr = get_attr_name_for_state("function")
-    if getattr(func, state_attr, None) is not None:
+    if getattr(func, get_attr_name_for_wrapper_installed_flag(), False):
         return func
 
     @torch.compiler.disable()
     @functools.wraps(func)  # for the original function name and docstring
     def wrapper(*args, **kwargs):
+        state_attr = get_attr_name_for_state("function")  # per call: see _magi_compile_bound_method
         state = getattr(wrapper, state_attr, None)
         if state is None:
             _lazy_init_magi_state(wrapper, func, dynamic_arg_dims, conf, model_tag, None, state_attr)
@@ -255,6 +273,7 @@ def _magi_compile_function(func: Callable, dynamic_arg_dims: dict[str, int | lis
 
         return _run_orchestration(state, args, kwargs)
 
+    setattr(wrapper, get_attr_name_for_wrapper_installed_flag(), True)
     return wrapper
 
 
