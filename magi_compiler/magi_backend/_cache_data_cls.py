@@ -27,3 +27,9 @@ class CacheEntry:
     runtime_shape: int | None
     graph_index: int
     backend_name: str
+    # A digest of the sizes dynamo turned into constants for this trace. runtime_shape
+    # alone does not identify an artifact: it is None for every dynamically compiled
+    # graph, while the dimensions nobody marked dynamic are baked in and differ between
+    # traces. Without this, a graph traced for one input size is silently handed to
+    # another and fails inside the kernel on a stride assertion.
+    static_sizes: str = ""

@@ -16,7 +16,7 @@ import ast
 import dataclasses
 import pprint
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -73,6 +73,21 @@ def make_compiler(compile_config: CompileConfig) -> CompilerInterface:
         assert compile_config.backend == "eager", f"Invalid backend for MagiCompiler: {compile_config.backend}"
         magi_logger.info("Using EagerAdaptor")
         return EagerAdaptor()
+
+
+def _static_sizes_digest(example_inputs: Iterable[Any]) -> str:
+    """The sizes this trace was specialised on.
+
+    A dimension marked dynamic arrives as a SymInt and the artifact generalises over it.
+    Every other dimension is a plain int that is now a constant in the graph, so two
+    traces that differ only in those ints are different programs.
+    """
+    sizes = [
+        (i, tuple(d for d in x.shape if isinstance(d, int)))
+        for i, x in enumerate(example_inputs)
+        if isinstance(x, torch.Tensor)
+    ]
+    return compute_hash([sizes])[:10]
 
 
 class CompilerManager:
@@ -151,7 +166,7 @@ class CompilerManager:
             return
         # serialize to a literal-friendly dict
         serializable = {
-            (e.runtime_shape, e.graph_index, e.backend_name): (h.key, h.path, h.restart_analysis_count)
+            (e.runtime_shape, e.graph_index, e.backend_name, e.static_sizes): (h.key, h.path, h.restart_analysis_count)
             for e, h in self.cache.items()
         }
         printer = pprint.PrettyPrinter(indent=4)
@@ -209,13 +224,14 @@ class CompilerManager:
             compilation_start_time = time.time()
 
         # Step1: Try loading from the cache
-        cache_entry = CacheEntry(runtime_shape, graph_index, self.compiler.name)
+        static_sizes = _static_sizes_digest(example_inputs)
+        cache_entry = CacheEntry(runtime_shape, graph_index, self.compiler.name, static_sizes)
         compiled_graph = self.load(graph, example_inputs, cache_entry)
         if compiled_graph is not None:
             return compiled_graph
 
         # Step2: Compile the graph
-        key = f"artifact_shape_{runtime_shape}_subgraph_{graph_index}"
+        key = f"artifact_shape_{runtime_shape}_static_{static_sizes}_subgraph_{graph_index}"
 
         with self.compile_context(runtime_shape, graph_index):
             compiled_graph, cache_handle = self.compiler.compile(
