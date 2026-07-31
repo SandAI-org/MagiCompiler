@@ -83,7 +83,12 @@ def test_static_concrete_dims_are_ints():
     assert _static((4, 8, 16)) == (4, 8, 16)
 
 
-def test_static_symbolic_dim_stringified():
+def test_static_symbolic_dim_keyed_by_hint():
+    """Symbolic dims key by their (rank-identical) size hint, NOT the symbol
+    name: dynamo numbers symbols per rank (s82 vs s74 for the same dim), and
+    symbol-name keys broke warm_and_sync's cross-rank key-set match on any
+    dynamic graph -> analytical-cost fallback -> exposed all-gathers."""
+
     class _FakeSym:
         # mimic a SymInt: _is_symbolic() returns True for objects with a `.node`
         node = object()
@@ -92,7 +97,17 @@ def test_static_symbolic_dim_stringified():
             return "s7"
 
     out = _static((_FakeSym(), 8))
-    assert out == ("s7", 8)  # symbolic -> str, static -> int (no specializing int())
+    # no live V.graph here -> _concrete_size falls back to 1; the shape of the
+    # key is what matters: ("~", <hint>) marks the dim dynamic, static dims stay
+    # plain ints (never int()'d from a SymInt, which would add a guard).
+    assert out == (("~", 1), 8)
+
+    # two differently-named symbols with the same hint must produce equal keys
+    class _FakeSym2(_FakeSym):
+        def __str__(self):
+            return "s99"
+
+    assert _static((_FakeSym2(), 8)) == out
 
 
 # ---------------------------------------------------------------------------

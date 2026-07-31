@@ -70,6 +70,37 @@ def test_reorder_multi_rank():
     assert "REORDER_PASS" in p.stdout, out[-3000:]
 
 
+def test_fingerprint_canonicalizes_shape_symbols():
+    """Dynamic-shape symbol NAMES are per-rank numbering noise (rank0 may print
+    ``s27 + s82`` where rank1 prints ``s27 + s74`` for the same graph): the
+    fingerprint must canonicalize them by first appearance, while still
+    distinguishing genuinely different symbolic structure."""
+    from magi_compiler.passes.fsdp_overlap.reorder import _graph_fingerprint
+
+    class _FakeIR:
+        def __init__(self, size_repr):
+            self.op_overload = "fake.op"
+            self._size = size_repr
+            self.origins = None
+
+        def get_size(self):
+            return self._size
+
+    class _FakeSnode:
+        snodes = None
+
+        def __init__(self, size_repr):
+            self.node = _FakeIR(size_repr)
+
+    rank0 = [_FakeSnode("[s27 + s82, 6, 64]"), _FakeSnode("[1, s27 + s82, 2, 64]")]
+    rank1 = [_FakeSnode("[s27 + s74, 6, 64]"), _FakeSnode("[1, s27 + s74, 2, 64]")]
+    assert _graph_fingerprint(rank0) == _graph_fingerprint(rank1)
+
+    # Different symbolic STRUCTURE (second node uses a fresh symbol) must differ.
+    other = [_FakeSnode("[s27 + s82, 6, 64]"), _FakeSnode("[1, s99, 2, 64]")]
+    assert _graph_fingerprint(rank0) != _graph_fingerprint(other)
+
+
 @requires_cuda
 @requires_torchrun
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires >=2 GPUs")

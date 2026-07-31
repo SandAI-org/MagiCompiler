@@ -135,11 +135,18 @@ def _is_symbolic(s) -> bool:
 def _static(shape) -> tuple:
     """Cache-key shape.  MUST NOT call ``int()`` on a SymInt -- that adds an
     ``Eq(sym, value)`` guard and specializes the dynamic dim, breaking dynamic
-    shape compilation.  Symbolic dims are stringified (stable within a compile)."""
+    shape compilation.
+
+    Symbolic dims are keyed by their size hint (guard-free, see
+    ``_concrete_size``), tagged "~".  Not by ``str(s)``: dynamo names shape
+    symbols differently per rank, so symbol-name keys broke
+    ``warm_and_sync``'s cross-rank check and silently fell back to the
+    inaccurate analytical estimate.  Hints are rank-identical and stable
+    within a compile, so isomorphic kernels share one measurement."""
     out = []
     for s in shape:
         if _is_symbolic(s):
-            out.append(str(s))
+            out.append(("~", _concrete_size(s)))
         else:
             out.append(int(s))
     return tuple(out)

@@ -37,6 +37,7 @@ Handles both lowering forms: plain all_gather (1 launch / 1 wait) and coalesced
 """
 
 import hashlib
+import re
 from collections import defaultdict
 
 import torch
@@ -80,13 +81,27 @@ def _is_multi_output(snode: BaseSchedulerNode) -> bool:
     return type(node) is MultiOutput
 
 
+_SHAPE_SYM_RE = re.compile(r"\bs\d+\b")
+
+
 def _graph_fingerprint(order: list[BaseSchedulerNode]) -> str:
     """Rank-comparable digest of the snode sequence: type + op identity + output
     sizes + sorted origin fx TARGETS.  Origins are required -- a fused pointwise
     kernel is one ComputedBuffer whose class/size hide its contents (relu vs
     relu+sin look identical without them).  Targets only, not node names: names
-    carry per-rank numbering noise."""
+    carry per-rank numbering noise.
+
+    Dynamic-shape symbols in the sizes are canonicalized by first-appearance
+    order for the same reason: dynamo numbers them per rank (e.g. a traced CP
+    all_to_all output prints ``s27 + s82`` on rank 0 but ``s27 + s74`` on rank
+    1 for structurally identical graphs), so raw symbol names would flag
+    isomorphic graphs as divergent and needlessly disable the overlap."""
     h = hashlib.sha256()
+    sym_canon: dict[str, str] = {}
+
+    def _canon_syms(size_repr: str) -> str:
+        return _SHAPE_SYM_RE.sub(lambda m: sym_canon.setdefault(m.group(0), f"sym{len(sym_canon)}"), size_repr)
+
     for s in order:
         h.update(type(s).__name__.encode())
         for sub in getattr(s, "snodes", None) or (s,):
@@ -96,7 +111,7 @@ def _graph_fingerprint(order: list[BaseSchedulerNode]) -> str:
             op = getattr(n, "op_overload", None) or getattr(n, "python_kernel_name", None) or type(n).__name__
             h.update(str(op).encode())
             try:
-                h.update(repr(n.get_size()).encode())
+                h.update(_canon_syms(repr(n.get_size())).encode())
             except Exception:  # noqa: BLE001
                 pass
             origins = getattr(n, "origins", None)
