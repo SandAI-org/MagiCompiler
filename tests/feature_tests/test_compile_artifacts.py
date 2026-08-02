@@ -748,7 +748,7 @@ class TestAOTIntegration:
         nodes[1].meta["example_value"] = ft_mul
         nodes[2].meta["example_value"] = ft_add
 
-        fn = MagiSerializableFunction(gm, [ft], "test_basic", lambda *a: None)
+        fn = MagiSerializableFunction(gm, "test_basic", lambda *a: None)
         data = MagiSerializableFunction.serialize_compile_artifacts(fn)
         assert isinstance(data, bytes) and len(data) > 0
 
@@ -800,7 +800,7 @@ class TestAOTIntegration:
         nodes[0].meta["example_value"] = ft
         nodes[1].meta["example_value"] = ft_out
 
-        fn = MagiSerializableFunction(gm, [ft], "test_einops", lambda *a: None)
+        fn = MagiSerializableFunction(gm, "test_einops", lambda *a: None)
         data = MagiSerializableFunction.serialize_compile_artifacts(fn)
         assert isinstance(data, bytes) and len(data) > 0
 
@@ -846,7 +846,7 @@ class TestAOTIntegration:
 
         list(gm.graph.nodes)[0].meta["example_value"] = ft
 
-        fn = MagiSerializableFunction(gm, [ft], "test_triton", lambda *a: None)
+        fn = MagiSerializableFunction(gm, "test_triton", lambda *a: None)
         data = MagiSerializableFunction.serialize_compile_artifacts(fn)
         assert isinstance(data, bytes) and len(data) > 0
 
@@ -890,7 +890,7 @@ class TestAOTIntegration:
         nodes[1].meta["example_value"] = 5
         nodes[2].meta["example_value"] = ft_sliced
 
-        fn = MagiSerializableFunction(gm, [ft, None], "test_slice", lambda *a: None)
+        fn = MagiSerializableFunction(gm, "test_slice", lambda *a: None)
         data = MagiSerializableFunction.serialize_compile_artifacts(fn)
         assert isinstance(data, bytes) and len(data) > 0
 

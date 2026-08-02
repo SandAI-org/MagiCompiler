@@ -711,7 +711,6 @@ class MagiBackend:
 
         return MagiSerializableFunction(
             graph,
-            example_inputs,
             self.model_tag,
             runnable_gm,
             model_idx=self.model_idx,

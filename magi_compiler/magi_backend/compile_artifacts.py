@@ -24,7 +24,6 @@ from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import torch
-from torch.utils._pytree import tree_map_only
 
 from magi_compiler.utils import magi_logger
 
@@ -48,13 +47,18 @@ class MagiSerializableFunction(SerializableCallable):
     disk. There's no need to wrap around the compiled function if we don't want
     to serialize them in particular cases.
     Right now serialization for the custom backend is done via
-    serializing the Dynamo fx graph plus example inputs.
+    serializing the Dynamo fx graph; compile inputs are re-derived from the
+    graph placeholders' ``example_value`` metadata on rebuild.
+
+    Deliberately does NOT hold the example inputs dynamo hands the backend:
+    those are the REAL first-call input tensors, and this object lives in the
+    dynamo code cache for the process lifetime, so storing them would pin the
+    whole first-call input set (multi-GB of activations for a large region).
     """
 
     def __init__(
         self,
         graph_module,
-        example_inputs,
         model_tag,
         optimized_call,
         model_idx: int = 0,
@@ -63,7 +67,6 @@ class MagiSerializableFunction(SerializableCallable):
     ):
         assert isinstance(graph_module, torch.fx.GraphModule)
         self.graph_module = graph_module
-        self.example_inputs = example_inputs
         self.model_idx = model_idx
         self.model_tag = model_tag
         self.traced_files = traced_files or []
@@ -92,14 +95,12 @@ class MagiSerializableFunction(SerializableCallable):
         patched_op_pickle = GraphNodeOpPatchUtils.make_patch_for_pickle()
 
         # Pickle under all patches
-        state["example_inputs"] = tree_map_only(torch.Tensor, lambda _: None, state["example_inputs"])
         with (
             patch.object(GraphPickler, "reducer_override", patched_reducer),
             patch.object(_NodePickleData, "__init__", patched_node_init),
             patch.object(_OpPickleData, "pickle", patched_op_pickle),
         ):
             state["graph_module"] = GraphPickler.dumps(state["graph_module"], Options(ops_filter=None))
-            state["example_inputs"] = GraphPickler.dumps(state["example_inputs"])
 
         return pickle.dumps(state)
 
@@ -125,16 +126,16 @@ class MagiSerializableFunction(SerializableCallable):
 
         state = pickle.loads(data)
 
-        # Backward compat: pop triton_kernel_info from old serialized artifacts.
+        # Backward compat: pop keys that old serialized artifacts carried.
         state.pop("triton_kernel_info", None)
+        state.pop("example_inputs", None)  # discarded unread; rebuild uses placeholder metadata
 
         fake_mode = FakeTensorMode(shape_env=ShapeEnv())
 
-        # Unpickle graph & inputs under node-level patches
+        # Unpickle the graph under node-level patches
         patched_unpickle = GraphNodePicklePatchUtils.make_patch_for_unpickle()
         with patch.object(_NodePickleData, "unpickle", patched_unpickle):
             state["graph_module"] = GraphPickler.loads(state["graph_module"], fake_mode)
-            state["example_inputs"] = GraphPickler.loads(state["example_inputs"], fake_mode)
 
         # Reconstruct CompileConfig from the serialized artifact (self-contained).
         compile_config_data = state.get("compile_config")
@@ -164,11 +165,17 @@ class MagiSerializableFunction(SerializableCallable):
         from magi_compiler.magi_backend import MagiBackend
         from magi_compiler.utils import OrderedSet
 
-        # Fill None placeholders in example_inputs with FakeTensors from graph metadata.
-        placeholder_fake_values = [
-            node.meta.get("example_value") for node in self.graph_module.graph.nodes if node.op == "placeholder"
-        ]
-        compile_inputs = [inp if inp is not None else placeholder_fake_values[i] for i, inp in enumerate(self.example_inputs)]
+        # Compile inputs come entirely from the graph placeholders' metadata:
+        # FakeTensors for tensor inputs, SymInts/scalars for the rest. Missing
+        # metadata would silently miscompile downstream, so fail loudly instead.
+        placeholders = [node for node in self.graph_module.graph.nodes if node.op == "placeholder"]
+        compile_inputs = [node.meta.get("example_value") for node in placeholders]
+        missing = [node.name for node, val in zip(placeholders, compile_inputs) if val is None]
+        if missing:
+            raise RuntimeError(
+                f"AOT rebuild: {len(missing)} graph placeholder(s) lack example_value metadata "
+                f"(e.g. {missing[:5]}); cannot reconstruct compile inputs for model_tag={self.model_tag}"
+            )
 
         fake_mode = detect_fake_mode(compile_inputs)
         magi_backend = MagiBackend(
