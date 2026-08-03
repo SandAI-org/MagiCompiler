@@ -83,31 +83,66 @@ def test_static_concrete_dims_are_ints():
     assert _static((4, 8, 16)) == (4, 8, 16)
 
 
+class _FakeSym:
+    """Mimics a torch.SymInt: ``_is_symbolic()`` keys on having a ``.node``."""
+
+    node = object()
+
+    def __init__(self, name="s7", hint=None):
+        self._name = name
+        self.hint = hint
+
+    def __str__(self):
+        return self._name
+
+
 def test_static_symbolic_dim_keyed_by_hint():
-    """Symbolic dims key by their (rank-identical) size hint, NOT the symbol
-    name: dynamo numbers symbols per rank (s82 vs s74 for the same dim), and
-    symbol-name keys broke warm_and_sync's cross-rank key-set match on any
-    dynamic graph -> analytical-cost fallback -> exposed all-gathers."""
+    """The PRODUCTION path (live V.graph): symbolic dims key by their
+    rank-identical size hint, NOT the symbol name -- dynamo numbers symbols
+    per rank (s82 vs s74 for the same dim), and symbol-name keys broke
+    warm_and_sync's cross-rank key-set match on any dynamic graph ->
+    analytical-cost fallback -> exposed all-gathers.
 
-    class _FakeSym:
-        # mimic a SymInt: _is_symbolic() returns True for objects with a `.node`
-        node = object()
+    Two symbols sharing a hint sharing one table entry is exact, not
+    approximate: ``_measure_extern`` realizes replay inputs at these same
+    hints (``_realize_arg`` -> ``_concrete_size``), so the measured ns is a
+    pure function of (op, dtype, hint shape) -- re-measuring under a separate
+    key would produce the same value."""
+    from torch._inductor.virtualized import V
 
-        def __str__(self):
-            return "s7"
+    class _FakeSizevars:
+        def size_hint(self, sym, fallback=0):
+            return sym.hint
 
-    out = _static((_FakeSym(), 8))
-    # no live V.graph here -> _concrete_size falls back to 1; the shape of the
-    # key is what matters: ("~", <hint>) marks the dim dynamic, static dims stay
-    # plain ints (never int()'d from a SymInt, which would add a guard).
+    class _FakeGraph:
+        sizevars = _FakeSizevars()
+
+    with V.set_graph_handler(_FakeGraph()):
+        seq, tok = _FakeSym("s27", hint=4096), _FakeSym("s82", hint=2048)
+        seq_other_rank = _FakeSym("s74", hint=4096)  # same dim, renamed by rank 1
+
+        # hint reaches the key (not the fallback), tagged "~" for dynamic
+        assert _static((seq, 3072)) == (("~", 4096), 3072)
+        # different hints -> different keys: no false sharing across dims
+        assert _static((seq, 3072)) != _static((tok, 3072))
+        # same hint, different symbol NAME -> same key (the fix's purpose)
+        assert _static((seq, 3072)) == _static((seq_other_rank, 3072))
+        # a dynamic dim never collides with a static dim of the same value
+        assert _static((seq,)) != _static((4096,))
+
+
+def test_static_symbolic_dim_fallback_without_graph():
+    """DEGRADED path only (no live V.graph, e.g. bare unit tests):
+    ``_concrete_size`` falls back to 1 for every symbolic dim.  In production
+    ``_structural_key`` always runs inside Inductor scheduling where V.graph
+    is set, so this collapse never happens there -- and if it somehow did, the
+    measurement itself realizes inputs through the same fallback, so keys and
+    values degrade together."""
+    out = _static((_FakeSym("s7"), 8))
+    # the key SHAPE is what matters: ("~", <hint>) marks the dim dynamic,
+    # static dims stay plain ints (never int()'d from a SymInt -> no guard)
     assert out == (("~", 1), 8)
-
-    # two differently-named symbols with the same hint must produce equal keys
-    class _FakeSym2(_FakeSym):
-        def __str__(self):
-            return "s99"
-
-    assert _static((_FakeSym2(), 8)) == out
+    assert _static((_FakeSym("s99"), 8)) == out
 
 
 # ---------------------------------------------------------------------------

@@ -70,35 +70,78 @@ def test_reorder_multi_rank():
     assert "REORDER_PASS" in p.stdout, out[-3000:]
 
 
+class _FakeIR:
+    """Sizes are REAL sympy expressions, as ``node.get_size()`` returns: the
+    canonicalization must survive sympy's StrPrinter, which orders commutative
+    terms by symbol NAME -- a hand-written repr string would bypass exactly the
+    layer the bug lives in."""
+
+    def __init__(self, size):
+        self.op_overload = "fake.op"
+        self._size = size
+        self.origins = None
+
+    def get_size(self):
+        return self._size
+
+
+class _FakeSnode:
+    snodes = None
+
+    def __init__(self, size):
+        self.node = _FakeIR(size)
+
+
+def _graph(*sizes):
+    """Build a fake snode list; each size is a list of sympy exprs / ints."""
+    return [_FakeSnode(size) for size in sizes]
+
+
 def test_fingerprint_canonicalizes_shape_symbols():
-    """Dynamic-shape symbol NAMES are per-rank numbering noise (rank0 may print
-    ``s27 + s82`` where rank1 prints ``s27 + s74`` for the same graph): the
-    fingerprint must canonicalize them by first appearance, while still
-    distinguishing genuinely different symbolic structure."""
+    """Dynamic-shape symbol NAMES are per-rank numbering noise (the same
+    logical dim is s82 on rank 0 and s74 on rank 1 for the same graph): the
+    fingerprint must be invariant under symbol renaming, while still
+    distinguishing genuinely different symbolic structure.
+
+    Modeled like the real wan graph: the local-seq symbol first appears alone
+    in a placeholder-like dim, then the CP all_to_all output sums it with the
+    fresh cross-rank symbol, then downstream nodes use the fresh symbol alone.
+    """
+    import sympy
+
     from magi_compiler.passes.fsdp_overlap.reorder import _graph_fingerprint
 
-    class _FakeIR:
-        def __init__(self, size_repr):
-            self.op_overload = "fake.op"
-            self._size = size_repr
-            self.origins = None
+    def syms(*names):
+        return [sympy.Symbol(n, positive=True, integer=True) for n in names]
 
-        def get_size(self):
-            return self._size
-
-    class _FakeSnode:
-        snodes = None
-
-        def __init__(self, size_repr):
-            self.node = _FakeIR(size_repr)
-
-    rank0 = [_FakeSnode("[s27 + s82, 6, 64]"), _FakeSnode("[1, s27 + s82, 2, 64]")]
-    rank1 = [_FakeSnode("[s27 + s74, 6, 64]"), _FakeSnode("[1, s27 + s74, 2, 64]")]
+    # Same digit count (the case the string-level rename happened to handle).
+    (a0, b0), (a1, b1) = syms("s27", "s82"), syms("s27", "s74")
+    rank0 = _graph([a0, 3072], [a0 + b0, 6, 64], [b0, 64])
+    rank1 = _graph([a1, 3072], [a1 + b1, 6, 64], [b1, 64])
     assert _graph_fingerprint(rank0) == _graph_fingerprint(rank1)
 
-    # Different symbolic STRUCTURE (second node uses a fresh symbol) must differ.
-    other = [_FakeSnode("[s27 + s82, 6, 64]"), _FakeSnode("[1, s99, 2, 64]")]
-    assert _graph_fingerprint(rank0) != _graph_fingerprint(other)
+    # Digit-count crossing: sympy prints ``s27 + s174`` as ``s174 + s27``
+    # (StrPrinter sorts terms by name), so any rename applied AFTER printing
+    # sees a different first-appearance order and diverges.
+    (a2, b2) = syms("s27", "s174")
+    rank2 = _graph([a2, 3072], [a2 + b2, 6, 64], [b2, 64])
+    assert _graph_fingerprint(rank0) == _graph_fingerprint(rank2)
+
+    # Same digit count but flipped relative order: fresh symbol sorts BEFORE
+    # the shared one on one rank (s34 < s50) and AFTER it on the other.
+    (a3, b3), (a4, b4) = syms("s50", "s82"), syms("s50", "s34")
+    rank3 = _graph([a3, 3072], [a3 + b3, 6, 64], [b3, 64])
+    rank4 = _graph([a4, 3072], [a4 + b4, 6, 64], [b4, 64])
+    assert _graph_fingerprint(rank3) == _graph_fingerprint(rank4)
+
+    # Genuinely different LINKAGE must still differ: downstream node reuses the
+    # local-seq symbol instead of the cross-rank one.
+    linked_other = _graph([a0, 3072], [a0 + b0, 6, 64], [a0, 64])
+    assert _graph_fingerprint(rank0) != _graph_fingerprint(linked_other)
+
+    # Genuinely different EXPRESSION structure must differ: 2*s vs s + s'.
+    doubled = _graph([a0, 3072], [2 * a0, 6, 64], [b0, 64])
+    assert _graph_fingerprint(rank0) != _graph_fingerprint(doubled)
 
 
 @requires_cuda

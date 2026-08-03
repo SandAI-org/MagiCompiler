@@ -37,7 +37,6 @@ Handles both lowering forms: plain all_gather (1 launch / 1 wait) and coalesced
 """
 
 import hashlib
-import re
 from collections import defaultdict
 
 import torch
@@ -81,7 +80,15 @@ def _is_multi_output(snode: BaseSchedulerNode) -> bool:
     return type(node) is MultiOutput
 
 
-_SHAPE_SYM_RE = re.compile(r"\bs\d+\b")
+def _size_hint_of(sym) -> int:
+    """Rank-identical size hint for a sympy symbol (0 if unavailable, e.g. in
+    unit tests without a live Inductor graph)."""
+    try:
+        from torch._inductor.virtualized import V
+
+        return int(V.graph.sizevars.size_hint(sym, fallback=0))
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def _graph_fingerprint(order: list[BaseSchedulerNode]) -> str:
@@ -91,16 +98,27 @@ def _graph_fingerprint(order: list[BaseSchedulerNode]) -> str:
     relu+sin look identical without them).  Targets only, not node names: names
     carry per-rank numbering noise.
 
-    Dynamic-shape symbols in the sizes are canonicalized by first-appearance
-    order for the same reason: dynamo numbers them per rank (e.g. a traced CP
-    all_to_all output prints ``s27 + s82`` on rank 0 but ``s27 + s74`` on rank
-    1 for structurally identical graphs), so raw symbol names would flag
-    isomorphic graphs as divergent and needlessly disable the overlap."""
-    h = hashlib.sha256()
-    sym_canon: dict[str, str] = {}
+    """
+    import sympy
 
-    def _canon_syms(size_repr: str) -> str:
-        return _SHAPE_SYM_RE.sub(lambda m: sym_canon.setdefault(m.group(0), f"sym{len(sym_canon)}"), size_repr)
+    h = hashlib.sha256()
+    sym_canon: dict = {}  # sympy.Symbol -> canonical sympy.Symbol
+
+    def _canon_size(size) -> str:
+        dims = []
+        for d in size:
+            free = getattr(d, "free_symbols", None)
+            if not free:
+                dims.append(repr(d))
+                continue
+            fresh = [sym for sym in free if sym not in sym_canon]
+            # Name-free assignment order; symbol name only as the last-resort
+            # tie-break (see docstring: that case fails safe).
+            fresh.sort(key=lambda sym: (_size_hint_of(sym), d.count(sym), sym.name))
+            for sym in fresh:
+                sym_canon[sym] = sympy.Symbol(f"c{len(sym_canon):04d}")
+            dims.append(repr(d.xreplace(sym_canon)))
+        return "[" + ", ".join(dims) + "]"
 
     for s in order:
         h.update(type(s).__name__.encode())
@@ -111,7 +129,7 @@ def _graph_fingerprint(order: list[BaseSchedulerNode]) -> str:
             op = getattr(n, "op_overload", None) or getattr(n, "python_kernel_name", None) or type(n).__name__
             h.update(str(op).encode())
             try:
-                h.update(_canon_syms(repr(n.get_size())).encode())
+                h.update(_canon_size(n.get_size()).encode())
             except Exception:  # noqa: BLE001
                 pass
             origins = getattr(n, "origins", None)
