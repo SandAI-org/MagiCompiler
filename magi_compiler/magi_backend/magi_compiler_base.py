@@ -184,22 +184,25 @@ class MagiCompileState:
 
         magi_logger.info("AOT cache hit: loading compiled artifacts from %s", aot_path)
 
-        with open(aot_path, "rb") as f:
-            data = f.read()
+        from magi_compiler.magi_backend._aot_compat import load_aot_artifacts
 
-        from torch._dynamo.aot_compile import AOTCompiledFunction
-
-        self.aot_compiled_fn = AOTCompiledFunction.deserialize(data, f_globals=self._aot_f_globals())
+        self.aot_compiled_fn = load_aot_artifacts(aot_path, f_globals=self._aot_f_globals())
         magi_logger.info("AOT cache loaded successfully from %s", aot_path)
         return True
 
     @observe_lifecycle("aot_artifact_save")
     def save_aot_compile_artifacts(self) -> None:
         """Save the AOT-compiled function and source checksum to disk."""
+        from magi_compiler.magi_backend._aot_compat import save_aot_artifacts
+
         aot_path = self.aot_compilation_path
 
         assert self.aot_compiled_fn is not None
-        self.aot_compiled_fn.save_compiled_function(aot_path)
+        save_aot_artifacts(
+            self.aot_compiled_fn,
+            aot_path,
+            aot_compile_artifacts=getattr(self, "aot_compile_artifacts", None),
+        )
         _save_source_checksum(self.aot_compilation_path, self.traced_files)
         magi_logger.info("AOT path: artifacts saved to %s", aot_path)
 
@@ -235,6 +238,10 @@ class MagiCompileState:
         for attempt in range(self._AOT_MAX_RETRIES):
             try:
                 self.aot_compiled_fn = self.compiled_entry.aot_compile((args, kwargs))
+                from magi_compiler.magi_backend._aot_compat import extract_aot_artifacts_from_fn
+                artifacts = extract_aot_artifacts_from_fn(self.aot_compiled_fn)
+                if artifacts is not None:
+                    self.aot_compile_artifacts = artifacts
                 return
             except TensorifyScalarRestartAnalysis:
                 if attempt >= self._AOT_MAX_RETRIES - 1:

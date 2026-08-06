@@ -27,6 +27,11 @@ import torch
 import torch.fx as fx
 from torch.utils._pytree import tree_map_only
 
+import torch
+
+_TORCH_VERSION = tuple(int(x) for x in torch.__version__.split(".")[:2])
+_IS_TORCH_212 = _TORCH_VERSION >= (2, 12)
+
 from magi_compiler.magi_backend.compile_artifacts import (
     GraphNodeOpPatchUtils,
     GraphNodePicklePatchUtils,
@@ -297,6 +302,7 @@ class TestGraphPicklerPatchUtils:
         assert desc_cleared.base is not None
         assert desc_cleared.base.fake_mode is fake_mode  # still the live object!
 
+    @pytest.mark.skipif(not _IS_TORCH_212, reason="PyTorch 2.12 restores view tensors into session FakeTensorMode")
     def test_view_tensor_reducer_restores_session_fake_mode(self):
         """PyTorch 2.12 restores view tensors into the session FakeTensorMode."""
         from unittest.mock import patch
@@ -491,6 +497,7 @@ class TestGraphNodePicklePatchUtils:
         assert isinstance(data.target, _OpPickleData)
         assert hasattr(data.target, "unpickle")
 
+    @pytest.mark.skipif(_IS_TORCH_212, reason="PyTorch 2.12 handles unknown ops natively via _OpFunctionPickleData")
     def test_patched_init_with_einops_needs_patch_c(self):
         """Third-party functions like einops.rearrange need Patch C on _OpPickleData.pickle."""
         from unittest.mock import patch
@@ -589,6 +596,7 @@ class TestGraphNodeOpPatchUtils:
     and falls back to ``_OpImportablePickleData``.
     """
 
+    @pytest.mark.skipif(_IS_TORCH_212, reason="PyTorch 2.12 no longer raises NotImplementedError for unknown ops")
     def test_original_pickle_raises_for_unknown_op(self):
         """Reproduce: _OpPickleData.pickle raises for unknown third-party ops."""
         from torch.fx._graph_pickler import Options, _OpPickleData
@@ -598,6 +606,7 @@ class TestGraphNodeOpPatchUtils:
         with pytest.raises(NotImplementedError):
             _OpPickleData.pickle(einops.rearrange, Options(ops_filter=None))
 
+    @pytest.mark.skipif(_IS_TORCH_212, reason="PyTorch 2.12 handles unknown ops natively; no fallback needed")
     def test_patched_pickle_catches_error(self):
         """The fix: patched pickle falls back to _OpImportablePickleData."""
         from unittest.mock import patch

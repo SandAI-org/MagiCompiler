@@ -37,6 +37,11 @@ import pytest
 import torch
 import torch.nn as nn
 
+import torch as _torch
+
+_TORCH_VERSION = tuple(int(x) for x in _torch.__version__.split(".")[:2])
+_IS_TORCH_212 = _TORCH_VERSION >= (2, 12)
+
 from magi_compiler import magi_compile, magi_register_custom_op
 
 HIDDEN = 64
@@ -156,6 +161,7 @@ def _run_two_shapes(compiled, device="cuda"):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(not _IS_TORCH_212, reason="This test documents PyTorch 2.12 upstream behavior")
 def test_without_fix_passes_on_torch_212():
     """PyTorch 2.12 no longer emits stale deferred runtime asserts here."""
     compiled = _build_compiled_model()

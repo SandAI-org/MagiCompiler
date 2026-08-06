@@ -24,6 +24,10 @@ a dimension via -1 force Inductor to guard on expressions like
 pass
 
 import pytest
+import torch as _torch
+
+_TORCH_VERSION = tuple(int(x) for x in _torch.__version__.split(".")[:2])
+_IS_TORCH_212 = _TORCH_VERSION >= (2, 12)
 import torch
 import torch._dynamo.decorators
 
@@ -114,6 +118,7 @@ def _make_inputs(seq_len: int, modality_sizes: list[int], device: str):
     return x, modality_mapping
 
 
+@pytest.mark.skipif(not _IS_TORCH_212, reason="PyTorch 2.12 compiles legacy view without guard error")
 def test_unbacked_symbol_guard_legacy_view_compiles_on_torch_212():
     """PyTorch 2.12 compiles the original view(k.shape[0], NUM_HEADS, -1)."""
     torch._dynamo.reset()
