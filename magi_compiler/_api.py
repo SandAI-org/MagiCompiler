@@ -25,7 +25,7 @@ from torch import distributed as dist
 from torch import nn
 from torch._dynamo.symbolic_convert import InliningInstructionTranslator
 
-from magi_compiler.config import debug_dump_path, inductor_cache_dump_path
+from magi_compiler.config import debug_dump_path, inductor_cache_dump_path, triton_cache_dump_path
 from magi_compiler.cuda.cudart import pin_memory_in_place
 from magi_compiler.magi_backend.magi_compiler_base import MagiCompileState
 from magi_compiler.utils import compilation_counter, envs, magi_logger
@@ -441,6 +441,7 @@ def _compilation_context(state: MagiCompileState):
 
     _debug_dump_path = debug_dump_path(state.compile_config.cache_root_dir, state.model_idx, state.model_tag)
     _inductor_cache_dump_path = inductor_cache_dump_path(state.compile_config.cache_root_dir)
+    _triton_cache_dump_path = triton_cache_dump_path(state.compile_config.cache_root_dir)
 
     with (
         _isolated_dynamo_config(),
@@ -449,7 +450,13 @@ def _compilation_context(state: MagiCompileState):
         patch.object(torch._dynamo.config, "force_nn_module_property_static_shapes", False),
         patch.object(torch._dynamo.config, "enable_aot_compile", True),
         _hijack_inline_call_to_collect_traced_files(state),
-        patch.dict(os.environ, {"TORCHINDUCTOR_CACHE_DIR": (_inductor_cache_dump_path).as_posix()}),
+        patch.dict(
+            os.environ,
+            {
+                "TORCHINDUCTOR_CACHE_DIR": (_inductor_cache_dump_path).as_posix(),
+                "TRITON_CACHE_DIR": (_triton_cache_dump_path).as_posix(),
+            },
+        ),
         explain_compilation(_debug_dump_path.as_posix()),
     ):
         yield

@@ -428,6 +428,10 @@ def magi_cache_dump_path(cache_root_dir: str, model_idx: int, model_tag: str | N
     return Path(cache_root_dir) / "magi_cache" / model_rank_dir_name(model_idx, model_tag)
 
 
+def triton_cache_dump_path(cache_root_dir: str) -> Path:
+    return Path(cache_root_dir) / "triton_cache"
+
+
 def inductor_cache_dump_path(cache_root_dir: str, model_idx: int | None = None, model_tag: str | None = None) -> Path:
     return Path(cache_root_dir) / "inductor_cache"
 
