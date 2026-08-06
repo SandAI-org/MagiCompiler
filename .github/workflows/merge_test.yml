@@ -1,0 +1,36 @@
+name: Merge Test
+
+# Builds the image and runs ALL tests from the merged commit on both
+# PyTorch versions. If this fails, use GitHub's "Re-run" button to retry.
+on:
+    pull_request:
+        types: [closed]
+        branches:
+        -   main
+
+jobs:
+    merge-pt29:
+        if: ${{ github.event.pull_request.merged == true }}
+        name: PyTorch 2.9
+        uses: ./.github/workflows/_ci_pipeline.yml
+        with:
+            kind: main
+            workspace: /home/niubility2/cenzhiyao/ci/magi-compiler-workspaces/merge-${{ github.event.pull_request.number }}-pt29
+            head-sha: ${{ github.event.pull_request.merge_commit_sha }}
+            pr-number: ${{ github.event.pull_request.number }}
+            base-image: nvcr.io/nvidia/pytorch:25.10-py3
+            pytorch-label: pt29
+        secrets: inherit
+
+    merge-pt212:
+        if: ${{ github.event.pull_request.merged == true }}
+        name: PyTorch 2.12
+        uses: ./.github/workflows/_ci_pipeline.yml
+        with:
+            kind: main
+            workspace: /home/niubility2/cenzhiyao/ci/magi-compiler-workspaces/merge-${{ github.event.pull_request.number }}-pt212
+            head-sha: ${{ github.event.pull_request.merge_commit_sha }}
+            pr-number: ${{ github.event.pull_request.number }}
+            base-image: nvcr.io/nvidia/pytorch:26.05-py3
+            pytorch-label: pt212
+        secrets: inherit

@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1.7
-FROM nvcr.io/nvidia/pytorch:25.10-py3
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.10-py3
+FROM ${BASE_IMAGE}
 
 ARG FLASH_ATTENTION_COMMIT_ID="b613d9e2c8475945baff3fd68f2030af1b890acf"
 
@@ -131,7 +132,15 @@ RUN --mount=type=secret,id=http_proxy,required=false \
     rm -rf /var/lib/apt/lists/* && \
     apt-get clean
 
-COPY requirements.txt /app/
-RUN pip install -r /app/requirements.txt
+COPY requirements.txt requirements-test.txt /app/
+RUN grep -v "^triton" /app/requirements.txt > /tmp/requirements-notriton.txt && \
+    pip install -r /tmp/requirements-notriton.txt && \
+    rm -f /tmp/requirements-notriton.txt
 
+# Install MagiCompiler
+COPY . /app
 WORKDIR /app
+RUN pip install --no-build-isolation -e .
+
+# Install test dependencies (skip packages that would upgrade torch)
+RUN pip install --no-deps diffusers==0.32.2 fairscale ninja pytest timm==1.0.15 transformers==4.48.3 || true

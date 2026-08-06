@@ -1,0 +1,201 @@
+name: CI Pipeline (reusable)
+
+# Build & test MagiCompiler in an isolated container.
+# ``kind`` selects behavior:
+#   pr   -> pre-checks + tests
+#   main -> ALL tests unconditionally
+on:
+    workflow_call:
+        inputs:
+            kind:
+                description: '"pr" or "main".'
+                required: true
+                type: string
+            workspace:
+                description: Absolute per-run workspace path.
+                required: true
+                type: string
+            head-sha:
+                description: Commit to build.
+                required: true
+                type: string
+            base-sha:
+                description: Base commit (kind=pr only).
+                required: false
+                type: string
+                default: ''
+            pr-number:
+                description: PR number (used in image tag).
+                required: true
+                type: string
+            base-image:
+                description: PyTorch base image (e.g. nvcr.io/nvidia/pytorch:25.10-py3).
+                required: true
+                type: string
+            pytorch-label:
+                description: Short label for display (e.g. pt29, pt212).
+                required: true
+                type: string
+        outputs:
+            image_tag:
+                description: Image reference that was built.
+                value: ${{ jobs.build.outputs.image_tag }}
+        secrets:
+            HTTP_PROXY:
+                required: true
+            HTTPS_PROXY:
+                required: true
+            CCR_USERNAME:
+                required: true
+            CCR_PASSWORD:
+                required: true
+
+jobs:
+    build:
+        name: "Build (${{ inputs.pytorch-label }})"
+        runs-on: [self-hosted, magi_compiler_ci]
+        timeout-minutes: 60
+        outputs:
+            image_tag: ${{ steps.docker.outputs.image_tag }}
+        env:
+            http_proxy: ${{ secrets.HTTP_PROXY }}
+            https_proxy: ${{ secrets.HTTPS_PROXY }}
+            no_proxy: localhost,127.0.0.1,::1
+            CCR_REGISTRY: registry.cn-sh-01.sensecore.cn
+            CCR_REPO: registry.cn-sh-01.sensecore.cn/sandai-ccr/magi-compiler
+            GIT_HTTP_CONNECT_TIMEOUT: 10
+            GIT_HTTP_LOW_SPEED_LIMIT: 100
+            GIT_HTTP_LOW_SPEED_TIME: 10
+            PR_WORKSPACE: ${{ inputs.workspace }}
+        defaults:
+            run:
+                shell: bash
+                working-directory: ${{ inputs.workspace }}
+        steps:
+        -   name: Init workspace
+            working-directory: /tmp
+            run: |
+                mkdir -p "$PR_WORKSPACE"
+                docker run --rm -v "$PR_WORKSPACE":"$PR_WORKSPACE" -w "$PR_WORKSPACE" alpine:latest \
+                    sh -c "rm -rf ./* ./.[!.]* 2>/dev/null; true"
+                find "$(dirname "$PR_WORKSPACE")/" -maxdepth 1 \
+                    \( -name "pr-*" -o -name "merge-*" \) -mtime +30 -print -exec rm -rf {} + 2>/dev/null || true
+
+        -   name: Checkout source
+            id: checkout
+            timeout-minutes: 10
+            env:
+                REPO_URL: https://github.com/${{ github.repository }}.git
+                GITHUB_REPOSITORY: ${{ github.repository }}
+                GITHUB_TOKEN: ${{ github.token }}
+                BASE_SHA: ${{ inputs.base-sha }}
+                HEAD_SHA: ${{ inputs.head-sha }}
+            run: |
+                set -euo pipefail
+                git config --global http.proxy "${{ secrets.HTTP_PROXY }}"
+                git config --global https.proxy "${{ secrets.HTTPS_PROXY }}"
+                git config --global user.email "ci@sandai.org"
+                git config --global user.name "CI"
+
+                script_path=".github/scripts/checkout_pr.py"
+                api_url="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${script_path}?ref=${HEAD_SHA}"
+
+                mkdir -p .github/scripts
+                for attempt in $(seq 1 10); do
+                    if curl -fsSL \
+                        -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                        -H "Accept: application/vnd.github.raw" \
+                        "$api_url" -o "$script_path"; then
+                        break
+                    fi
+                    [ "$attempt" -eq 10 ] && { echo "failed to download checkout script" >&2; exit 1; }
+                    sleep 3
+                done
+
+                python3 "$script_path"
+
+        -   name: Pre-commit checks
+            if: ${{ inputs.kind == 'pr' }}
+            run: |
+                git config --global --add safe.directory "$PR_WORKSPACE"
+                pre-commit run --show-diff-on-failure --color=always --all-files
+
+        -   name: Check Chinese characters
+            if: ${{ inputs.kind == 'pr' }}
+            env:
+                BASE_REF: ${{ steps.checkout.outputs.base_ref || inputs.base-sha }}
+                HEAD_REF: ${{ steps.checkout.outputs.head_ref || inputs.head-sha }}
+            run: python3 .github/workflows/check_chinese_chars.py
+
+        -   name: "Build & push image (${{ inputs.pytorch-label }})"
+            id: docker
+            env:
+                CCR_USERNAME: ${{ secrets.CCR_USERNAME }}
+                CCR_PASSWORD: ${{ secrets.CCR_PASSWORD }}
+                HEAD_SHA: ${{ inputs.head-sha }}
+                PR_NUMBER: ${{ inputs.pr-number }}
+                BASE_IMAGE: ${{ inputs.base-image }}
+                PT_LABEL: ${{ inputs.pytorch-label }}
+            run: |
+                set -euo pipefail
+                SHORT_SHA="$(echo "${HEAD_SHA}" | cut -c1-7)"
+                IMAGE_TAG="magi-compiler-${PT_LABEL}-${PR_NUMBER}-${SHORT_SHA}"
+                PROXY_ARGS="--build-arg no_proxy=${no_proxy:-} --build-arg http_proxy=${http_proxy:-} --build-arg https_proxy=${https_proxy:-}"
+
+                echo "image_tag=${CCR_REPO}:${IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
+                echo "${CCR_PASSWORD}" | docker login "${CCR_REGISTRY}" -u "${CCR_USERNAME}" --password-stdin
+
+                DOCKER_BUILDKIT=1 docker build ${PROXY_ARGS} \
+                    --build-arg BASE_IMAGE="${BASE_IMAGE}" \
+                    -t "${CCR_REPO}:${IMAGE_TAG}" .
+                docker push "${CCR_REPO}:${IMAGE_TAG}"
+
+                echo "Pushed: ${CCR_REPO}:${IMAGE_TAG}"
+
+        -   name: Cleanup workspace
+            if: always()
+            working-directory: /tmp
+            run: |
+                [ -d "$PR_WORKSPACE" ] || exit 0
+                docker run --rm -v "$PR_WORKSPACE":"$PR_WORKSPACE" -w "$PR_WORKSPACE" alpine:latest \
+                    sh -c "rm -rf ./* ./.[!.]* 2>/dev/null; true"
+                rm -rf "$PR_WORKSPACE"
+
+    test:
+        name: "Test (${{ inputs.pytorch-label }})"
+        needs: build
+        runs-on: [self-hosted, magi_compiler_ci]
+        timeout-minutes: 40
+        container:
+            image: ${{ needs.build.outputs.image_tag }}
+            credentials:
+                username: ${{ secrets.CCR_USERNAME }}
+                password: ${{ secrets.CCR_PASSWORD }}
+            options: --gpus all --ipc=host
+        env:
+            http_proxy: ${{ secrets.HTTP_PROXY }}
+            https_proxy: ${{ secrets.HTTPS_PROXY }}
+            no_proxy: localhost,127.0.0.1,::1
+            PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+            PIP_TRUSTED_HOST: pypi.tuna.tsinghua.edu.cn
+        defaults:
+            run:
+                shell: bash
+                working-directory: /app
+        steps:
+        -   name: Check environment (torch & CUDA)
+            run: |
+                python3 -c "
+                import torch
+                print(f'PyTorch version: {torch.__version__}')
+                assert torch.cuda.is_available(), 'CUDA is not available on this runner'
+                print(f'CUDA version: {torch.version.cuda}')
+                print(f'GPU: {torch.cuda.get_device_name(0)}')
+                print(f'GPU count: {torch.cuda.device_count()}')
+
+                import magi_compiler
+                print(f'MagiCompiler: OK')
+                "
+
+        -   name: Run MagiCompiler Unit Tests
+            run: pytest -v tests/ --tb=short
