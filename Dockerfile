@@ -142,5 +142,14 @@ COPY . /app
 WORKDIR /app
 RUN pip install --no-build-isolation -e .
 
-# Install test dependencies (skip packages that would upgrade torch)
-RUN pip install --no-deps diffusers==0.32.2 fairscale ninja pytest timm==1.0.15 transformers==4.48.3 || true
+# Install test dependencies.
+# torchvision pins torch>=2.12 so we exclude it on 2.9 base images;
+# torchtitan is installed --no-deps to avoid pulling a newer torch.
+RUN grep -vE "^(torchvision|torchtitan)" /app/requirements-test.txt \
+        > /tmp/requirements-test-safe.txt && \
+    pip install -r /tmp/requirements-test-safe.txt && \
+    pip install --no-deps torchtitan==0.2.0 && \
+    rm -f /tmp/requirements-test-safe.txt && \
+    apt-get -qq update && \
+    DEBIAN_FRONTEND=noninteractive apt-get -qq install -y --no-install-recommends graphviz && \
+    rm -rf /var/lib/apt/lists/*

@@ -1,0 +1,14 @@
+.git
+.github
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+build/
+dist/
+.cache/
+*.nsys-rep
+*.ncu-rep
+magi_dump_src_dir/
+.pre-commit-config.yaml
+.pytest_cache
