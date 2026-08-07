@@ -12,12 +12,14 @@ ENV PIP_NO_CACHE_DIR=1 \
 
 WORKDIR /workspace
 
-# System packages + CUTLASS headers (EVT-fusion codegen needs the include path).
+# System packages.
 RUN apt-get -qq update && \
     DEBIAN_FRONTEND=noninteractive apt-get -qq install -y --no-install-recommends \
     ca-certificates git graphviz && \
-    rm -rf /var/lib/apt/lists/* && \
-    git clone --depth 1 https://github.com/NVIDIA/cutlass.git /usr/local/cutlass && \
+    rm -rf /var/lib/apt/lists/*
+
+# CUTLASS headers only (EVT-fusion codegen needs the include path).
+RUN git clone --depth 1 https://github.com/NVIDIA/cutlass.git /usr/local/cutlass && \
     cd /usr/local/cutlass && git fetch origin ${CUTLASS_COMMIT_ID} --depth 1 && \
     git checkout ${CUTLASS_COMMIT_ID}
 
