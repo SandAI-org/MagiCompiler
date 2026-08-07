@@ -2,6 +2,10 @@
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.10-py3
 FROM ${BASE_IMAGE}
 
+ARG no_proxy
+ARG http_proxy
+ARG https_proxy
+
 ARG FLASH_ATTENTION_COMMIT_ID="b613d9e2c8475945baff3fd68f2030af1b890acf"
 
 # CUTLASS — source is always cloned (the magi_compiler EVT-fusion path
@@ -29,11 +33,7 @@ ENV PIP_NO_CACHE_DIR=1 \
 
 WORKDIR /workspace
 
-RUN --mount=type=secret,id=http_proxy,required=false \
-    --mount=type=secret,id=https_proxy,required=false \
-    export http_proxy="$(cat /run/secrets/http_proxy 2>/dev/null || true)" && \
-    export https_proxy="$(cat /run/secrets/https_proxy 2>/dev/null || true)" && \
-    apt-get -qq update && \
+RUN apt-get -qq update && \
     DEBIAN_FRONTEND=noninteractive apt-get -qq install -y --no-install-recommends \
     ca-certificates \
     git \
@@ -45,11 +45,7 @@ RUN --mount=type=secret,id=http_proxy,required=false \
 
 RUN pip install --upgrade pip setuptools wheel ninja
 
-RUN --mount=type=secret,id=http_proxy,required=false \
-    --mount=type=secret,id=https_proxy,required=false \
-    export http_proxy="$(cat /run/secrets/http_proxy 2>/dev/null || true)" && \
-    export https_proxy="$(cat /run/secrets/https_proxy 2>/dev/null || true)" && \
-    mkdir -p /tmp/flash-attention && \
+RUN mkdir -p /tmp/flash-attention && \
     cd /tmp/flash-attention && \
     git init && \
     git remote add origin https://github.com/Dao-AILab/flash-attention.git && \
@@ -64,11 +60,7 @@ RUN --mount=type=secret,id=http_proxy,required=false \
     rm -rf /tmp/flash-attention
 
 
-RUN --mount=type=secret,id=http_proxy,required=false \
-    --mount=type=secret,id=https_proxy,required=false \
-    export http_proxy="$(cat /run/secrets/http_proxy 2>/dev/null || true)" && \
-    export https_proxy="$(cat /run/secrets/https_proxy 2>/dev/null || true)" && \
-    mkdir -p /usr/local/cutlass && \
+RUN mkdir -p /usr/local/cutlass && \
     cd /usr/local/cutlass && \
     git init -q && \
     git remote add origin https://github.com/NVIDIA/cutlass.git && \
@@ -122,11 +114,7 @@ RUN set -eu; \
     mkdir -p build && cd build && \
     cmake .. -DCUTLASS_NVCC_ARCHS="${NVCC_ARCHS}"
 
-RUN --mount=type=secret,id=http_proxy,required=false \
-    --mount=type=secret,id=https_proxy,required=false \
-    export http_proxy="$(cat /run/secrets/http_proxy 2>/dev/null || true)" && \
-    export https_proxy="$(cat /run/secrets/https_proxy 2>/dev/null || true)" && \
-    apt-get -qq update && \
+RUN apt-get -qq update && \
     DEBIAN_FRONTEND=noninteractive apt-get -qq install -y --no-install-recommends \
     ffmpeg && \
     rm -rf /var/lib/apt/lists/* && \
