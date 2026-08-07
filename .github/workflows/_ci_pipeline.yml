@@ -166,36 +166,47 @@ jobs:
         needs: build
         runs-on: [self-hosted, magi-compiler]
         timeout-minutes: 40
-        container:
-            image: ${{ needs.build.outputs.image_tag }}
-            credentials:
-                username: ${{ secrets.CCR_USERNAME }}
-                password: ${{ secrets.CCR_PASSWORD }}
-            options: --gpus all --ipc=host
         env:
-            http_proxy: ${{ secrets.HTTP_PROXY }}
-            https_proxy: ${{ secrets.HTTPS_PROXY }}
-            no_proxy: localhost,127.0.0.1,::1
-            PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
-            PIP_TRUSTED_HOST: pypi.tuna.tsinghua.edu.cn
-        defaults:
-            run:
-                shell: bash
-                working-directory: /app
+            IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+            CCR_REGISTRY: registry.cn-sh-01.sensecore.cn
         steps:
-        -   name: Check environment (torch & CUDA)
-            run: |
-                python3 -c "
-                import torch
-                print(f'PyTorch version: {torch.__version__}')
-                assert torch.cuda.is_available(), 'CUDA is not available on this runner'
-                print(f'CUDA version: {torch.version.cuda}')
-                print(f'GPU: {torch.cuda.get_device_name(0)}')
-                print(f'GPU count: {torch.cuda.device_count()}')
+        -   name: Login to registry
+            env:
+                CCR_USERNAME: ${{ secrets.CCR_USERNAME }}
+                CCR_PASSWORD: ${{ secrets.CCR_PASSWORD }}
+            run: echo "${CCR_PASSWORD}" | docker login "${CCR_REGISTRY}" -u "${CCR_USERNAME}" --password-stdin
 
-                import magi_compiler
-                print(f'MagiCompiler: OK')
+        -   name: Run tests in container
+            env:
+                http_proxy: ${{ secrets.HTTP_PROXY }}
+                https_proxy: ${{ secrets.HTTPS_PROXY }}
+            run: |
+                docker run --rm --gpus all --ipc=host --shm-size=4g \
+                    -e http_proxy="${http_proxy}" \
+                    -e https_proxy="${https_proxy}" \
+                    -e no_proxy="localhost,127.0.0.1,::1" \
+                    -e PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple" \
+                    -e PIP_TRUSTED_HOST="pypi.tuna.tsinghua.edu.cn" \
+                    "${IMAGE_TAG}" \
+                    bash -c '
+                        set -euo pipefail
+                        cd /app
+
+                        echo "=== Environment ==="
+                        python3 -c "
+                import torch
+                print(f'"'"'PyTorch: {torch.__version__}'"'"')
+                assert torch.cuda.is_available(), '"'"'CUDA not available'"'"'
+                print(f'"'"'CUDA: {torch.version.cuda}'"'"')
+                print(f'"'"'GPU: {torch.cuda.get_device_name(0)}'"'"')
+                print(f'"'"'GPUs: {torch.cuda.device_count()}'"'"')
+                import magi_compiler; print('"'"'MagiCompiler: OK'"'"')
                 "
 
-        -   name: Run MagiCompiler Unit Tests
-            run: pytest -v tests/ --tb=short
+                        echo "=== Running tests ==="
+                        pytest -v tests/ --tb=short
+                    '
+
+        -   name: Cleanup image
+            if: always()
+            run: docker rmi "${IMAGE_TAG}" 2>/dev/null || true
