@@ -29,6 +29,7 @@ import torch
 from magi_compiler.config import CompileConfig, model_rank_dir_name
 from magi_compiler.magi_backend.magi_backend import init_backend
 from magi_compiler.magi_depyf.timeline import emit_after_dynamo_bytecode_transform, observe_lifecycle
+from magi_compiler.magi_backend._aot_compat import extract_aot_artifacts_from_fn, load_aot_artifacts, save_aot_artifacts
 from magi_compiler.utils import OrderedSet, compute_code_hash, compute_hash, magi_logger
 
 
@@ -184,8 +185,6 @@ class MagiCompileState:
 
         magi_logger.info("AOT cache hit: loading compiled artifacts from %s", aot_path)
 
-        from magi_compiler.magi_backend._aot_compat import load_aot_artifacts
-
         self.aot_compiled_fn = load_aot_artifacts(aot_path, f_globals=self._aot_f_globals())
         magi_logger.info("AOT cache loaded successfully from %s", aot_path)
         return True
@@ -193,8 +192,6 @@ class MagiCompileState:
     @observe_lifecycle("aot_artifact_save")
     def save_aot_compile_artifacts(self) -> None:
         """Save the AOT-compiled function and source checksum to disk."""
-        from magi_compiler.magi_backend._aot_compat import save_aot_artifacts
-
         aot_path = self.aot_compilation_path
 
         assert self.aot_compiled_fn is not None
@@ -238,7 +235,6 @@ class MagiCompileState:
         for attempt in range(self._AOT_MAX_RETRIES):
             try:
                 self.aot_compiled_fn = self.compiled_entry.aot_compile((args, kwargs))
-                from magi_compiler.magi_backend._aot_compat import extract_aot_artifacts_from_fn
                 artifacts = extract_aot_artifacts_from_fn(self.aot_compiled_fn)
                 if artifacts is not None:
                     self.aot_compile_artifacts = artifacts
