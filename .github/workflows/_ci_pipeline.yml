@@ -171,11 +171,12 @@ jobs:
             credentials:
                 username: ${{ secrets.CCR_USERNAME }}
                 password: ${{ secrets.CCR_PASSWORD }}
-            options: --gpus all --ipc=host
+            options: --gpus all --ipc=host --shm-size=2g
         env:
             http_proxy: ${{ secrets.HTTP_PROXY }}
             https_proxy: ${{ secrets.HTTPS_PROXY }}
             no_proxy: localhost,127.0.0.1,::1
+            NCCL_NVLS_ENABLE: 0
             PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
             PIP_TRUSTED_HOST: pypi.tuna.tsinghua.edu.cn
         defaults:
@@ -183,6 +184,11 @@ jobs:
                 shell: bash
                 working-directory: /app
         steps:
+        -   name: Prepare environment
+            run: |
+                mkdir -p /tmp/torchinductor_root
+                echo "Cache dir ready"
+
         -   name: Check environment (torch & CUDA)
             run: |
                 python3 -c "
