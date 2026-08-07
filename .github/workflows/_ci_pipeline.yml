@@ -164,7 +164,7 @@ jobs:
     test:
         name: Test (${{ inputs.pytorch-label }})
         needs: build
-        runs-on: [self-hosted, athena-new]
+        runs-on: [self-hosted, magi-compiler]
         timeout-minutes: 40
         container:
             image: ${{ needs.build.outputs.image_tag }}
