@@ -52,9 +52,7 @@ def load_aot_artifacts(aot_path: str, f_globals: dict | None = None):
     if _HAS_AOT_COMPILED_FUNCTION:
         return _AOTCompiledFunction.deserialize(data, f_globals=f_globals)
 
-    assert _HAS_COMPILE_ARTIFACTS, (
-        "Neither AOTCompiledFunction (torch>=2.12) nor CompileArtifacts (torch<2.12) is available"
-    )
+    assert _HAS_COMPILE_ARTIFACTS, "Neither AOTCompiledFunction (torch>=2.12) nor CompileArtifacts (torch<2.12) is available"
     artifacts = _CompileArtifacts.deserialize(data)
     return artifacts.compiled_function()
 
@@ -69,9 +67,9 @@ def save_aot_artifacts(aot_compiled_fn, aot_path: str, aot_compile_artifacts=Non
         aot_compiled_fn.save_compiled_function(aot_path)
         return
 
-    assert _HAS_COMPILE_ARTIFACTS and aot_compile_artifacts is not None, (
-        "CompileArtifacts required for saving on PyTorch < 2.12"
-    )
+    assert (
+        _HAS_COMPILE_ARTIFACTS and aot_compile_artifacts is not None
+    ), "CompileArtifacts required for saving on PyTorch < 2.12"
     with open(aot_path, "wb") as f:
         f.write(_CompileArtifacts.serialize(aot_compile_artifacts))
 

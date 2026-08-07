@@ -27,9 +27,9 @@ from typing import Callable, Literal
 import torch
 
 from magi_compiler.config import CompileConfig, model_rank_dir_name
+from magi_compiler.magi_backend._aot_compat import extract_aot_artifacts_from_fn, load_aot_artifacts, save_aot_artifacts
 from magi_compiler.magi_backend.magi_backend import init_backend
 from magi_compiler.magi_depyf.timeline import emit_after_dynamo_bytecode_transform, observe_lifecycle
-from magi_compiler.magi_backend._aot_compat import extract_aot_artifacts_from_fn, load_aot_artifacts, save_aot_artifacts
 from magi_compiler.utils import OrderedSet, compute_code_hash, compute_hash, magi_logger
 
 
@@ -195,11 +195,7 @@ class MagiCompileState:
         aot_path = self.aot_compilation_path
 
         assert self.aot_compiled_fn is not None
-        save_aot_artifacts(
-            self.aot_compiled_fn,
-            aot_path,
-            aot_compile_artifacts=getattr(self, "aot_compile_artifacts", None),
-        )
+        save_aot_artifacts(self.aot_compiled_fn, aot_path, aot_compile_artifacts=getattr(self, "aot_compile_artifacts", None))
         _save_source_checksum(self.aot_compilation_path, self.traced_files)
         magi_logger.info("AOT path: artifacts saved to %s", aot_path)
 

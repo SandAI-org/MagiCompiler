@@ -52,7 +52,7 @@ on:
 
 jobs:
     build:
-        name: "Build (${{ inputs.pytorch-label }})"
+        name: Build (${{ inputs.pytorch-label }})
         runs-on: [self-hosted, magi-compiler]
         timeout-minutes: 60
         outputs:
@@ -127,7 +127,7 @@ jobs:
                 HEAD_REF: ${{ steps.checkout.outputs.head_ref || inputs.head-sha }}
             run: python3 .github/workflows/check_chinese_chars.py
 
-        -   name: "Build & push image (${{ inputs.pytorch-label }})"
+        -   name: Build & push image (${{ inputs.pytorch-label }})
             id: docker
             env:
                 CCR_USERNAME: ${{ secrets.CCR_USERNAME }}
@@ -162,7 +162,7 @@ jobs:
                 rm -rf "$PR_WORKSPACE"
 
     test:
-        name: "Test (${{ inputs.pytorch-label }})"
+        name: Test (${{ inputs.pytorch-label }})
         needs: build
         runs-on: [self-hosted, magi-compiler]
         timeout-minutes: 40

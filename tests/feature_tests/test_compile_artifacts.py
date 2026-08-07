@@ -27,8 +27,6 @@ import torch
 import torch.fx as fx
 from torch.utils._pytree import tree_map_only
 
-import torch
-
 _TORCH_VERSION = tuple(int(x) for x in torch.__version__.split(".")[:2])
 _IS_TORCH_212 = _TORCH_VERSION >= (2, 12)
 

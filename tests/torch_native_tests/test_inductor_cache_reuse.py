@@ -115,7 +115,7 @@ def _assert_delta(actual: CounterDelta, expected: CounterDelta):
 
 @pytest.mark.skip(
     reason="Expected autograd cache counters differ between PT 2.9 and 2.12, "
-           "and are affected by AOT compatibility changes; needs recalibration"
+    "and are affected by AOT compatibility changes; needs recalibration"
 )
 class TestTorchInductorCache:
     """Validate TorchInductor cache behavior in train/eval flows."""
