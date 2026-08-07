@@ -43,7 +43,7 @@ RUN apt-get -qq update && \
     rm -rf /var/lib/apt/lists/* && \
     apt-get clean
 
-RUN pip install --upgrade pip setuptools wheel ninja
+RUN pip install --upgrade pip "setuptools<82" wheel ninja
 
 RUN mkdir -p /tmp/flash-attention && \
     cd /tmp/flash-attention && \
