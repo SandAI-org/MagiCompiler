@@ -53,7 +53,7 @@ on:
 jobs:
     build:
         name: "Build (${{ inputs.pytorch-label }})"
-        runs-on: [self-hosted, magi_compiler_ci]
+        runs-on: [self-hosted, magi-compiler]
         timeout-minutes: 60
         outputs:
             image_tag: ${{ steps.docker.outputs.image_tag }}
@@ -164,7 +164,7 @@ jobs:
     test:
         name: "Test (${{ inputs.pytorch-label }})"
         needs: build
-        runs-on: [self-hosted, magi_compiler_ci]
+        runs-on: [self-hosted, magi-compiler]
         timeout-minutes: 40
         container:
             image: ${{ needs.build.outputs.image_tag }}
