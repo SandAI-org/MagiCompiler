@@ -30,6 +30,8 @@ from magi_compiler.profiling.runtime_estimator import ProfileEntry, _measure_ext
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
+_TORCH_VERSION = tuple(int(x) for x in torch.__version__.split(".")[:2])
+
 
 # ---------------------------------------------------------------------------
 # _realize_arg  -- fx args -> concrete replay inputs
@@ -470,6 +472,11 @@ _COLL_HELPER = Path(__file__).parent / "fsdp_overlap_helper" / "estimator_collec
 @requires_cuda
 @pytest.mark.skipif(shutil.which("torchrun") is None, reason="requires torchrun")
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires >=2 GPUs")
+@pytest.mark.skipif(
+    _TORCH_VERSION >= (2, 12),
+    reason="PT 2.12 Inductor generates different scheduler node counts across ranks, "
+    "causing cross-rank key-set mismatch and analytical fallback",
+)
 def test_collective_profile_accuracy_multi_rank():
     env = os.environ.copy()
     env["MAGI_LOGGING_LEVEL"] = "warning"
