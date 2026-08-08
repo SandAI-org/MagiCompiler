@@ -184,6 +184,9 @@ jobs:
                 shell: bash
                 working-directory: /app
         steps:
+        -   name: Prepare environment
+            run: mkdir -p /tmp/torchinductor_root
+
         -   name: Check environment (torch & CUDA)
             run: |
                 python3 -c "
