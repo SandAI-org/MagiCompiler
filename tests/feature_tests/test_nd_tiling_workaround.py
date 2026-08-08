@@ -32,14 +32,8 @@ import pytest
 import torch
 
 from magi_compiler.config import PassConfig
-from magi_compiler.passes.piecewise_graph.nd_tiling_workaround import (
-    ND_TilingWorkaroundPass,
-)
-from tests.feature_tests.conftest import (
-    build_graph_module,
-    dynamic_tensor,
-    static_tensor,
-)
+from magi_compiler.passes.piecewise_graph.nd_tiling_workaround import ND_TilingWorkaroundPass
+from tests.feature_tests.conftest import build_graph_module, dynamic_tensor, static_tensor
 
 
 @pytest.fixture(autouse=True)
@@ -50,19 +44,11 @@ def _restore_inductor_config():
     without this fixture one test could leak into the next.
     """
     cfg = torch._inductor.config
-    saved = (
-        cfg.triton.prefer_nd_tiling,
-        cfg.triton.max_tiles,
-        cfg.triton.tile_reductions,
-    )
+    saved = (cfg.triton.prefer_nd_tiling, cfg.triton.max_tiles, cfg.triton.tile_reductions)
     try:
         yield
     finally:
-        (
-            cfg.triton.prefer_nd_tiling,
-            cfg.triton.max_tiles,
-            cfg.triton.tile_reductions,
-        ) = saved
+        (cfg.triton.prefer_nd_tiling, cfg.triton.max_tiles, cfg.triton.tile_reductions) = saved
 
 
 _TORCH_VERSION = tuple(int(x) for x in torch.__version__.split(".")[:2])
@@ -84,18 +70,13 @@ def _assert_injected(injected):
 
 def _auto_eligible_graph(fake_mode):
     """Dynamic, conv-heavy graph (nnodes < 300 * nconv): the workaround applies."""
-    return build_graph_module(
-        fake_mode, placeholder_vals=[dynamic_tensor(fake_mode)], n_conv=1, n_filler=5
-    )
+    return build_graph_module(fake_mode, placeholder_vals=[dynamic_tensor(fake_mode)], n_conv=1, n_filler=5)
 
 
 @pytest.mark.parametrize("value", [True, False])
 def test_config_field_binary(value):
     """enable_nd_tiling_workaround accepts True/False (default True covered in test_magi_inductor_pass)."""
-    assert (
-        PassConfig(enable_nd_tiling_workaround=value).enable_nd_tiling_workaround
-        is value
-    )
+    assert PassConfig(enable_nd_tiling_workaround=value).enable_nd_tiling_workaround is value
 
 
 def test_auto_injects_when_all_conditions_met(fake_mode):
@@ -107,9 +88,7 @@ def test_auto_injects_when_all_conditions_met(fake_mode):
 
 def test_auto_skips_on_static_shapes(fake_mode):
     pass_ = ND_TilingWorkaroundPass()
-    gm = build_graph_module(
-        fake_mode, placeholder_vals=[static_tensor(fake_mode)], n_conv=0, n_filler=5
-    )
+    gm = build_graph_module(fake_mode, placeholder_vals=[static_tensor(fake_mode)], n_conv=0, n_filler=5)
     pass_(gm.graph)
     _assert_injected(False)
 
@@ -117,9 +96,7 @@ def test_auto_skips_on_static_shapes(fake_mode):
 def test_auto_skips_when_graph_not_conv_heavy(fake_mode):
     """``nnodes >= 300 * nconv`` (conv-sparse graph): low conv ratio, ND-tiling gives little, so skip."""
     pass_ = ND_TilingWorkaroundPass()
-    gm = build_graph_module(
-        fake_mode, placeholder_vals=[dynamic_tensor(fake_mode)], n_conv=1, n_filler=320
-    )
+    gm = build_graph_module(fake_mode, placeholder_vals=[dynamic_tensor(fake_mode)], n_conv=1, n_filler=320)
     pass_(gm.graph)
     _assert_injected(False)
 
@@ -189,9 +166,7 @@ def test_max_tiles_2_compiles_successfully():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.skipif(
-    not _IS_TORCH_212, reason="version-aware logic only differs on PT >= 2.12"
-)
+@pytest.mark.skipif(not _IS_TORCH_212, reason="version-aware logic only differs on PT >= 2.12")
 def test_nd_tiling_pass_uses_safe_max_tiles_on_pt212(fake_mode):
     """End-to-end: the pass itself picks max_tiles=2 on PT 2.12."""
     pass_ = ND_TilingWorkaroundPass()
