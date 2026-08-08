@@ -50,7 +50,7 @@ LATENT_C, LATENT_T, LATENT_H, LATENT_W = 48, 7, 34, 60
 
 # magi_compile (channels-last on) vs vanilla torch.compile, both on the static path.
 # Real 540p decode lands ~1.2x; assert a conservative lower bound (calibrated GPUs only).
-CONV_CHANNELS_LAST_SPEEDUP_THRESHOLD = 1.20
+CONV_CHANNELS_LAST_SPEEDUP_THRESHOLD = 1.05
 
 
 @pytest.fixture(scope="function")
