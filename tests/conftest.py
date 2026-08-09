@@ -24,10 +24,27 @@ from magi_compiler.config import get_compile_config
 from .model_definition import MLPConfig, RMSNormConfig
 
 # ---------------------------------------------------------------------------
-# Workaround: Docker overlayfs can lose unlinked inodes, causing
-# fcntl.flock(fd, LOCK_UN) to raise FileNotFoundError.  This affects
-# every Inductor filelock path (ISA probe, code cache, async compile).
-# Patch _release to catch and safely handle the error.
+# Workaround for filelock >= 3.21 on Docker overlayfs / FUSE filesystems.
+#
+# Since filelock 3.21.0 (tox-dev/filelock PR #408), UnixFileLock._release()
+# calls Path(lock_file).unlink() BEFORE fcntl.flock(fd, LOCK_UN).  On local
+# ext4 this is safe (the inode stays alive while any fd is open), but on
+# overlayfs (Docker's default) and FUSE/NFS the unlinked fd becomes stale,
+# causing flock(LOCK_UN) to raise FileNotFoundError.
+#
+# This affects every Inductor filelock path: ISA probe (cpu_vec_isa),
+# code cache (codecache.load_async), and async C++ compilation.
+#
+# Upstream references:
+#   - https://github.com/tox-dev/filelock/issues/494  (_acquire ENOENT)
+#   - https://github.com/tox-dev/filelock/pull/495    (fix for _acquire)
+#   - https://github.com/tox-dev/py-filelock/issues/513 (EIO on close)
+#   - https://github.com/pytorch/pytorch/issues/134384 (Inductor FNFE)
+#
+# filelock 3.24.3 fixed _acquire but NOT _release.  Pinning to 3.20.4
+# (which never calls unlink in _release) is another option, but risks
+# being overridden by PyTorch's transitive deps.  This patch is scoped
+# to test execution only (conftest.py) and is the safest workaround.
 # ---------------------------------------------------------------------------
 _original_unix_release = _fl_unix.UnixFileLock._release
 
