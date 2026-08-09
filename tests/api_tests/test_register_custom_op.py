@@ -2127,5 +2127,44 @@ class TestNestedMagiOpCall:
         assert_close(outer(x), x * 3.0 + 1)
 
 
+class TestDuplicateOpNameRejected:
+    """Re-registering the same ``namespace::op_name`` should raise a clear
+    error instead of letting ``torch.library`` complain about schema
+    fingerprints.
+    """
+
+    def test_duplicate_name_rejected(self):
+        @magi_register_custom_op(name="test::dup_name_first")
+        def _op_a(x: torch.Tensor) -> torch.Tensor:
+            return x + 1
+
+        with pytest.raises(RuntimeError, match="already"):
+
+            @magi_register_custom_op(name="test::dup_name_first")
+            def _op_b(x: torch.Tensor) -> torch.Tensor:
+                return x + 2
+
+
+class TestOpNameNamespaceRequired:
+    """``torch.library`` requires ``namespace::op_name``; a bare name causes a
+    confusing low-level error. We surface a clear, actionable message
+    pointing at the convention.
+    """
+
+    def test_missing_namespace_rejected(self):
+        with pytest.raises(ValueError, match="namespace"):
+
+            @magi_register_custom_op(name="missing_namespace_op")
+            def _op(x: torch.Tensor) -> torch.Tensor:
+                return x
+
+    def test_namespaced_name_accepted(self):
+        @magi_register_custom_op(name="test::ns_ok")
+        def _op(x: torch.Tensor) -> torch.Tensor:
+            return x + 1
+
+        assert_close(_op(torch.zeros(2)), torch.ones(2))
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
