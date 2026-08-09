@@ -12,15 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import shutil
 from pathlib import Path
 
+import filelock._unix as _fl_unix
 import pytest
 import torch
 
 from magi_compiler.config import get_compile_config
 
 from .model_definition import MLPConfig, RMSNormConfig
+
+# ---------------------------------------------------------------------------
+# Workaround: Docker overlayfs can lose unlinked inodes, causing
+# fcntl.flock(fd, LOCK_UN) to raise FileNotFoundError.  This affects
+# every Inductor filelock path (ISA probe, code cache, async compile).
+# Patch _release to catch and safely handle the error.
+# ---------------------------------------------------------------------------
+_original_unix_release = _fl_unix.UnixFileLock._release
+
+
+def _resilient_release(self):  # noqa: ANN001
+    try:
+        _original_unix_release(self)
+    except FileNotFoundError:
+        fd = self._context.lock_file_fd
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            self._context.lock_file_fd = None
+
+
+_fl_unix.UnixFileLock._release = _resilient_release
 
 # Subdirectories owned by MagiCompiler that are safe to delete between tests.
 # inductor_cache/ is managed by PyTorch Inductor (with async FileLock);
