@@ -16,10 +16,11 @@
 
 Docker overlayfs can cause fcntl.flock(fd, LOCK_UN) to raise FileNotFoundError
 on unlinked inodes.  The conftest patches filelock._unix.UnixFileLock._release
-to catch this error and close the fd safely.  These tests verify the patch.
+to catch this error and close the fd safely.
 """
 
 import os
+import shutil
 import tempfile
 from unittest.mock import patch
 
@@ -42,8 +43,7 @@ class TestFilelockResiliencePatch:
         lock.acquire()
         lock.release()
         assert not lock.is_locked
-        os.unlink(lock_path)
-        os.rmdir(tmpdir)
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
     def test_release_survives_simulated_overlayfs_error(self):
         """Simulate the overlayfs FileNotFoundError on LOCK_UN and verify
@@ -66,5 +66,4 @@ class TestFilelockResiliencePatch:
             lock.release()
 
         assert not lock.is_locked
-        os.unlink(lock_path)
-        os.rmdir(tmpdir)
+        shutil.rmtree(tmpdir, ignore_errors=True)

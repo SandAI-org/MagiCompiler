@@ -14,7 +14,6 @@
 
 import os
 import shutil
-from pathlib import Path
 
 import filelock._unix as _fl_unix
 import pytest
@@ -48,17 +47,6 @@ def _resilient_release(self):  # noqa: ANN001
 
 _fl_unix.UnixFileLock._release = _resilient_release
 
-# Subdirectories owned by MagiCompiler that are safe to delete between tests.
-# inductor_cache/ is managed by PyTorch Inductor (with async FileLock);
-# deleting it mid-process causes FileNotFoundError on lock release.
-_MAGI_OWNED_SUBDIRS = ("magi_cache", "magi_depyf")
-
-
-def _cleanup_magi_cache() -> None:
-    root = Path(get_compile_config().cache_root_dir)
-    for name in _MAGI_OWNED_SUBDIRS:
-        shutil.rmtree(root / name, ignore_errors=True)
-
 
 @pytest.fixture(scope="function")
 def device():
@@ -80,7 +68,7 @@ def rms_norm_config():
 
 @pytest.fixture(scope="function", autouse=True)
 def cleanup_cache():
-    """Auto cleanup MagiCompiler cache between tests (preserves inductor_cache/)."""
-    _cleanup_magi_cache()
+    """Auto cleanup cache fixture, executed before and after each test"""
+    shutil.rmtree(get_compile_config().cache_root_dir, ignore_errors=True)
     yield
-    _cleanup_magi_cache()
+    shutil.rmtree(get_compile_config().cache_root_dir, ignore_errors=True)
