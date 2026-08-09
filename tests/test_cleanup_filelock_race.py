@@ -1,10 +1,24 @@
+# Copyright (c) 2026 SandAI. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Minimal reproduction + fix verification for the cleanup_cache vs Inductor filelock race.
 
 Root cause (PT 2.12 CI #55):
   The autouse cleanup_cache fixture called shutil.rmtree(cache_root_dir) which
   wipes ~/.cache/magi_compiler/ INCLUDING inductor_cache/.  Inductor's async
   compiler holds FileLock objects inside that directory; when the lock file is
-  deleted while still held, _release() → fcntl.flock(fd, LOCK_UN) raises
+  deleted while still held, _release() -> fcntl.flock(fd, LOCK_UN) raises
   FileNotFoundError on Linux overlayfs (GitHub Actions container).
 
 Fix:
@@ -17,7 +31,6 @@ import shutil
 import tempfile
 import threading
 
-import pytest
 from filelock import FileLock
 
 
@@ -34,10 +47,9 @@ def _hold_lock_then_release(lock_path: str, barrier: threading.Barrier, errors: 
 
 
 class TestCleanupFilelockRace:
-
     def test_rmtree_deletes_held_lock_file(self):
         """REPRODUCE: shutil.rmtree on cache_root_dir deletes the lock file
-        while Inductor's async thread still holds it — the scenario that
+        while Inductor's async thread still holds it -- the scenario that
         triggers FileNotFoundError on overlayfs."""
         tmpdir = tempfile.mkdtemp(prefix="magi_race_repro_")
         inductor_dir = os.path.join(tmpdir, "inductor_cache", "locks")
@@ -51,7 +63,6 @@ class TestCleanupFilelockRace:
         t.start()
 
         barrier.wait()  # lock is now held by thread
-        # This is what the OLD cleanup_cache did:
         shutil.rmtree(tmpdir, ignore_errors=True)
         assert not os.path.exists(lock_path), "Lock file should be gone after rmtree"
         barrier.wait()  # let thread try to release
@@ -59,7 +70,7 @@ class TestCleanupFilelockRace:
 
         # On macOS native fs, flock(fd, LOCK_UN) on a deleted-but-open fd
         # succeeds (inode kept alive).  On Linux overlayfs (CI containers),
-        # this raises FileNotFoundError — the exact CI failure we see.
+        # this raises FileNotFoundError -- the exact CI failure we see.
         # Regardless of OS, the lock FILE is deleted, which is the root cause.
 
     def test_selective_cleanup_preserves_lock(self):
@@ -81,7 +92,6 @@ class TestCleanupFilelockRace:
         t.start()
 
         barrier.wait()  # lock is now held
-        # This is what the NEW cleanup_cache does:
         for subdir in ("magi_cache", "magi_depyf"):
             shutil.rmtree(os.path.join(tmpdir, subdir), ignore_errors=True)
         barrier.wait()  # let thread release
