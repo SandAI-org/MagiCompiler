@@ -11,19 +11,18 @@ concurrency:
     cancel-in-progress: true
 
 jobs:
-    # pt29 temporarily skipped — validating filelock<3.19 fix on pt212 first
-    # pt29:
-    #     name: PyTorch 2.9
-    #     uses: ./.github/workflows/_ci_pipeline.yml
-    #     with:
-    #         kind: pr
-    #         workspace: /home/niubility2/cenzhiyao/ci/magi-compiler-workspaces/pr-${{ github.event.pull_request.number }}-pt29
-    #         head-sha: ${{ github.event.pull_request.head.sha }}
-    #         base-sha: ${{ github.event.pull_request.base.sha }}
-    #         pr-number: ${{ github.event.pull_request.number }}
-    #         base-image: nvcr.io/nvidia/pytorch:25.10-py3
-    #         pytorch-label: pt29
-    #     secrets: inherit
+    pt29:
+        name: PyTorch 2.9
+        uses: ./.github/workflows/_ci_pipeline.yml
+        with:
+            kind: pr
+            workspace: /home/niubility2/cenzhiyao/ci/magi-compiler-workspaces/pr-${{ github.event.pull_request.number }}-pt29
+            head-sha: ${{ github.event.pull_request.head.sha }}
+            base-sha: ${{ github.event.pull_request.base.sha }}
+            pr-number: ${{ github.event.pull_request.number }}
+            base-image: nvcr.io/nvidia/pytorch:25.10-py3
+            pytorch-label: pt29
+        secrets: inherit
 
     pt212:
         name: PyTorch 2.12
@@ -40,10 +39,10 @@ jobs:
 
     gate:
         name: Integration Test
-        needs: [pt212]
+        needs: [pt29, pt212]
         if: always()
         runs-on: ubuntu-latest
         steps:
         -   run: |
-                # test "${{ needs.pt29.result }}" = "success"
+                test "${{ needs.pt29.result }}" = "success"
                 test "${{ needs.pt212.result }}" = "success"
