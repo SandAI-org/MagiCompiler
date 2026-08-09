@@ -16,10 +16,32 @@ import shutil
 
 import pytest
 import torch
+from torch._inductor import cpu_vec_isa as _vec_isa
 
 from magi_compiler.config import get_compile_config
 
 from .model_definition import MLPConfig, RMSNormConfig
+
+# ---------------------------------------------------------------------------
+# Backport of PyTorch upstream PR #181617: cache check_build() results
+# in-memory so the filelock + subprocess probe runs at most once per code
+# snippet per process.  PT 2.12 lacks the on-disk .load_ok marker that
+# newer PyTorch uses, causing FileNotFoundError races in containers.
+# ---------------------------------------------------------------------------
+_check_build_cache: dict[str, bool] = {}
+_original_check_build = _vec_isa.VecISA.check_build
+
+
+def _cached_check_build(self, code: str) -> bool:  # noqa: ANN001
+    if code not in _check_build_cache:
+        _check_build_cache[code] = _original_check_build(self, code)
+    return _check_build_cache[code]
+
+
+_vec_isa.VecISA.check_build = _cached_check_build
+
+# Warm up: trigger all ISA probes once at collection time.
+_vec_isa.pick_vec_isa()
 
 
 @pytest.fixture(scope="function")

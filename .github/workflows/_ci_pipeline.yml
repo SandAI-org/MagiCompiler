@@ -177,8 +177,6 @@ jobs:
             https_proxy: ${{ secrets.HTTPS_PROXY }}
             no_proxy: localhost,127.0.0.1,::1
             NCCL_NVLS_ENABLE: 0
-            TORCHINDUCTOR_VEC_ISA_OK: 1
-            TORCHINDUCTOR_CACHE_DIR: /app/.inductor_cache
             PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
             PIP_TRUSTED_HOST: pypi.tuna.tsinghua.edu.cn
         defaults:
@@ -186,15 +184,6 @@ jobs:
                 shell: bash
                 working-directory: /app
         steps:
-        -   name: Warm up Inductor cache
-            run: |
-                mkdir -p /app/.inductor_cache
-                python3 -c "
-                from torch._inductor.cpu_vec_isa import pick_vec_isa
-                isa = pick_vec_isa()
-                print(f'Picked ISA: {isa}, cache populated')
-                "
-
         -   name: Check environment (torch & CUDA)
             run: |
                 python3 -c "
