@@ -1,6 +1,10 @@
 # Test-only dependencies (not required for magi_compiler itself)
 diffusers==0.32.2
 fairscale
+# Pin filelock < 3.19: versions >= 3.19 call unlink() in _release() before
+# flock(LOCK_UN), which raises FileNotFoundError on Docker overlayfs/FUSE.
+# See: https://github.com/tox-dev/filelock/issues/494
+filelock<3.19
 ninja
 pytest
 timm==1.0.15
