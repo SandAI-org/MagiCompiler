@@ -24,12 +24,10 @@ a dimension via -1 force Inductor to guard on expressions like
 pass
 
 import pytest
-import torch as _torch
-
-_TORCH_VERSION = tuple(int(x) for x in _torch.__version__.split(".")[:2])
-_IS_TORCH_212 = _TORCH_VERSION >= (2, 12)
 import torch
 import torch._dynamo.decorators
+
+from magi_compiler.utils.envs import IS_PT_212
 
 HIDDEN_SIZE = 64
 NUM_HEADS = 4
@@ -118,7 +116,7 @@ def _make_inputs(seq_len: int, modality_sizes: list[int], device: str):
     return x, modality_mapping
 
 
-@pytest.mark.skipif(_IS_TORCH_212, reason="PyTorch 2.12 compiles legacy view; see _pt212 variant")
+@pytest.mark.skipif(IS_PT_212, reason="PyTorch 2.12 compiles legacy view; see _pt212 variant")
 def test_unbacked_symbol_guard_legacy_view_pt29():
     """PT 2.9: legacy view(-1) with unbacked symbols hits a guard error during compile."""
     torch._dynamo.reset()
@@ -131,7 +129,7 @@ def test_unbacked_symbol_guard_legacy_view_pt29():
         compiled(x, mm)
 
 
-@pytest.mark.skipif(not _IS_TORCH_212, reason="PyTorch 2.9 hits guard error; see _pt29 variant")
+@pytest.mark.skipif(not IS_PT_212, reason="PyTorch 2.9 hits guard error; see _pt29 variant")
 def test_unbacked_symbol_guard_legacy_view_pt212():
     """PT 2.12: compiles the original view(k.shape[0], NUM_HEADS, -1) without guard error."""
     torch._dynamo.reset()

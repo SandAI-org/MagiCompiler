@@ -39,13 +39,10 @@ from unittest.mock import patch
 
 import pytest
 import torch
-import torch as _torch
 import torch.nn as nn
 
-_TORCH_VERSION = tuple(int(x) for x in _torch.__version__.split(".")[:2])
-_IS_TORCH_212 = _TORCH_VERSION >= (2, 12)
-
 from magi_compiler import magi_compile, magi_register_custom_op
+from magi_compiler.utils.envs import IS_PT_212
 
 HIDDEN = 64
 NUM_MOD = 3
@@ -164,7 +161,7 @@ def _run_two_shapes(compiled, device="cuda"):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.skipif(_IS_TORCH_212, reason="PT 2.12 upstream fixed this; see _pt212 variant")
+@pytest.mark.skipif(IS_PT_212, reason="PT 2.12 upstream fixed this; see _pt212 variant")
 @pytest.mark.xfail(
     reason="Original NameError may no longer reproduce due to later MagiCompiler fixes; " "kept as regression guard",
     raises=AssertionError,
@@ -182,7 +179,7 @@ def test_without_fix_raises_nameerror_pt29():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.skipif(not _IS_TORCH_212, reason="PT 2.9 expected NameError; see _pt29 variant")
+@pytest.mark.skipif(not IS_PT_212, reason="PT 2.9 expected NameError; see _pt29 variant")
 def test_without_fix_passes_on_pt212():
     """PT 2.12: upstream no longer emits stale deferred runtime asserts,
     so even without the MagiCompiler fix, the model runs correctly."""

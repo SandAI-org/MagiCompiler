@@ -51,15 +51,14 @@ def _restore_inductor_config():
         (cfg.triton.prefer_nd_tiling, cfg.triton.max_tiles, cfg.triton.tile_reductions) = saved
 
 
-_TORCH_VERSION = tuple(int(x) for x in torch.__version__.split(".")[:2])
-_IS_TORCH_212 = _TORCH_VERSION >= (2, 12)
+from magi_compiler.utils.envs import IS_PT_212
 
 
 def _assert_injected(injected):
     cfg = torch._inductor.config
     if injected:
         assert cfg.triton.prefer_nd_tiling is True
-        expected_max_tiles = 2 if _IS_TORCH_212 else 3
+        expected_max_tiles = 2 if IS_PT_212 else 3
         assert cfg.triton.max_tiles == expected_max_tiles
         assert cfg.triton.tile_reductions is True
     else:
@@ -133,7 +132,7 @@ _BUG_INPUT_SHAPE = (1, 48, 7, 34, 60)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.skipif(not _IS_TORCH_212, reason="bug only manifests on PT >= 2.12")
+@pytest.mark.skipif(not IS_PT_212, reason="bug only manifests on PT >= 2.12")
 def test_max_tiles_3_crashes_on_pt212():
     """Reproduce: max_tiles=3 + tile_reductions generates invalid 3D-grid kernel on PT 2.12."""
     torch._inductor.config.triton.prefer_nd_tiling = True
@@ -166,7 +165,7 @@ def test_max_tiles_2_compiles_successfully():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.skipif(not _IS_TORCH_212, reason="version-aware logic only differs on PT >= 2.12")
+@pytest.mark.skipif(not IS_PT_212, reason="version-aware logic only differs on PT >= 2.12")
 def test_nd_tiling_pass_uses_safe_max_tiles_on_pt212(fake_mode):
     """End-to-end: the pass itself picks max_tiles=2 on PT 2.12."""
     pass_ = ND_TilingWorkaroundPass()

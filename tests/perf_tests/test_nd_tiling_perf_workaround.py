@@ -42,6 +42,7 @@ import pytest
 import torch
 
 from magi_compiler import magi_compile
+from magi_compiler.utils.envs import IS_PT_212
 from tests.model_definition import VAEDecoderLike
 from tests.perf_tests import cuda_benchmark, print_perf_comparison
 from tests.perf_tests.utils import assert_magi_vs_torch
@@ -78,12 +79,9 @@ def _compile_torch(device: torch.device):
     return torch.compile(model, backend="inductor")
 
 
-_TORCH_VERSION = tuple(int(x) for x in torch.__version__.split(".")[:2])
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
 @pytest.mark.skipif(
-    _TORCH_VERSION >= (2, 12),
+    IS_PT_212,
     reason="PT 2.12 caps max_tiles=2 to avoid Inductor codegen bug; "
     "the reduced tiling granularity eliminates the speedup this test measures",
 )

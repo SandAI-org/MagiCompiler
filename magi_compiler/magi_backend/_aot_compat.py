@@ -21,27 +21,11 @@ a unified interface that works across both versions.
 
 from __future__ import annotations
 
-try:
-    from torch._dynamo.aot_compile import AOTCompiledFunction as _AOTCompiledFunction
-
-    _HAS_AOT_COMPILED_FUNCTION = True
-except ImportError:
-    _AOTCompiledFunction = None
-    _HAS_AOT_COMPILED_FUNCTION = False
-
-try:
-    from torch._dynamo.aot_compile import CompileArtifacts as _CompileArtifacts
-
-    _HAS_COMPILE_ARTIFACTS = True
-except ImportError:
-    _CompileArtifacts = None
-    _HAS_COMPILE_ARTIFACTS = False
+from magi_compiler.utils.envs import IS_PT_212
 
 
 def load_aot_artifacts(aot_path: str, f_globals: dict | None = None):
     """Load AOT-compiled artifacts from disk.
-
-    Returns the callable compiled function on success.
 
     PyTorch >= 2.12: uses AOTCompiledFunction.deserialize(data, f_globals=...)
     PyTorch < 2.12:  uses CompileArtifacts.deserialize(data).compiled_function()
@@ -49,12 +33,14 @@ def load_aot_artifacts(aot_path: str, f_globals: dict | None = None):
     with open(aot_path, "rb") as f:
         data = f.read()
 
-    if _HAS_AOT_COMPILED_FUNCTION:
-        return _AOTCompiledFunction.deserialize(data, f_globals=f_globals)
+    if IS_PT_212:
+        from torch._dynamo.aot_compile import AOTCompiledFunction
 
-    assert _HAS_COMPILE_ARTIFACTS, "Neither AOTCompiledFunction (torch>=2.12) nor CompileArtifacts (torch<2.12) is available"
-    artifacts = _CompileArtifacts.deserialize(data)
-    return artifacts.compiled_function()
+        return AOTCompiledFunction.deserialize(data, f_globals=f_globals)
+
+    from torch._dynamo.aot_compile import CompileArtifacts
+
+    return CompileArtifacts.deserialize(data).compiled_function()
 
 
 def save_aot_artifacts(aot_compiled_fn, aot_path: str, aot_compile_artifacts=None) -> None:
@@ -63,15 +49,15 @@ def save_aot_artifacts(aot_compiled_fn, aot_path: str, aot_compile_artifacts=Non
     PyTorch >= 2.12: calls aot_compiled_fn.save_compiled_function(path)
     PyTorch < 2.12:  serializes CompileArtifacts via CompileArtifacts.serialize()
     """
-    if _HAS_AOT_COMPILED_FUNCTION:
+    if IS_PT_212:
         aot_compiled_fn.save_compiled_function(aot_path)
         return
 
-    assert (
-        _HAS_COMPILE_ARTIFACTS and aot_compile_artifacts is not None
-    ), "CompileArtifacts required for saving on PyTorch < 2.12"
+    from torch._dynamo.aot_compile import CompileArtifacts
+
+    assert aot_compile_artifacts is not None, "CompileArtifacts required for saving on PyTorch < 2.12"
     with open(aot_path, "wb") as f:
-        f.write(_CompileArtifacts.serialize(aot_compile_artifacts))
+        f.write(CompileArtifacts.serialize(aot_compile_artifacts))
 
 
 def extract_aot_artifacts_from_fn(aot_compiled_fn):
@@ -80,7 +66,7 @@ def extract_aot_artifacts_from_fn(aot_compiled_fn):
     In PyTorch 2.12+, artifacts are managed internally by AOTCompiledFunction
     and this function returns None.
     """
-    if _HAS_AOT_COMPILED_FUNCTION:
+    if IS_PT_212:
         return None
 
     save_fn = aot_compiled_fn.save_compiled_function

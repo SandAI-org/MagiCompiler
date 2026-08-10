@@ -16,6 +16,11 @@ import contextlib
 import os
 from typing import Iterator
 
+import torch
+
+TORCH_VERSION: tuple[int, int] = tuple(int(x) for x in torch.__version__.split(".")[:2])  # type: ignore[assignment]
+IS_PT_212: bool = TORCH_VERSION >= (2, 12)
+
 
 def _env_to_bool(env_name: str, default: bool) -> bool:
     env_value = str(os.environ.get(env_name, default))

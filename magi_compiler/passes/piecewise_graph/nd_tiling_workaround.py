@@ -18,6 +18,7 @@
 import torch
 
 from ...magi_depyf.timeline import emit_pass_lifecycle
+from ...utils.envs import IS_PT_212
 from ..pass_base import MagiInductorPass
 
 
@@ -42,5 +43,4 @@ class ND_TilingWorkaroundPass(MagiInductorPass):
         # PT 2.12 Inductor generates invalid 3D-grid reduction kernels with
         # max_tiles=3 (program_id(2) mapped to a non-existent grid dim).
         # Cap at 2 on PT >= 2.12 until the upstream fix lands.
-        _torch_version = tuple(int(x) for x in torch.__version__.split(".")[:2])
-        torch._inductor.config.triton.max_tiles = 2 if _torch_version >= (2, 12) else 3
+        torch._inductor.config.triton.max_tiles = 2 if IS_PT_212 else 3

@@ -33,11 +33,15 @@ Part D: Two-level compile (@torch.compile outer + @magi_compile inner)
         with carrier + guard.
 """
 
+import os
+import re
+
 import pytest
 import torch
 import torch.nn as nn
 
 from magi_compiler import magi_compile
+from magi_compiler.utils.envs import IS_PT_212
 
 HIDDEN = 64
 NUM_MODALITIES = 3
@@ -100,16 +104,12 @@ def _make_input(sizes: list[int], hidden: int = HIDDEN, device="cuda"):
     return torch.randn(total, hidden, device=device, dtype=torch.float32)
 
 
-@torch.compiler.disable()
-def _mark_carrier_unbacked(carrier: torch.Tensor, num_modalities: int) -> torch.Tensor:
-    for i in range(num_modalities):
-        torch._dynamo.decorators.mark_unbacked(carrier, i)
-    return carrier
-
-
 def _make_carrier(sizes: list[int]):
     """Create a CPU carrier tensor and mark each dim as unbacked."""
-    return _mark_carrier_unbacked(torch.empty(*sizes), len(sizes))
+    carrier = torch.empty(*sizes)
+    for i in range(len(sizes)):
+        torch._dynamo.decorators.mark_unbacked(carrier, i)
+    return carrier
 
 
 def _bypass_all_guards(guards):
@@ -408,7 +408,8 @@ def test_cp4_cache_reuse_magi_compile():
 
 
 class ModalityDispatcherMockV2:
-    """Mock dispatcher matching the real two-level compile pattern."""
+    """Mock dispatcher matching the real ModalityDispatcher — carrier
+    tensor with mark_unbacked behind is_compiling() guard."""
 
     def __init__(self, modality_mapping: torch.Tensor, num_modalities: int):
         self.num_modalities = num_modalities
@@ -416,7 +417,10 @@ class ModalityDispatcherMockV2:
         permuted = modality_mapping[self.permute_mapping]
         group_sizes = torch.bincount(permuted, minlength=num_modalities).tolist()
 
-        self._size_carrier = _mark_carrier_unbacked(torch.empty(*[int(s) for s in group_sizes]), num_modalities)
+        self._size_carrier = torch.empty(*[int(s) for s in group_sizes])
+        if not torch.compiler.is_compiling():
+            for i in range(num_modalities):
+                torch._dynamo.decorators.mark_unbacked(self._size_carrier, i)
 
     @property
     def group_size_cpu(self) -> list[int]:
@@ -488,18 +492,69 @@ def test_two_level_compile_cache_reuse_good_order():
             )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_two_level_compile_cache_reuse_bad_order():
-    """Two-level compile: first call has zero-token modalities.
+def _check_inductor_cache_has_independent_symbols_u(cache_dir: str):
+    """PT 2.9: verify generated kernels use independent unbacked SymInts
+    (u0, u1, u2) rather than a single backed symbol for all modalities."""
+    py_files = []
+    for root, _dirs, files in os.walk(cache_dir):
+        for f in files:
+            if f.endswith(".py"):
+                py_files.append(os.path.join(root, f))
 
-    This is the critical case — initial compilation with some modalities = 0
-    would cause symbolic over-unification without mark_unbacked.  The carrier
-    tensor + is_compiling() guard ensures mark_unbacked runs in eager (after
-    tolist() graph break) even when __init__ is called inside @torch.compile.
+    assert py_files, f"No .py files found in {cache_dir}"
 
-    The full shape sequence is the regression check: the compiled graph must
-    keep working when a later call has a different total token count.
+    found_independent = False
+    for path in py_files:
+        with open(path) as fh:
+            code = fh.read()
+        if "u0" in code and "u1" in code and "u2" in code and "(u0 + u1 + u2)" in code:
+            found_independent = True
+            break
+
+    assert found_independent, (
+        "Inductor cache does not contain independent unbacked SymInts " "(u0, u1, u2).  mark_unbacked may not be working."
+    )
+
+
+def _check_inductor_cache_has_independent_symbols_s(cache_dir: str):
+    """PT 2.12: verify generated kernels use independent SymInts.
+
+    PT 2.12 names unbacked symbols with high-numbered s-prefixed ids
+    (e.g. s66, s69, s98) instead of PT 2.9's u0/u1/u2.  The constraint
+    still manifests as a sum of 3 distinct s-symbols in assert_size_stride.
     """
+    py_files = []
+    for root, _dirs, files in os.walk(cache_dir):
+        for f in files:
+            if f.endswith(".py"):
+                py_files.append(os.path.join(root, f))
+
+    assert py_files, f"No .py files found in {cache_dir}"
+
+    # Look for assert_size_stride containing a sum of 3+ distinct s-symbols,
+    # e.g.  assert_size_stride(arg1_1, (s66 + s69 + s98, ), (1, ))
+    sum_pattern = re.compile(r"s\d+\s*\+\s*s\d+\s*\+\s*s\d+")
+    found_independent = False
+    for path in py_files:
+        with open(path) as fh:
+            code = fh.read()
+        for line in code.split("\n"):
+            if "assert_size_stride" in line and sum_pattern.search(line):
+                syms = set(re.findall(r"s\d+", line))
+                if len(syms) >= 3:
+                    found_independent = True
+                    break
+        if found_independent:
+            break
+
+    assert found_independent, (
+        "Inductor cache does not contain a sum of 3+ independent s-symbols "
+        "in assert_size_stride.  mark_unbacked may not be working on PT 2.12."
+    )
+
+
+def _run_bad_order_test():
+    """Shared logic for bad-order two-level compile test."""
     torch._dynamo.reset()
 
     @magi_compile(dynamic_arg_dims={"x": 0})
@@ -528,6 +583,45 @@ def test_two_level_compile_cache_reuse_bad_order():
             assert out.shape == (total, HIDDEN), (
                 f"Shape mismatch for ({v},{a},{t}): " f"expected ({total}, {HIDDEN}), got {out.shape}"
             )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(IS_PT_212, reason="PT 2.12 uses s-prefixed symbols; see _pt212 variant")
+def test_two_level_compile_cache_reuse_bad_order_pt29():
+    """Two-level compile: first call has zero-token modalities (PT 2.9).
+
+    This is the critical case — initial compilation with some modalities = 0
+    would cause symbolic over-unification without mark_unbacked.  The carrier
+    tensor + is_compiling() guard ensures mark_unbacked runs in eager (after
+    tolist() graph break) even when __init__ is called inside @torch.compile.
+
+    After the first compile we also inspect the generated Inductor cache to
+    confirm that three independent unbacked SymInts (u0, u1, u2) are used
+    instead of a single backed symbol.
+    """
+    _run_bad_order_test()
+
+    from magi_compiler.config import get_compile_config
+
+    cache_dir = os.path.join(get_compile_config().cache_root_dir, "inductor_cache")
+    _check_inductor_cache_has_independent_symbols_u(cache_dir)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not IS_PT_212, reason="PT 2.9 uses u-prefixed symbols; see _pt29 variant")
+def test_two_level_compile_cache_reuse_bad_order_pt212():
+    """Two-level compile: first call has zero-token modalities (PT 2.12).
+
+    Same critical scenario as the PT 2.9 variant.  PT 2.12 names unbacked
+    SymInts with high-numbered s-prefixed ids (e.g. s66, s69, s98) instead
+    of u0/u1/u2, and the constraint sum appears in assert_size_stride lines.
+    """
+    _run_bad_order_test()
+
+    from magi_compiler.config import get_compile_config
+
+    cache_dir = os.path.join(get_compile_config().cache_root_dir, "inductor_cache")
+    _check_inductor_cache_has_independent_symbols_s(cache_dir)
 
 
 class ModalityDispatcherMockNoGuard:
