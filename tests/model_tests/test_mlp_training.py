@@ -243,15 +243,15 @@ def test_transformer_training_with_magi_compiler():
     # Set device
     device = torch.device("cuda")
 
-    # Create Transformer configuration
+    # Tiny config — just enough to exercise the magi_compile training path.
     transformer_config = TransformerConfig(
-        vocab_size=10000,
-        hidden_size=1024,
-        intermediate_size=4096,
+        vocab_size=256,
+        hidden_size=64,
+        intermediate_size=128,
         num_hidden_layers=2,
-        num_attention_heads=16,
-        num_key_value_heads=16,
-        max_position_embeddings=1024,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=64,
         rms_norm_eps=1e-6,
         params_dtype=torch.bfloat16,
     )
@@ -263,10 +263,10 @@ def test_transformer_training_with_magi_compiler():
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
     # Training parameters
-    batch_size = 8
-    seq_len = 1024 * 4
+    batch_size = 2
+    seq_len = 32
     vocab_size = transformer_config.vocab_size
-    num_epochs = 4
+    num_epochs = 2
     batches_per_epoch = 2
 
     # Execute training
