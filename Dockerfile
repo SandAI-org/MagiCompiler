@@ -27,9 +27,8 @@ RUN git clone --depth 1 https://github.com/NVIDIA/cutlass.git /usr/local/cutlass
 COPY requirements.txt requirements-test.txt /app/
 RUN pip install --upgrade pip "setuptools<82" wheel && \
     grep -v "^triton" /app/requirements.txt > /tmp/req.txt && \
-    grep -vE "^(torchvision|torchtitan)" /app/requirements-test.txt >> /tmp/req.txt && \
+    grep -v "^torchvision" /app/requirements-test.txt >> /tmp/req.txt && \
     pip install -r /tmp/req.txt && \
-    pip install --no-deps torchtitan==0.2.0 && pip install tyro && \
     rm -f /tmp/req.txt
 
 # ── Source layer (only this and below re-run on code changes) ───────────
