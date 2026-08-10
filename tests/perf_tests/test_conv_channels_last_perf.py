@@ -41,6 +41,7 @@ import pytest
 import torch
 
 from magi_compiler import magi_compile
+from magi_compiler.utils.envs import IS_PT_212
 from tests.model_definition import VAEDecoderLike
 from tests.perf_tests import cuda_benchmark, print_perf_comparison
 from tests.perf_tests.utils import assert_magi_vs_torch
@@ -49,8 +50,9 @@ from tests.perf_tests.utils import assert_magi_vs_torch
 LATENT_C, LATENT_T, LATENT_H, LATENT_W = 48, 7, 34, 60
 
 # magi_compile (channels-last on) vs vanilla torch.compile, both on the static path.
-# Real 540p decode lands ~1.2x; assert a conservative lower bound (calibrated GPUs only).
-CONV_CHANNELS_LAST_SPEEDUP_THRESHOLD = 1.05
+# Real 540p decode lands ~1.2x on PT 2.9; PT 2.12's improved torch.compile baseline
+# narrows the gap to ~1.1x, so we use a lower threshold there.
+CONV_CHANNELS_LAST_SPEEDUP_THRESHOLD = 1.05 if IS_PT_212 else 1.20
 
 
 @pytest.fixture(scope="function")
