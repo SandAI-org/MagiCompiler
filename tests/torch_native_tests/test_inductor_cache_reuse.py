@@ -24,6 +24,7 @@ import torch
 import torch.nn.functional as F
 from torch._dynamo.utils import counters
 
+from magi_compiler.utils.envs import IS_PT_212
 from tests.model_definition import TransformerConfig, create_transformer_model_with_initial_params
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for Inductor cache reuse")
@@ -40,12 +41,8 @@ class CounterDelta:
 
 
 # NOTE: may be different on different machines, and this config is suitable for CI machine
-# Expected autograd cache counters differ between PyTorch 2.9 and 2.12
-# (e.g. training autograd_miss is 1 on 2.9 but 2 on 2.12).
-# The entire test class is skipped until version-conditional thresholds
-# are established and the AOT compatibility layer stabilizes.
 EXPECTED = {
-    "train": CounterDelta(autograd_hit=31, autograd_miss=2, inductor_hit=0, inductor_miss=0),
+    "train": CounterDelta(autograd_hit=31, autograd_miss=1, inductor_hit=0, inductor_miss=0),
     "eval": CounterDelta(autograd_hit=31, autograd_miss=1, inductor_hit=0, inductor_miss=0),
 }
 
@@ -113,9 +110,9 @@ def _assert_delta(actual: CounterDelta, expected: CounterDelta):
     assert actual == expected, f"counter delta mismatch, got={actual}, expected={expected}"
 
 
-@pytest.mark.skip(
-    reason="Expected autograd cache counters differ between PT 2.9 and 2.12, "
-    "and are affected by AOT compatibility changes; needs recalibration"
+@pytest.mark.skipif(
+    IS_PT_212,
+    reason="PT 2.12 autograd cache counters differ (training autograd_miss=2 vs 1); " "needs version-conditional thresholds",
 )
 class TestTorchInductorCache:
     """Validate TorchInductor cache behavior in train/eval flows."""
