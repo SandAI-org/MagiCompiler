@@ -1,4 +1,7 @@
 # Test-only dependencies (not required for magi_compiler itself)
+# NOTE: torch, triton, torchvision are NOT listed here — they must be
+# pre-installed (e.g. via NVIDIA NGC base image) because their versions
+# are tightly coupled to each other and to the CUDA toolkit.
 diffusers==0.32.2
 fairscale
 # Pin filelock < 3.19: versions >= 3.19 call unlink() in _release() before
@@ -9,5 +12,4 @@ ninja
 pytest
 timm==1.0.15
 torchtitan==0.2.0
-torchvision==0.27.1
 transformers==4.48.3

@@ -4,4 +4,3 @@ depyf
 graphviz
 pydantic-settings
 seaborn
-triton==3.7.1

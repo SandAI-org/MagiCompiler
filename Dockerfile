@@ -26,10 +26,7 @@ RUN git clone --depth 1 https://github.com/NVIDIA/cutlass.git /usr/local/cutlass
 # ── Dependency layer (cached unless requirements files change) ──────────
 COPY requirements.txt requirements-test.txt /app/
 RUN pip install --upgrade pip "setuptools<82" wheel && \
-    grep -v "^triton" /app/requirements.txt > /tmp/req.txt && \
-    grep -v "^torchvision" /app/requirements-test.txt >> /tmp/req.txt && \
-    pip install -r /tmp/req.txt && \
-    rm -f /tmp/req.txt
+    pip install -r /app/requirements.txt -r /app/requirements-test.txt
 
 # ── Source layer (only this and below re-run on code changes) ───────────
 COPY . /app
