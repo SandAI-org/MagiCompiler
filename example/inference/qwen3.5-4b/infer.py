@@ -20,12 +20,11 @@ import time
 from pathlib import Path
 
 import torch
+from modeling import Qwen35ForConditionalGeneration
 from torch import nn
 
 import magi_compiler.utils.nvtx as nvtx
 from magi_compiler import magi_compile
-from modeling import Qwen35ForConditionalGeneration
-
 
 MODEL_PATH = os.environ.get("MODEL_PATH")
 MODE = os.environ.get("MODE", "all")
@@ -78,21 +77,19 @@ class Qwen35Entrypoints(nn.Module):
         image_grid_thw: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
-        del mm_token_type_ids, image_grid_thw
+        del image_grid_thw
         inputs_embeds = self.model.model.language_model.embed_tokens(input_ids)
-        image_tokens = self.model.model.visual(pixel_values, grid_thw=self.image_grid)
+        image_embeds = self.model.model.visual(pixel_values, grid_thw=self.image_grid)
         inputs_embeds = inputs_embeds.clone()
-        image_end = IMAGE_TOKEN_START + self.image_tokens
-        inputs_embeds[:, IMAGE_TOKEN_START:image_end, :] = image_tokens.view(1, self.image_tokens, -1)
+        inputs_embeds[mm_token_type_ids.bool()] = image_embeds.view(-1, inputs_embeds.shape[-1]).to(
+            inputs_embeds.device, inputs_embeds.dtype
+        )
         hidden_states = self.model.model(
             input_ids=None,
             attention_mask=None,
             position_ids=position_ids,
             past_key_values=self.model.cache,
             inputs_embeds=inputs_embeds,
-            pixel_values=None,
-            image_grid_thw=None,
-            mm_token_type_ids=None,
             use_cache=True,
         )
         return self.model.lm_head(hidden_states[:, -1:, :])
@@ -174,11 +171,7 @@ def make_image_inputs(
     patch_values = math.prod(image_grid)
     patch_dim = vc.in_channels * vc.temporal_patch_size * vc.patch_size * vc.patch_size
     pixel_values = torch.randn((patch_values, patch_dim), dtype=DTYPE, device=device)
-    prefill_position_ids, rope_deltas = model.model.get_rope_index(
-        input_ids,
-        mm_token_type_ids,
-        image_grid_thw=grid,
-    )
+    prefill_position_ids, rope_deltas = model.model.get_rope_index(input_ids, mm_token_type_ids, image_grid_thw=grid)
     decode_position_ids = torch.arange(seq_len, seq_len + 1, device=device, dtype=torch.long)
     decode_position_ids = decode_position_ids.view(1, 1, -1).expand(3, input_ids.shape[0], -1)
     decode_position_ids = decode_position_ids + rope_deltas.to(device=device, dtype=torch.long)

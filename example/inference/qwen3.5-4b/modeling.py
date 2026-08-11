@@ -17,16 +17,16 @@ from __future__ import annotations
 import itertools
 import json
 import math
-from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import torch
 import torch.nn.functional as F
-from magi_compiler import magi_register_custom_op
 from safetensors.torch import load_file
 from torch import nn
+
+from magi_compiler import magi_register_custom_op
 
 GridTHW = torch.Tensor | tuple[int, int, int]
 
@@ -68,9 +68,7 @@ class Qwen35RMSNormGated(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor | None = None) -> torch.Tensor:
         input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.float() * torch.rsqrt(
-            hidden_states.float().pow(2).mean(-1, keepdim=True) + self.eps
-        )
+        hidden_states = hidden_states.float() * torch.rsqrt(hidden_states.float().pow(2).mean(-1, keepdim=True) + self.eps)
         hidden_states = hidden_states * self.weight.float()
         if gate is not None:
             hidden_states = hidden_states * F.silu(gate.float())
@@ -286,9 +284,7 @@ class Qwen35Cache:
         start = self.seq_len
         end = start + key_states.shape[2]
         if end > self.max_seq_len:
-            raise ValueError(
-                f"Cache capacity {self.max_seq_len} is too small for sequence length {end}."
-            )
+            raise ValueError(f"Cache capacity {self.max_seq_len} is too small for sequence length {end}.")
         if full_key_states is None or full_value_states is None:
             full_key_states = torch.empty(
                 (key_states.shape[0], key_states.shape[1], self.max_seq_len, key_states.shape[3]),
@@ -470,9 +466,7 @@ class Qwen35VisionPatchEmbed(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         target_dtype = self.proj.weight.dtype
-        hidden_states = hidden_states.view(
-            -1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size
-        )
+        hidden_states = hidden_states.view(-1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size)
         hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
         return hidden_states
 
@@ -581,8 +575,7 @@ class Qwen35VisionModel(nn.Module):
         cu_seqlens = get_vision_cu_seqlens(grid_thw).to(hidden_states.device)
         hidden_states = self.patch_embed(hidden_states)
         pos_embeds = (
-            self.pos_embed(bilinear_indices.to(hidden_states.device))
-            * bilinear_weights[:, :, None].to(hidden_states.device)
+            self.pos_embed(bilinear_indices.to(hidden_states.device)) * bilinear_weights[:, :, None].to(hidden_states.device)
         ).sum(0)
         hidden_states = hidden_states + pos_embeds.to(hidden_states.dtype)
         rotary_pos_emb = self.rotary_pos_emb(position_ids.to(hidden_states.device))
@@ -711,7 +704,14 @@ class Qwen35GatedDeltaNet(nn.Module):
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
         if use_precomputed_states and seq_len == 1:
             core_attn_out, last_recurrent_state = torch_recurrent_gated_delta_rule(
-                query, key, value, g=g, beta=beta, initial_state=recurrent_state, output_final_state=cache_params is not None
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=recurrent_state,
+                output_final_state=cache_params is not None,
+                use_qk_l2norm_in_kernel=True,
             )
         else:
             core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
@@ -722,6 +722,7 @@ class Qwen35GatedDeltaNet(nn.Module):
                 beta=beta,
                 initial_state=recurrent_state if use_precomputed_states else None,
                 output_final_state=cache_params is not None,
+                use_qk_l2norm_in_kernel=True,
             )
         if cache_params is not None:
             cache_params.update_linear_recurrent_state(self.layer_idx, last_recurrent_state)
@@ -758,9 +759,7 @@ class Qwen35Attention(nn.Module):
     ) -> torch.Tensor:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-        query_states, gate = torch.chunk(
-            self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1
-        )
+        query_states, gate = torch.chunk(self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
         gate = gate.reshape(*input_shape, -1)
         query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
@@ -822,7 +821,9 @@ class Qwen35TextModel(nn.Module):
         super().__init__()
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
-        self.layers = nn.ModuleList([Qwen35TextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList(
+            [Qwen35TextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
         self.norm = Qwen35RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen35TextRotaryEmbedding(config=config)
 
@@ -851,7 +852,9 @@ class Qwen35TextModel(nn.Module):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer_idx, decoder_layer in enumerate(self.layers, start=1):
-            hidden_states = decoder_layer(hidden_states, position_embeddings=position_embeddings, past_key_values=past_key_values)
+            hidden_states = decoder_layer(
+                hidden_states, position_embeddings=position_embeddings, past_key_values=past_key_values
+            )
             if layer_idx < len(self.layers):
                 hidden_states = qwen35_chunk_boundary(hidden_states)
         hidden_states = self.norm(hidden_states)
@@ -946,7 +949,10 @@ class Qwen35Model(nn.Module):
         spatial_merge_size = self.config.vision_config.spatial_merge_size
         mrope_position_deltas = []
         position_ids = torch.zeros(3, input_ids.shape[0], input_ids.shape[1], dtype=input_ids.dtype, device=input_ids.device)
-        grid_iters = {1: iter(image_grid_thw) if image_grid_thw is not None else None, 2: iter(video_grid_thw) if video_grid_thw is not None else None}
+        grid_iters = {
+            1: iter(image_grid_thw) if image_grid_thw is not None else None,
+            2: iter(video_grid_thw) if video_grid_thw is not None else None,
+        }
         for batch_idx, current_input_ids in enumerate(input_ids):
             input_token_type = mm_token_type_ids[batch_idx]
             if attention_mask is not None:
@@ -963,7 +969,9 @@ class Qwen35Model(nn.Module):
             for modality_type, start_idx, end_idx in input_type_group:
                 if modality_type == 0:
                     text_len = end_idx - start_idx
-                    llm_pos_ids_list.append(torch.arange(text_len, device=input_ids.device).view(1, -1).expand(3, -1) + current_pos)
+                    llm_pos_ids_list.append(
+                        torch.arange(text_len, device=input_ids.device).view(1, -1).expand(3, -1) + current_pos
+                    )
                     current_pos += text_len
                 else:
                     grid_thw = next(grid_iters[modality_type])
