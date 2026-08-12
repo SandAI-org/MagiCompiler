@@ -1,7 +1,7 @@
 name: Integration Test on PR
 
 on:
-    pull_request:
+    pull_request_target:
         types: [opened, reopened, synchronize, ready_for_review]
         branches:
         -   main
