@@ -68,6 +68,49 @@ class TestBasicRegistration:
 
         assert_close(output, expected)
 
+    def test_materialize_inputs_same_signature_as_op(self):
+        """Decorator hook is called with the custom op's realized arguments."""
+        from magi_compiler.profiling import apply_materialize_inputs, get_materialize_inputs_hook, op_has_internal_collective
+        from magi_compiler.profiling.materialize_inputs import _INTERNAL_COLLECTIVE_OPS, _MATERIALIZE_INPUT_HOOKS
+
+        def _materialize(q, k, v, cp_split_sizes):
+            seq = int(q.shape[0])
+            return q, k, v, [seq] * len(cp_split_sizes)
+
+        @magi_register_custom_op(
+            name="test::materialize_same_sig_op",
+            infer_output_meta_fn=["q"],
+            materialize_inputs=_materialize,
+            has_internal_collective=True,
+        )
+        def _op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cp_split_sizes: list[int]) -> torch.Tensor:
+            return q
+
+        try:
+            assert op_has_internal_collective("test::materialize_same_sig_op")
+            hook = get_materialize_inputs_hook("test::materialize_same_sig_op")
+            q = torch.zeros(8, 4)
+            args, kwargs = apply_materialize_inputs(hook, (q, q, q, [0, 0]), {})
+            assert kwargs == {}
+            assert args[3] == [8, 8]
+        finally:
+            _MATERIALIZE_INPUT_HOOKS.pop("test::materialize_same_sig_op", None)
+            _INTERNAL_COLLECTIVE_OPS.discard("test::materialize_same_sig_op")
+
+    def test_has_internal_collective_without_hook(self):
+        from magi_compiler.profiling import get_materialize_inputs_hook, op_has_internal_collective
+        from magi_compiler.profiling.materialize_inputs import _INTERNAL_COLLECTIVE_OPS
+
+        @magi_register_custom_op(name="test::moe_flag_only_op", has_internal_collective=True)
+        def _moe(x: torch.Tensor) -> torch.Tensor:
+            return x
+
+        try:
+            assert op_has_internal_collective("test::moe_flag_only_op")
+            assert get_materialize_inputs_hook("test::moe_flag_only_op") is None
+        finally:
+            _INTERNAL_COLLECTIVE_OPS.discard("test::moe_flag_only_op")
+
 
 class TestInferOutputMeta:
     """Tests for custom op with infer_output_meta_fn."""

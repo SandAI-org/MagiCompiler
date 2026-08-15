@@ -54,6 +54,22 @@ def test_realize_tensor_node_builds_matching_tensor():
     assert out.device.type == "cuda"
 
 
+@requires_cuda
+def test_realize_float8_tensor_does_not_raise():
+    """float8 has no ``randn`` kernel; replay must cast from float32 noise so fp8
+    custom-op / SmoothQuant GEMM measurement does not silently fall back to 0."""
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("float8_e4m3fn not available")
+    dev = torch.cuda.current_device()
+    node = _node_with_val(torch.empty(4, 8, device=dev, dtype=torch.float8_e4m3fn))
+    out = _realize_arg(node)
+    assert isinstance(out, torch.Tensor)
+    assert out.shape == (4, 8)
+    assert out.dtype == torch.float8_e4m3fn
+    assert out.device.type == "cuda"
+    assert torch.isfinite(out.float()).all()
+
+
 def test_realize_scalar_int_node():
     node = _node_with_val(16)  # a Node carrying a plain int scalar
     assert _realize_arg(node) == 16
@@ -248,9 +264,9 @@ def test_internal_collective_extern_not_measured_in_sync_warmup(monkeypatch, syn
     adaptive benchmarker would issue rank-dependent numbers of the internal NCCL op
     -> hang).  It is seeded analytical + stashed for warm_and_sync.  In non-sync
     mode the normal measurement path still runs."""
-    from magi_compiler.profiling import register_benchmark_inputs
+    from magi_compiler.profiling import register_materialize_inputs
     from magi_compiler.profiling import runtime_estimator as re_mod
-    from magi_compiler.profiling.benchmark_inputs import _BENCHMARK_INPUT_HOOKS, _INTERNAL_COLLECTIVE_OPS
+    from magi_compiler.profiling.materialize_inputs import _INTERNAL_COLLECTIVE_OPS, _MATERIALIZE_INPUT_HOOKS
 
     measured = {"called": False}
 
@@ -258,7 +274,7 @@ def test_internal_collective_extern_not_measured_in_sync_warmup(monkeypatch, syn
         measured["called"] = True
         raise AssertionError("must not be measured in sync warm-up")
 
-    register_benchmark_inputs("aten::mm", lambda fx_node, realize: None, has_internal_collective=True)
+    register_materialize_inputs("aten::mm", has_internal_collective=True)
     monkeypatch.setattr(re_mod, "_measure_extern", _boom)
     try:
         est = ProfilingRuntimeEstimator()
@@ -273,7 +289,7 @@ def test_internal_collective_extern_not_measured_in_sync_warmup(monkeypatch, syn
         else:
             assert measured["called"] is True  # non-sync: measurement path still taken
     finally:
-        _BENCHMARK_INPUT_HOOKS.pop("aten::mm", None)
+        _MATERIALIZE_INPUT_HOOKS.pop("aten::mm", None)
         _INTERNAL_COLLECTIVE_OPS.discard("aten::mm")
 
 
@@ -490,6 +506,6 @@ def test_collective_profile_accuracy_multi_rank():
     assert p.returncode == 0, f"helper failed:\n{out[-3000:]}"
     assert "COLL_ACCURATE ok=True" in p.stdout, out[-3000:]
     assert "COLL_WARMSYNC" in p.stdout and "ok=True" in p.stdout, out[-3000:]
-    # key-set mismatch fail-fast: no deadlock + degraded to analytical on all ranks
+    # key-set intersection: shared keys still measured; no hang on mismatch
     assert "COLL_MISMATCH ok=True" in p.stdout, out[-3000:]
     assert "COLL_PASS" in p.stdout, out[-3000:]

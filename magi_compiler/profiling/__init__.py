@@ -13,7 +13,18 @@
 # limitations under the License.
 
 
-from .benchmark_inputs import get_benchmark_inputs_hook, op_has_internal_collective, register_benchmark_inputs
+from .materialize_inputs import (
+    apply_materialize_inputs,
+    get_materialize_inputs_hook,
+    op_has_internal_collective,
+    register_materialize_inputs,
+)
 from .runtime_estimator import ProfilingRuntimeEstimator
 
-__all__ = ["ProfilingRuntimeEstimator", "register_benchmark_inputs", "get_benchmark_inputs_hook", "op_has_internal_collective"]
+__all__ = [
+    "ProfilingRuntimeEstimator",
+    "register_materialize_inputs",
+    "get_materialize_inputs_hook",
+    "op_has_internal_collective",
+    "apply_materialize_inputs",
+]

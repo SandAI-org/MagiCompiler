@@ -24,10 +24,10 @@ iters, rank-lockstep).  Here we:
   4. assert the estimate is within a tolerance band of the independent measurement.
 Also exercises ``ProfilingRuntimeEstimator.warm_and_sync`` (the profile_sync entry) to
 confirm it runs rank-lockstep without deadlock and reconciles a collective entry, and
-the KEY-SET MISMATCH fail-fast: when one rank's table has an extra key (simulating a
-per-rank structural divergence), warm_and_sync must NOT enter the barrier loop (which
-would deadlock) -- it must detect the mismatch on every rank, warn, and degrade every
-stashed entry to the analytical estimate (measured=False).
+the KEY-SET INTERSECTION path: when one rank's table has an extra key (simulating a
+per-rank structural divergence), warm_and_sync must still lockstep-measure the SHARED
+collective key (not abandon the whole table) and degrade only the rank-local
+collective-bearing keys to analytical -- completing at all proves no hang.
 
 Run: torchrun --nproc_per_node=2 .../estimator_collective_helper.py
 
@@ -147,20 +147,23 @@ def main() -> None:
     coll_entries = [e for e in est.table.values() if e.kind == "collective"]
     warmsync_ok = len(coll_entries) >= 1 and all(e.measured for e in coll_entries)
 
-    # 5. key-set MISMATCH fail-fast: rank 1 injects an extra table entry so the
-    #    cross-rank key sets differ.  warm_and_sync must detect this on EVERY rank
-    #    (symmetric all_gather_object), skip the per-key barrier loop entirely (which
-    #    would deadlock on the count mismatch), and degrade this compile's entries to
-    #    the analytical estimate (measured=False).  Completing at all proves no hang.
+    # 5. key-set INTERSECTION: rank 1 injects an extra table entry so the
+    #    cross-rank key sets differ.  warm_and_sync must still lockstep-measure the
+    #    shared collective key (measured=True), and degrade only the rank1-only
+    #    collective-bearing fake key to analytical.  Completing at all proves no hang.
     est2 = ProfilingRuntimeEstimator()
     est2._sync_across_ranks = True
     est2(coll_snode)  # both ranks: seed the shared collective entry
     if rank == 1:
         fake_key = ("mismatch_only_on_rank1",)
         est2._table[fake_key] = ProfileEntry(ns=1.0, kind="extern", label="fake", measured=True)
-        est2._key_snode[fake_key] = coll_snode
+        est2._key_snode[fake_key] = coll_snode  # coll-bearing -> analytical on local-only path
     est2.warm_and_sync()
-    mismatch_ok = all(not e.measured for e in est2.table.values()) and not est2._key_snode
+    shared_entries = [e for k, e in est2.table.items() if k != ("mismatch_only_on_rank1",)]
+    mismatch_ok = len(shared_entries) >= 1 and all(e.measured for e in shared_entries) and not est2._key_snode
+    if rank == 1:
+        fake = est2.table.get(("mismatch_only_on_rank1",))
+        mismatch_ok = mismatch_ok and fake is not None and not fake.measured
     dist.barrier()
 
     # gather agreement across ranks

@@ -202,6 +202,8 @@ def magi_register_custom_op(
     backward_fn: Callable | None = None,
     is_compute_sensitive: bool = False,
     is_subgraph_boundary: bool = False,
+    has_internal_collective: bool = False,
+    materialize_inputs: Callable | None = None,
 ):
     """
     A unified decorator to register a custom operator with PyTorch's library.
@@ -233,6 +235,14 @@ def magi_register_custom_op(
             ops are prioritised for saving rather than recomputing.
         is_subgraph_boundary: Split the FX graph at this op during compilation.
             Each sub-graph between boundary ops is compiled independently.
+        has_internal_collective: The op issues NCCL internally (CP all-to-all,
+            EP dispatch, ...).  The profiler then lockstep-replays
+            the whole custom op with a fixed iteration count.
+        materialize_inputs: Optional hook with the **same signature as the op**.
+            MagiCompiler generic-realizes every argument, then calls
+            ``fn(*args, **kwargs)``. Use this to rebuild value-dependent metadata
+            (``cp_split_sizes``, ``cu_seqlens``, ...) from the tensors the
+            op actually receives.
 
     Returns:
         A callable with the user's original signature.
@@ -313,4 +323,6 @@ def magi_register_custom_op(
         backward_fn=backward_fn,
         is_compute_sensitive=is_compute_sensitive,
         is_subgraph_boundary=is_subgraph_boundary,
+        has_internal_collective=has_internal_collective,
+        materialize_inputs=materialize_inputs,
     )

@@ -214,11 +214,10 @@ class FSDPConfig(BaseModel):
     cost_mode: Literal["profile_sync", "analytical"] = Field(
         "profile_sync",
         description=(
-            "Cost model for the reorder placement; must be rank-identical multi-rank (else NCCL deadlock). "
-            "'profile_sync' (default): real per-op profiling, re-measured in rank-lockstep and max-reduced; "
-            "requires structurally identical per-rank graphs (verified at runtime, degrades safely on "
-            "mismatch). 'analytical': Inductor roofline -- rank-deterministic, less accurate, deadlock-free "
-            "fallback."
+            "Cost model for the reorder placement. "
+            "'profile_sync' (default): real per-op profiling; entries shared across ranks "
+            "are re-measured in rank-lockstep and max-reduced (works even when per-rank graphs "
+            "'analytical': Inductor roofline -- rank-deterministic, less accurate, deadlock-free fallback.",
         ),
     )
     comm_overlap_window_margin_ns: float = Field(

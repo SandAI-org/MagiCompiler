@@ -67,6 +67,7 @@ def test_reorder_multi_rank():
     p = _run(2)
     out = p.stdout + p.stderr
     assert p.returncode == 0, f"helper failed:\n{out[-3000:]}"
+    assert "REORDER_SKELETON ok=True" in p.stdout, out[-3000:]
     assert "REORDER_PASS" in p.stdout, out[-3000:]
 
 
@@ -144,16 +145,33 @@ def test_fingerprint_canonicalizes_shape_symbols():
     assert _graph_fingerprint(rank0) != _graph_fingerprint(doubled)
 
 
+@requires_torchrun
+def test_reorder_mode_ladder():
+    """The cross-rank safety ladder, driven directly on synthetic inputs (gloo, no
+    CUDA): identical graphs, graphs differing only in compute (-> slot consensus),
+    differing collective skeletons (-> pinned) and differing weight-AG counts
+    (-> abort)."""
+    p = _run(2, "--modes-only", port="29633")
+    out = p.stdout + p.stderr
+    assert p.returncode == 0, f"helper failed:\n{out[-3000:]}"
+    assert "REORDER_MODES ok=True" in p.stdout, out[-3000:]
+
+
 @requires_cuda
 @requires_torchrun
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires >=2 GPUs")
-def test_reorder_graph_mismatch_fail_fast():
+def test_reorder_graph_mismatch_slot_mode():
     """world=2 with rank1 compiling a structurally DIFFERENT graph: the cross-rank
-    graph-fingerprint check must fire on both ranks (warning), leave the schedule
-    unchanged, and complete without deadlock."""
+    graph-fingerprint check must fire on both ranks (warning) and continue in
+    SLOT-consensus mode -- the graphs differ only in compute, so the collective
+    skeleton still matches and the gather may hop the graph's other collective, as
+    long as every rank hops it.  The emitted collective sequence must come out
+    identical on both ranks (REORDER_SKELETON), which is what rules out deadlock."""
     p = _run(2, "--mismatch", port="29632")
     out = p.stdout + p.stderr
     assert p.returncode == 0, f"helper failed:\n{out[-3000:]}"
-    assert "REORDER_MISMATCH unchanged=True" in p.stdout, out[-3000:]
-    assert "REORDER_WARNED" in p.stdout, out[-3000:]  # the fail-fast warning fired
+    assert "REORDER_MISMATCH local=True" in p.stdout, out[-3000:]
+    assert "REORDER_WARNED" in p.stdout, out[-3000:]  # the divergent-graph warning fired
+    assert "REORDER_SLOT" in p.stdout, out[-3000:]  # ... and it chose SLOT consensus
+    assert "REORDER_SKELETON ok=True" in p.stdout, out[-3000:]
     assert "REORDER_PASS" in p.stdout, out[-3000:]
