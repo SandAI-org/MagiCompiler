@@ -216,8 +216,8 @@ class FSDPConfig(BaseModel):
         description=(
             "Cost model for the reorder placement. "
             "'profile_sync' (default): real per-op profiling; entries shared across ranks "
-            "are re-measured in rank-lockstep and max-reduced (works even when per-rank graphs "
-            "'analytical': Inductor roofline -- rank-deterministic, less accurate, deadlock-free fallback.",
+            "are re-measured in rank-lockstep and max-reduced (works even when per-rank graphs diverge). "
+            "'analytical': Inductor roofline -- rank-deterministic, less accurate, deadlock-free fallback."
         ),
     )
     comm_overlap_window_margin_ns: float = Field(
