@@ -34,16 +34,6 @@ repair the returned order, so it must be a valid topological order.
 
 Handles both lowering forms: plain all_gather (1 launch / 1 wait) and coalesced
 (1 packed launch + N MultiOutput members moved together as one block + N waits).
-
-Multi-rank: the only correctness constraint is that the resulting SEQUENCE of
-NCCL-issuing snodes (the "collective skeleton": weight AGs, other collectives,
-custom ops with an internal collective) is rank-identical -- NCCL matches calls
-positionally and one comm stream serializes them, so a divergent interleaving
-deadlocks.  Identical ABSOLUTE placement is not required, only identical
-placement RELATIVE to the skeleton, which is what lets graphs that differ only in
-pure compute still overlap: ranks negotiate one consensus skeleton SLOT per
-gather and are then free to pick any index inside it.  See ``_negotiate_mode``
-for the mode ladder.
 """
 
 import bisect
@@ -51,6 +41,7 @@ import hashlib
 from collections import defaultdict
 
 import torch
+import torch.distributed as dist
 from torch._inductor.comms import _is_fake_dep
 from torch._inductor.ir import MultiOutput
 from torch._inductor.scheduler import BaseSchedulerNode
@@ -333,23 +324,10 @@ class FsdpOverlapReorder:
             )
 
         if world > 1 and mode != "pinned":
-            # The targets above are per-rank numbers derived from per-rank compute.
-            # Re-express them as consensus skeleton slots -- unconditionally, also
-            # when the graphs matched: identity of the schedule is then only a reason
-            # to EXPECT agreement, not a substitute for reaching it (a cost that ends
-            # up rank-local, e.g. an analytical fallback on one rank, would otherwise
-            # silently place a gather differently).
             self._consensus_slot_targets(targets, lowers, launches_in_order, skel_idx, index_of, sync_group, world)
 
-        # Clamp targets NON-DECREASING in original program order.  NCCL matches the
-        # Nth call on a PG positionally across ranks, so the gathers' relative order
-        # must be rank-identical; `max(lower, t)` can invert two gathers and whether
-        # the inversion happens depends on per-rank cost jitter -> deadlock.  The
-        # clamp pins the original subsequence at the cost of occasionally placing a
-        # launch later than its compute window would allow.  In "slot" mode it is
-        # also what keeps two gathers landing in the SAME slot from swapping: their
-        # in-slot indices are per-rank, this makes their ORDER rank-identical (equal
-        # targets are broken by original index in the rebuild's sort key).
+        # Keep gather order: clamp targets non-decreasing so cost jitter or
+        # same-slot per-rank indices cannot swap two launches.
         running = -1
         for launch in launches_in_order:
             if launch not in targets:
@@ -413,34 +391,12 @@ class FsdpOverlapReorder:
     # -- multi-rank agreement ---------------------------------------------
     @staticmethod
     def _negotiate_mode(order, launches, skel_kinds) -> tuple[str, object, int]:
-        """How much placement freedom every rank agrees to take: (mode, group, world).
+        """Rank-identical placement mode: (mode, group, world).
 
-        Deadlock freedom needs the FINAL collective skeleton to be rank-identical
-        (NCCL matches calls positionally per PG and one comm stream serializes them).
-        It does NOT need identical graphs, nor identical absolute placement -- only
-        placement that is identical RELATIVE to the skeleton.  So:
-
-        ``identical`` / ``slot``
-                    the skeletons match, so every gather is placed in a slot all
-                    ranks negotiate (``_consensus_slot_targets``); only compute lives
-                    inside a slot, so the exact index within it stays a free per-rank
-                    choice.  The two differ only in what is worth reporting:
-                    ``identical`` means the whole graph matched (the consensus is
-                    then a formality), ``slot`` that the graphs diverged in compute
-                    only and overlap keeps working anyway.
-        ``pinned``  the skeleton ITSELF differs, so there is nothing to index slots
-                    by: fall back to pinning each AG between the two NCCL-issuing
-                    snodes it already sits between, reproducing whatever interleaving
-                    the unmodified graph had.
-        ``abort``   weight-AG counts differ: no correspondence to reconcile.
-
-        Decided from one symmetric all_gather, so every rank returns the same mode.
+        ``identical`` / ``slot``: skeletons match → consensus slots (in-slot index is per-rank).
+        ``pinned``: skeletons differ → keep each AG between its neighboring NCCL snodes.
+        ``abort``: weight-AG counts differ → leave the graph unchanged.
         """
-        import torch.distributed as dist
-
-        if not (dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1):
-            return "identical", None, 1
-
         from magi_compiler.profiling.runtime_estimator import _get_cost_sync_group
 
         group = _get_cost_sync_group()
@@ -482,12 +438,9 @@ class FsdpOverlapReorder:
 
     @staticmethod
     def _agree(ok: bool, sync_group, world: int) -> bool:
-        """Reduce a local yes/no into a rank-identical one (AND over ranks).  A
-        decision taken on some ranks only is exactly the divergence to avoid; a
-        failed reduction means we cannot know, so nobody commits."""
+        """Reduce a local yes/no into a rank-identical one (AND over ranks)."""
         if world <= 1:
             return ok
-        import torch.distributed as dist
 
         try:
             t = torch.tensor([1 if ok else 0], dtype=torch.int32)
@@ -499,33 +452,14 @@ class FsdpOverlapReorder:
 
     @staticmethod
     def _consensus_slot_targets(targets, lowers, launches_in_order, skel_idx, index_of, sync_group, world) -> None:
-        """Rewrite ``targets`` in place so every rank puts each gather in the SAME
-        skeleton slot -- the general form of "same relative position".
-
-        Slot ``q`` means "issued after skeleton element q-1 and before element q".
-        The gather's own slot ``p`` is its no-move slot, so hoisting is ``q <= p``.
-        Per gather each rank contributes its locally desired slot plus the earliest
-        slot its own data deps permit; the consensus is the MAX of all of them --
-        latest, hence feasible everywhere (a rank whose deps forbid slot q would
-        otherwise have to place later, which is the divergence we are removing) and
-        never hoisting more than the most constrained rank wants.  Slots are also
-        clamped non-decreasing, so gathers cannot swap.
-
-        Inside the agreed slot the absolute index is a free per-rank choice: the
-        only snodes there are compute and waits, which issue no NCCL.  Each rank
-        keeps its own compute-window target, clamped into the slot's index range.
+        """Put each gather in the same skeleton slot on every rank (max of desired
+        slot and dep floor, then non-decreasing).  Index inside the slot stays local.
         """
-        import torch.distributed as dist
 
-        # An index's slot is the number of skeleton elements before it, which for a
-        # skeleton element (every weight AG is one) is exactly its own position.
         def slot_of(idx: int) -> int:
             return bisect.bisect_left(skel_idx, idx)
 
-        # One entry per launch, in program order -- NOT only the ones in `targets`:
-        # whether a gather is skipped (no consumer found) is a per-rank decision, and
-        # the lists must stay positionally aligned.  A skipped gather contributes its
-        # own slot, which max-reduces to "nobody moves it".
+        # One entry per launch in program order so skipped gathers stay aligned.
         mine = []
         for launch in launches_in_order:
             own = slot_of(index_of[launch])
