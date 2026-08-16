@@ -46,6 +46,11 @@ from __future__ import annotations
 
 from typing import Callable
 
+# TODO: Find a better way to solve the materialize_inputs problem. The current
+# per-op hook is a workaround for custom ops whose replay inputs cannot be
+# reconstructed from generic size-hinted tensors (value-dependent metadata).
+# Look for a more general approach that does not require model-side hooks.
+
 # op name (OpOverload string, e.g. "mylib::attn_cp") -> hook; plus the set of ops
 # that issue an internal collective (need fixed-iter lockstep replay).
 _MATERIALIZE_INPUT_HOOKS: dict[str, Callable] = {}
