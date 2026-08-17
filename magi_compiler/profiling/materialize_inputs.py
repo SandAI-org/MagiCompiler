@@ -33,7 +33,7 @@ keep the generic realize.  Prefer attaching the hook on the op decorator::
         seq = int(q.shape[1] if q.dim() == 4 else q.shape[0])
         return q, k, v, [seq] * len(cp_split_sizes)
 
-    @magi_register_custom_op("mylib::attn_cp", materialize_inputs=_attn_cp_inputs, has_internal_collective=True)
+    @magi_register_custom_op("mylib::attn_cp", materialize_inputs=_attn_cp_inputs)
     def attn_cp(q, k, v, cp_split_sizes):
         ...
 

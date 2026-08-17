@@ -64,8 +64,8 @@ _COST_SYNC_GROUP = "uninit"
 
 def snode_issues_collective(snode: BaseSchedulerNode) -> bool:
     """
-    True if replaying / running this snode issues NCCL (collective AG, or a custom
-    op registered with ``has_internal_collective``).
+    True if replaying / running this snode issues NCCL (collective AG, or a
+    ``magi_register_custom_op`` extern).
     """
     if contains_collective(snode):
         return True

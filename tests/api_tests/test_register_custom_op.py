@@ -78,10 +78,7 @@ class TestBasicRegistration:
             return q, k, v, [seq] * len(cp_split_sizes)
 
         @magi_register_custom_op(
-            name="test::materialize_same_sig_op",
-            infer_output_meta_fn=["q"],
-            materialize_inputs=_materialize,
-            has_internal_collective=True,
+            name="test::materialize_same_sig_op", infer_output_meta_fn=["q"], materialize_inputs=_materialize
         )
         def _op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cp_split_sizes: list[int]) -> torch.Tensor:
             return q
@@ -97,11 +94,11 @@ class TestBasicRegistration:
             _MATERIALIZE_INPUT_HOOKS.pop("test::materialize_same_sig_op", None)
             _INTERNAL_COLLECTIVE_OPS.discard("test::materialize_same_sig_op")
 
-    def test_has_internal_collective_without_hook(self):
+    def test_decorator_marks_internal_collective_without_hook(self):
         from magi_compiler.profiling import get_materialize_inputs_hook, op_has_internal_collective
         from magi_compiler.profiling.materialize_inputs import _INTERNAL_COLLECTIVE_OPS
 
-        @magi_register_custom_op(name="test::moe_flag_only_op", has_internal_collective=True)
+        @magi_register_custom_op(name="test::moe_flag_only_op")
         def _moe(x: torch.Tensor) -> torch.Tensor:
             return x
 
