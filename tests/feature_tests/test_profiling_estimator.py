@@ -259,7 +259,7 @@ def _make_fake_extern_snode():
 
 @pytest.mark.parametrize("sync", [True, False])
 def test_internal_collective_extern_not_measured_in_sync_warmup(monkeypatch, sync):
-    """An extern registered with has_internal_collective=True must NOT be measured
+    """An extern registered via ``register_materialize_inputs`` must NOT be measured
     by __call__ in sync mode (the warm-up runs per-rank without barriers; the
     adaptive benchmarker would issue rank-dependent numbers of the internal NCCL op
     -> hang).  It is seeded analytical + stashed for warm_and_sync.  In non-sync
@@ -274,7 +274,7 @@ def test_internal_collective_extern_not_measured_in_sync_warmup(monkeypatch, syn
         measured["called"] = True
         raise AssertionError("must not be measured in sync warm-up")
 
-    register_materialize_inputs("aten::mm", has_internal_collective=True)
+    register_materialize_inputs("aten::mm")
     monkeypatch.setattr(re_mod, "_measure_extern", _boom)
     try:
         est = ProfilingRuntimeEstimator()

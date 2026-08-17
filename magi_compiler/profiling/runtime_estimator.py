@@ -288,9 +288,9 @@ def _op_name(target) -> str:
 
 
 def _extern_has_internal_collective(snode: BaseSchedulerNode) -> bool:
-    """Ops that issue collectives internally (declared via
-    ``register_materialize_inputs(..., has_internal_collective=True)``) must be
-    measured with fixed iterations under a barrier."""
+    """Ops registered via ``register_materialize_inputs`` are treated as
+    issuing an internal collective and must be measured with fixed iterations
+    under a barrier."""
     node = getattr(snode, "node", None)
     origin = node.get_origin_node() if (node is not None and hasattr(node, "get_origin_node")) else None
     target = getattr(origin, "target", None) if origin is not None else None

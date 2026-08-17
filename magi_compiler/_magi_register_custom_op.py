@@ -58,6 +58,8 @@ from typing import Any, Callable, get_args, get_origin
 import torch
 import torch.utils._pytree as pytree
 
+from magi_compiler.profiling import register_materialize_inputs
+
 from .config import get_compile_config
 from .utils.logger import magi_logger
 
@@ -886,12 +888,6 @@ class _DataclassRuntimeAdapter:
 # ==============================================================================
 
 
-def _maybe_register_op_profiling(op_name: str, materialize_inputs: Callable | None) -> None:
-    from magi_compiler.profiling import register_materialize_inputs
-
-    register_materialize_inputs(op_name, materialize_inputs, has_internal_collective=True)
-
-
 def _magi_register_custom_op_impl(
     name: str | None = None,
     mutates_args: tuple[str, ...] = (),
@@ -910,7 +906,8 @@ def _magi_register_custom_op_impl(
             get_compile_config().recompute_config.custom_compute_sensitive_ops.append(op_name)
         if is_subgraph_boundary:
             get_compile_config().splitting_ops.append(op_name)
-        _maybe_register_op_profiling(op_name, materialize_inputs)
+
+        register_materialize_inputs(op_name, materialize_inputs)
 
         _validate_op_signature_constraints(fn)
         original_sig, lowered_sig, param_mapping_tree = _lower_op_signature(fn)

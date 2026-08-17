@@ -48,18 +48,16 @@ def test_register_and_get(clean_registry):
 
     register_materialize_inputs("ns::op_a", hook)
     assert get_materialize_inputs_hook("ns::op_a") is hook
-    # not flagged as internal-collective by default
-    assert op_has_internal_collective("ns::op_a") is False
+    assert op_has_internal_collective("ns::op_a") is True
 
 
-def test_internal_collective_flag(clean_registry):
-    register_materialize_inputs("ns::coll_op", has_internal_collective=True)
+def test_register_without_hook_still_marks_collective(clean_registry):
+    register_materialize_inputs("ns::coll_op")
     assert op_has_internal_collective("ns::coll_op") is True
     assert get_materialize_inputs_hook("ns::coll_op") is None
 
-    # a hook registered WITHOUT the flag must not be marked
     register_materialize_inputs("ns::plain_op", lambda *a, **k: None)
-    assert op_has_internal_collective("ns::plain_op") is False
+    assert op_has_internal_collective("ns::plain_op") is True
 
 
 def test_register_overrides_previous(clean_registry):
@@ -77,7 +75,7 @@ def test_register_overrides_previous(clean_registry):
 
 def test_hook_is_callable_returning_none(clean_registry):
     """A no-op hook (returns None -> keep generic realize) is valid."""
-    register_materialize_inputs("ns::noop", lambda *a, **k: None, has_internal_collective=True)
+    register_materialize_inputs("ns::noop", lambda *a, **k: None)
     hook = get_materialize_inputs_hook("ns::noop")
     assert hook(object()) is None
     assert op_has_internal_collective("ns::noop") is True

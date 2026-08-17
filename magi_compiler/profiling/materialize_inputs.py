@@ -51,24 +51,23 @@ from typing import Callable
 # reconstructed from generic size-hinted tensors (value-dependent metadata).
 # Look for a more general approach that does not require model-side hooks.
 
-# op name (OpOverload string, e.g. "mylib::attn_cp") -> hook; plus the set of ops
-# that issue an internal collective (need fixed-iter lockstep replay).
+# op name (OpOverload string, e.g. "mylib::attn_cp") -> optional hook.
+# Every registered name is treated as an internal-collective op (fixed-iter
+# lockstep replay); ``fn`` is only needed when generic realize is not enough.
 _MATERIALIZE_INPUT_HOOKS: dict[str, Callable] = {}
 _INTERNAL_COLLECTIVE_OPS: set[str] = set()
 
 
-def register_materialize_inputs(op_name: str, fn: Callable | None = None, *, has_internal_collective: bool = False) -> None:
-    """Register a same-signature replay-input builder for ``op_name``.
+def register_materialize_inputs(op_name: str, fn: Callable | None = None) -> None:
+    """Mark ``op_name`` for lockstep replay; optionally attach a same-signature hook.
 
-    ``fn`` is optional when only ``has_internal_collective`` is needed (generic
-    realize is already valid).  ``has_internal_collective``: replay with a fixed
-    iteration count under barriers (an adaptive count would desync the internal
-    NCCL op across ranks).
+    ``fn`` rebuilds value-dependent metadata after generic realize.  Omit it when
+    the generic tensors are already valid.  Registration always flags the op as
+    issuing an internal collective (adaptive iter counts would desync NCCL).
     """
     if fn is not None:
         _MATERIALIZE_INPUT_HOOKS[op_name] = fn
-    if has_internal_collective:
-        _INTERNAL_COLLECTIVE_OPS.add(op_name)
+    _INTERNAL_COLLECTIVE_OPS.add(op_name)
 
 
 def get_materialize_inputs_hook(op_name: str) -> Callable | None:
