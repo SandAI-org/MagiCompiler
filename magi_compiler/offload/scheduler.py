@@ -154,7 +154,7 @@ class BaseScheduler(OffloadScheduler):
         except ValueError:
             return
 
-        max_lookahead = 2
+        max_lookahead = self.compile_config.offload_config.max_prefetch_lookahead
         target_node = None
         is_next_iter = False
 

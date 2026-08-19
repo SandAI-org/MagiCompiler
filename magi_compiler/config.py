@@ -180,6 +180,7 @@ class OffloadConfig(BaseModel):
         OffloadPolicy.COST_EFFECTIVE, description="The policy for offloading the model to CPU."
     )
     bandwidth_safety_factor: float = Field(0.9, description="The safety factor for the H2D bandwidth.")
+    max_prefetch_lookahead: int = Field(2, description="Max layers to prefetch ahead. 0 disables prefetch to save GPU memory.")
 
 
 class FSDPConfig(BaseModel):
