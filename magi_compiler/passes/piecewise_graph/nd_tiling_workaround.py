@@ -40,7 +40,11 @@ class ND_TilingWorkaroundPass(MagiInductorPass):
         torch._inductor.config.triton.prefer_nd_tiling = True
         torch._inductor.config.triton.tile_reductions = True
 
-        # PT 2.12 Inductor generates invalid 3D-grid reduction kernels with
-        # max_tiles=3 (program_id(2) mapped to a non-existent grid dim).
-        # Cap at 2 on PT >= 2.12 until the upstream fix lands.
-        torch._inductor.config.triton.max_tiles = 2 if IS_PT_212 else 3
+        # max_tiles=3 causes two known issues:
+        # - PT 2.12+: invalid 3D-grid reduction kernels (program_id(2) mapped
+        #   to a non-existent grid dim).
+        # - All versions: conv-heavy dynamic-shape graphs (e.g. turbo VAE at
+        #   1080p) can overflow CUDA's z-grid limit (65535) when Inductor's
+        #   coalesce_tiling_analysis collapses high-dim tensors into 3D.
+        # max_tiles=3 is documented as "experimental and may have bugs".
+        torch._inductor.config.triton.max_tiles = 2
