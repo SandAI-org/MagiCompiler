@@ -92,6 +92,18 @@ class PassConfig(BaseModel):
             "Env var: MAGI_COMPILE_PASS_CONFIG__ENABLE_ND_TILING_WORKAROUND (1/0/true/false)."
         ),
     )
+    nd_tiling_max_tiles: int = Field(
+        2,
+        ge=1,
+        le=3,
+        description=(
+            "max_tiles the ND-tiling workaround sets. 2 (default) is safe: Inductor's Grid2D "
+            "folds a y-grid overflow into z. 3 is experimental -- Grid3D has no z-overflow "
+            "handling, so a conv-heavy dynamic-shape graph (turbo VAE at 1080p) can exceed "
+            "CUDA's 65535 z-grid limit. "
+            "Env var: MAGI_COMPILE_PASS_CONFIG__ND_TILING_MAX_TILES."
+        ),
+    )
     enable_mm_epilogue_fusion: bool = Field(
         False,
         description=(
