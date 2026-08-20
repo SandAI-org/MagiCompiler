@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -203,10 +204,41 @@ def test_make_image_inputs_accepts_minimum_default_grid(monkeypatch):
             def get_rope_index(input_ids, mm_token_type_ids, image_grid_thw):
                 return torch.zeros((3, 1, input_ids.shape[1]), dtype=torch.long), torch.zeros((1, 1), dtype=torch.long)
 
-    prefill_args, decode_args = module.make_image_inputs(FakeQwenModel(), 4, (1, 2, 2), torch.device("cpu"))
+    prefill_args, decode_args = module.make_image_inputs(FakeQwenModel(), 1, 4, (1, 2, 2), torch.device("cpu"))
 
     assert prefill_args[0].shape == (1, 4)
     assert decode_args[0].shape == (3, 1, 1)
+
+
+def test_make_text_ids_and_image_inputs_honor_batch_size(monkeypatch):
+    module = load_infer_module()
+    monkeypatch.setattr(module, "DTYPE", torch.float32)
+
+    class FakeQwenModel:
+        config = types.SimpleNamespace(
+            text_config=types.SimpleNamespace(vocab_size=1000),
+            image_token_id=900,
+            vision_start_token_id=901,
+            vision_end_token_id=902,
+            vision_config=types.SimpleNamespace(spatial_merge_size=2, in_channels=3, temporal_patch_size=1, patch_size=1),
+        )
+
+        class model:
+            @staticmethod
+            def get_rope_index(input_ids, mm_token_type_ids, image_grid_thw):
+                batch = input_ids.shape[0]
+                return torch.zeros((3, batch, input_ids.shape[1]), dtype=torch.long), torch.zeros((batch, 1), dtype=torch.long)
+
+    ids = module.make_text_ids(FakeQwenModel(), 2, 8, torch.device("cpu"))
+    assert ids.shape == (2, 8)
+
+    prefill_args, decode_args = module.make_image_inputs(FakeQwenModel(), 2, 8, (1, 2, 2), torch.device("cpu"))
+
+    assert prefill_args[0].shape == (2, 8)
+    assert prefill_args[1].shape == (2, 8)
+    assert prefill_args[4].shape == (3, 2, 8)
+    assert prefill_args[3].shape == (2, 3)  # one image grid per sample
+    assert decode_args[0].shape == (3, 2, 1)
 
 
 def test_run_decode_mode_times_decode_after_prefill(monkeypatch):
@@ -221,7 +253,6 @@ def test_run_decode_mode_times_decode_after_prefill(monkeypatch):
 
     monkeypatch.setattr(module.time, "perf_counter", fake_perf_counter)
     monkeypatch.setattr(module, "PROFILE_CNT", 1)
-    monkeypatch.setattr(module, "switch_profile_if_enabled", lambda *_: None)
     monkeypatch.setattr(module, "sync_cuda", lambda: None)
 
     class FakeCacheModel:
@@ -256,6 +287,112 @@ def test_run_decode_mode_times_decode_after_prefill(monkeypatch):
         ("prefill", True, (1, 4)),
         ("decode", True, (1, 1)),
     ]
+
+
+def load_modeling_module():
+    module_name = "qwen35_modeling_test"
+    had_module = module_name in sys.modules
+    old_module = sys.modules.get(module_name)
+    try:
+        spec = importlib.util.spec_from_file_location(module_name, EXAMPLE_DIR / "modeling.py")
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.modules.pop(module_name, None)
+        if had_module:
+            sys.modules[module_name] = old_module
+
+
+TINY_QWEN35_CONFIG = {
+    "image_token_id": 100,
+    "video_token_id": 101,
+    "vision_start_token_id": 102,
+    "vision_end_token_id": 103,
+    "text_config": {
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "head_dim": 16,
+        "hidden_act": "silu",
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "layer_types": ["full_attention"],
+        "linear_conv_kernel_dim": 4,
+        "linear_key_head_dim": 16,
+        "linear_num_key_heads": 1,
+        "linear_num_value_heads": 2,
+        "linear_value_head_dim": 16,
+        "max_position_embeddings": 128,
+        "num_attention_heads": 2,
+        "num_hidden_layers": 1,
+        "num_key_value_heads": 1,
+        "pad_token_id": 0,
+        "rms_norm_eps": 1e-6,
+        "vocab_size": 128,
+        "rope_parameters": {
+            "mrope_section": [1, 1, 0],
+            "rope_type": "default",
+            "rope_theta": 10000,
+            "partial_rotary_factor": 0.25,
+        },
+    },
+    "vision_config": {
+        "depth": 1,
+        "hidden_act": "gelu_pytorch_tanh",
+        "hidden_size": 32,
+        "in_channels": 3,
+        "intermediate_size": 64,
+        "num_heads": 2,
+        "num_position_embeddings": 16,
+        "out_hidden_size": 32,
+        "patch_size": 2,
+        "spatial_merge_size": 2,
+        "temporal_patch_size": 1,
+    },
+}
+
+
+def test_resolve_model_path_treats_missing_as_random(monkeypatch):
+    module = load_infer_module()
+
+    monkeypatch.setattr(module, "MODEL_PATH", None)
+    assert module.resolve_model_path() is None
+    monkeypatch.setattr(module, "MODEL_PATH", "")
+    assert module.resolve_model_path() is None
+    monkeypatch.setattr(module, "MODEL_PATH", "/tmp/Qwen3.5-4B")
+    assert module.resolve_model_path() == Path("/tmp/Qwen3.5-4B")
+
+
+def test_load_qwen35_config_uses_builtin_default_without_checkpoint():
+    module = load_modeling_module()
+    config = module.load_qwen35_config(None)
+
+    assert config["text_config"]["num_hidden_layers"] == 32
+    assert config["text_config"]["hidden_size"] == 2560
+    assert config["text_config"]["vocab_size"] == 248320
+    assert len(config["text_config"]["layer_types"]) == 32
+    assert config["vision_config"]["depth"] == 24
+    assert module.has_sharded_weights(None) is False
+
+
+def test_random_weights_init_from_config_only_checkpoint(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps(TINY_QWEN35_CONFIG))
+    module = load_modeling_module()
+
+    model = module.Qwen35ForConditionalGeneration(tmp_path, dtype=torch.float32, device="cpu")
+    input_ids = torch.randint(0, TINY_QWEN35_CONFIG["text_config"]["vocab_size"], (2, 4))
+
+    with torch.inference_mode():
+        logits = model(input_ids)
+
+    assert logits.shape == (2, 1, 128)
+    assert logits.device.type == "cpu"
+    assert logits.dtype == torch.float32
+    assert torch.isfinite(logits).all().item()
+    assert next(model.parameters()).device.type == "cpu"
+    assert not any(parameter.device.type == "meta" for parameter in model.parameters())
 
 
 def test_no_machine_specific_defaults():

@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
+import copy
 import itertools
 import json
+import logging
 import math
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +31,56 @@ from torch import nn
 from magi_compiler import magi_register_custom_op
 
 GridTHW = torch.Tensor | tuple[int, int, int]
+logger = logging.getLogger(__name__)
+
+# Official Qwen3.5-4B architecture used when no checkpoint (or only a config) is provided.
+DEFAULT_QWEN35_4B_CONFIG: dict[str, Any] = {
+    "image_token_id": 248056,
+    "video_token_id": 248057,
+    "vision_start_token_id": 248053,
+    "vision_end_token_id": 248054,
+    "tie_word_embeddings": True,
+    "text_config": {
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "head_dim": 256,
+        "hidden_act": "silu",
+        "hidden_size": 2560,
+        "intermediate_size": 9216,
+        "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 8,
+        "linear_conv_kernel_dim": 4,
+        "linear_key_head_dim": 128,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 32,
+        "linear_value_head_dim": 128,
+        "max_position_embeddings": 262144,
+        "num_attention_heads": 16,
+        "num_hidden_layers": 32,
+        "num_key_value_heads": 4,
+        "pad_token_id": 0,
+        "rms_norm_eps": 1e-6,
+        "vocab_size": 248320,
+        "rope_parameters": {
+            "mrope_section": [11, 11, 10],
+            "rope_type": "default",
+            "rope_theta": 10000000,
+            "partial_rotary_factor": 0.25,
+        },
+    },
+    "vision_config": {
+        "depth": 24,
+        "hidden_act": "gelu_pytorch_tanh",
+        "hidden_size": 1024,
+        "in_channels": 3,
+        "intermediate_size": 4096,
+        "num_heads": 16,
+        "num_position_embeddings": 2304,
+        "out_hidden_size": 2560,
+        "patch_size": 16,
+        "spatial_merge_size": 2,
+        "temporal_patch_size": 2,
+    },
+}
 
 
 def _ns(value: dict[str, Any]) -> SimpleNamespace:
@@ -37,6 +89,26 @@ def _ns(value: dict[str, Any]) -> SimpleNamespace:
         if isinstance(item, dict):
             setattr(out, key, _ns(item))
     return out
+
+
+def _normalize_config(config: dict[str, Any]) -> dict[str, Any]:
+    config.setdefault("video_token_id", config.get("video_token_id", 248057))
+    config.setdefault("image_token_id", config.get("image_token_id", 248056))
+    config.setdefault("vision_start_token_id", config.get("vision_start_token_id", 248053))
+    config.setdefault("vision_end_token_id", config.get("vision_end_token_id", 248054))
+    config["text_config"].setdefault("pad_token_id", config["text_config"].get("pad_token_id", 0))
+    return config
+
+
+def load_qwen35_config(model_path: str | Path | None = None) -> dict[str, Any]:
+    if model_path is None:
+        return _normalize_config(copy.deepcopy(DEFAULT_QWEN35_4B_CONFIG))
+    config_path = Path(model_path) / "config.json"
+    return _normalize_config(json.loads(config_path.read_text()))
+
+
+def has_sharded_weights(model_path: str | Path | None) -> bool:
+    return model_path is not None and (Path(model_path) / "model.safetensors.index.json").is_file()
 
 
 def _act(name: str, x: torch.Tensor) -> torch.Tensor:
@@ -1077,27 +1149,43 @@ class Qwen35Model(nn.Module):
 class Qwen35ForConditionalGeneration(nn.Module):
     _keys_to_ignore_on_load_unexpected = [r"^mtp.*", r"^model.visual.*"]
 
-    def __init__(self, model_path: str | Path, dtype: torch.dtype = torch.bfloat16, device: str | torch.device = "cuda"):
+    def __init__(
+        self,
+        model_path: str | Path | None = None,
+        dtype: torch.dtype = torch.bfloat16,
+        device: str | torch.device = "cuda",
+        load_weights: bool | None = None,
+    ):
         super().__init__()
-        self.model_path = Path(model_path)
+        self.model_path = Path(model_path) if model_path is not None else None
         self.dtype = dtype
         self.device = torch.device(device)
-        config_path = self.model_path / "config.json"
-        config = json.loads(config_path.read_text())
-        config.setdefault("video_token_id", config.get("video_token_id", 248057))
-        config.setdefault("image_token_id", config.get("image_token_id", 248056))
-        config.setdefault("vision_start_token_id", config.get("vision_start_token_id", 248053))
-        config.setdefault("vision_end_token_id", config.get("vision_end_token_id", 248054))
-        config["text_config"].setdefault("pad_token_id", config["text_config"].get("pad_token_id", 0))
-        self.config = _ns(config)
-        with torch.device("meta"):
-            self.model = Qwen35Model(self.config)
-            self.lm_head = nn.Linear(self.config.text_config.hidden_size, self.config.text_config.vocab_size, bias=False)
-        self._load_sharded_weights()
+        self.config = _ns(load_qwen35_config(self.model_path))
+        if load_weights is None:
+            load_weights = has_sharded_weights(self.model_path)
+        if load_weights and self.model_path is None:
+            raise ValueError("load_weights=True requires a checkpoint directory.")
+        if load_weights:
+            self._init_modules(torch.device("meta"))
+            self._load_sharded_weights()
+        else:
+            logger.warning("Using randomly initialized Qwen3.5-4B weights.")
+            # Materialize on the target device/dtype so random init does not peak at fp32.
+            prev_dtype = torch.get_default_dtype()
+            torch.set_default_dtype(self.dtype)
+            try:
+                self._init_modules(self.device)
+            finally:
+                torch.set_default_dtype(prev_dtype)
         self._tie_weights()
         self.model.reset_buffers(device=self.device)
         self.eval().requires_grad_(False)
         self.reset_cache()
+
+    def _init_modules(self, device: torch.device) -> None:
+        with torch.device(device):
+            self.model = Qwen35Model(self.config)
+            self.lm_head = nn.Linear(self.config.text_config.hidden_size, self.config.text_config.vocab_size, bias=False)
 
     def _expected_keys(self) -> set[str]:
         keys = set(self.state_dict().keys())
