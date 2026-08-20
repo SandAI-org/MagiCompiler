@@ -640,8 +640,8 @@ support (defaulting to dim 0).</p>
 <span class="n">model</span> <span class="o">=</span> <span class="n">TransformerBlock</span><span class="p">(</span><span class="n">hidden_dim</span><span class="o">=</span><span class="mi">1024</span><span class="p">)</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span>
 
 <span class="c1"># Execute normally - whole-graph compilation handles dynamic batches automatically!</span>
-<span class="n">out</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">),</span> <span class="kc">None</span><span class="p">)</span>
-<span class="n">out</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">),</span> <span class="kc">None</span><span class="p">)</span>
+<span class="n">out</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">),</span> <span class="kc">None</span><span class="p">)</span>
+<span class="n">out</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cuda"</span><span class="p">),</span> <span class="kc">None</span><span class="p">)</span>
 </pre></div>
 </div>
 </section>
@@ -653,8 +653,8 @@ graph partitioning and recomputation.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">magi_compiler</span><span class="w"> </span><span class="kn">import</span> <span class="n">magi_register_custom_op</span>
 
 <span class="nd">@magi_register_custom_op</span><span class="p">(</span>
-    <span class="n">name</span><span class="o">=</span><span class="s2">&quot;athena::flash_attn&quot;</span><span class="p">,</span>
-    <span class="n">infer_output_meta_fn</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;q&quot;</span><span class="p">],</span>       <span class="c1"># Output shape matches parameter &#39;q&#39;</span>
+    <span class="n">name</span><span class="o">=</span><span class="s2">"athena::flash_attn"</span><span class="p">,</span>
+    <span class="n">infer_output_meta_fn</span><span class="o">=</span><span class="p">[</span><span class="s2">"q"</span><span class="p">],</span>       <span class="c1"># Output shape matches parameter 'q'</span>
     <span class="n">is_subgraph_boundary</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>        <span class="c1"># Split graph here for subgraph compilation</span>
     <span class="n">is_compute_sensitive</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>        <span class="c1"># Retain this output during recomputation</span>
 <span class="p">)</span>
