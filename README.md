@@ -230,8 +230,8 @@ MagiCompiler is deeply inspired by and builds upon the shoulders of giants. We e
 ## ⭐ Star History
 
 <div align="center">
-  <a href="https://star-history.com/#SandAI-org/MagiCompiler&Date">
-    <img src="https://api.star-history.com/svg?repos=SandAI-org/MagiCompiler&type=Date" alt="Star History Chart" style="max-width: 60%; height: auto;"/>
+  <a href="https://star-history.dera.page/#SandAI-org/MagiCompiler&Date">
+    <img src="https://star-history.dera.page/svg?repos=SandAI-org/MagiCompiler&type=Date" alt="Star History Chart" style="max-width: 60%; height: auto;"/>
   </a>
 </div>
 
