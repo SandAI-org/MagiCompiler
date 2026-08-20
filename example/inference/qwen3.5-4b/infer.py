@@ -28,6 +28,7 @@ from magi_compiler import magi_compile
 
 MODEL_PATH = os.environ.get("MODEL_PATH")
 SKIP_LOAD_MODEL = os.environ.get("SKIP_LOAD_MODEL", "false").lower() in {"1", "true", "yes"}
+COMPILE_MODE = os.environ.get("COMPILE_MODE", "magi").lower()
 MODE = os.environ.get("MODE", "all")
 SEQ_LEN = int(os.environ.get("SEQ_LEN", "128"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "1"))
@@ -35,6 +36,7 @@ IMAGE_GRID = tuple(int(x) for x in os.environ.get("IMAGE_GRID", "1,2,2").split("
 PROFILE_CNT = int(os.environ.get("PROFILE_CNT", "3"))
 DTYPE = torch.bfloat16
 MODES = ("text_prefill", "text_decode", "image_prefill", "image_decode")
+COMPILE_MODES = ("magi", "eager")
 IMAGE_TOKEN_START = 2
 
 
@@ -131,8 +133,16 @@ def compile_entrypoints(runner: Qwen35Entrypoints) -> Qwen35Entrypoints:
     return runner
 
 
-def build_runner(model: Qwen35ForConditionalGeneration, image_grid: tuple[int, int, int]) -> Qwen35Entrypoints:
-    return compile_entrypoints(Qwen35Entrypoints(model, image_grid=image_grid))
+def build_runner(
+    model: Qwen35ForConditionalGeneration, image_grid: tuple[int, int, int], compile_mode: str | None = None
+) -> Qwen35Entrypoints:
+    runner = Qwen35Entrypoints(model, image_grid=image_grid)
+    resolved_mode = COMPILE_MODE if compile_mode is None else compile_mode
+    if resolved_mode == "eager":
+        return runner
+    if resolved_mode == "magi":
+        return compile_entrypoints(runner)
+    raise ValueError(f"Unsupported COMPILE_MODE={resolved_mode!r}. Use one of {COMPILE_MODES}.")
 
 
 def needs_image_inputs(modes: tuple[str, ...]) -> bool:
@@ -263,6 +273,8 @@ def resolve_model_path() -> Path | None:
 def main() -> None:
     if MODE != "all" and MODE not in MODES:
         raise ValueError(f"Unsupported MODE={MODE!r}. Use one of {MODES} or all.")
+    if COMPILE_MODE not in COMPILE_MODES:
+        raise ValueError(f"Unsupported COMPILE_MODE={COMPILE_MODE!r}. Use one of {COMPILE_MODES}.")
     if BATCH_SIZE < 1:
         raise ValueError(f"BATCH_SIZE={BATCH_SIZE} must be >= 1.")
     if not torch.cuda.is_available():
@@ -275,7 +287,8 @@ def main() -> None:
     model = Qwen35ForConditionalGeneration(
         model_path, dtype=DTYPE, device=device, load_weights=False if SKIP_LOAD_MODEL else None
     )
-    runner = build_runner(model, image_grid=IMAGE_GRID)
+    runner = build_runner(model, image_grid=IMAGE_GRID, compile_mode=COMPILE_MODE)
+    label = "eager" if COMPILE_MODE == "eager" else "compiled"
 
     text_ids = make_text_ids(model, BATCH_SIZE, SEQ_LEN, device)
     decode_ids = make_text_ids(model, BATCH_SIZE, 1, device)
@@ -285,6 +298,7 @@ def main() -> None:
     weight_source = "random" if SKIP_LOAD_MODEL or model_path is None else MODEL_PATH
     print(f"Model path: {MODEL_PATH or '(default Qwen3.5-4B config)'}")
     print(f"Weights: {weight_source}")
+    print(f"Compile mode: {COMPILE_MODE}")
     print(f"Modes: {', '.join(modes)}")
     print(f"SEQ_LEN={SEQ_LEN} BATCH_SIZE={BATCH_SIZE} IMAGE_GRID={IMAGE_GRID} PROFILE_CNT={PROFILE_CNT}")
 
@@ -296,15 +310,15 @@ def main() -> None:
             # modes run in one process, each mode shows up as a named region in nsys.
             with nvtx.add_nvtx_event(mode):
                 if mode == "text_prefill":
-                    outputs, _ = run_prefill_mode(mode, runner, (text_ids,))
+                    outputs, _ = run_prefill_mode(mode, runner, (text_ids,), label=label)
                 elif mode == "text_decode":
-                    outputs, _ = run_decode_mode(mode, runner, (text_ids,), (decode_ids,))
+                    outputs, _ = run_decode_mode(mode, runner, (text_ids,), (decode_ids,), label=label)
                 elif mode == "image_prefill":
                     assert image_inputs is not None
-                    outputs, _ = run_prefill_mode(mode, runner, image_inputs[0])
+                    outputs, _ = run_prefill_mode(mode, runner, image_inputs[0], label=label)
                 elif mode == "image_decode":
                     assert image_inputs is not None
-                    outputs, _ = run_decode_mode(mode, runner, image_inputs[0], (decode_ids, *image_inputs[1]))
+                    outputs, _ = run_decode_mode(mode, runner, image_inputs[0], (decode_ids, *image_inputs[1]), label=label)
     print(f"Final logits: {tuple(outputs.shape)}")
 
 

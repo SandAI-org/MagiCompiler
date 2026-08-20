@@ -19,13 +19,14 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 PROJECT_ROOT=$(cd "$SCRIPT_DIR/../../.." &> /dev/null && pwd)
 
 export MODE=${MODE:-all}
+export COMPILE_MODE=${COMPILE_MODE:-magi}
 PYTHON_BIN=${PYTHON_BIN:-python}
 
 if [ "${NSYS_PROFILE:-true}" = "true" ]; then
     mkdir -p "$PROJECT_ROOT/nsys_reports"
 
-    NSYS_OUTPUT="$PROJECT_ROOT/nsys_reports/nsys_qwen35_4b_${MODE}_$(date +%Y%m%d_%H%M%S)"
-    echo "${MODE} nsys report: ${NSYS_OUTPUT}.nsys-rep"
+    NSYS_OUTPUT="$PROJECT_ROOT/nsys_reports/nsys_qwen35_4b_${COMPILE_MODE}_${MODE}_$(date +%Y%m%d_%H%M%S)"
+    echo "${COMPILE_MODE} ${MODE} nsys report: ${NSYS_OUTPUT}.nsys-rep"
 
     NSYS_CMD=(nsys profile --force-overwrite true -o "$NSYS_OUTPUT" --trace=cuda,nvtx --capture-range=cudaProfilerApi)
 else

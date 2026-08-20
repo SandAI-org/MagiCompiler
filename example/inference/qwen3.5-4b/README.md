@@ -15,6 +15,13 @@ MODE=all NSYS_PROFILE=false \
 bash example/inference/qwen3.5-4b/infer.sh
 ```
 
+Run the eager baseline without `magi_compile`:
+
+```bash
+COMPILE_MODE=eager MODE=all NSYS_PROFILE=false \
+bash example/inference/qwen3.5-4b/infer.sh
+```
+
 Load a local checkpoint:
 
 ```bash
@@ -56,6 +63,7 @@ Useful environment variables:
 
 - `MODEL_PATH`: checkpoint directory, optional. When unset, the example uses the built-in Qwen3.5-4B config and random weights
 - `SKIP_LOAD_MODEL`: `true` to skip loading checkpoint weights even if `MODEL_PATH` is set, default `false`
+- `COMPILE_MODE`: `magi` to compile with MagiCompiler, or `eager` to run uncompiled PyTorch, default `magi`
 - `MODE`: `text_prefill`, `text_decode`, `image_prefill`, `image_decode`, or `all`, default `all`
 - `SEQ_LEN`: synthetic sequence length, default `128`
 - `BATCH_SIZE`: synthetic batch size, default `1`

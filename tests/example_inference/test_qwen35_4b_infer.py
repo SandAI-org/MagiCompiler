@@ -186,6 +186,33 @@ def test_compiled_entrypoints_smoke_with_fake_model(monkeypatch):
     assert model.calls[2]["logits_to_keep"] == 1
 
 
+def test_eager_build_runner_skips_magi_compile(monkeypatch):
+    module = load_infer_module()
+
+    def boom(*args, **kwargs):
+        raise AssertionError("eager path must not call magi_compile")
+
+    monkeypatch.setattr(module, "magi_compile", boom)
+    model = FakeModel()
+    runner = module.build_runner(model, image_grid=(1, 2, 2), compile_mode="eager")
+
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+    decode_ids = torch.tensor([[6]])
+    assert runner.text_prefill(input_ids).shape == (1, 1, 7)
+    assert runner.text_decode(decode_ids).shape == (1, 1, 7)
+
+
+def test_build_runner_rejects_unknown_compile_mode():
+    module = load_infer_module()
+
+    try:
+        module.build_runner(FakeModel(), image_grid=(1, 2, 2), compile_mode="torch")
+    except ValueError as exc:
+        assert "COMPILE_MODE" in str(exc)
+    else:
+        raise AssertionError("expected unknown COMPILE_MODE to raise")
+
+
 def test_make_image_inputs_accepts_minimum_default_grid(monkeypatch):
     module = load_infer_module()
     monkeypatch.setattr(module, "DTYPE", torch.float32)
