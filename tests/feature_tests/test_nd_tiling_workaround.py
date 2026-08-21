@@ -54,11 +54,10 @@ def _restore_inductor_config():
 from magi_compiler.utils.envs import IS_PT_212
 
 
-def _assert_injected(injected):
+def _assert_injected(injected, expected_max_tiles=2):
     cfg = torch._inductor.config
     if injected:
         assert cfg.triton.prefer_nd_tiling is True
-        expected_max_tiles = 2 if IS_PT_212 else 3
         assert cfg.triton.max_tiles == expected_max_tiles
         assert cfg.triton.tile_reductions is True
     else:
@@ -82,7 +81,22 @@ def test_auto_injects_when_all_conditions_met(fake_mode):
     pass_ = ND_TilingWorkaroundPass()
     gm = _auto_eligible_graph(fake_mode)
     pass_(gm.graph)
-    _assert_injected(True)
+    _assert_injected(True, expected_max_tiles=2)
+
+
+def test_auto_injects_with_version_appropriate_max_tiles(fake_mode):
+    """PT < 2.12 can safely use max_tiles=3; PT >= 2.12 must stay at 2."""
+    from magi_compiler.config import get_compile_config
+
+    safe_max = 2 if IS_PT_212 else 3
+    get_compile_config().pass_config.nd_tiling_max_tiles = safe_max
+    try:
+        pass_ = ND_TilingWorkaroundPass()
+        gm = _auto_eligible_graph(fake_mode)
+        pass_(gm.graph)
+        _assert_injected(True, expected_max_tiles=safe_max)
+    finally:
+        get_compile_config().pass_config.nd_tiling_max_tiles = 2
 
 
 def test_auto_skips_on_static_shapes(fake_mode):
