@@ -509,6 +509,17 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
         id_cpu_lambda = getattr(fn, "__qualname__", "") == "Module.cpu.<locals>.<lambda>"
         is_to_lambda = getattr(fn, "__qualname__", "") == "Module.to.<locals>.convert"
 
+        # Detect .to("cuda:X") by probing the lambda on a small CPU tensor.
+        # .to("cpu") also produces is_to_lambda=True but should not trigger offload.
+        is_to_cuda = False
+        if is_to_lambda and not getattr(self, "_magi_offloaded_once", False):
+            try:
+                is_to_cuda = fn(torch.empty(0, device="cpu")).is_cuda
+            except Exception:
+                pass
+
+        is_moving_to_gpu = is_cuda_lambda or is_to_cuda
+
         # after first time to call _apply(cuda), skip "Module.to" and "Module.cpu" and "Module.cuda"
         if getattr(self, "_magi_offloaded_once", False):
             if is_cuda_lambda or id_cpu_lambda or is_to_lambda:
@@ -516,8 +527,8 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
             else:
                 return _orig_apply(self, fn)
         else:
-            # first time to call _apply(cuda), move all parameters/buffers to CPU
-            if not is_cuda_lambda:
+            # first time to call _apply(cuda) or _apply(to_cuda), move all parameters/buffers to CPU
+            if not is_moving_to_gpu:
                 return _orig_apply(self, fn)
 
         # move all parameters/buffers to CPU

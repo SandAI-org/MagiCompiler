@@ -18,7 +18,6 @@
 import torch
 
 from ...magi_depyf.timeline import emit_pass_lifecycle
-from ...utils.envs import IS_PT_212
 from ..pass_base import MagiInductorPass
 
 
@@ -40,7 +39,9 @@ class ND_TilingWorkaroundPass(MagiInductorPass):
         torch._inductor.config.triton.prefer_nd_tiling = True
         torch._inductor.config.triton.tile_reductions = True
 
-        # PT 2.12 Inductor generates invalid 3D-grid reduction kernels with
-        # max_tiles=3 (program_id(2) mapped to a non-existent grid dim).
-        # Cap at 2 on PT >= 2.12 until the upstream fix lands.
-        torch._inductor.config.triton.max_tiles = 2 if IS_PT_212 else 3
+        # Capped at 2 by default: Grid3D has no z-overflow handling, so a
+        # conv-heavy dynamic-shape graph can exceed CUDA's 65535 z-grid limit.
+        # Raise it via MAGI_COMPILE_PASS_CONFIG__ND_TILING_MAX_TILES to test 3.
+        from ...config import get_compile_config
+
+        torch._inductor.config.triton.max_tiles = get_compile_config().pass_config.nd_tiling_max_tiles
