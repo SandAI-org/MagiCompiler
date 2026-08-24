@@ -306,6 +306,17 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                                 node.update_kwarg('device', target_device)
                                 needs_recompile = True
 
+            # Also fix get_attr nodes whose example_value is on CPU.
+            # model_cpu_offload keeps weights on CPU via _patch_cpu_offload_apply,
+            # so get_attr FakeTensors carry cpu device. Moving them to CUDA
+            # prevents device conflicts during Inductor compilation.
+            for node in module.graph.nodes:
+                if node.op == 'get_attr':
+                    ev = node.meta.get('example_value')
+                    if ev is not None and hasattr(ev, 'device') and str(ev.device) == 'cpu':
+                        node.meta['example_value'] = ev.to(target_device)
+                        needs_recompile = True
+
             if needs_recompile:
                 module.recompile()
 
