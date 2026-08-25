@@ -79,6 +79,20 @@ class RemoveItemPass(MagiInductorPass):
             return True
         return False
 
+    @staticmethod
+    def _user_accepts_tensor_scalar(user: torch.fx.Node) -> bool:
+        """Whether this user can take a 0-dim tensor instead of a Python scalar.
+
+        ``F.dropout`` must keep the Python float: it does ``if p < 0.0``.
+        Custom ``torch.ops.*`` overloads accept tensor scalars.
+        """
+        if user.op != "call_function":
+            return False
+        target = user.target
+        if target in RemoveItemPass.SUPPORTED_OPS:
+            return True
+        return isinstance(target, (torch._ops.OpOverload, torch._ops.OpOverloadPacket))
+
     def is_applicable(self, graph: torch.fx.Graph, shape: int | None = None) -> bool:
         for node in graph.nodes:
             if self._is_item_node(node):
@@ -99,16 +113,13 @@ class RemoveItemPass(MagiInductorPass):
             if not isinstance(input_node, torch.fx.Node) or input_node.op != "placeholder":
                 continue
 
-            # Allow removal if all users are call_function with supported ops,
-            # OR if all users are call_function (any target) — custom ops like
-            # athena.gaga4_fa_with_sink_cp accept scalar tensors transparently.
-            can_remove = all(
-                user.op == "call_function" and (
-                    user.target in self.SUPPORTED_OPS
-                    or hasattr(user.target, '__module__')  # custom op / torch op
-                )
-                for user in node.users
-            )
+            # a91a4b4 used ``hasattr(target, "__module__")`` which matches
+            # *every* Python function, including F.dropout.  That stripped
+            # item() in front of dropout so piecewise fake-run hit
+            # ``if p < 0.0`` on a FakeTensor (DataDependentOutputException).
+            # Keep the original whitelist, plus real torch.ops overloads
+            # (athena.gaga4_fa_with_sink_cp etc.).
+            can_remove = all(self._user_accepts_tensor_scalar(user) for user in node.users)
             if not can_remove:
                 continue
 
