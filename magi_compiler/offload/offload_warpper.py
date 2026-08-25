@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import collections
+import os
 import operator
 from typing import Any, Dict
 
@@ -68,7 +69,7 @@ class OffloadExecutor:
                 self.user_counts[input_node] += 1
 
             if node.op == "placeholder":
-                is_w = isinstance(node.meta.get("example_value"), torch.nn.Parameter)
+                is_w = self._is_weight_node(node)
                 self.arg_index_weight[placeholder_idx] = is_w
                 self.placeholder_nodes.append(node)
                 self.name_node_map[node.name] = node
@@ -92,7 +93,19 @@ class OffloadExecutor:
             self.submod_weight_sizes[node.name] = size
 
     def _is_weight_node(self, node: Node) -> bool:
-        return node.op == "placeholder" and isinstance(node.meta.get("example_value"), torch.nn.Parameter)
+        if node.op != "placeholder":
+            return False
+        grapharg = node.meta.get("grapharg")
+        if grapharg is not None:
+            src = str(grapharg.source)
+            if "ParamBufferSource" in src:
+                return True
+            if "LocalSource" in src and "ParamBuffer" not in src:
+                return False
+        val = node.meta.get("example_value")
+        if val is not None and isinstance(val, torch.nn.Parameter):
+            return True
+        return False
 
     def _prepare_inputs(self, args) -> Dict[Node, Any]:
         env = {}
