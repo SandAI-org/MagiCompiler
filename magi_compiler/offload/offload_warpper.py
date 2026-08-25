@@ -64,6 +64,9 @@ class OffloadExecutor:
         self.name_node_map = {}
 
         placeholder_idx = 0
+        _src_types = {}
+        _weight_count = 0
+        _total_ph = 0
         for node in self.graph_module.graph.nodes:
             for input_node in node.all_input_nodes:
                 self.user_counts[input_node] += 1
@@ -71,9 +74,19 @@ class OffloadExecutor:
             if node.op == "placeholder":
                 is_w = self._is_weight_node(node)
                 self.arg_index_weight[placeholder_idx] = is_w
+                _total_ph += 1
+                if is_w:
+                    _weight_count += 1
+                ga = node.meta.get("grapharg")
+                if ga is not None:
+                    st = type(ga.source).__name__
+                    _src_types[st] = _src_types.get(st, 0) + 1
                 self.placeholder_nodes.append(node)
                 self.name_node_map[node.name] = node
                 placeholder_idx += 1
+
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(f"[offload stats] total_ph={_total_ph} weight={_weight_count} non_weight={_total_ph-_weight_count} source_types={_src_types}", flush=True)
 
         self.submod_weights_map = {}
         self.submod_weight_sizes = {}
@@ -105,6 +118,9 @@ class OffloadExecutor:
         val = node.meta.get("example_value")
         if val is not None and isinstance(val, torch.nn.Parameter):
             return True
+        if not hasattr(self, "_dbg_is_w") and int(os.environ.get("RANK", "0")) == 0:
+            self._dbg_is_w = True
+            print(f"[offload _is_weight] node={node.name} grapharg={'yes' if grapharg else 'no'} val_type={type(val).__name__ if val else 'None'} -> False", flush=True)
         return False
 
     def _prepare_inputs(self, args) -> Dict[Node, Any]:
@@ -207,14 +223,18 @@ class OffloadExecutor:
                     self.profiler.end_compute_profile(node.name, self.compute_stream)
 
             elif node.op == "call_function":
-                # ... (Standard execution logic same as before)
                 if node.target == operator.getitem:
                     parent_node, idx = node.args
                     env[node] = env[parent_node][idx]
                 else:
+                    def _ensure_cuda(v):
+                        if isinstance(v, torch.Tensor) and not v.is_cuda:
+                            return v.to("cuda", non_blocking=True)
+                        return v
+
                     with torch.cuda.stream(self.compute_stream):
-                        f_args = map_arg(node.args, lambda n: env[n])
-                        f_kwargs = map_arg(node.kwargs, lambda n: env[n])
+                        f_args = map_arg(node.args, lambda n: _ensure_cuda(env[n]))
+                        f_kwargs = map_arg(node.kwargs, lambda n: _ensure_cuda(env[n]))
                         env[node] = node.target(*f_args, **f_kwargs)
 
             elif node.op == "output":
