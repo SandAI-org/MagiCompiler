@@ -329,6 +329,27 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                 if isinstance(arg, torch.Tensor):
                     fake_args[i] = arg.cuda()
 
+            # Debug: dump node devices for offload analysis
+            import os
+            if os.environ.get("MAGI_OFFLOAD_DEBUG") == "1" and int(os.environ.get("RANK", "0")) == 0:
+                dump_dir = Path(os.environ.get("MAGI_OFFLOAD_DUMP_DIR", "/tmp/magi_offload_debug"))
+                dump_dir.mkdir(parents=True, exist_ok=True)
+                with open(dump_dir / "graph_nodes.txt", "w") as f:
+                    f.write("=== FX Graph Nodes ===\n")
+                    for node in self.module.graph.nodes:
+                        ev = node.meta.get("example_value")
+                        dev = "?"
+                        if hasattr(ev, "device"):
+                            dev = str(ev.device)
+                        elif isinstance(ev, (list, tuple)) and len(ev) > 0 and hasattr(ev[0], "device"):
+                            dev = str(ev[0].device)
+                        f.write(f"{node.op:15s} {node.target!s:60s} device={dev}\n")
+                    f.write(f"\n=== fake_args devices ===\n")
+                    for i, a in enumerate(fake_args):
+                        dev = getattr(a, "device", "non-tensor") if hasattr(a, "device") else type(a).__name__
+                        f.write(f"  arg[{i}] {dev}\n")
+                magi_logger.info(f"[offload debug] dumped graph nodes to {dump_dir / 'graph_nodes.txt'}")
+
         with self.fake_mode, enable_python_dispatcher():
             return super().run(*fake_args)
 

@@ -44,6 +44,9 @@ class RemoveItemPass(MagiInductorPass):
         torch.ops.aten.le.Scalar,
         torch.ops.aten.eq.Scalar,
         torch.ops.aten.ne.Scalar,
+        # Symbolic scalar conversion (e.g. float(scalar_tensor))
+        torch.sym_float,
+        torch.sym_int,
         # Python-level operators (Dynamo-traced graphs)
         operator.add,
         operator.mul,
@@ -96,7 +99,16 @@ class RemoveItemPass(MagiInductorPass):
             if not isinstance(input_node, torch.fx.Node) or input_node.op != "placeholder":
                 continue
 
-            can_remove = all(user.op == "call_function" and user.target in self.SUPPORTED_OPS for user in node.users)
+            # Allow removal if all users are call_function with supported ops,
+            # OR if all users are call_function (any target) — custom ops like
+            # athena.gaga4_fa_with_sink_cp accept scalar tensors transparently.
+            can_remove = all(
+                user.op == "call_function" and (
+                    user.target in self.SUPPORTED_OPS
+                    or hasattr(user.target, '__module__')  # custom op / torch op
+                )
+                for user in node.users
+            )
             if not can_remove:
                 continue
 
