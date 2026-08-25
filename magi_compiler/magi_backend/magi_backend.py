@@ -1,3 +1,4 @@
+import torch
 # Copyright (c) 2025 SandAI. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -306,12 +307,14 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                                 node.update_kwarg('device', target_device)
                                 needs_recompile = True
 
-            # Also fix get_attr nodes whose example_value is on CPU.
-            # model_cpu_offload keeps weights on CPU via _patch_cpu_offload_apply,
-            # so get_attr FakeTensors carry cpu device. Moving them to CUDA
-            # prevents device conflicts during Inductor compilation.
+            # Fix get_attr AND placeholder nodes with CPU example_values.
+            # model_cpu_offload keeps weights on CPU, so FakeTensors carry
+            # CPU device. Submod placeholders inherit the split_gm's env
+            # device but their meta["example_value"] may still say CPU.
+            # Inductor autotuning creates benchmark tensors on the
+            # example_value device, so they must be CUDA.
             for node in module.graph.nodes:
-                if node.op == 'get_attr':
+                if node.op in ('get_attr', 'placeholder'):
                     ev = node.meta.get('example_value')
                     if ev is not None and hasattr(ev, 'device') and str(ev.device) == 'cpu':
                         node.meta['example_value'] = ev.to(target_device)
@@ -725,16 +728,24 @@ class MagiBackend:
         # NOTE: `tensorify_python_scalars` pass triggers dynamo recapture by raising `TensorifyScalarRestartAnalysis` error.
         # So that we need to update `_called_once` after all compilation is done.
 
+        if torch.cuda.is_available():
+            print("[compile] PRE-compile GPU: alloc=%.2f GiB reserved=%.2f GiB" % (torch.cuda.memory_allocated() / 2**30, torch.cuda.memory_reserved() / 2**30), flush=True)
         PiecewiseCompileInterpreter(
             split_gm, self.compiler_manager, submod_names_to_compile, self.compile_config, self.inductor_compile_config
         ).run(*example_inputs)
+        if torch.cuda.is_available():
+            print("[compile] POST-compile GPU: alloc=%.2f GiB reserved=%.2f GiB" % (torch.cuda.memory_allocated() / 2**30, torch.cuda.memory_reserved() / 2**30), flush=True)
 
         self._called_once = True
 
         # TODO: Support DBO (Dynamic Batching Orchestration) and NAT here.
         # TODO: Support TokenFlow graph forking here.
 
+        # Free GPU memory accumulated during compile (Inductor autotuning,
+        # Triton kernel cache, FakeTensor materialization).
         if self.compile_config.offload_config.model_cpu_offload:
+            torch.cuda.empty_cache()
+            print("Post-compile GPU after empty_cache: alloc=%.2f GiB reserved=%.2f GiB" % (torch.cuda.memory_allocated() / 2**30, torch.cuda.memory_reserved() / 2**30), flush=True)
             split_gm = OffloadWrapper(split_gm, self.compile_config)
 
         runnable_gm = split_gm

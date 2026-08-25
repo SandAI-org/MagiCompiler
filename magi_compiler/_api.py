@@ -531,11 +531,14 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
             if not is_moving_to_gpu:
                 return _orig_apply(self, fn)
 
-        # move all parameters/buffers to CPU
-        def _force_cpu(t):
-            return fn(t).cpu()
+        # Keep all parameters/buffers on CPU (skip GPU round-trip that
+        # causes OOM on GPUs with less memory than model size).
+        def _stay_cpu(t):
+            if t.device.type != "cpu":
+                return t.cpu()
+            return t
 
-        _orig_apply(self, _force_cpu)
+        _orig_apply(self, _stay_cpu)
 
         # create shared memory tensors for all parameters/buffers on CPU
         if dist.is_initialized():

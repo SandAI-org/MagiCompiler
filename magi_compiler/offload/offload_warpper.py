@@ -99,6 +99,22 @@ class OffloadExecutor:
         args = list(args)
         submod_0 = self.submod_nodes[0]
 
+        # Debug: count weight vs non-weight and memory
+        import os
+        if os.environ.get("MAGI_OFFLOAD_DEBUG") == "1" and int(os.environ.get("RANK", "0")) == 0:
+            n_w = sum(1 for v in self.arg_index_weight.values() if v)
+            n_nw = sum(1 for v in self.arg_index_weight.values() if not v)
+            nw_bytes = sum(
+                args[i].nbytes for i, v in self.arg_index_weight.items()
+                if not v and isinstance(args[i], torch.Tensor)
+            )
+            w_bytes = sum(
+                args[i].nbytes for i, v in self.arg_index_weight.items()
+                if v and isinstance(args[i], torch.Tensor)
+            )
+            print(f"[offload debug] placeholders: {n_w} weight ({w_bytes/1e9:.2f}GiB) + {n_nw} non-weight ({nw_bytes/1e9:.2f}GiB)", flush=True)
+            print(f"[offload debug] GPU before: alloc={torch.cuda.memory_allocated()/1e9:.2f}GiB reserved={torch.cuda.memory_reserved()/1e9:.2f}GiB", flush=True)
+
         for i, node in enumerate(self.placeholder_nodes):
             arg_val = args[i]
             is_weight = self.arg_index_weight[i]

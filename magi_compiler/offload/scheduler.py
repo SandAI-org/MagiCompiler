@@ -158,7 +158,9 @@ class BaseScheduler(OffloadScheduler):
         target_node = None
         is_next_iter = False
 
-        for offset in range(1, max_lookahead + 1):
+        # Always ensure current submod's weights are on GPU (offset=0),
+        # then optionally prefetch ahead (offset=1..max_lookahead).
+        for offset in range(0, max_lookahead + 1):
             candidate_idx = (idx + offset) % self.submod_num
             candidate_node = self.submod_nodes[candidate_idx]
 
