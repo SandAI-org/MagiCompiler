@@ -253,8 +253,28 @@ def _magi_compile_bound_method(
             state = getattr(instance, state_attr)
 
         if state.compile_config.offload_config.model_cpu_offload and state.jit_compiled_code is None:
-            args = offload(args)
-            kwargs = offload(kwargs)
+            # Move ALL tensors in the model to CUDA before first compile call
+            # so Dynamo traces with CUDA tensors and captures the correct
+            # (Triton) code path.  Without this, CPU weights cause
+            # x.is_cuda=False during tracing, leading to a decomposed Python
+            # path with 10x more subgraph boundaries and catastrophic
+            # numerical divergence in MoE routing.
+            def _deep_cuda(mod):
+                for name, child in mod.named_children():
+                    _deep_cuda(child)
+                for name, buf in list(mod._buffers.items()):
+                    if buf is not None and buf.device.type == "cpu":
+                        mod._buffers[name] = buf.cuda()
+                for name, param in list(mod._parameters.items()):
+                    if param is not None and param.device.type == "cpu":
+                        mod._parameters[name] = torch.nn.Parameter(param.data.cuda(), requires_grad=param.requires_grad)
+                for name in list(vars(mod)):
+                    v = getattr(mod, name)
+                    if isinstance(v, torch.Tensor) and not isinstance(v, torch.nn.Parameter) and v.device.type == "cpu":
+                        setattr(mod, name, v.cuda())
+            _deep_cuda(instance)
+            import gc; gc.collect(); torch.cuda.empty_cache()
+            # Do NOT offload args — keep them on CUDA for correct tracing
 
         if torch.compiler.is_compiling():
             return old_method(*args, **kwargs)
@@ -538,7 +558,8 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
         _orig_apply(self, _force_cpu)
 
         # create shared memory tensors for all parameters/buffers on CPU
-        if dist.is_initialized():
+        ep_size = int(os.environ.get("ENGINE_CONFIG__EP_SIZE", "1"))
+        if dist.is_initialized() and ep_size <= 1:
             local_rank = int(os.environ.get("LOCAL_RANK", 0))
             full_state_dict = self.state_dict()
 
@@ -572,7 +593,6 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
                     if dtype == torch.bfloat16:
                         flat_buffer.view(torch.int16).numpy().tofile(shared_bin_path)
                     elif dtype.itemsize == 1 and dtype.is_floating_point:
-                        # fp8
                         flat_buffer.view(torch.uint8).numpy().tofile(shared_bin_path)
                     else:
                         flat_buffer.numpy().tofile(shared_bin_path)
