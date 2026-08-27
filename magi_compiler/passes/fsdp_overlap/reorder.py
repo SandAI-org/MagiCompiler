@@ -517,10 +517,6 @@ class FsdpOverlapReorder:
             target, group = targets[launch]
             slot_lo = max(lowers[launch], skel_idx[q - 1] + 1 if q > 0 else 0)
             slot_hi = skel_idx[q] if q < len(skel_idx) else index_of[launch]
-            # The upper bound keeps the gather below the next collective, but it
-            # must never win against the floor: with no collective above (or, on a
-            # pure copy-engine graph, no skeleton at all) it degenerates to the
-            # launch's current index and would silently undo a legal hoist.
             new_target = min(max(target, slot_lo), max(slot_hi, slot_lo))
             targets[launch] = (new_target, group)
             magi_logger.debug(
@@ -558,11 +554,6 @@ class FsdpOverlapReorder:
                     if deps and all(d.name in produced for d in deps):
                         group.append(s)
         elif _is_symm_ag_ir(node):
-            # A FallbackKernel's result is re-exposed through an alias snode
-            # (``buf1 = buf0`` in the generated code), which is what the wait and
-            # the consumer actually read.  Inductor's own collectives have no such
-            # layer, so this is the one structural difference the copy-engine
-            # transport introduces -- and it has to move with the launch.
             for s in order:
                 if s is launch or contains_wait(s) or not self._is_transparent(s):
                     continue

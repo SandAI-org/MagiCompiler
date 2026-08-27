@@ -386,14 +386,7 @@ def _is_symm_ag_coalesced_ir(node) -> bool:
 
 
 def _symm_ag_spec(node):
-    """(shapes, dtype, group_size, group_name) for a copy-engine gather.
-
-    ``shapes`` is a tuple of local-shard shapes (one member, or one per
-    coalesced input).  Read off ``constant_args``, the way ``_collective_spec``
-    reads a group name.  Not off ``get_origin_node()``: Inductor leaves that
-    unset on these nodes, and the resulting ``None`` silently degraded the
-    gather to a zero cost.
-    """
+    """(shapes, dtype, group_size, group_name). Use ``constant_args``; ``get_origin_node()`` is unset and would cost 0."""
     args = getattr(node, "constant_args", None)
     if not args or len(args) < 2:
         return None
@@ -436,14 +429,7 @@ def _symm_ag_launch_wait(snode: BaseSchedulerNode):
 
 
 def _measure_symm_ag(snode: BaseSchedulerNode) -> float:
-    """Time the copy-engine gather TOGETHER WITH its wait.
-
-    Timing the launch alone would measure the CPU issue cost and nothing else:
-    the copies run on a side stream, so without the wait the timing events on the
-    current stream close before a single byte has moved.  That reads as ~3us for
-    a gather that really takes tens of microseconds, and the reorder pass then
-    sizes a window an order of magnitude too small.
-    """
+    """Time ``wait(launch())``. Launch-only is ~3us CPU issue; copies run on a side stream."""
     pair = _symm_ag_launch_wait(snode)
     if pair is None:
         return 0.0
