@@ -578,9 +578,12 @@ class MagiBackend:
         from magi_compiler.profiling import ProfilingRuntimeEstimator
 
         bucket_size_bytes = int(fsdp_cfg.bucket_size_mib) * 1024 * 1024
-        n_buckets = lower_and_bucket_full_graph(graph, fsdp_cfg.bucket_mode, bucket_size_bytes=bucket_size_bytes)
+        n_buckets = lower_and_bucket_full_graph(
+            graph, fsdp_cfg.bucket_mode, bucket_size_bytes=bucket_size_bytes, transport=fsdp_cfg.transport
+        )
         magi_logger.info(
-            "FSDP fullgraph overlap: bucket_mode=%s bucket_size=%d MiB created %d buckets",
+            "FSDP fullgraph overlap: transport=%s bucket_mode=%s bucket_size=%d MiB created %d buckets",
+            fsdp_cfg.transport,
             fsdp_cfg.bucket_mode,
             fsdp_cfg.bucket_size_mib,
             n_buckets,

@@ -293,6 +293,25 @@ def test_internal_collective_extern_not_measured_in_sync_warmup(monkeypatch, syn
         _INTERNAL_COLLECTIVE_OPS.discard("aten::mm")
 
 
+# ---------------------------------------------------------------------------
+# window scale: need = comm * scale + margin
+# ---------------------------------------------------------------------------
+def test_reorder_window_params_survive_deepcopy():
+    """Both terms of the window budget must survive the deepcopy Inductor does
+    when it folds this pass into the fx-graph cache key.  ``__deepcopy__``
+    copies the fields by hand, so a dropped line silently reverts one of them
+    to its default instead of raising."""
+    import copy
+
+    from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder
+
+    pass_obj = FsdpOverlapReorder(comm_overlap_window_scale=2.0, comm_overlap_window_margin_ns=1234.0)
+    clone = copy.deepcopy(pass_obj)
+    for obj in (pass_obj, clone):
+        assert obj.comm_overlap_window_scale == pytest.approx(2.0)
+        assert obj.comm_overlap_window_margin_ns == pytest.approx(1234.0)
+
+
 import torch._inductor.config as inductor_config  # noqa: E402
 
 # ===========================================================================

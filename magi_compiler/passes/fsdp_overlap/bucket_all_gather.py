@@ -177,7 +177,7 @@ def _coalesce_one_bucket(graph: fx.GraphModule, node_index: dict[fx.Node, int], 
         graph.graph.erase_node(ag_old)
 
 
-def bucket_weight_all_gather_coalesced(graph: fx.GraphModule, bucket_size_bytes: int = 0) -> int:
+def bucket_weight_all_gather_coalesced(graph: fx.GraphModule, bucket_size_bytes: int = 0, eligible=None) -> int:
     """Coalesce the SimpleFSDP weight all-gathers over the WHOLE graph: per process
     group, walk them in program order and cut a new bucket at every dtype change or
     when the accumulated local-shard bytes would exceed ``bucket_size_bytes``
@@ -203,6 +203,8 @@ def bucket_weight_all_gather_coalesced(graph: fx.GraphModule, bucket_size_bytes:
     groups: dict[str, list[fx.Node]] = defaultdict(list)
     for node in graph.graph.nodes:
         if not _is_weight_all_gather(node):
+            continue
+        if eligible is not None and not eligible(node):
             continue
         _, _world, group_name = node.args
         groups[group_name].append(node)

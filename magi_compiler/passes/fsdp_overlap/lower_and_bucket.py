@@ -20,9 +20,12 @@ from magi_compiler.utils import magi_logger
 
 from .bucket_all_gather import bucket_weight_all_gather_coalesced
 from .redistribute_lowering import lower_prim_redistribute_to_collectives
+from .symm_ag_rewrite import rewrite_weight_ag_to_copy_engine
 
 
-def lower_and_bucket_full_graph(graph: fx.GraphModule, bucket_mode: str, bucket_size_bytes: int = 0) -> int:
+def lower_and_bucket_full_graph(
+    graph: fx.GraphModule, bucket_mode: str, bucket_size_bytes: int = 0, transport: str = "nccl"
+) -> int:
     """Lower SimpleFSDP weight redistribute -> explicit collectives, then
     optionally bucket them across the WHOLE graph (no subgraph partitioning).
 
@@ -36,19 +39,28 @@ def lower_and_bucket_full_graph(graph: fx.GraphModule, bucket_mode: str, bucket_
     the byte cap in program order (see ``bucket_weight_all_gather_coalesced``).
     0 = no cap (one bucket per (group, dtype) run).
 
+    ``transport="copy_engine"`` buckets *first* (only arena-shard gathers, so
+    cast/pad stays out of the bucket), then retargets both the leftover singles
+    and the coalesced launches at the copy-engine ops.  The wrapper still runs
+    one gather per member; reorder just sees one comm node per bucket.
+
     Returns the number of buckets created.
     """
     lowered = lower_prim_redistribute_to_collectives(graph)
     magi_logger.info("Whole-graph FSDP lowering: %d weight redistribute -> collectives", lowered)
 
     bucket_mode = (bucket_mode or "none").lower()
-    if bucket_mode == "none":
-        return 0
-
+    n = 0
     if bucket_mode == "coalesced":
-        n = bucket_weight_all_gather_coalesced(graph, bucket_size_bytes=bucket_size_bytes)
-    else:
+        from .symm_ag_rewrite import _input_is_arena_shard
+
+        eligible = _input_is_arena_shard if transport == "copy_engine" else None
+        n = bucket_weight_all_gather_coalesced(graph, bucket_size_bytes=bucket_size_bytes, eligible=eligible)
+        magi_logger.info("Whole-graph FSDP bucketing (%s): created %d buckets", bucket_mode, n)
+    elif bucket_mode not in ("none", ""):
         raise ValueError(f"Unknown bucket_mode={bucket_mode!r}; expected 'none' or 'coalesced'")
 
-    magi_logger.info("Whole-graph FSDP bucketing (%s): created %d buckets", bucket_mode, n)
+    if transport == "copy_engine":
+        rewrite_weight_ag_to_copy_engine(graph)
+
     return n

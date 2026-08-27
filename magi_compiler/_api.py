@@ -182,6 +182,11 @@ def _lazy_init_magi_state(
     if getattr(state_holder, state_attr, None) is not None:
         return
 
+    if conf.fsdp_config.transport == "copy_engine":
+        from magi_compiler.runtime.symm_arena import barrier_after_load
+
+        barrier_after_load()
+
     compilation_counter.num_models_seen += 1
 
     setattr(
@@ -216,6 +221,11 @@ def _magi_compile_class(
     if issubclass(cls, nn.Module) and conf.offload_config.model_cpu_offload:
         _patch_cpu_offload_apply(cls)
 
+    if issubclass(cls, nn.Module) and conf.fsdp_config.transport == "copy_engine":
+        from magi_compiler.runtime.symm_arena import patch_symm_arena_apply
+
+        patch_symm_arena_apply(cls)
+
     old_init = cls.__init__
 
     @functools.wraps(old_init)
@@ -238,6 +248,11 @@ def _magi_compile_bound_method(
     installed_attr = get_attr_name_for_bound_wrapper_flag(method_name)
     if getattr(instance, installed_attr, False):
         return instance
+
+    if conf.fsdp_config.transport == "copy_engine" and isinstance(instance, nn.Module):
+        from magi_compiler.runtime.symm_arena import migrate_to_arenas
+
+        migrate_to_arenas(instance)
 
     old_method = getattr(instance, method_name)
 

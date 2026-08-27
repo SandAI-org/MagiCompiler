@@ -51,7 +51,21 @@ from magi_compiler.utils import magi_logger
 
 _AG = torch.ops._c10d_functional.all_gather_into_tensor.default
 _AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
-_WEIGHT_AG_OPS = (_AG, _AG_COALESCED)
+
+
+def _symm_ag_ops():
+    """Copy-engine gather ops, imported lazily so this pass stays importable
+    without a CUDA build."""
+    try:
+        from magi_compiler.runtime.symm_all_gather import SYMM_ALL_GATHER, SYMM_ALL_GATHER_COALESCED
+
+        return tuple(op for op in (SYMM_ALL_GATHER, SYMM_ALL_GATHER_COALESCED) if op is not None)
+    except Exception:  # noqa: BLE001
+        return ()
+
+
+_SYMM_AG_OPS = _symm_ag_ops()
+_WEIGHT_AG_OPS = tuple(op for op in (_AG, _AG_COALESCED, *_SYMM_AG_OPS) if op is not None)
 
 # Default extra headroom (ns) added to each collective's runtime when sizing the
 # compute window, absorbing estimator error + kernel-launch latency so the wait
@@ -59,17 +73,41 @@ _WEIGHT_AG_OPS = (_AG, _AG_COALESCED)
 _DEFAULT_WINDOW_MARGIN_NS = 5_000.0
 
 
+def _is_symm_ag_ir(node) -> bool:
+    """
+    ``magi::symm_all_gather`` lowers to an ordinary FallbackKernel, so
+    Inductor's ``is_collective`` does not recognize it.
+    """
+    return getattr(node, "op_overload", None) in _SYMM_AG_OPS
+
+
+def _is_symm_ag_coalesced(node) -> bool:
+    try:
+        from magi_compiler.runtime.symm_all_gather import SYMM_ALL_GATHER_COALESCED
+    except Exception:  # noqa: BLE001
+        return False
+    return SYMM_ALL_GATHER_COALESCED is not None and getattr(node, "op_overload", None) is SYMM_ALL_GATHER_COALESCED
+
+
+def _is_gather_ir(node) -> bool:
+    return node is not None and (is_collective(node) or _is_symm_ag_ir(node))
+
+
 def _leaf_collective_node(snode: BaseSchedulerNode):
     """The underlying collective IR node for a (possibly grouped) snode, or None."""
     node = getattr(snode, "node", None)
-    if node is not None and is_collective(node):
+    if _is_gather_ir(node):
         return node
     # GroupedSchedulerNode: find the collective child.
     for child in getattr(snode, "snodes", []) or []:
         cn = getattr(child, "node", None)
-        if cn is not None and is_collective(cn):
+        if _is_gather_ir(cn):
             return cn
     return None
+
+
+def _issues_transfer(snode: BaseSchedulerNode) -> bool:
+    return contains_collective(snode) or _leaf_collective_node(snode) is not None
 
 
 def _is_weight_gather(snode: BaseSchedulerNode) -> bool:
@@ -107,12 +145,13 @@ def _collective_kind_key(snode: BaseSchedulerNode) -> tuple:
 
 def _collective_skeleton(order: list[BaseSchedulerNode]) -> tuple[list[int], list[tuple]]:
     """The graph's collective skeleton: indices (ascending) and rank-comparable
-    kinds of every snode that ISSUES NCCL -- functional collectives plus custom ops
-    with an internal collective . This sequence is what must stay rank-identical;
-    the compute between two consecutive entries is rank-private."""
+    kinds of every snode that issues a transfer -- functional NCCL collectives,
+    custom ops with an internal collective, and copy-engine / symmetric-memory
+    gathers.  This sequence is what must stay rank-identical; the compute
+    between two consecutive entries is rank-private."""
     from magi_compiler.profiling.runtime_estimator import snode_issues_collective
 
-    idx = [i for i, s in enumerate(order) if snode_issues_collective(s)]
+    idx = [i for i, s in enumerate(order) if snode_issues_collective(s) or _issues_transfer(s)]
     return idx, [_collective_kind_key(order[i]) for i in idx]
 
 
@@ -212,7 +251,7 @@ class FsdpOverlapReorder:
 
     @staticmethod
     def _is_compute(snode: BaseSchedulerNode) -> bool:
-        return not contains_collective(snode) and not contains_wait(snode)
+        return not _issues_transfer(snode) and not contains_wait(snode)
 
     # -- main -------------------------------------------------------------
     def __call__(self, snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
@@ -247,7 +286,7 @@ class FsdpOverlapReorder:
         if hasattr(self._cost_fn, "warm_and_sync") and getattr(self._cost_fn, "_sync_across_ranks", False):
             try:
                 for s in order:
-                    if self._is_compute(s) or contains_collective(s):
+                    if self._is_compute(s) or _issues_transfer(s):
                         self._cost(s)
                 n_changed = self._cost_fn.warm_and_sync()
                 self._cost_cache = {}  # re-read synced costs
@@ -311,8 +350,10 @@ class FsdpOverlapReorder:
             #               compute before covering comm -- i.e. hit `lower` or the
             #               previous gather's placement first)
             magi_logger.debug(
-                "FSDP overlap placement: launch cur=%d -> target=%d fc=%d lower=%d | "
+                "FSDP overlap placement: launch %s(%s) cur=%d -> target=%d fc=%d lower=%d | "
                 "comm=%.1fus acc_upstream=%.1fus need=%.1fus %s",
+                launch.get_name(),
+                getattr(_leaf_collective_node(launch), "op_overload", "?"),
                 cur,
                 target,
                 fc_idx,
@@ -476,7 +517,11 @@ class FsdpOverlapReorder:
             target, group = targets[launch]
             slot_lo = max(lowers[launch], skel_idx[q - 1] + 1 if q > 0 else 0)
             slot_hi = skel_idx[q] if q < len(skel_idx) else index_of[launch]
-            new_target = min(max(target, slot_lo), slot_hi)
+            # The upper bound keeps the gather below the next collective, but it
+            # must never win against the floor: with no collective above (or, on a
+            # pure copy-engine graph, no skeleton at all) it degenerates to the
+            # launch's current index and would silently undo a legal hoist.
+            new_target = min(max(target, slot_lo), max(slot_hi, slot_lo))
             targets[launch] = (new_target, group)
             magi_logger.debug(
                 "FSDP overlap slot consensus: launch cur=%d slot=%d/%d (mine=%s) target %d -> %d [%d, %d]",
@@ -500,27 +545,53 @@ class FsdpOverlapReorder:
         """
         group = [launch]
         node = _leaf_collective_node(launch)
-        if node is not None and getattr(node, "op_overload", None) is _AG_COALESCED:
-            produced = set(launch.get_buffer_names())
+        produced = set(launch.get_buffer_names())
+        if node is not None and (getattr(node, "op_overload", None) is _AG_COALESCED or _is_symm_ag_coalesced(node)):
             for s in order:
                 if _is_multi_output(s) and any((not _is_fake_dep(d)) and d.name in produced for d in s.unmet_dependencies):
+                    group.append(s)
+            if _is_symm_ag_coalesced(node):
+                for s in order:
+                    if s is launch or s in group or contains_wait(s) or not self._is_transparent(s):
+                        continue
+                    deps = [d for d in s.unmet_dependencies if not _is_fake_dep(d)]
+                    if deps and all(d.name in produced for d in deps):
+                        group.append(s)
+        elif _is_symm_ag_ir(node):
+            # A FallbackKernel's result is re-exposed through an alias snode
+            # (``buf1 = buf0`` in the generated code), which is what the wait and
+            # the consumer actually read.  Inductor's own collectives have no such
+            # layer, so this is the one structural difference the copy-engine
+            # transport introduces -- and it has to move with the launch.
+            for s in order:
+                if s is launch or contains_wait(s) or not self._is_transparent(s):
+                    continue
+                deps = [d for d in s.unmet_dependencies if not _is_fake_dep(d)]
+                if deps and all(d.name in produced for d in deps):
                     group.append(s)
         return group
 
     # -- consumer discovery ----------------------------------------------
     def _wait_snodes(self, group, order, users) -> list[BaseSchedulerNode]:
-        produced: set[str] = set()
-        for s in group:
-            produced |= set(s.get_buffer_names())
-        waits = []
-        seen = set()
-        for b in produced:
-            for u in users.get(b, ()):  # readers of the launch/member buffers
+        """The waits guarding this launch, reached through any alias layer.
+
+        Searching only the launch's direct readers was enough while every gather
+        was an Inductor collective; a custom-op gather puts an alias snode between
+        the launch and its wait, and missing the wait silently drops the gather
+        from the placement plan altogether.
+        """
+        stack = [b for s in group for b in s.get_buffer_names()]
+        waits: list[BaseSchedulerNode] = []
+        seen: set = set()
+        while stack:
+            for u in users.get(stack.pop(), ()):
                 if u in seen:
                     continue
                 seen.add(u)
                 if contains_wait(u):
                     waits.append(u)
+                elif self._is_transparent(u):
+                    stack.extend(u.get_buffer_names())
         return waits
 
     def _first_consumer_index(self, launch, group, order, users) -> int | None:
