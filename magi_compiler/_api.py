@@ -554,70 +554,107 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
             shared_state_dict = {}
             self._magi_giant_buffers = []
 
-            # EP <= 1: all ranks have identical weights → rank 0 writes, all read (saves RAM).
-            # EP > 1: each rank holds a unique expert shard → every rank writes its own file.
             per_rank_shm = ep_size > 1
-            writer_rank = local_rank if per_rank_shm else 0
 
-            dist.barrier()
+            if per_rank_shm:
+                # EP > 1: each rank holds a unique expert shard.
+                # Stagger writes so only one rank at a time allocates the mmap
+                # file on /dev/shm (~43 GB). Without staggering, all 8 ranks
+                # would simultaneously need old_params + shm_file = ~87 GB each,
+                # totalling ~700 GB and exceeding the 512 Gi container limit.
+                world_size = dist.get_world_size()
+                for turn in range(world_size):
+                    if local_rank == turn:
+                        for dtype, param_list in grouped_params.items():
+                            dtype_str = str(dtype).split(".")[-1]
+                            cls_name = self.__class__.__name__
+                            shm_path = f"{envs.MAGI_SHARED_BIN_PATH}/magi_model_shared_{dtype_str}_{cls_name}_rank{local_rank}.bin"
+                            total_numel = sum(t.numel() for _, t in param_list)
+                            elem_size = torch.empty(0, dtype=dtype).element_size()
 
-            for dtype, param_list in grouped_params.items():
-                dtype_str = str(dtype).split(".")[-1]
-                cls_name = self.__class__.__name__
-                if per_rank_shm:
-                    shared_bin_path = f"{envs.MAGI_SHARED_BIN_PATH}/magi_model_shared_{dtype_str}_{cls_name}_rank{local_rank}.bin"
-                else:
+                            with open(shm_path, "wb") as f:
+                                f.truncate(total_numel * elem_size)
+
+                            giant = torch.from_file(shm_path, shared=True, size=total_numel, dtype=dtype, device="cpu")
+                            offset = 0
+                            for _, tensor in param_list:
+                                numel = tensor.numel()
+                                giant[offset : offset + numel].copy_(tensor.view(-1))
+                                offset += numel
+
+                            pin_memory_in_place(giant)
+                            self._magi_giant_buffers.append(giant)
+
+                            offset = 0
+                            for name, original_tensor in param_list:
+                                numel = original_tensor.numel()
+                                shared_param = giant[offset : offset + numel].view(original_tensor.shape)
+                                if original_tensor.requires_grad:
+                                    shared_param.requires_grad_(True)
+                                shared_state_dict[name] = shared_param
+                                offset += numel
+
+                            if os.path.exists(shm_path):
+                                os.remove(shm_path)
+
+                        self.load_state_dict(shared_state_dict, assign=True)
+                        del full_state_dict, grouped_params
+                        gc.collect()
+
+                    dist.barrier()
+
+            else:
+                # EP <= 1: all ranks have identical weights; rank 0 writes, all read.
+                dist.barrier()
+                for dtype, param_list in grouped_params.items():
+                    dtype_str = str(dtype).split(".")[-1]
+                    cls_name = self.__class__.__name__
                     shared_bin_path = f"{envs.MAGI_SHARED_BIN_PATH}/magi_model_shared_{dtype_str}_{cls_name}.bin"
+                    total_numel = sum(t.numel() for _, t in param_list)
 
-                total_numel = sum(t.numel() for _, t in param_list)
+                    if local_rank == 0:
+                        flat_buffer = torch.zeros(total_numel, dtype=dtype)
+                        offset = 0
+                        for _, tensor in param_list:
+                            numel = tensor.numel()
+                            flat_buffer[offset : offset + numel].copy_(tensor.view(-1))
+                            offset += numel
 
-                if local_rank == writer_rank:
-                    flat_buffer = torch.zeros(total_numel, dtype=dtype)
+                        if dtype == torch.bfloat16:
+                            flat_buffer.view(torch.int16).numpy().tofile(shared_bin_path)
+                        elif dtype.itemsize == 1 and dtype.is_floating_point:
+                            flat_buffer.view(torch.uint8).numpy().tofile(shared_bin_path)
+                        else:
+                            flat_buffer.numpy().tofile(shared_bin_path)
+
+                        del flat_buffer
+                        gc.collect()
+
+                    dist.barrier()
+
+                    giant_shared_tensor = torch.from_file(
+                        shared_bin_path, shared=True, size=total_numel, dtype=dtype, device="cpu"
+                    )
+                    self._magi_giant_buffers.append(giant_shared_tensor)
+
+                    pin_memory_in_place(giant_shared_tensor)
+
                     offset = 0
-                    for _, tensor in param_list:
-                        numel = tensor.numel()
-                        flat_buffer[offset : offset + numel].copy_(tensor.view(-1))
+                    for name, original_tensor in param_list:
+                        numel = original_tensor.numel()
+                        shared_param = giant_shared_tensor[offset : offset + numel].view(original_tensor.shape)
+
+                        if original_tensor.requires_grad:
+                            shared_param.requires_grad_(True)
+
+                        shared_state_dict[name] = shared_param
                         offset += numel
 
-                    if dtype == torch.bfloat16:
-                        flat_buffer.view(torch.int16).numpy().tofile(shared_bin_path)
-                    elif dtype.itemsize == 1 and dtype.is_floating_point:
-                        flat_buffer.view(torch.uint8).numpy().tofile(shared_bin_path)
-                    else:
-                        flat_buffer.numpy().tofile(shared_bin_path)
-
-                    del flat_buffer
-                    gc.collect()
-
-                dist.barrier()
-
-                giant_shared_tensor = torch.from_file(
-                    shared_bin_path, shared=True, size=total_numel, dtype=dtype, device="cpu"
-                )
-                self._magi_giant_buffers.append(giant_shared_tensor)
-
-                pin_memory_in_place(giant_shared_tensor)
-
-                offset = 0
-                for name, original_tensor in param_list:
-                    numel = original_tensor.numel()
-                    shared_param = giant_shared_tensor[offset : offset + numel].view(original_tensor.shape)
-
-                    if original_tensor.requires_grad:
-                        shared_param.requires_grad_(True)
-
-                    shared_state_dict[name] = shared_param
-                    offset += numel
-
-                dist.barrier()
-                if per_rank_shm:
-                    if os.path.exists(shared_bin_path):
-                        os.remove(shared_bin_path)
-                else:
+                    dist.barrier()
                     if local_rank == 0 and os.path.exists(shared_bin_path):
                         os.remove(shared_bin_path)
 
-            self.load_state_dict(shared_state_dict, assign=True)
+                self.load_state_dict(shared_state_dict, assign=True)
 
         else:
 
