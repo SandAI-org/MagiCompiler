@@ -253,28 +253,8 @@ def _magi_compile_bound_method(
             state = getattr(instance, state_attr)
 
         if state.compile_config.offload_config.model_cpu_offload and state.jit_compiled_code is None:
-            # Move ALL tensors in the model to CUDA before first compile call
-            # so Dynamo traces with CUDA tensors and captures the correct
-            # (Triton) code path.  Without this, CPU weights cause
-            # x.is_cuda=False during tracing, leading to a decomposed Python
-            # path with 10x more subgraph boundaries and catastrophic
-            # numerical divergence in MoE routing.
-            def _deep_cuda(mod):
-                for name, child in mod.named_children():
-                    _deep_cuda(child)
-                for name, buf in list(mod._buffers.items()):
-                    if buf is not None and buf.device.type == "cpu":
-                        mod._buffers[name] = buf.cuda()
-                for name, param in list(mod._parameters.items()):
-                    if param is not None and param.device.type == "cpu":
-                        mod._parameters[name] = torch.nn.Parameter(param.data.cuda(), requires_grad=param.requires_grad)
-                for name in list(vars(mod)):
-                    v = getattr(mod, name)
-                    if isinstance(v, torch.Tensor) and not isinstance(v, torch.nn.Parameter) and v.device.type == "cpu":
-                        setattr(mod, name, v.cuda())
-            _deep_cuda(instance)
-            import gc; gc.collect(); torch.cuda.empty_cache()
-            # Do NOT offload args — keep them on CUDA for correct tracing
+            args = offload(args)
+            kwargs = offload(kwargs)
 
         if torch.compiler.is_compiling():
             return old_method(*args, **kwargs)
@@ -559,7 +539,7 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
 
         # create shared memory tensors for all parameters/buffers on CPU
         ep_size = int(os.environ.get("ENGINE_CONFIG__EP_SIZE", os.environ.get("EP_SIZE", "1")))
-        if dist.is_initialized() and ep_size <= 1:
+        if dist.is_initialized():
             local_rank = int(os.environ.get("LOCAL_RANK", 0))
             full_state_dict = self.state_dict()
 
@@ -574,15 +554,24 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
             shared_state_dict = {}
             self._magi_giant_buffers = []
 
+            # EP <= 1: all ranks have identical weights → rank 0 writes, all read (saves RAM).
+            # EP > 1: each rank holds a unique expert shard → every rank writes its own file.
+            per_rank_shm = ep_size > 1
+            writer_rank = local_rank if per_rank_shm else 0
+
             dist.barrier()
 
             for dtype, param_list in grouped_params.items():
                 dtype_str = str(dtype).split(".")[-1]
-                shared_bin_path = f"{envs.MAGI_SHARED_BIN_PATH}/magi_model_shared_{dtype_str}_{self.__class__.__name__}.bin"
+                cls_name = self.__class__.__name__
+                if per_rank_shm:
+                    shared_bin_path = f"{envs.MAGI_SHARED_BIN_PATH}/magi_model_shared_{dtype_str}_{cls_name}_rank{local_rank}.bin"
+                else:
+                    shared_bin_path = f"{envs.MAGI_SHARED_BIN_PATH}/magi_model_shared_{dtype_str}_{cls_name}.bin"
 
                 total_numel = sum(t.numel() for _, t in param_list)
 
-                if local_rank == 0:
+                if local_rank == writer_rank:
                     flat_buffer = torch.zeros(total_numel, dtype=dtype)
                     offset = 0
                     for _, tensor in param_list:
@@ -621,8 +610,12 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
                     offset += numel
 
                 dist.barrier()
-                if local_rank == 0 and os.path.exists(shared_bin_path):
-                    os.remove(shared_bin_path)
+                if per_rank_shm:
+                    if os.path.exists(shared_bin_path):
+                        os.remove(shared_bin_path)
+                else:
+                    if local_rank == 0 and os.path.exists(shared_bin_path):
+                        os.remove(shared_bin_path)
 
             self.load_state_dict(shared_state_dict, assign=True)
 
@@ -646,4 +639,12 @@ def offload(obj):
         return {k: offload(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return type(obj)(offload(i) for i in obj)
+    if hasattr(obj, "__dict__"):
+        import copy
+        obj = copy.copy(obj)
+        for attr_name in list(vars(obj)):
+            attr_val = getattr(obj, attr_name)
+            if isinstance(attr_val, torch.Tensor) and attr_val.is_cuda:
+                setattr(obj, attr_name, attr_val.cpu())
+        return obj
     return obj

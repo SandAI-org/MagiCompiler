@@ -20,13 +20,15 @@ from local_rank=0 and had ALL ranks read it.  With expert parallelism
 (EP > 1), each rank holds a different expert shard; reading rank-0's data
 on every rank destroyed expert weight diversity and produced garbled output.
 
-Fix: when EP_SIZE > 1, fall back to per-rank pin_memory instead of
-cross-rank shared-memory dedup.
+Fix: when EP_SIZE > 1, each rank writes its OWN shared-memory file so that
+expert shards are preserved.  When EP_SIZE <= 1, the original rank-0-writes
+all-read scheme is safe (weights are identical across ranks).
 
-These tests use torch.multiprocessing.spawn with 2 GPUs to reproduce the
-exact multi-rank scenario without a real model.
+These tests use torch.multiprocessing.spawn with 2 workers and the gloo
+backend to reproduce the exact multi-rank scenario without a real model.
 """
 
+import gc
 import os
 import tempfile
 
@@ -54,11 +56,12 @@ class FakeExpertBlock(nn.Module):
         return x @ self.expert_weight.T
 
 
-def _extract_shared_memory_logic(module, local_rank, shared_dir):
+def _shm_write_read(module, local_rank, shared_dir, per_rank):
     """
-    Reproduces the ORIGINAL (buggy) shared-memory logic from
-    _patch_cpu_offload_apply: only local_rank==0 writes the file,
-    all ranks read the same file and load_state_dict(assign=True).
+    Core shared-memory logic extracted from _patch_cpu_offload_apply.
+
+    per_rank=False → original buggy path (rank 0 writes, all read same file).
+    per_rank=True  → fixed path (each rank writes its own file).
     """
     full_state_dict = module.state_dict()
     grouped: dict[torch.dtype, list[tuple[str, torch.Tensor]]] = {}
@@ -66,13 +69,16 @@ def _extract_shared_memory_logic(module, local_rank, shared_dir):
         dt = tensor.dtype
         grouped.setdefault(dt, []).append((name, tensor))
 
+    writer_rank = local_rank if per_rank else 0
     shared_state = {}
+
     for dtype, param_list in grouped.items():
         dtype_str = str(dtype).split(".")[-1]
-        shared_path = os.path.join(shared_dir, f"shared_{dtype_str}.bin")
+        suffix = f"_rank{local_rank}" if per_rank else ""
+        shared_path = os.path.join(shared_dir, f"shared_{dtype_str}{suffix}.bin")
         total_numel = sum(t.numel() for _, t in param_list)
 
-        if local_rank == 0:
+        if local_rank == writer_rank:
             flat = torch.zeros(total_numel, dtype=dtype)
             off = 0
             for _, t in param_list:
@@ -84,6 +90,7 @@ def _extract_shared_memory_logic(module, local_rank, shared_dir):
             else:
                 flat.numpy().tofile(shared_path)
             del flat
+            gc.collect()
 
         dist.barrier()
 
@@ -95,6 +102,12 @@ def _extract_shared_memory_logic(module, local_rank, shared_dir):
             off += n
 
         dist.barrier()
+        if per_rank:
+            if os.path.exists(shared_path):
+                os.remove(shared_path)
+        else:
+            if local_rank == 0 and os.path.exists(shared_path):
+                os.remove(shared_path)
 
     module.load_state_dict(shared_state, assign=True)
 
@@ -102,6 +115,7 @@ def _extract_shared_memory_logic(module, local_rank, shared_dir):
 # ───────────────────────────────────────────────────────────────
 #  Worker functions for spawn
 # ───────────────────────────────────────────────────────────────
+
 
 def _worker_bug_repro(rank, world_size, shared_dir, seed_per_rank, result_file):
     """Reproduces the bug: all ranks get rank-0's weights after shared-memory dedup."""
@@ -114,7 +128,7 @@ def _worker_bug_repro(rank, world_size, shared_dir, seed_per_rank, result_file):
     model = FakeExpertBlock(num_experts=4, dim=8)
     original_weight = model.expert_weight.data.clone()
 
-    _extract_shared_memory_logic(model, local_rank=rank, shared_dir=shared_dir)
+    _shm_write_read(model, local_rank=rank, shared_dir=shared_dir, per_rank=False)
 
     weight_after = model.state_dict()["expert_weight"]
     matches_own = torch.equal(weight_after, original_weight)
@@ -124,7 +138,7 @@ def _worker_bug_repro(rank, world_size, shared_dir, seed_per_rank, result_file):
 
 
 def _worker_fix_verified(rank, world_size, shared_dir, seed_per_rank, result_file):
-    """Verifies the fix: with EP>1, skip shared-memory → each rank keeps its own weights."""
+    """Verifies the fix: EP>1 uses per-rank shm files, each rank keeps its own weights."""
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "29502"
     os.environ["LOCAL_RANK"] = str(rank)
@@ -136,10 +150,7 @@ def _worker_fix_verified(rank, world_size, shared_dir, seed_per_rank, result_fil
     original_weight = model.expert_weight.data.clone()
 
     ep_size = int(os.environ.get("ENGINE_CONFIG__EP_SIZE", "1"))
-    if ep_size <= 1:
-        _extract_shared_memory_logic(model, local_rank=rank, shared_dir=shared_dir)
-    else:
-        pass  # pin_memory path: weights stay as-is
+    _shm_write_read(model, local_rank=rank, shared_dir=shared_dir, per_rank=(ep_size > 1))
 
     weight_after = model.state_dict()["expert_weight"]
     matches_own = torch.equal(weight_after, original_weight)
@@ -151,6 +162,7 @@ def _worker_fix_verified(rank, world_size, shared_dir, seed_per_rank, result_fil
 # ───────────────────────────────────────────────────────────────
 #  Tests
 # ───────────────────────────────────────────────────────────────
+
 
 @_skip_no_dist
 def test_shared_memory_overwrites_ep_shards():
@@ -183,8 +195,8 @@ def test_shared_memory_overwrites_ep_shards():
 @_skip_no_dist
 def test_ep_fix_preserves_per_rank_shards():
     """
-    FIX VERIFIED: with EP_SIZE > 1, shared-memory is skipped and each rank
-    keeps its own expert shard.
+    FIX VERIFIED: with EP_SIZE > 1, per-rank shared-memory files ensure each
+    rank keeps its own expert shard intact.
     """
     world_size = 2
     seeds = {0: 42, 1: 123}
@@ -203,5 +215,5 @@ def test_ep_fix_preserves_per_rank_shards():
         )
         assert not torch.equal(r0["weight"], r1["weight"]), (
             "With EP > 1, each rank should have DIFFERENT expert weights. "
-            "If they're equal, the shared-memory path ran despite EP > 1."
+            "If they're equal, the per-rank shm path did not work correctly."
         )
