@@ -183,7 +183,7 @@ def _lazy_init_magi_state(
         return
 
     if conf.fsdp_config.transport == "copy_engine":
-        from magi_compiler.runtime.symm_arena import barrier_after_load
+        from magi_compiler.symm_mem import barrier_after_load
 
         barrier_after_load()
 
@@ -222,7 +222,7 @@ def _magi_compile_class(
         _patch_cpu_offload_apply(cls)
 
     if issubclass(cls, nn.Module) and conf.fsdp_config.transport == "copy_engine":
-        from magi_compiler.runtime.symm_arena import patch_symm_arena_apply
+        from magi_compiler.symm_mem import patch_symm_arena_apply
 
         patch_symm_arena_apply(cls)
 
@@ -250,7 +250,7 @@ def _magi_compile_bound_method(
         return instance
 
     if conf.fsdp_config.transport == "copy_engine" and isinstance(instance, nn.Module):
-        from magi_compiler.runtime.symm_arena import migrate_to_arenas
+        from magi_compiler.symm_mem import migrate_to_arenas
 
         migrate_to_arenas(instance)
 

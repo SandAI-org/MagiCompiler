@@ -355,7 +355,7 @@ def _collective_spec(node):
 def _symm_ag_ops():
     """Copy-engine gather ops, or empty when the runtime is unavailable."""
     try:
-        from magi_compiler.runtime.symm_all_gather import SYMM_ALL_GATHER, SYMM_ALL_GATHER_COALESCED
+        from magi_compiler.symm_mem.all_gather import SYMM_ALL_GATHER, SYMM_ALL_GATHER_COALESCED
 
         return tuple(op for op in (SYMM_ALL_GATHER, SYMM_ALL_GATHER_COALESCED) if op is not None)
     except Exception:  # noqa: BLE001
@@ -379,7 +379,7 @@ def _leaf_symm_ag(snode: BaseSchedulerNode):
 
 def _is_symm_ag_coalesced_ir(node) -> bool:
     try:
-        from magi_compiler.runtime.symm_all_gather import SYMM_ALL_GATHER_COALESCED
+        from magi_compiler.symm_mem.all_gather import SYMM_ALL_GATHER_COALESCED
     except Exception:  # noqa: BLE001
         return False
     return SYMM_ALL_GATHER_COALESCED is not None and getattr(node, "op_overload", None) is SYMM_ALL_GATHER_COALESCED
@@ -411,7 +411,7 @@ def _symm_ag_launch_wait(snode: BaseSchedulerNode):
     Split in two rather than one fused closure so the cost model can time
     ``wait(launch())`` as a unit.
     """
-    from magi_compiler.runtime.symm_arena import find_shard_by_layout
+    from magi_compiler.symm_mem import find_shard_by_layout
 
     node = _leaf_symm_ag(snode)
     spec = _symm_ag_spec(node) if node is not None else None
@@ -427,7 +427,7 @@ def _symm_ag_launch_wait(snode: BaseSchedulerNode):
             dtype,
         )
         return None
-    from magi_compiler.runtime.symm_all_gather import SYMM_ALL_GATHER, SYMM_ALL_GATHER_COALESCED
+    from magi_compiler.symm_mem.all_gather import SYMM_ALL_GATHER, SYMM_ALL_GATHER_COALESCED
 
     if _is_symm_ag_coalesced_ir(node):
         op = SYMM_ALL_GATHER_COALESCED

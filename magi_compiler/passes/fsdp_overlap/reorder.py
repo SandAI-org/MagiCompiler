@@ -57,7 +57,7 @@ def _symm_ag_ops():
     """Copy-engine gather ops, imported lazily so this pass stays importable
     without a CUDA build."""
     try:
-        from magi_compiler.runtime.symm_all_gather import SYMM_ALL_GATHER, SYMM_ALL_GATHER_COALESCED
+        from magi_compiler.symm_mem.all_gather import SYMM_ALL_GATHER, SYMM_ALL_GATHER_COALESCED
 
         return tuple(op for op in (SYMM_ALL_GATHER, SYMM_ALL_GATHER_COALESCED) if op is not None)
     except Exception:  # noqa: BLE001
@@ -83,7 +83,7 @@ def _is_symm_ag_ir(node) -> bool:
 
 def _is_symm_ag_coalesced(node) -> bool:
     try:
-        from magi_compiler.runtime.symm_all_gather import SYMM_ALL_GATHER_COALESCED
+        from magi_compiler.symm_mem.all_gather import SYMM_ALL_GATHER_COALESCED
     except Exception:  # noqa: BLE001
         return False
     return SYMM_ALL_GATHER_COALESCED is not None and getattr(node, "op_overload", None) is SYMM_ALL_GATHER_COALESCED

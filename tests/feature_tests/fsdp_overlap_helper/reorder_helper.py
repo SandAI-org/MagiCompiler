@@ -167,8 +167,8 @@ def main() -> None:
 
     ce_shards: list = []
     if args.copy_engine:
-        from magi_compiler.runtime.symm_all_gather import SYMM_ALL_GATHER
-        from magi_compiler.runtime.symm_arena import SymmArena, register_shard
+        from magi_compiler.symm_mem import SymmArena, register_shard
+        from magi_compiler.symm_mem.all_gather import SYMM_ALL_GATHER
 
         arena = SymmArena(torch.bfloat16, torch.device("cuda", dev), grp)
         for _ in range(N_CE_LAYERS):
