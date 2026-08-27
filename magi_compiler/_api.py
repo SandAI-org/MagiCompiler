@@ -558,7 +558,7 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
         _orig_apply(self, _force_cpu)
 
         # create shared memory tensors for all parameters/buffers on CPU
-        ep_size = int(os.environ.get("ENGINE_CONFIG__EP_SIZE", "1"))
+        ep_size = int(os.environ.get("ENGINE_CONFIG__EP_SIZE", os.environ.get("EP_SIZE", "1")))
         if dist.is_initialized() and ep_size <= 1:
             local_rank = int(os.environ.get("LOCAL_RANK", 0))
             full_state_dict = self.state_dict()
