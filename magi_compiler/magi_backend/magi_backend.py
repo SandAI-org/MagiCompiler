@@ -307,20 +307,37 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                                 node.update_kwarg('device', target_device)
                                 needs_recompile = True
 
-            # Fix get_attr AND placeholder nodes with CPU example_values.
-            # model_cpu_offload keeps weights on CPU, so FakeTensors carry
-            # CPU device. Submod placeholders inherit the split_gm's env
-            # device but their meta["example_value"] may still say CPU.
-            # Inductor autotuning creates benchmark tensors on the
-            # example_value device, so they must be CUDA.
+            # Fix ALL nodes with CPU example_values — not just get_attr/placeholder.
+            # model_cpu_offload traces with CPU FakeTensors; Inductor autotuning
+            # creates benchmark tensors on the example_value device, and the
+            # codegen may pick CPU-specific paths if it sees CPU metadata.
+            cpu_fix_count = 0
             for node in module.graph.nodes:
-                if node.op in ('get_attr', 'placeholder'):
-                    ev = node.meta.get('example_value')
-                    if ev is not None and hasattr(ev, 'device') and str(ev.device) == 'cpu':
+                ev = node.meta.get('example_value')
+                if ev is not None:
+                    if hasattr(ev, 'device') and str(ev.device) == 'cpu':
                         node.meta['example_value'] = ev.to(target_device)
                         needs_recompile = True
+                        cpu_fix_count += 1
+                    elif isinstance(ev, (list, tuple)):
+                        fixed_list = []
+                        any_fixed = False
+                        for item in ev:
+                            if hasattr(item, 'device') and str(item.device) == 'cpu':
+                                fixed_list.append(item.to(target_device))
+                                any_fixed = True
+                                cpu_fix_count += 1
+                            else:
+                                fixed_list.append(item)
+                        if any_fixed:
+                            node.meta['example_value'] = type(ev)(fixed_list)
+                            needs_recompile = True
 
             if needs_recompile:
+                import os as _os
+                if _os.environ.get('RANK', '0') == '0':
+                    from magi_compiler.utils import magi_logger
+                    magi_logger.info(f'[fix_device] fixed {cpu_fix_count} CPU example_values to cuda:{target_device}')
                 module.recompile()
 
     @observe_lifecycle("piecewise_compile")
