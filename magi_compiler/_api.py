@@ -573,13 +573,37 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
 
             skip_shm = os.environ.get("MAGI_OFFLOAD_SKIP_SHM", "0") == "1"
             if skip_shm:
-                magi_logger.info(
-                    "[Rank %d] MAGI_OFFLOAD_SKIP_SHM=1: skipping shared memory + pin_memory. "
-                    "Params remain as regular CPU tensors for OffloadExecutor.",
-                    local_rank,
-                )
-                # No shared memory creation, no pin_memory_in_place.
-                # OffloadExecutor will use unpinned H2D transfers (functional but slower).
+                pin_budget_gb = float(os.environ.get("MAGI_OFFLOAD_PIN_BUDGET_GB", "0"))
+                if pin_budget_gb > 0:
+                    limit = int(pin_budget_gb * (1024 ** 3))
+                    params_with_size = []
+                    for name, tensor in full_state_dict.items():
+                        if tensor.device.type == "cpu":
+                            params_with_size.append((name, tensor, tensor.numel() * tensor.element_size()))
+                    params_with_size.sort(key=lambda x: x[2], reverse=True)
+                    pinned_bytes = 0
+                    pinned_count = 0
+                    for name, tensor, size in params_with_size:
+                        if pinned_bytes + size > limit:
+                            continue
+                        try:
+                            pin_memory_in_place(tensor)
+                            pinned_bytes += size
+                            pinned_count += 1
+                        except RuntimeError:
+                            break
+                    total_bytes = sum(s for _, _, s in params_with_size)
+                    magi_logger.info(
+                        "[Rank %d] Pinned %d params (%.2f GB / %.2f GB total, budget=%.1f GB)",
+                        local_rank, pinned_count, pinned_bytes / (1024**3),
+                        total_bytes / (1024**3), pin_budget_gb,
+                    )
+                else:
+                    magi_logger.info(
+                        "[Rank %d] MAGI_OFFLOAD_SKIP_SHM=1, PIN_BUDGET=0: "
+                        "params remain as unpinned CPU tensors.",
+                        local_rank,
+                    )
                 del full_state_dict, grouped_params
                 gc.collect()
             elif per_rank_shm:

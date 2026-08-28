@@ -14,6 +14,8 @@
 
 import collections
 import operator
+import os
+import time
 from typing import Any, Dict
 
 import torch
@@ -23,9 +25,13 @@ from torch.fx.node import map_arg
 from magi_compiler.config import CompileConfig
 from magi_compiler.offload.profiler import OffloadProfiler
 from magi_compiler.offload.scheduler import OffloadRuntimeContext, SchedulerFactory
+from magi_compiler.utils import magi_logger
 from magi_compiler.utils.nvtx import add_nvtx_event
 
 from ..magi_depyf.timeline import observe_lifecycle
+
+_OFFLOAD_DEBUG = os.environ.get("MAGI_OFFLOAD_DEBUG", "0") == "1"
+
 
 
 class OffloadExecutor:
@@ -153,12 +159,24 @@ class OffloadExecutor:
         )
         need_profile = self.second_call
 
+        _step_h2d_ms = 0.0
+        _step_compute_ms = 0.0
+        _step_count = 0
+
         for node in self.graph_module.graph.nodes:
             if node.op == "placeholder":
                 continue
 
             elif node.op == "call_module":
+                if _OFFLOAD_DEBUG:
+                    torch.cuda.synchronize()
+                    _t0 = time.perf_counter()
+
                 self.scheduler.prefetch(node.name, runtime_ctx)
+
+                if _OFFLOAD_DEBUG:
+                    torch.cuda.synchronize()
+                    _t1 = time.perf_counter()
 
                 if need_profile:
                     if torch.distributed.is_initialized():
@@ -171,6 +189,13 @@ class OffloadExecutor:
                         s_kwargs = map_arg(node.kwargs, lambda n: env[n])
                         env[node] = getattr(self.graph_module, node.target)(*s_args, **s_kwargs)
                         del s_args, s_kwargs
+
+                if _OFFLOAD_DEBUG:
+                    torch.cuda.synchronize()
+                    _t2 = time.perf_counter()
+                    _step_h2d_ms += (_t1 - _t0) * 1000
+                    _step_compute_ms += (_t2 - _t1) * 1000
+                    _step_count += 1
 
                 if need_profile:
                     if torch.distributed.is_initialized():
@@ -189,6 +214,15 @@ class OffloadExecutor:
                         env[node] = node.target(*f_args, **f_kwargs)
 
             elif node.op == "output":
+                if _OFFLOAD_DEBUG and _step_count > 0:
+                    _rank = int(os.environ.get("RANK", "0"))
+                    if _rank == 0:
+                        magi_logger.info(
+                            "[offload-timing] submods=%d h2d=%.1fms compute=%.1fms total=%.1fms",
+                            _step_count, _step_h2d_ms, _step_compute_ms,
+                            _step_h2d_ms + _step_compute_ms,
+                        )
+
                 if self.second_call:
                     self._finalize_warmup()
                     self.second_call = False
