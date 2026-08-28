@@ -532,7 +532,22 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
                 return _orig_apply(self, fn)
 
         # move all parameters/buffers to CPU
+        # Optimized: skip GPU roundtrip when tensor is already on CPU and fn
+        # only changes device (not dtype). The roundtrip was originally needed
+        # for cases where fn includes dtype conversion (e.g. model.to(dtype=fp16)),
+        # but the common offload path is just model.cuda() with no dtype change.
+        _dtype_target_cache: dict = {}
+
         def _force_cpu(t):
+            if t.device.type == "cpu":
+                dt = t.dtype
+                if dt not in _dtype_target_cache:
+                    probe = torch.empty(0, dtype=dt, device="cpu")
+                    _dtype_target_cache[dt] = fn(probe).dtype
+                target_dt = _dtype_target_cache[dt]
+                if target_dt == dt:
+                    return t
+                return t.to(dtype=target_dt)
             return fn(t).cpu()
 
         _orig_apply(self, _force_cpu)
@@ -556,7 +571,18 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
 
             per_rank_shm = ep_size > 1
 
-            if per_rank_shm:
+            skip_shm = os.environ.get("MAGI_OFFLOAD_SKIP_SHM", "0") == "1"
+            if skip_shm:
+                magi_logger.info(
+                    "[Rank %d] MAGI_OFFLOAD_SKIP_SHM=1: skipping shared memory + pin_memory. "
+                    "Params remain as regular CPU tensors for OffloadExecutor.",
+                    local_rank,
+                )
+                # No shared memory creation, no pin_memory_in_place.
+                # OffloadExecutor will use unpinned H2D transfers (functional but slower).
+                del full_state_dict, grouped_params
+                gc.collect()
+            elif per_rank_shm:
                 # EP > 1: each rank holds a unique expert shard.
                 # Stagger writes so only one rank at a time allocates the mmap
                 # file on /dev/shm (~43 GB). Without staggering, all 8 ranks
