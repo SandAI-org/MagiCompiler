@@ -315,7 +315,10 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                 ev = node.meta.get('example_value')
                 if ev is not None:
                     if hasattr(ev, 'device') and str(ev.device) == 'cpu':
-                        node.meta['example_value'] = ev.to(target_device)
+                        new_ev = ev.to(target_device)
+                        if isinstance(ev, torch.nn.Parameter):
+                            new_ev = torch.nn.Parameter(new_ev, requires_grad=ev.requires_grad)
+                        node.meta['example_value'] = new_ev
                         needs_recompile = True
                         cpu_fix_count += 1
                     elif isinstance(ev, (list, tuple)):
@@ -323,7 +326,10 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                         any_fixed = False
                         for item in ev:
                             if hasattr(item, 'device') and str(item.device) == 'cpu':
-                                fixed_list.append(item.to(target_device))
+                                new_item = item.to(target_device)
+                                if isinstance(item, torch.nn.Parameter):
+                                    new_item = torch.nn.Parameter(new_item, requires_grad=item.requires_grad)
+                                fixed_list.append(new_item)
                                 any_fixed = True
                                 cpu_fix_count += 1
                             else:
