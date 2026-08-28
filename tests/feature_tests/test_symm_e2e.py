@@ -19,8 +19,9 @@ The unit tests each stub something out: the arena tests materialize by calling
 the peer view is the local shard.  The property that only shows up when the
 whole chain runs -- meta build, SimpleFSDP, ``to_empty``, checkpoint load,
 compile, rewrite, reorder -- is that the weights are never ordinary tensors at
-any point, and that is what the example script asserts.  Driving it here as a
-subprocess keeps that assertion in CI instead of in someone's shell history.
+any point, and that is what the helper script asserts.  It needs a real process
+group and two ranks, so it runs as a ``torchrun`` subprocess and this file
+asserts on its stdout markers.
 """
 
 import os
@@ -31,7 +32,7 @@ from pathlib import Path
 import pytest
 import torch
 
-_SCRIPT = Path(__file__).resolve().parents[2] / "example" / "inference" / "fsdp_overlap" / "verify_symm_e2e.py"
+_SCRIPT = Path(__file__).parent / "symm_helper" / "verify_symm_e2e.py"
 
 requires_2gpu = pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires >=2 GPUs")
 requires_torchrun = pytest.mark.skipif(shutil.which("torchrun") is None, reason="requires torchrun")
