@@ -296,6 +296,14 @@ class CompileConfig(BaseSettings):
         ),
     )
     disable_cache: bool = Field(False, description="Force re-compilation by ignoring any cached piecewise compiled artifacts.")
+    assert_cache_hit: bool = Field(
+        False,
+        description=(
+            "When True, raise RuntimeError on compile cache miss instead of recompiling. "
+            "Use to verify that a pre-baked compile cache covers all subgraphs. "
+            "Env var: MAGI_COMPILE_ASSERT_CACHE_HIT."
+        ),
+    )
 
     # ---- CPU Offload ----
     offload_config: OffloadConfig = Field(

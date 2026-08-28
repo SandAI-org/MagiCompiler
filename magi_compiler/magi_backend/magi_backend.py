@@ -214,6 +214,12 @@ class CompilerManager:
         if compiled_graph is not None:
             return compiled_graph
 
+        if self.compile_config.assert_cache_hit:
+            raise RuntimeError(
+                f"MAGI_COMPILE_ASSERT_CACHE_HIT: cache miss for runtime_shape={runtime_shape} "
+                f"graph_index={graph_index}. The pre-baked compile cache does not cover this subgraph."
+            )
+
         # Step2: Compile the graph
         key = f"artifact_shape_{runtime_shape}_subgraph_{graph_index}"
 
