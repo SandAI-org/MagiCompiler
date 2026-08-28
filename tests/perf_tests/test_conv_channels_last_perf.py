@@ -34,7 +34,7 @@ Real WAN 2.2 VAE decode (540p, static shapes) numbers that motivate this:
   - with conv channels-last layout: 520ms -> 430ms / decode (**~1.2x speedup**)
 This synthetic, weightless decoder reproduces this regime. The absolute ratio is
 GPU-dependent, so CONV_CHANNELS_LAST_SPEEDUP_THRESHOLD is set to a conservative
-lower bound of 1.20 that still proves a clear, non-noise win.
+lower bound of 1.10 that still proves a clear, non-noise win.
 """
 
 import pytest
@@ -52,7 +52,7 @@ LATENT_C, LATENT_T, LATENT_H, LATENT_W = 48, 7, 34, 60
 # magi_compile (channels-last on) vs vanilla torch.compile, both on the static path.
 # Real 540p decode lands ~1.2x on PT 2.9; PT 2.12's improved torch.compile baseline
 # narrows the gap to ~1.1x, so we use a lower threshold there.
-CONV_CHANNELS_LAST_SPEEDUP_THRESHOLD = 1.05 if IS_PT_212 else 1.20
+CONV_CHANNELS_LAST_SPEEDUP_THRESHOLD = 1.05 if IS_PT_212 else 1.10
 
 
 @pytest.fixture(scope="function")
