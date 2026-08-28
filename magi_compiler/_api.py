@@ -575,29 +575,35 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
             if skip_shm:
                 pin_budget_gb = float(os.environ.get("MAGI_OFFLOAD_PIN_BUDGET_GB", "0"))
                 if pin_budget_gb > 0:
-                    limit = int(pin_budget_gb * (1024 ** 3))
-                    params_with_size = []
-                    for name, tensor in full_state_dict.items():
-                        if tensor.device.type == "cpu":
-                            params_with_size.append((name, tensor, tensor.numel() * tensor.element_size()))
-                    params_with_size.sort(key=lambda x: x[2], reverse=True)
-                    pinned_bytes = 0
-                    pinned_count = 0
-                    for name, tensor, size in params_with_size:
-                        if pinned_bytes + size > limit:
-                            continue
-                        try:
-                            pin_memory_in_place(tensor)
-                            pinned_bytes += size
-                            pinned_count += 1
-                        except RuntimeError:
-                            break
-                    total_bytes = sum(s for _, _, s in params_with_size)
-                    magi_logger.info(
-                        "[Rank %d] Pinned %d params (%.2f GB / %.2f GB total, budget=%.1f GB)",
-                        local_rank, pinned_count, pinned_bytes / (1024**3),
-                        total_bytes / (1024**3), pin_budget_gb,
-                    )
+                    world_size = dist.get_world_size() if dist.is_initialized() else 1
+                    for turn in range(world_size):
+                        if local_rank == turn:
+                            limit = int(pin_budget_gb * (1024 ** 3))
+                            params_with_size = []
+                            for name, tensor in full_state_dict.items():
+                                if tensor.device.type == "cpu":
+                                    params_with_size.append((name, tensor, tensor.numel() * tensor.element_size()))
+                            params_with_size.sort(key=lambda x: x[2], reverse=True)
+                            pinned_bytes = 0
+                            pinned_count = 0
+                            for name, tensor, size in params_with_size:
+                                if pinned_bytes + size > limit:
+                                    continue
+                                try:
+                                    pin_memory_in_place(tensor)
+                                    pinned_bytes += size
+                                    pinned_count += 1
+                                except RuntimeError as e:
+                                    magi_logger.warning("[Rank %d] pin failed at %.2f GB: %s", local_rank, pinned_bytes / (1024**3), e)
+                                    break
+                            total_bytes = sum(s for _, _, s in params_with_size)
+                            magi_logger.info(
+                                "[Rank %d] Pinned %d params (%.2f GB / %.2f GB total, budget=%.1f GB)",
+                                local_rank, pinned_count, pinned_bytes / (1024**3),
+                                total_bytes / (1024**3), pin_budget_gb,
+                            )
+                        if dist.is_initialized():
+                            dist.barrier()
                 else:
                     magi_logger.info(
                         "[Rank %d] MAGI_OFFLOAD_SKIP_SHM=1, PIN_BUDGET=0: "
