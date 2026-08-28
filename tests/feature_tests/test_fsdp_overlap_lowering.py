@@ -15,14 +15,14 @@
 """Unit tests for the SimpleFSDP weight redistribute lowering pass
 (``magi_compiler.passes.fsdp_overlap.lower_prim_redistribute_to_collectives``).
 
-The pass matches ``prim_redistribute`` + ``prim_to_local`` fx nodes (by
-``target.__name__``) whose input is a weight placeholder carrying a ``Shard(0)``
-DTensor ``example_value``, and rewrites them into explicit
-``all_gather_into_tensor`` + ``wait_tensor``.  ``prim_redistribute`` is a
-torch.compile-internal prim that can't be constructed directly, so we build a
-minimal synthetic graph with plain functions named ``prim_redistribute`` /
-``prim_to_local`` and REAL 1-rank DTensor metas (this drives the exact matching /
-rewrite logic without depending on Dynamo capturing the prim).
+The pass matches a redistribute + to_local pair whose input is a weight
+placeholder carrying a ``Shard(0)`` DTensor ``example_value``, and rewrites it
+into explicit ``all_gather_into_tensor`` + ``wait_tensor``.  Dynamo emits that
+pair in two shapes -- ``prim_redistribute`` / ``prim_to_local`` call_functions
+through torch 2.9, plain ``redistribute`` / ``to_local`` call_methods from 2.12 --
+and both are covered here, because a shape the pass fails to match produces no
+error, just an un-lowered graph.  Neither shape can be constructed by calling
+into torch, so the graphs are synthetic, with REAL 1-rank DTensor metas.
 
 Uses a 1-rank process group + device mesh (GPU required).
 """
@@ -91,8 +91,36 @@ def _build_redistribute_graph(mesh, weight_name, dtype=torch.bfloat16, rows=8, c
     return fx.GraphModule(torch.nn.Module(), g)
 
 
+def _build_method_redistribute_graph(mesh, weight_name, *, forward_dtype=None, dtype=torch.bfloat16, rows=8, cols=4):
+    """The same chain in the shape Dynamo emits from torch 2.12 on.
+
+    There is no on-the-fly prim anymore: the method call itself is traced, and the
+    placements and dtypes that used to live in the prim's closure ride along in
+    ``kwargs``.  A pass that only knows the older shape leaves this graph
+    un-lowered, and the only symptom is a copy-engine rewrite that finds nothing.
+    """
+    from torch.distributed.tensor import Partial, Replicate, Shard, distribute_tensor
+
+    full = torch.randn(rows, cols, device="cuda", dtype=dtype)
+    sharded = distribute_tensor(full, mesh, [Shard(0)])
+    replicated = distribute_tensor(full, mesh, [Replicate()])
+
+    g = fx.Graph()
+    w = g.placeholder(weight_name)
+    w.meta["example_value"] = sharded
+    rd = g.call_method(
+        "redistribute", (w,), {"placements": [Replicate()], "forward_dtype": forward_dtype, "backward_dtype": None}
+    )
+    rd.meta["example_value"] = replicated
+    tl = g.call_method("to_local", (rd,), {"grad_placements": [Partial()]})
+    tl.meta["example_value"] = replicated._local_tensor
+    g.output((tl,))
+    return fx.GraphModule(torch.nn.Module(), g)
+
+
 _AG = torch.ops._c10d_functional.all_gather_into_tensor.default
 _WAIT = torch.ops._c10d_functional.wait_tensor.default
+_TO_COPY = torch.ops.aten._to_copy.default
 
 
 def _targets(gm):
@@ -128,6 +156,37 @@ def test_lowering_skips_non_weight_input(dist_1rank):
     targets = _targets(gm)
     assert _AG not in targets
     assert prim_redistribute in targets  # untouched
+
+
+@requires_cuda
+def test_lowering_rewrites_method_shaped_redistribute(dist_1rank):
+    """The 2.12+ shape must lower exactly like the prim one, marked gather included."""
+    from magi_compiler.passes.fsdp_overlap import lower_prim_redistribute_to_collectives
+
+    gm = _build_method_redistribute_graph(dist_1rank, "model_fc1_weight_parameter")
+    assert lower_prim_redistribute_to_collectives(gm) == 1
+
+    targets = _targets(gm)
+    assert _AG in targets and _WAIT in targets
+    methods = [n.target for n in gm.graph.nodes if n.op == "call_method"]
+    assert "redistribute" not in methods  # consumed; only the to_local of the shard is left
+    assert len([x for x in gm.graph.nodes if x.meta.get("magi_fsdp_weight_ag")]) == 1
+
+
+@requires_cuda
+def test_lowering_reads_forward_dtype_from_method_kwargs(dist_1rank):
+    """Mixed precision is a kwarg on the method node, not a closure variable: miss
+    it and the gather moves the shard in its stored dtype, silently."""
+    from magi_compiler.passes.fsdp_overlap import lower_prim_redistribute_to_collectives
+
+    gm = _build_method_redistribute_graph(dist_1rank, "layer_weight", forward_dtype=torch.float32)
+    assert lower_prim_redistribute_to_collectives(gm) == 1
+
+    cast = [n for n in gm.graph.nodes if n.op == "call_function" and n.target is _TO_COPY]
+    assert len(cast) == 1
+    assert cast[0].kwargs["dtype"] is torch.float32
+    ag = [n for n in gm.graph.nodes if n.op == "call_function" and n.target is _AG]
+    assert ag[0].args[0] is cast[0]  # the gather moves the cast shard, not the stored one
 
 
 @requires_cuda

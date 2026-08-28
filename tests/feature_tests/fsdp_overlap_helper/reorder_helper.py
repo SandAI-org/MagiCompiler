@@ -95,6 +95,16 @@ class _FakeSnode:
         self.node = _FakeIR()
 
 
+def _is_driver_refusal(e: Exception) -> bool:
+    """True when the CUDA driver, not our code, rejected the symmetric-memory setup.
+
+    Anything else -- a shape error, an arena overflow, a missing registration -- is a
+    real failure and must not be mistaken for an unequipped host.
+    """
+    msg = str(e)
+    return "CUDA driver error" in msg or "not supported" in msg
+
+
 def _mode_ladder_selfcheck(rank: int) -> bool:
     """Assert every rung of ``_negotiate_mode``'s ladder, with rank 1 feeding the
     divergent input.  All ranks walk the cases in the same order, so the symmetric
@@ -173,7 +183,18 @@ def main() -> None:
         arena = SymmArena(torch.bfloat16, torch.device("cuda", dev), grp)
         for _ in range(N_CE_LAYERS):
             arena.reserve(H * H)
-        arena.commit()
+        try:
+            arena.commit()
+        except RuntimeError as e:
+            # A symmetric window needs an initialized NVLink fabric -- on NVSwitch hosts a
+            # running nvidia-fabricmanager.  Where it is not, the driver refuses the
+            # rendezvous on every rank before any of the pass under test runs, so report
+            # the host as unable rather than the pass as broken.
+            if not _is_driver_refusal(e):
+                raise
+            print(f"REORDER_SYMM_UNAVAILABLE rank={rank} {e}", flush=True)
+            dist.destroy_process_group()
+            raise SystemExit(0) from None
         for i in range(N_CE_LAYERS):
             s = arena.take((H, H))
             s.normal_(0.0, H**-0.5).add_(0.01 * i)

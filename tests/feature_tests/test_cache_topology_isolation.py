@@ -160,8 +160,9 @@ class TestCompileStateIsolation:
                 return x
 
         probe = Probe()
+        conf = SimpleNamespace(fsdp_config=SimpleNamespace(transport="nccl"))
         with patch.dict(os.environ, {"MAGI_COMPILE_TOPOLOGY_KEY": "cp8_dp1"}):
-            _magi_compile_bound_method(probe, {"x": 0}, SimpleNamespace(), "probe", method_name="forward")
+            _magi_compile_bound_method(probe, {"x": 0}, conf, "probe", method_name="forward")
 
         with patch.dict(os.environ, {"MAGI_COMPILE_TOPOLOGY_KEY": "cp4_dp2"}):
             with patch("magi_compiler._api._lazy_init_magi_state", side_effect=fake_init):
