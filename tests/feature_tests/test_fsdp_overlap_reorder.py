@@ -177,16 +177,6 @@ def test_reorder_graph_mismatch_slot_mode():
     assert "REORDER_PASS" in p.stdout, out[-3000:]
 
 
-def _skip_if_symm_mem_unusable(out: str) -> None:
-    """Symmetric memory needs an initialized NVLink fabric on the host (on NVSwitch
-    machines, a running nvidia-fabricmanager).  Where the driver refuses the rendezvous
-    the copy-engine transport cannot run at all, so there is nothing here to assert on --
-    the helper says so explicitly and only for a driver-level refusal."""
-    line = next((ln for ln in out.splitlines() if "REORDER_SYMM_UNAVAILABLE" in ln), None)
-    if line is not None:
-        pytest.skip(f"symmetric memory unusable on this host: {line.strip()}")
-
-
 @requires_cuda
 @requires_torchrun
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires >=2 GPUs")
@@ -200,7 +190,6 @@ def test_reorder_copy_engine_recognition():
     """
     p = _run(2, "--copy-engine", port="29634")
     out = p.stdout + p.stderr
-    _skip_if_symm_mem_unusable(out)
     assert p.returncode == 0, f"helper failed:\n{out[-3000:]}"
     assert "REORDER_CALLED gathers=3" in p.stdout, out[-3000:]  # all three were recognized
     assert "REORDER_FINITE ok=True" in p.stdout, out[-3000:]  # ... and match the NCCL answer

@@ -50,13 +50,15 @@ from __future__ import annotations
 import argparse
 import os
 
-import torch
-import torch.distributed as dist
-import torch.nn as nn
-from torch.distributed.device_mesh import init_device_mesh
+os.environ.setdefault("TORCH_SYMM_MEM_DISABLE_MULTICAST", "1")
 
-from magi_compiler import magi_compile
-from magi_compiler.config import CompileMode, CudaGraphMode
+import torch  # noqa: E402
+import torch.distributed as dist  # noqa: E402
+import torch.nn as nn  # noqa: E402
+from torch.distributed.device_mesh import init_device_mesh  # noqa: E402
+
+from magi_compiler import magi_compile  # noqa: E402
+from magi_compiler.config import CompileMode, CudaGraphMode  # noqa: E402
 
 
 def _block_cls(transport: str) -> type:
@@ -142,16 +144,6 @@ def _named_shards(model: nn.Module):
                 yield (f"{mod_name}.{p_name}" if mod_name else p_name), p
 
 
-def _is_driver_refusal(e: Exception) -> bool:
-    """True when the CUDA driver, not our code, rejected the symmetric-memory setup.
-
-    Anything else -- a shape error, an arena overflow, a missing registration -- is a
-    real failure and must not be mistaken for an unequipped host.
-    """
-    msg = str(e)
-    return "CUDA driver error" in msg or "not supported" in msg
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--hidden", type=int, default=4096)
@@ -209,19 +201,7 @@ def main() -> None:
     with torch.device("meta"):
         model = Root(_block_cls(args.transport), args.hidden, args.n_layers, dtype)
     model = data_parallel(model, mesh, mode="fully_shard", ac_mode="full")
-    try:
-        model.to_empty(device=device)
-    except RuntimeError as e:
-        # to_empty is where the patched _apply opens the symmetric window, and a window
-        # needs an initialized NVLink fabric -- on NVSwitch hosts a running
-        # nvidia-fabricmanager.  Where there is none the driver refuses the rendezvous on
-        # every rank before any of the chain under test runs, so report the host as
-        # unable rather than the chain as broken.
-        if not (ce and _is_driver_refusal(e)):
-            raise
-        print(f"E2E_SYMM_UNAVAILABLE rank={rank} {e}", flush=True)
-        dist.destroy_process_group()
-        raise SystemExit(0) from None
+    model.to_empty(device=device)
     _load_into_shards(model, state)
 
     # (1) placement: the block's shards are in a window, the head's are not.
