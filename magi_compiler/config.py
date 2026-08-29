@@ -118,9 +118,12 @@ class PassConfig(BaseModel):
         ),
     )
 
+    _HASH_EXCLUDE_FIELDS = frozenset({"cache_root_dir", "disable_cache", "assert_cache_hit"})
+
     @property
     def hash(self) -> str:
-        return compute_hash(self.model_dump(mode="json"))
+        data = {k: v for k, v in self.model_dump(mode="json").items() if k not in self._HASH_EXCLUDE_FIELDS}
+        return compute_hash(data)
 
     # Compatible with torch pass
     def uuid(self) -> str:
@@ -309,6 +312,14 @@ class CompileConfig(BaseSettings):
         ),
     )
     disable_cache: bool = Field(False, description="Force re-compilation by ignoring any cached piecewise compiled artifacts.")
+    assert_cache_hit: bool = Field(
+        False,
+        description=(
+            "When True, raise RuntimeError on compile cache miss instead of recompiling. "
+            "Use to verify that a pre-baked compile cache covers all subgraphs. "
+            "Env var: MAGI_COMPILE_ASSERT_CACHE_HIT."
+        ),
+    )
 
     # ---- CPU Offload ----
     offload_config: OffloadConfig = Field(
@@ -380,9 +391,12 @@ class CompileConfig(BaseSettings):
     def has_cutlass(self) -> bool:
         return bool(self.cutlass_root)
 
+    _HASH_EXCLUDE_FIELDS = frozenset({"cache_root_dir", "disable_cache", "assert_cache_hit"})
+
     @property
     def hash(self) -> str:
-        return compute_hash(self.model_dump(mode="json"))
+        data = {k: v for k, v in self.model_dump(mode="json").items() if k not in self._HASH_EXCLUDE_FIELDS}
+        return compute_hash(data)
 
     def __str__(self, indent: int = 4):
         data = self.model_dump(mode="json")
