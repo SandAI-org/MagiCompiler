@@ -500,7 +500,6 @@ def _check_dynamic_arg_dims(inferred_dims: dict[str, int | list[int]], target_fu
         assert base_k in inspect.signature(target_func).parameters, f"Argument {base_k} (from {k}) not found in {target_func}"
 
 
-
 def _shm_path(cls_name: str, dtype: torch.dtype, rank: int | None = None) -> str:
     """Build the /dev/shm path for a shared weight file."""
     dtype_str = str(dtype).split(".")[-1]
@@ -517,10 +516,7 @@ def _pack_params_flat(flat: torch.Tensor, param_list: list[tuple[str, torch.Tens
         offset += numel
 
 
-def _split_flat_to_params(
-    flat: torch.Tensor,
-    param_list: list[tuple[str, torch.Tensor]],
-) -> dict[str, torch.Tensor]:
+def _split_flat_to_params(flat: torch.Tensor, param_list: list[tuple[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
     """Return views into *flat* shaped like the original parameters."""
     out: dict[str, torch.Tensor] = {}
     offset = 0
@@ -534,11 +530,7 @@ def _split_flat_to_params(
     return out
 
 
-def _create_shm_tensor(
-    shm_path: str,
-    param_list: list[tuple[str, torch.Tensor]],
-    dtype: torch.dtype,
-) -> torch.Tensor:
+def _create_shm_tensor(shm_path: str, param_list: list[tuple[str, torch.Tensor]], dtype: torch.dtype) -> torch.Tensor:
     """Create a shared-memory mmap file, pack *param_list* into it, return the giant tensor."""
     total_numel = sum(t.numel() for _, t in param_list)
     elem_size = torch.empty(0, dtype=dtype).element_size()
@@ -549,12 +541,8 @@ def _create_shm_tensor(
     return giant
 
 
-
 def _materialize_shm_weights(
-    module: nn.Module,
-    grouped_params: dict[torch.dtype, list[tuple[str, torch.Tensor]]],
-    local_rank: int,
-    per_rank: bool,
+    module: nn.Module, grouped_params: dict[torch.dtype, list[tuple[str, torch.Tensor]]], local_rank: int, per_rank: bool
 ) -> None:
     """Replace module params with pinned shared-memory tensors.
 
@@ -586,9 +574,7 @@ def _materialize_shm_weights(
             if local_rank == 0:
                 _create_shm_tensor(path, param_list, dtype)
             dist.barrier()
-            giant = torch.from_file(
-                path, shared=True, size=total_numel, dtype=dtype, device="cpu",
-            )
+            giant = torch.from_file(path, shared=True, size=total_numel, dtype=dtype, device="cpu")
             pin_memory_in_place(giant)
             buffers.append(giant)
             shared_state.update(_split_flat_to_params(giant, param_list))
@@ -600,11 +586,7 @@ def _materialize_shm_weights(
     module.load_state_dict(shared_state, assign=True)
 
 
-def _staggered_pin_memory(
-    full_state_dict: dict[str, torch.Tensor],
-    local_rank: int,
-    pin_budget_gb: float,
-):
+def _staggered_pin_memory(full_state_dict: dict[str, torch.Tensor], local_rank: int, pin_budget_gb: float):
     """Pin CPU tensors in coordinated waves to avoid host OOM.
 
     Automatically determines how many ranks can pin concurrently based on
@@ -617,12 +599,8 @@ def _staggered_pin_memory(
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
 
-    per_rank_bytes = sum(
-        t.numel() * t.element_size()
-        for t in full_state_dict.values()
-        if t.device.type == "cpu"
-    )
-    per_rank_gb = per_rank_bytes / (1024 ** 3)
+    per_rank_bytes = sum(t.numel() * t.element_size() for t in full_state_dict.values() if t.device.type == "cpu")
+    per_rank_gb = per_rank_bytes / (1024**3)
 
     concurrency_env = os.environ.get("MAGI_OFFLOAD_PIN_CONCURRENCY", "")
     if concurrency_env:
@@ -645,15 +623,17 @@ def _staggered_pin_memory(
 
     num_waves = (world_size + pin_concurrency - 1) // pin_concurrency
     magi_logger.info(
-        "[Rank %d] pin_memory: world=%d per_rank=%.2f GB, "
-        "concurrency=%d (waves=%d), RLIMIT_MEMLOCK soft=%s hard=%s",
-        local_rank, world_size, per_rank_gb,
-        pin_concurrency, num_waves,
+        "[Rank %d] pin_memory: world=%d per_rank=%.2f GB, " "concurrency=%d (waves=%d), RLIMIT_MEMLOCK soft=%s hard=%s",
+        local_rank,
+        world_size,
+        per_rank_gb,
+        pin_concurrency,
+        num_waves,
         "unlimited" if soft == resource.RLIM_INFINITY else f"{soft / (1024 ** 3):.1f}GB",
         "unlimited" if hard == resource.RLIM_INFINITY else f"{hard / (1024 ** 3):.1f}GB",
     )
 
-    limit_bytes = int(pin_budget_gb * (1024 ** 3))
+    limit_bytes = int(pin_budget_gb * (1024**3))
     my_wave = local_rank // pin_concurrency
     for wave in range(num_waves):
         if wave == my_wave:
@@ -675,20 +655,20 @@ def _staggered_pin_memory(
                     pinned_bytes += size
                     pinned_count += 1
                 except RuntimeError as e:
-                    magi_logger.warning(
-                        "[Rank %d] pin failed at %.2f GB: %s",
-                        local_rank, pinned_bytes / (1024 ** 3), e,
-                    )
+                    magi_logger.warning("[Rank %d] pin failed at %.2f GB: %s", local_rank, pinned_bytes / (1024**3), e)
                     break
 
             total_bytes = sum(s for _, _, s in params)
             magi_logger.info(
-                "[Rank %d] pin_memory DONE (wave %d/%d) %.1fs: "
-                "%d params (%.2f / %.2f GB, budget=%.1f GB)",
-                local_rank, wave + 1, num_waves,
+                "[Rank %d] pin_memory DONE (wave %d/%d) %.1fs: " "%d params (%.2f / %.2f GB, budget=%.1f GB)",
+                local_rank,
+                wave + 1,
+                num_waves,
                 time.perf_counter() - t0,
-                pinned_count, pinned_bytes / (1024 ** 3),
-                total_bytes / (1024 ** 3), pin_budget_gb,
+                pinned_count,
+                pinned_bytes / (1024**3),
+                total_bytes / (1024**3),
+                pin_budget_gb,
             )
         if dist.is_initialized():
             dist.barrier()
@@ -768,8 +748,7 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
                     _staggered_pin_memory(full_state_dict, local_rank, pin_budget_gb)
                 else:
                     magi_logger.info(
-                        "[Rank %d] MAGI_OFFLOAD_SKIP_SHM=1, PIN_BUDGET=0: "
-                        "params remain as unpinned CPU tensors.",
+                        "[Rank %d] MAGI_OFFLOAD_SKIP_SHM=1, PIN_BUDGET=0: " "params remain as unpinned CPU tensors.",
                         local_rank,
                     )
             else:

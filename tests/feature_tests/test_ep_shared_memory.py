@@ -38,10 +38,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 
-
 _skip_no_dist = pytest.mark.skipif(
-    not hasattr(dist, "is_gloo_available") or not dist.is_gloo_available(),
-    reason="requires gloo backend",
+    not hasattr(dist, "is_gloo_available") or not dist.is_gloo_available(), reason="requires gloo backend"
 )
 
 
@@ -209,10 +207,7 @@ def test_ep_fix_preserves_per_rank_shards():
         r1 = torch.load(f"{result_file}_1.pt", weights_only=True)
 
         assert r0["matches_own"], "rank 0 should keep its own weights"
-        assert r1["matches_own"], (
-            "FIX FAILED: rank 1 should keep its own weights when EP > 1, "
-            "but they were overwritten."
-        )
+        assert r1["matches_own"], "FIX FAILED: rank 1 should keep its own weights when EP > 1, " "but they were overwritten."
         assert not torch.equal(r0["weight"], r1["weight"]), (
             "With EP > 1, each rank should have DIFFERENT expert weights. "
             "If they're equal, the per-rank shm path did not work correctly."
