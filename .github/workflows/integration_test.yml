@@ -2,7 +2,7 @@ name: Integration Test on PR
 
 on:
     pull_request_target:
-        types: [opened, reopened, synchronize, ready_for_review]
+        types: [labeled]
         branches:
         -   main
 
@@ -11,8 +11,32 @@ concurrency:
     cancel-in-progress: true
 
 jobs:
+    guard:
+        name: Check ci:run label
+        runs-on: ubuntu-latest
+        permissions:
+            pull-requests: write
+        steps:
+        -   name: Require ci:run label
+            run: |
+                if [ "${{ github.event.label.name }}" != "ci:run" ]; then
+                  echo "::notice::Skipped: label is not ci:run."
+                  exit 1
+                fi
+        -   name: Remove ci:run label
+            uses: actions/github-script@v7
+            with:
+                script: |
+                    await github.rest.issues.removeLabel({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        issue_number: context.issue.number,
+                        name: 'ci:run'
+                    });
+
     pt29:
         name: PyTorch 2.9
+        needs: guard
         uses: ./.github/workflows/_ci_pipeline.yml
         with:
             kind: pr
@@ -26,6 +50,7 @@ jobs:
 
     pt212:
         name: PyTorch 2.12
+        needs: guard
         uses: ./.github/workflows/_ci_pipeline.yml
         with:
             kind: pr
