@@ -575,9 +575,20 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
             if skip_shm:
                 pin_budget_gb = float(os.environ.get("MAGI_OFFLOAD_PIN_BUDGET_GB", "0"))
                 if pin_budget_gb > 0:
+                    import time as _time
+                    import resource as _resource
                     world_size = dist.get_world_size() if dist.is_initialized() else 1
+                    _soft, _hard = _resource.getrlimit(_resource.RLIMIT_MEMLOCK)
+                    magi_logger.info(
+                        "[Rank %d] pin_memory: world=%d budget=%.1f GB, RLIMIT_MEMLOCK soft=%s hard=%s",
+                        local_rank, world_size, pin_budget_gb,
+                        "unlimited" if _soft == _resource.RLIM_INFINITY else f"{_soft/(1024**3):.1f}GB",
+                        "unlimited" if _hard == _resource.RLIM_INFINITY else f"{_hard/(1024**3):.1f}GB",
+                    )
                     for turn in range(world_size):
                         if local_rank == turn:
+                            _t_pin_start = _time.perf_counter()
+                            magi_logger.info("[Rank %d] pin_memory START (turn %d/%d)", local_rank, turn, world_size)
                             limit = int(pin_budget_gb * (1024 ** 3))
                             params_with_size = []
                             for name, tensor in full_state_dict.items():
@@ -597,11 +608,15 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
                                     magi_logger.warning("[Rank %d] pin failed at %.2f GB: %s", local_rank, pinned_bytes / (1024**3), e)
                                     break
                             total_bytes = sum(s for _, _, s in params_with_size)
+                            _t_pin_end = _time.perf_counter()
                             magi_logger.info(
-                                "[Rank %d] Pinned %d params (%.2f GB / %.2f GB total, budget=%.1f GB)",
-                                local_rank, pinned_count, pinned_bytes / (1024**3),
+                                "[Rank %d] pin_memory DONE (turn %d/%d) %.1fs: %d params (%.2f GB / %.2f GB total, budget=%.1f GB)",
+                                local_rank, turn, world_size, _t_pin_end - _t_pin_start,
+                                pinned_count, pinned_bytes / (1024**3),
                                 total_bytes / (1024**3), pin_budget_gb,
                             )
+                        else:
+                            magi_logger.info("[Rank %d] pin_memory WAIT (turn %d/%d, rank %d pinning)", local_rank, turn, world_size, turn)
                         if dist.is_initialized():
                             dist.barrier()
                 else:
