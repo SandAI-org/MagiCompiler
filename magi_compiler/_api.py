@@ -500,6 +500,101 @@ def _check_dynamic_arg_dims(inferred_dims: dict[str, int | list[int]], target_fu
         assert base_k in inspect.signature(target_func).parameters, f"Argument {base_k} (from {k}) not found in {target_func}"
 
 
+
+def _staggered_pin_memory(
+    full_state_dict: dict[str, torch.Tensor],
+    local_rank: int,
+    pin_budget_gb: float,
+):
+    """Pin CPU tensors in coordinated waves to avoid host OOM.
+
+    Automatically determines how many ranks can pin concurrently based on
+    host RAM and per-rank parameter size.  Override with env var
+    ``MAGI_OFFLOAD_PIN_CONCURRENCY``.
+    """
+    import resource
+    import time
+
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+
+    per_rank_bytes = sum(
+        t.numel() * t.element_size()
+        for t in full_state_dict.values()
+        if t.device.type == "cpu"
+    )
+    per_rank_gb = per_rank_bytes / (1024 ** 3)
+
+    concurrency_env = os.environ.get("MAGI_OFFLOAD_PIN_CONCURRENCY", "")
+    if concurrency_env:
+        pin_concurrency = int(concurrency_env)
+    else:
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        total_ram_kb = int(line.split()[1])
+                        break
+                else:
+                    total_ram_kb = 512 * 1024 * 1024
+            total_ram_gb = total_ram_kb / (1024 * 1024)
+        except Exception:
+            total_ram_gb = 512.0
+        safe_ram_gb = total_ram_gb / 2
+        pin_concurrency = max(1, int(safe_ram_gb / per_rank_gb)) if per_rank_gb > 0 else world_size
+    pin_concurrency = min(pin_concurrency, world_size)
+
+    num_waves = (world_size + pin_concurrency - 1) // pin_concurrency
+    magi_logger.info(
+        "[Rank %d] pin_memory: world=%d per_rank=%.2f GB, "
+        "concurrency=%d (waves=%d), RLIMIT_MEMLOCK soft=%s hard=%s",
+        local_rank, world_size, per_rank_gb,
+        pin_concurrency, num_waves,
+        "unlimited" if soft == resource.RLIM_INFINITY else f"{soft / (1024 ** 3):.1f}GB",
+        "unlimited" if hard == resource.RLIM_INFINITY else f"{hard / (1024 ** 3):.1f}GB",
+    )
+
+    limit_bytes = int(pin_budget_gb * (1024 ** 3))
+    my_wave = local_rank // pin_concurrency
+    for wave in range(num_waves):
+        if wave == my_wave:
+            t0 = time.perf_counter()
+            params = [
+                (name, tensor, tensor.numel() * tensor.element_size())
+                for name, tensor in full_state_dict.items()
+                if tensor.device.type == "cpu"
+            ]
+            params.sort(key=lambda x: x[2], reverse=True)
+
+            pinned_bytes = 0
+            pinned_count = 0
+            for name, tensor, size in params:
+                if pinned_bytes + size > limit_bytes:
+                    continue
+                try:
+                    pin_memory_in_place(tensor)
+                    pinned_bytes += size
+                    pinned_count += 1
+                except RuntimeError as e:
+                    magi_logger.warning(
+                        "[Rank %d] pin failed at %.2f GB: %s",
+                        local_rank, pinned_bytes / (1024 ** 3), e,
+                    )
+                    break
+
+            total_bytes = sum(s for _, _, s in params)
+            magi_logger.info(
+                "[Rank %d] pin_memory DONE (wave %d/%d) %.1fs: "
+                "%d params (%.2f / %.2f GB, budget=%.1f GB)",
+                local_rank, wave + 1, num_waves,
+                time.perf_counter() - t0,
+                pinned_count, pinned_bytes / (1024 ** 3),
+                total_bytes / (1024 ** 3), pin_budget_gb,
+            )
+        if dist.is_initialized():
+            dist.barrier()
+
+
 def _patch_cpu_offload_apply(cls: type[nn.Module]):
     magi_logger.info(f"Enabling CPU offload for {cls}")
     _orig_apply = cls._apply
@@ -575,88 +670,7 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
             if skip_shm:
                 pin_budget_gb = float(os.environ.get("MAGI_OFFLOAD_PIN_BUDGET_GB", "0"))
                 if pin_budget_gb > 0:
-                    import time as _time
-                    import resource as _resource
-                    world_size = dist.get_world_size() if dist.is_initialized() else 1
-
-                    _soft, _hard = _resource.getrlimit(_resource.RLIMIT_MEMLOCK)
-
-                    per_rank_bytes = sum(
-                        t.numel() * t.element_size()
-                        for t in full_state_dict.values()
-                        if t.device.type == "cpu"
-                    )
-                    per_rank_gb = per_rank_bytes / (1024 ** 3)
-
-                    _pin_concurrency_env = os.environ.get("MAGI_OFFLOAD_PIN_CONCURRENCY", "")
-                    if _pin_concurrency_env:
-                        pin_concurrency = int(_pin_concurrency_env)
-                    else:
-                        try:
-                            with open("/proc/meminfo") as _f:
-                                for _line in _f:
-                                    if _line.startswith("MemTotal:"):
-                                        total_ram_kb = int(_line.split()[1])
-                                        break
-                                else:
-                                    total_ram_kb = 512 * 1024 * 1024
-                            total_ram_gb = total_ram_kb / (1024 * 1024)
-                        except Exception:
-                            total_ram_gb = 512.0
-                        safe_ram_gb = total_ram_gb / 2
-                        pin_concurrency = max(1, int(safe_ram_gb / per_rank_gb)) if per_rank_gb > 0 else world_size
-                    pin_concurrency = min(pin_concurrency, world_size)
-
-                    num_waves = (world_size + pin_concurrency - 1) // pin_concurrency
-                    magi_logger.info(
-                        "[Rank %d] pin_memory: world=%d budget=%.1f GB, per_rank=%.2f GB, "
-                        "concurrency=%d (waves=%d), RLIMIT_MEMLOCK soft=%s hard=%s",
-                        local_rank, world_size, pin_budget_gb, per_rank_gb,
-                        pin_concurrency, num_waves,
-                        "unlimited" if _soft == _resource.RLIM_INFINITY else f"{_soft/(1024**3):.1f}GB",
-                        "unlimited" if _hard == _resource.RLIM_INFINITY else f"{_hard/(1024**3):.1f}GB",
-                    )
-
-                    my_wave = local_rank // pin_concurrency
-                    for wave in range(num_waves):
-                        if wave == my_wave:
-                            _t_pin_start = _time.perf_counter()
-                            magi_logger.info(
-                                "[Rank %d] pin_memory START (wave %d/%d, ranks %d-%d)",
-                                local_rank, wave + 1, num_waves,
-                                wave * pin_concurrency,
-                                min((wave + 1) * pin_concurrency, world_size) - 1,
-                            )
-                            limit = int(pin_budget_gb * (1024 ** 3))
-                            params_with_size = []
-                            for name, tensor in full_state_dict.items():
-                                if tensor.device.type == "cpu":
-                                    params_with_size.append((name, tensor, tensor.numel() * tensor.element_size()))
-                            params_with_size.sort(key=lambda x: x[2], reverse=True)
-                            pinned_bytes = 0
-                            pinned_count = 0
-                            for name, tensor, size in params_with_size:
-                                if pinned_bytes + size > limit:
-                                    continue
-                                try:
-                                    pin_memory_in_place(tensor)
-                                    pinned_bytes += size
-                                    pinned_count += 1
-                                except RuntimeError as e:
-                                    magi_logger.warning("[Rank %d] pin failed at %.2f GB: %s", local_rank, pinned_bytes / (1024**3), e)
-                                    break
-                            total_bytes = sum(s for _, _, s in params_with_size)
-                            _t_pin_end = _time.perf_counter()
-                            magi_logger.info(
-                                "[Rank %d] pin_memory DONE (wave %d/%d) %.1fs: %d params "
-                                "(%.2f GB / %.2f GB, budget=%.1f GB)",
-                                local_rank, wave + 1, num_waves,
-                                _t_pin_end - _t_pin_start,
-                                pinned_count, pinned_bytes / (1024**3),
-                                total_bytes / (1024**3), pin_budget_gb,
-                            )
-                        if dist.is_initialized():
-                            dist.barrier()
+                    _staggered_pin_memory(full_state_dict, local_rank, pin_budget_gb)
                 else:
                     magi_logger.info(
                         "[Rank %d] MAGI_OFFLOAD_SKIP_SHM=1, PIN_BUDGET=0: "
@@ -785,12 +799,4 @@ def offload(obj):
         return {k: offload(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return type(obj)(offload(i) for i in obj)
-    if hasattr(obj, "__dict__"):
-        import copy
-        obj = copy.copy(obj)
-        for attr_name in list(vars(obj)):
-            attr_val = getattr(obj, attr_name)
-            if isinstance(attr_val, torch.Tensor) and attr_val.is_cuda:
-                setattr(obj, attr_name, attr_val.cpu())
-        return obj
     return obj

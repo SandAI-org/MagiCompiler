@@ -14,8 +14,6 @@
 
 import collections
 import operator
-import os
-import time
 from typing import Any, Dict
 
 import torch
@@ -25,12 +23,9 @@ from torch.fx.node import map_arg
 from magi_compiler.config import CompileConfig
 from magi_compiler.offload.profiler import OffloadProfiler
 from magi_compiler.offload.scheduler import OffloadRuntimeContext, SchedulerFactory
-from magi_compiler.utils import magi_logger
 from magi_compiler.utils.nvtx import add_nvtx_event
 
 from ..magi_depyf.timeline import observe_lifecycle
-
-
 
 
 class OffloadExecutor:

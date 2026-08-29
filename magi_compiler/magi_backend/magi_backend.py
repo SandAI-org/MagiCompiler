@@ -15,6 +15,7 @@
 import ast
 import dataclasses
 import pprint
+import os
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -345,10 +346,8 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                             needs_recompile = True
 
             if needs_recompile:
-                import os as _os
-                if _os.environ.get('RANK', '0') == '0':
-                    from magi_compiler.utils import magi_logger
-                    magi_logger.info(f'[fix_device] fixed {cpu_fix_count} CPU example_values to cuda:{target_device}')
+                if os.environ.get('RANK', '0') == '0':
+                    magi_logger.info('[fix_device] fixed %d CPU example_values to cuda:%s', cpu_fix_count, target_device)
                 module.recompile()
 
     @observe_lifecycle("piecewise_compile")
