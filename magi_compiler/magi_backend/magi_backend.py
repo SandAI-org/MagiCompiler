@@ -313,6 +313,42 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                                 node.update_kwarg('device', target_device)
                                 needs_recompile = True
 
+            # Fix .to(device('cpu')) calls baked during CPU-offload tracing.
+            # Without _deep_cuda, Dynamo traces with CPU tensors and specialises
+            # .to(x.device) as .to(device('cpu')).  After we move example_values
+            # to CUDA below, these hardcoded .to(cpu) nodes create CUDA-vs-CPU
+            # mismatches in PiecewiseCompileInterpreter.run().
+            def _is_cpu_device(val):
+                if isinstance(val, torch.device):
+                    return val.type == 'cpu'
+                if isinstance(val, str):
+                    return val == 'cpu'
+                return False
+
+            for node in module.graph.nodes:
+                if node.op == 'call_method' and node.target == 'to':
+                    new_args = list(node.args)
+                    changed = False
+                    for i, arg in enumerate(new_args):
+                        if _is_cpu_device(arg):
+                            new_args[i] = torch.device('cuda', target_device)
+                            changed = True
+                    if changed:
+                        node.args = tuple(new_args)
+                        needs_recompile = True
+                    if 'device' in node.kwargs and _is_cpu_device(node.kwargs['device']):
+                        node.update_kwarg('device', torch.device('cuda', target_device))
+                        needs_recompile = True
+
+                if node.op == 'call_function' and 'device' in node.kwargs:
+                    kdev = node.kwargs['device']
+                    is_already_handled = node.target in factory_functions or (
+                        hasattr(node.target, '__name__') and node.target.__name__ in ['empty', 'zeros', 'ones', 'full']
+                    )
+                    if not is_already_handled and _is_cpu_device(kdev):
+                        node.update_kwarg('device', torch.device('cuda', target_device))
+                        needs_recompile = True
+
             # Fix ALL nodes with CPU example_values — not just get_attr/placeholder.
             # model_cpu_offload traces with CPU FakeTensors; Inductor autotuning
             # creates benchmark tensors on the example_value device, and the
