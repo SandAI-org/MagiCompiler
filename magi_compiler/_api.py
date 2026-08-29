@@ -550,6 +550,56 @@ def _create_shm_tensor(
 
 
 
+def _materialize_shm_weights(
+    module: nn.Module,
+    grouped_params: dict[torch.dtype, list[tuple[str, torch.Tensor]]],
+    local_rank: int,
+    per_rank: bool,
+) -> None:
+    """Replace module params with pinned shared-memory tensors.
+
+    per_rank=True  (EP > 1): each rank writes its own mmap, staggered.
+    per_rank=False (EP <= 1): rank 0 writes, all ranks share pages.
+    """
+    cls_name = module.__class__.__name__
+    shared_state: dict[str, torch.Tensor] = {}
+    buffers: list[torch.Tensor] = []
+
+    if per_rank:
+        world_size = dist.get_world_size()
+        for turn in range(world_size):
+            if local_rank == turn:
+                for dtype, param_list in grouped_params.items():
+                    path = _shm_path(cls_name, dtype, rank=local_rank)
+                    giant = _create_shm_tensor(path, param_list, dtype)
+                    pin_memory_in_place(giant)
+                    buffers.append(giant)
+                    shared_state.update(_split_flat_to_params(giant, param_list))
+                    if os.path.exists(path):
+                        os.remove(path)
+            dist.barrier()
+    else:
+        dist.barrier()
+        for dtype, param_list in grouped_params.items():
+            path = _shm_path(cls_name, dtype)
+            total_numel = sum(t.numel() for _, t in param_list)
+            if local_rank == 0:
+                _create_shm_tensor(path, param_list, dtype)
+            dist.barrier()
+            giant = torch.from_file(
+                path, shared=True, size=total_numel, dtype=dtype, device="cpu",
+            )
+            pin_memory_in_place(giant)
+            buffers.append(giant)
+            shared_state.update(_split_flat_to_params(giant, param_list))
+            dist.barrier()
+            if local_rank == 0 and os.path.exists(path):
+                os.remove(path)
+
+    module._magi_giant_buffers = buffers
+    module.load_state_dict(shared_state, assign=True)
+
+
 def _staggered_pin_memory(
     full_state_dict: dict[str, torch.Tensor],
     local_rank: int,
@@ -710,13 +760,9 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
                         grouped_params[dt] = []
                     grouped_params[dt].append((name, tensor))
 
-            shared_state_dict = {}
-            self._magi_giant_buffers = []
-
-            per_rank_shm = ep_size > 1
-
             skip_shm = os.environ.get("MAGI_OFFLOAD_SKIP_SHM", "0") == "1"
             if skip_shm:
+                self._magi_giant_buffers = []
                 pin_budget_gb = float(os.environ.get("MAGI_OFFLOAD_PIN_BUDGET_GB", "0"))
                 if pin_budget_gb > 0:
                     _staggered_pin_memory(full_state_dict, local_rank, pin_budget_gb)
@@ -726,44 +772,11 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
                         "params remain as unpinned CPU tensors.",
                         local_rank,
                     )
-                del full_state_dict, grouped_params
-                gc.collect()
-            elif per_rank_shm:
-                # EP > 1: each rank writes its own mmap (staggered to cap peak host memory).
-                cls_name = self.__class__.__name__
-                world_size = dist.get_world_size()
-                for turn in range(world_size):
-                    if local_rank == turn:
-                        for dtype, param_list in grouped_params.items():
-                            path = _shm_path(cls_name, dtype, rank=local_rank)
-                            giant = _create_shm_tensor(path, param_list, dtype)
-                            pin_memory_in_place(giant)
-                            self._magi_giant_buffers.append(giant)
-                            shared_state_dict.update(_split_flat_to_params(giant, param_list))
-                            if os.path.exists(path):
-                                os.remove(path)
-                        self.load_state_dict(shared_state_dict, assign=True)
-                        del full_state_dict, grouped_params
-                        gc.collect()
-                    dist.barrier()
             else:
-                # EP <= 1: rank 0 writes mmap, all ranks share the same pages.
-                cls_name = self.__class__.__name__
-                dist.barrier()
-                for dtype, param_list in grouped_params.items():
-                    path = _shm_path(cls_name, dtype)
-                    total_numel = sum(t.numel() for _, t in param_list)
-                    if local_rank == 0:
-                        _create_shm_tensor(path, param_list, dtype)
-                    dist.barrier()
-                    giant = torch.from_file(path, shared=True, size=total_numel, dtype=dtype, device="cpu")
-                    pin_memory_in_place(giant)
-                    self._magi_giant_buffers.append(giant)
-                    shared_state_dict.update(_split_flat_to_params(giant, param_list))
-                    dist.barrier()
-                    if local_rank == 0 and os.path.exists(path):
-                        os.remove(path)
-                self.load_state_dict(shared_state_dict, assign=True)
+                _materialize_shm_weights(self, grouped_params, local_rank, per_rank=(ep_size > 1))
+
+            del full_state_dict, grouped_params
+            gc.collect()
 
         else:
 
