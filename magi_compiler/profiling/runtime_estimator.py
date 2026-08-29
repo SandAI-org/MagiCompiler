@@ -225,19 +225,15 @@ def _realize_arg(v):
     return v
 
 
-def _measure_extern(snode: ExternKernelSchedulerNode, fixed_iters: bool = False) -> float:
-    """Time an extern (matmul / custom-op) snode by replaying its aten op.
-
-    ``fixed_iters=True``: constant iteration count with CUDA events instead of the
-    duration-adaptive benchmarker.  Required for ops with an INTERNAL collective
-    (CP all_to_all inside attention/MoE): adaptive iteration counts differ per rank
-    -> NCCL count mismatch -> deadlock.
+def _extern_replay_fn(snode: ExternKernelSchedulerNode):
+    """A callable that runs this extern's aten op on rebuilt inputs, or None.
 
     Replay inputs: generic ``_realize_arg``, then an optional same-signature
-    hook (``materialize_inputs``) that rebuilds value-consistent metadata."""
+    hook (``materialize_inputs``) that rebuilds value-consistent metadata.
+    """
     fx_node = snode.node.get_origin_node()
     if fx_node is None:
-        return 0.0
+        return None
     target = fx_node.target
 
     args = tuple(_realize_arg(a) for a in fx_node.args)
@@ -257,22 +253,43 @@ def _measure_extern(snode: ExternKernelSchedulerNode, fixed_iters: bool = False)
         with torch.no_grad():
             return _call()
 
-    if not fixed_iters:
-        fn()  # warmup / correctness
-        return benchmarker.benchmark_gpu(fn) * 1e6  # ms -> ns
-    # Fixed-iteration timing (lockstep-safe for internal collectives).
-    _WARMUP, _ITERS = 3, 10
-    for _ in range(_WARMUP):
+    return fn
+
+
+def _measure_extern(snode: ExternKernelSchedulerNode, fixed_iters: bool = False) -> float:
+    """Time an extern (matmul / custom-op) snode by replaying its aten op.
+
+    ``fixed_iters=True``: constant iteration count with CUDA events instead of the
+    duration-adaptive benchmarker.  Required for ops with an INTERNAL collective
+    (CP all_to_all inside attention/MoE): adaptive iteration counts differ per rank
+    -> NCCL count mismatch -> deadlock."""
+    fn = _extern_replay_fn(snode)
+    if fn is None:
+        return 0.0
+    if fixed_iters:
+        return _time_fixed(fn)
+    fn()  # warmup / correctness
+    return benchmarker.benchmark_gpu(fn) * 1e6  # ms -> ns
+
+
+def _time_fixed(fn, warmup: int = 3, iters: int = 10) -> float:
+    """CUDA-event timing over a FIXED iteration count, in nanoseconds.
+
+    Fixed, not adaptive: anything that issues a collective must issue the same
+    number of them on every rank, or the NCCL counts diverge and the ranks
+    deadlock inside what is supposed to be a measurement.
+    """
+    for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
-    for _ in range(_ITERS):
+    for _ in range(iters):
         fn()
     end.record()
     torch.cuda.synchronize()
-    return (start.elapsed_time(end) / _ITERS) * 1e6  # ms/iter -> ns
+    return (start.elapsed_time(end) / iters) * 1e6  # ms/iter -> ns
 
 
 def _op_name(target) -> str:
@@ -335,6 +352,103 @@ def _collective_spec(node):
     return op, group_name, group_size, specs
 
 
+def _symm_ag_ops():
+    """Copy-engine gather ops, or empty when the runtime is unavailable."""
+    try:
+        from magi_compiler.symm_mem.all_gather import SYMM_ALL_GATHER, SYMM_ALL_GATHER_COALESCED
+
+        return tuple(op for op in (SYMM_ALL_GATHER, SYMM_ALL_GATHER_COALESCED) if op is not None)
+    except Exception:  # noqa: BLE001
+        return ()
+
+
+def _leaf_symm_ag(snode: BaseSchedulerNode):
+    """The copy-engine gather IR node inside ``snode``, or None.
+
+    It is an ordinary FallbackKernel, not a ``_CollectiveKernel``, so none of
+    Inductor's collective predicates see it.
+    """
+    ops = _symm_ag_ops()
+    if not ops:
+        return None
+    for n in (getattr(snode, "node", None), *(getattr(c, "node", None) for c in getattr(snode, "snodes", []) or [])):
+        if n is not None and getattr(n, "op_overload", None) in ops:
+            return n
+    return None
+
+
+def _is_symm_ag_coalesced_ir(node) -> bool:
+    try:
+        from magi_compiler.symm_mem.all_gather import SYMM_ALL_GATHER_COALESCED
+    except Exception:  # noqa: BLE001
+        return False
+    return SYMM_ALL_GATHER_COALESCED is not None and getattr(node, "op_overload", None) is SYMM_ALL_GATHER_COALESCED
+
+
+def _symm_ag_spec(node):
+    """(shapes, dtype, group_size, group_name). Use ``constant_args``; ``get_origin_node()`` is unset and would cost 0."""
+    args = getattr(node, "constant_args", None)
+    if not args or len(args) < 2:
+        return None
+    group_size, group_name = args[-2:]
+    ins = list(node.inputs)
+    if not ins:
+        return None
+    shapes = tuple(tuple(_concrete_size(s) for s in inp.layout.size) for inp in ins)
+    return shapes, ins[0].layout.dtype, int(group_size), str(group_name)
+
+
+def _symm_ag_launch_wait(snode: BaseSchedulerNode):
+    """``(launch, wait)`` replaying a copy-engine gather, or None.
+
+    Split in two rather than one fused closure so the cost model can time
+    ``wait(launch())`` as a unit.
+    """
+    from magi_compiler.symm_mem import find_shard_by_layout
+
+    node = _leaf_symm_ag(snode)
+    spec = _symm_ag_spec(node) if node is not None else None
+    if spec is None:
+        return None
+    shapes, dtype, group_size, group_name = spec
+    shards = [find_shard_by_layout(shape, dtype) for shape in shapes]
+    if any(s is None for s in shards):
+        magi_logger.warning(
+            "No registered symmetric shard with layout %s/%s; the copy-engine gather keeps its "
+            "analytical cost and its overlap window may be mis-sized",
+            shapes,
+            dtype,
+        )
+        return None
+    from magi_compiler.symm_mem.all_gather import SYMM_ALL_GATHER, SYMM_ALL_GATHER_COALESCED
+
+    if _is_symm_ag_coalesced_ir(node):
+        op = SYMM_ALL_GATHER_COALESCED
+        return (lambda: op(shards, group_size, group_name)), lambda outs: [_WAIT(o) for o in outs]
+    return (lambda: SYMM_ALL_GATHER(shards[0], group_size, group_name)), _WAIT
+
+
+def _measure_symm_ag(snode: BaseSchedulerNode) -> float:
+    """Time ``wait(launch())``. Launch-only is ~3us CPU issue; copies run on a side stream."""
+    pair = _symm_ag_launch_wait(snode)
+    if pair is None:
+        return 0.0
+    launch, wait = pair
+    return _time_fixed(lambda: wait(launch()))
+
+
+def _symm_ag_label(snode: BaseSchedulerNode) -> str:
+    node = _leaf_symm_ag(snode)
+    spec = _symm_ag_spec(node) if node is not None else None
+    if spec is None:
+        return _snode_label(snode)
+    shapes, _dtype, group_size, _gn = spec
+    shape0 = "x".join(str(x) for x in shapes[0])
+    if len(shapes) > 1:
+        return f"symm_all_gather_coalesced(ws={group_size},n={len(shapes)},{shape0})"
+    return f"symm_all_gather(ws={group_size},{shape0})"
+
+
 def _collective_label(snode: BaseSchedulerNode) -> str:
     """Readable identity of a collective: op name, world size, #inputs + first shape."""
     node = _leaf_collective(snode)
@@ -346,43 +460,26 @@ def _collective_label(snode: BaseSchedulerNode) -> str:
     return f"all_gather(ws={group_size},n={len(specs)},{shape0})"
 
 
-def _measure_collective_op(snode: BaseSchedulerNode) -> float:
-    """Replay the functional all-gather (+wait) on real tensors and time it."""
+def _nccl_launch_wait(snode: BaseSchedulerNode):
+    """``(launch, wait)`` replaying a functional all-gather, or None."""
     node = _leaf_collective(snode)
-    if node is None:
-        return 0.0
-    spec = _collective_spec(node)
+    spec = _collective_spec(node) if node is not None else None
     if spec is None:
-        return 0.0
+        return None
     op, group_name, group_size, specs = spec
-
     ins = [torch.empty(shape, dtype=dt, device=dev) for shape, dt, dev in specs]
     if op is _AG_COALESCED:
+        return (lambda: _AG_COALESCED(ins, group_size, group_name), lambda outs: [_WAIT(o) for o in outs])
+    return (lambda: _AG(ins[0], group_size, group_name)), _WAIT
 
-        def fn():
-            outs = _AG_COALESCED(ins, group_size, group_name)
-            for o in outs:
-                _WAIT(o)
 
-    else:
-
-        def fn():
-            _WAIT(_AG(ins[0], group_size, group_name))
-
-    # Fixed iteration count on all ranks -- an adaptive benchmarker would issue
-    # different numbers of collectives per rank -> NCCL count mismatch -> deadlock.
-    _WARMUP, _ITERS = 3, 10
-    for _ in range(_WARMUP):
-        fn()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(_ITERS):
-        fn()
-    end.record()
-    torch.cuda.synchronize()
-    return (start.elapsed_time(end) / _ITERS) * 1e6  # ms/iter -> ns
+def _measure_collective_op(snode: BaseSchedulerNode) -> float:
+    """Replay the functional all-gather (+wait) on real tensors and time it."""
+    pair = _nccl_launch_wait(snode)
+    if pair is None:
+        return 0.0
+    launch, wait = pair
+    return _time_fixed(lambda: wait(launch()))
 
 
 class ProfilingRuntimeEstimator:
@@ -517,6 +614,8 @@ class ProfilingRuntimeEstimator:
         """Lockstep-safe single measurement (fixed iters for anything containing a
         collective); never raises -- falls back to the analytical estimate."""
         try:
+            if _leaf_symm_ag(snode) is not None:
+                return _measure_symm_ag(snode)
             if contains_collective(snode):
                 return _measure_collective_op(snode)
             if isinstance(snode, ExternKernelSchedulerNode):
@@ -556,6 +655,29 @@ class ProfilingRuntimeEstimator:
 
         if _is_multi_output_unpack(snode):
             return 0.0
+
+        if _leaf_symm_ag(snode) is not None:
+            node = _leaf_symm_ag(snode)
+            spec = _symm_ag_spec(node)
+            if spec is None:
+                return _safe_analytical(snode)
+            shapes, dtype, group_size, _gn = spec
+            ckey = ("symm_ag", group_size, shapes, str(dtype))
+            entry = self._table.get(ckey)
+            if entry is not None:
+                entry.reuse_count += 1
+                self.n_cache_hits += 1
+                return entry.ns
+            ns = _safe_analytical(snode)
+            self._table[ckey] = ProfileEntry(ns=ns, kind="symm_ag", label=_symm_ag_label(snode), measured=False)
+            if self._sync_across_ranks:
+                self._key_snode[ckey] = snode
+            else:
+                ns = _measure_symm_ag(snode)
+                self._table[ckey].ns = ns
+                self._table[ckey].measured = True
+                self.n_measured += 1
+            return ns
 
         if contains_collective(snode):
             cnode = _leaf_collective(snode)

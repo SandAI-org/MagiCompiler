@@ -175,3 +175,22 @@ def test_reorder_graph_mismatch_slot_mode():
     assert "REORDER_SLOT" in p.stdout, out[-3000:]  # ... and it chose SLOT consensus
     assert "REORDER_SKELETON ok=True" in p.stdout, out[-3000:]
     assert "REORDER_PASS" in p.stdout, out[-3000:]
+
+
+@requires_cuda
+@requires_torchrun
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires >=2 GPUs")
+def test_reorder_copy_engine_recognition():
+    """world=2, gathers served by the copy engine out of a symmetric arena.
+
+    The gather is an opaque fallback kernel, so if the pass fails to see through
+    it nothing is planned and ``gathers`` comes out 0.  Destinations are fresh
+    ``empty``s -- Inductor owns liveness -- so the only extra invariant is that
+    the three launches are recognized and the compiled answer matches NCCL.
+    """
+    p = _run(2, "--copy-engine", port="29634")
+    out = p.stdout + p.stderr
+    assert p.returncode == 0, f"helper failed:\n{out[-3000:]}"
+    assert "REORDER_CALLED gathers=3" in p.stdout, out[-3000:]  # all three were recognized
+    assert "REORDER_FINITE ok=True" in p.stdout, out[-3000:]  # ... and match the NCCL answer
+    assert "REORDER_PASS" in p.stdout, out[-3000:]

@@ -14,7 +14,8 @@
 
 """Unit tests for the profiling runtime estimator
 (``magi_compiler.profiling.runtime_estimator``): the arg-realizer, the cache-key
-shape helper, the estimator's memoization/deepcopy, and the extern replay measure.
+shape helper, the estimator's memoization/deepcopy, the extern replay measure,
+and the copy-engine gather branch.
 """
 
 import copy
@@ -26,7 +27,19 @@ import torch.fx as fx
 from torch.fx.immutable_collections import immutable_list
 
 from magi_compiler.profiling import ProfilingRuntimeEstimator
-from magi_compiler.profiling.runtime_estimator import ProfileEntry, _measure_extern, _realize_arg, _static
+from magi_compiler.profiling import runtime_estimator as re_mod
+from magi_compiler.profiling.runtime_estimator import (
+    ProfileEntry,
+    _is_symm_ag_coalesced_ir,
+    _leaf_symm_ag,
+    _measure_extern,
+    _measure_symm_ag,
+    _realize_arg,
+    _static,
+    _symm_ag_label,
+    _symm_ag_launch_wait,
+    _symm_ag_spec,
+)
 from magi_compiler.utils.envs import TORCH_VERSION
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -265,7 +278,6 @@ def test_internal_collective_extern_not_measured_in_sync_warmup(monkeypatch, syn
     -> hang).  It is seeded analytical + stashed for warm_and_sync.  In non-sync
     mode the normal measurement path still runs."""
     from magi_compiler.profiling import register_materialize_inputs
-    from magi_compiler.profiling import runtime_estimator as re_mod
     from magi_compiler.profiling.materialize_inputs import _INTERNAL_COLLECTIVE_OPS, _MATERIALIZE_INPUT_HOOKS
 
     measured = {"called": False}
@@ -291,6 +303,25 @@ def test_internal_collective_extern_not_measured_in_sync_warmup(monkeypatch, syn
     finally:
         _MATERIALIZE_INPUT_HOOKS.pop("aten::mm", None)
         _INTERNAL_COLLECTIVE_OPS.discard("aten::mm")
+
+
+# ---------------------------------------------------------------------------
+# window scale: need = comm * scale + margin
+# ---------------------------------------------------------------------------
+def test_reorder_window_params_survive_deepcopy():
+    """Both terms of the window budget must survive the deepcopy Inductor does
+    when it folds this pass into the fx-graph cache key.  ``__deepcopy__``
+    copies the fields by hand, so a dropped line silently reverts one of them
+    to its default instead of raising."""
+    import copy
+
+    from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder
+
+    pass_obj = FsdpOverlapReorder(comm_overlap_window_scale=2.0, comm_overlap_window_margin_ns=1234.0)
+    clone = copy.deepcopy(pass_obj)
+    for obj in (pass_obj, clone):
+        assert obj.comm_overlap_window_scale == pytest.approx(2.0)
+        assert obj.comm_overlap_window_margin_ns == pytest.approx(1234.0)
 
 
 import torch._inductor.config as inductor_config  # noqa: E402
@@ -509,3 +540,305 @@ def test_collective_profile_accuracy_multi_rank():
     # key-set intersection: shared keys still measured; no hang on mismatch
     assert "COLL_MISMATCH ok=True" in p.stdout, out[-3000:]
     assert "COLL_PASS" in p.stdout, out[-3000:]
+
+
+# ===========================================================================
+# COPY-ENGINE GATHER (``fsdp_config.transport="copy_engine"``).
+#
+# The reorder pass sizes each gather's overlap window from what the estimator
+# returns here, and this is the one branch with no self-check: a gather priced
+# at 0ns is not a wrong number that surfaces as a wrong answer, it is a gather
+# with no window -- so nothing is hoisted, the transport still works, and the
+# only symptom is that the speedup is missing.  Both ways that has happened are
+# pinned below: reading the spec off ``get_origin_node()`` (Inductor leaves it
+# unset on these nodes) and timing the launch without its wait (the copies run
+# on a side stream, so the launch alone times a ~3us CPU issue).
+#
+# The IR these helpers read is three attributes deep, so the structural tests
+# use stand-ins rather than a full compile.  The replay tests need a real
+# symmetric window and run on one rank, where a peer read reads our own shard.
+# ===========================================================================
+_CE_ROWS = 128
+
+
+def _ce_ops():
+    from magi_compiler.symm_mem.all_gather import SYMM_ALL_GATHER, SYMM_ALL_GATHER_COALESCED
+
+    return SYMM_ALL_GATHER, SYMM_ALL_GATHER_COALESCED
+
+
+class _FakeLayout:
+    def __init__(self, size, dtype):
+        self.size = size
+        self.dtype = dtype
+
+
+class _FakeBuf:
+    def __init__(self, shape, dtype):
+        self.layout = _FakeLayout(tuple(shape), dtype)
+
+
+class _FakeSymmAgIR:
+    """A ``magi::symm_all_gather`` FallbackKernel.
+
+    ``get_origin_node`` returns None on purpose: that is what the real node
+    does, and it is why the spec has to come from ``constant_args``.
+    """
+
+    def __init__(self, op, shapes, dtype=torch.bfloat16, group_size=1, group_name="grp"):
+        self.op_overload = op
+        self.inputs = [_FakeBuf(s, dtype) for s in shapes]
+        self.constant_args = (group_size, group_name)
+
+    def get_origin_node(self):
+        return None
+
+
+class _FakeMmIR:
+    def __init__(self):
+        self.op_overload = torch.ops.aten.mm.default
+        self.inputs = []
+        self.constant_args = ()
+
+
+class _FakeGatherSnode:
+    def __init__(self, node=None, snodes=()):
+        self.node = node
+        self.snodes = list(snodes)
+
+
+def _ce_snode(shape=(_CE_ROWS, 64), group_size=1):
+    ag, _ = _ce_ops()
+    return _FakeGatherSnode(node=_FakeSymmAgIR(ag, [shape], group_size=group_size))
+
+
+# --- spec / recognition / label: structural, no window needed ---------------
+def test_symm_ag_spec_is_read_off_constant_args_not_the_origin_node():
+    """``get_origin_node()`` is unset on these nodes; reading the group from it
+    yields None, which degraded the gather to a zero cost and a zero window."""
+    ag, _ = _ce_ops()
+    node = _FakeSymmAgIR(ag, [(_CE_ROWS, 64)], group_size=8, group_name="fsdp")
+    assert node.get_origin_node() is None  # the trap this test exists for
+
+    shapes, dtype, group_size, group_name = _symm_ag_spec(node)
+    assert shapes == ((_CE_ROWS, 64),)
+    assert dtype is torch.bfloat16
+    assert group_size == 8
+    assert group_name == "fsdp"
+
+
+def test_symm_ag_spec_of_a_coalesced_gather_has_one_shape_per_member():
+    """The bucket's cost is the whole batch, so every member's shape must be in
+    the spec -- and in the cache key built from it."""
+    _, coalesced = _ce_ops()
+    shapes, _dtype, group_size, _gn = _symm_ag_spec(_FakeSymmAgIR(coalesced, [(8, 4), (16, 4), (32, 4)], group_size=4))
+    assert shapes == ((8, 4), (16, 4), (32, 4))
+    assert group_size == 4
+
+
+@pytest.mark.parametrize("constant_args", [(), (1,)], ids=["empty", "group_name_only"])
+def test_symm_ag_spec_is_none_when_the_group_args_are_missing(constant_args):
+    ag, _ = _ce_ops()
+    node = _FakeSymmAgIR(ag, [(8, 4)])
+    node.constant_args = constant_args
+    assert _symm_ag_spec(node) is None
+
+
+def test_symm_ag_spec_is_none_when_the_node_has_no_inputs():
+    ag, _ = _ce_ops()
+    assert _symm_ag_spec(_FakeSymmAgIR(ag, [])) is None
+
+
+def test_leaf_symm_ag_finds_the_gather_in_a_plain_and_in_a_fused_snode():
+    """Inductor may hand the pass either the gather's own snode or a fused snode
+    that contains it; the cost model has to price both."""
+    ag, _ = _ce_ops()
+    node = _FakeSymmAgIR(ag, [(8, 4)])
+
+    assert _leaf_symm_ag(_FakeGatherSnode(node=node)) is node
+    fused = _FakeGatherSnode(node=None, snodes=[_FakeGatherSnode(node=_FakeMmIR()), _FakeGatherSnode(node=node)])
+    assert _leaf_symm_ag(fused) is node
+
+
+def test_leaf_symm_ag_is_none_for_an_ordinary_kernel():
+    """A copy-engine gather is a plain FallbackKernel, so the probe cannot key on
+    'is a fallback' -- an mm must not be mistaken for one."""
+    assert _leaf_symm_ag(_FakeGatherSnode(node=_FakeMmIR())) is None
+    assert _leaf_symm_ag(_FakeGatherSnode()) is None
+
+
+def test_coalesced_gather_is_distinguished_from_a_single_one():
+    ag, coalesced = _ce_ops()
+    assert _is_symm_ag_coalesced_ir(_FakeSymmAgIR(coalesced, [(8, 4)]))
+    assert not _is_symm_ag_coalesced_ir(_FakeSymmAgIR(ag, [(8, 4)]))
+
+
+def test_symm_ag_label_reports_transport_world_size_and_member_count():
+    """``summary()`` is diffed against nsys traces by hand, so a copy-engine
+    gather must not be labelled like the NCCL one it replaced."""
+    ag, coalesced = _ce_ops()
+    single = _symm_ag_label(_FakeGatherSnode(node=_FakeSymmAgIR(ag, [(8, 4)], group_size=2)))
+    batch = _symm_ag_label(_FakeGatherSnode(node=_FakeSymmAgIR(coalesced, [(8, 4), (16, 4)], group_size=2)))
+
+    assert single == "symm_all_gather(ws=2,8x4)"
+    assert batch == "symm_all_gather_coalesced(ws=2,n=2,8x4)"
+
+
+# --- replay: needs a real symmetric window ----------------------------------
+@pytest.fixture
+def symm_registry():
+    """CE tests register real shards; leaking one across tests would let a stale
+    layout answer ``find_shard_by_layout`` after its window is gone."""
+    import magi_compiler.symm_mem.all_gather  # noqa: F401 - importing defines the ops
+    from magi_compiler.symm_mem import reset_registry
+
+    reset_registry()
+    yield
+    reset_registry()
+
+
+def _ce_group_name() -> str:
+    import torch.distributed as dist
+
+    return dist.group.WORLD.group_name
+
+
+def _register_shards(shapes, dtype=torch.bfloat16):
+    """Register ``shapes`` as real symmetric-memory shards, filled distinctly."""
+    from magi_compiler.symm_mem import SymmArena, register_shard
+
+    arena = SymmArena(dtype, torch.device("cuda", 0), _ce_group_name())
+    for shape in shapes:
+        arena.reserve(shape[0] * shape[1])
+    arena.commit()
+
+    shards = []
+    for i, shape in enumerate(shapes):
+        s = arena.take(shape)
+        s.fill_(i + 1)
+        register_shard(s, arena)
+        shards.append(s)
+    torch.cuda.synchronize()
+    return shards
+
+
+def _ce_replay_snode(shapes, coalesced=False):
+    ag, ag_coalesced = _ce_ops()
+    op = ag_coalesced if coalesced else ag
+    return _FakeGatherSnode(node=_FakeSymmAgIR(op, shapes, group_size=1, group_name=_ce_group_name()))
+
+
+@requires_cuda
+def test_symm_ag_replay_gathers_the_registered_shard(pg_1rank, symm_registry):
+    """The replay must run the real op on a real arena shard: a gather of an
+    ordinary ``empty`` has no peers and would be rejected, leaving the cost model
+    on the analytical estimate it was installed to replace."""
+    (shard,) = _register_shards([(_CE_ROWS, 64)])
+
+    launch, wait = _symm_ag_launch_wait(_ce_replay_snode([(_CE_ROWS, 64)]))
+    out = wait(launch())
+    # No synchronize: if the timed closure did not include the wait, this is a
+    # race -- which is exactly the cost-model bug being pinned.
+    assert torch.equal(out, shard.expand_as(out))
+
+
+@requires_cuda
+def test_symm_ag_coalesced_replay_covers_every_member(pg_1rank, symm_registry):
+    shapes = [(_CE_ROWS, 64), (_CE_ROWS, 32)]
+    shards = _register_shards(shapes)
+
+    launch, wait = _symm_ag_launch_wait(_ce_replay_snode(shapes, coalesced=True))
+    outs = wait(launch())
+    assert len(outs) == len(shards)
+    for out, shard in zip(outs, shards):
+        assert torch.equal(out, shard.expand_as(out))
+
+
+@requires_cuda
+def test_measure_symm_ag_prices_the_gather_above_zero(pg_1rank, symm_registry):
+    """The whole point of the CE branch: a real number, not Inductor's 0us for a
+    fallback kernel."""
+    _register_shards([(1024, 1024)])
+    assert _measure_symm_ag(_ce_replay_snode([(1024, 1024)])) > 0.0
+
+
+@requires_cuda
+def test_measure_symm_ag_degrades_quietly_when_no_shard_has_that_layout(pg_1rank, symm_registry):
+    """Cast/pad gathers keep NCCL, so a CE-shaped node with no matching shard is
+    reachable.  It must fall back, not raise inside the scheduler callback."""
+    _register_shards([(_CE_ROWS, 64)])
+    snode = _ce_replay_snode([(7, 5)])
+
+    assert _symm_ag_launch_wait(snode) is None
+    assert _measure_symm_ag(snode) == 0.0
+
+
+# --- __call__: the ("symm_ag", ...) cache -----------------------------------
+@pytest.fixture
+def ce_measure_calls(monkeypatch):
+    """Drive ``__call__`` straight into the copy-engine branch and count measures."""
+    calls = []
+
+    def fake_measure(snode):
+        calls.append(snode)
+        return 222.0
+
+    monkeypatch.setattr(re_mod, "contains_wait", lambda s: False)
+    monkeypatch.setattr(re_mod, "_is_multi_output_unpack", lambda s: False)
+    monkeypatch.setattr(re_mod, "_safe_analytical", lambda s: 111.0)
+    monkeypatch.setattr(re_mod, "_measure_symm_ag", fake_measure)
+    return calls
+
+
+def test_isomorphic_symm_ag_gathers_are_measured_once(ce_measure_calls):
+    """Every layer gathers the same shape.  Measuring each one would make compile
+    time linear in depth for no new information."""
+    est = ProfilingRuntimeEstimator()
+
+    first = est(_ce_snode())
+    second = est(_ce_snode())
+
+    assert first == second == 222.0
+    assert len(ce_measure_calls) == 1, "the second gather re-measured instead of hitting the cache"
+    assert est.n_cache_hits == 1
+    assert len(est.table) == 1
+
+
+def test_symm_ag_cache_key_separates_shape_and_world_size(ce_measure_calls):
+    """Sharing an entry across shapes would price a small gather like a large one
+    and size its window from the wrong transfer."""
+    est = ProfilingRuntimeEstimator()
+    est(_ce_snode(shape=(_CE_ROWS, 64)))
+    est(_ce_snode(shape=(_CE_ROWS, 32)))
+    est(_ce_snode(shape=(_CE_ROWS, 64), group_size=8))
+
+    assert len(ce_measure_calls) == 3
+    assert len(est.table) == 3
+    assert est.n_cache_hits == 0
+
+
+def test_symm_ag_entry_is_tagged_as_a_copy_engine_gather(ce_measure_calls):
+    est = ProfilingRuntimeEstimator()
+    est(_ce_snode())
+
+    (entry,) = est.table.values()
+    assert entry.kind == "symm_ag"
+    assert entry.measured
+    assert entry.ns == 222.0
+    assert "symm_all_gather" in entry.label
+
+
+def test_symm_ag_sync_mode_defers_the_measurement_to_warm_and_sync(ce_measure_calls):
+    """In profile_sync mode every rank must measure the same keys in the same
+    order.  Measuring here instead would let a rank whose graph reaches the
+    gather first run copies the others have not issued."""
+    est = ProfilingRuntimeEstimator()
+    est._sync_across_ranks = True
+
+    ns = est(_ce_snode())
+
+    assert ns == 111.0, "sync mode must seed with the analytical estimate"
+    assert ce_measure_calls == [], "sync mode measured inside __call__"
+    (entry,) = est.table.values()
+    assert not entry.measured
+    assert list(est._key_snode) == list(est.table), "snode not stashed for warm_and_sync"
