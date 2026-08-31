@@ -46,9 +46,9 @@ import torch
 import torch.nn as nn
 
 from magi_compiler._api import (
-    _assign_param,
     _create_empty_shm,
     _pack_params_flat,
+    _split_flat_to_params,
     _stream_copy_and_replace,
 )
 
@@ -102,7 +102,6 @@ def _batch_materialize(module: nn.Module, shm_dir: str) -> None:
         path = os.path.join(shm_dir, f"batch_{dtype}.bin")
         giant = _create_empty_shm(path, total_numel, dtype)
         _pack_params_flat(giant, param_list)
-        from magi_compiler._api import _split_flat_to_params
         shared_state.update(_split_flat_to_params(giant, param_list))
         buffers.append(giant)
         if os.path.exists(path):
@@ -110,6 +109,7 @@ def _batch_materialize(module: nn.Module, shm_dir: str) -> None:
 
     module.load_state_dict(shared_state, assign=True)
     module._buffers_ref = buffers
+    gc.collect()
 
 
 # ── streaming (fix) ─────────────────────────────────────────
