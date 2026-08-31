@@ -14,7 +14,6 @@
 
 import ast
 import dataclasses
-import os
 import pprint
 import time
 from collections.abc import Callable

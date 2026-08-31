@@ -29,8 +29,8 @@ from magi_compiler.config import debug_dump_path, inductor_cache_dump_path, trit
 from magi_compiler.cuda.cudart import pin_memory_in_place
 from magi_compiler.magi_backend.magi_compiler_base import MagiCompileState
 from magi_compiler.utils import compilation_counter, envs, magi_logger
-from magi_compiler.utils.host_memory import fmt_host_mem
 from magi_compiler.utils.compile_time_monitor import CompileMonitor
+from magi_compiler.utils.host_memory import fmt_host_mem
 
 from .config import CompileConfig, CompileMode
 
@@ -554,11 +554,7 @@ def _create_shm_tensor(shm_path: str, param_list: list[tuple[str, torch.Tensor]]
     return giant
 
 
-def _stream_copy_and_replace(
-    module: nn.Module,
-    giant: torch.Tensor,
-    param_list: list[tuple[str, torch.Tensor]],
-) -> None:
+def _stream_copy_and_replace(module: nn.Module, giant: torch.Tensor, param_list: list[tuple[str, torch.Tensor]]) -> None:
     """Copy each param into *giant*, replace in module immediately.
 
     By replacing before moving to the next param, only one param's worth

@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 
 
 def get_host_mem_gb() -> dict[str, float]:

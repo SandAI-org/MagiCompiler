@@ -47,9 +47,7 @@ import torch
 import torch.nn as nn
 
 _IS_LINUX = os.path.exists("/proc/self/status")
-_skip_no_procfs = pytest.mark.skipif(
-    not _IS_LINUX, reason="requires /proc/self/status for VmHWM"
-)
+_skip_no_procfs = pytest.mark.skipif(not _IS_LINUX, reason="requires /proc/self/status for VmHWM")
 
 PARAM_MB = 512
 NUM_PARAMS = 4
@@ -65,19 +63,17 @@ def _read_vm(key: str = "VmHWM") -> float:
 
 
 class HeavyModule(nn.Module):
-    def __init__(self, numel_per_param: int, num_params: int = NUM_PARAMS,
-                 dtype: torch.dtype = torch.bfloat16):
+    def __init__(self, numel_per_param: int, num_params: int = NUM_PARAMS, dtype: torch.dtype = torch.bfloat16):
         super().__init__()
         for i in range(num_params):
-            self.register_parameter(
-                f"w{i}", nn.Parameter(torch.randn(numel_per_param, dtype=dtype))
-            )
+            self.register_parameter(f"w{i}", nn.Parameter(torch.randn(numel_per_param, dtype=dtype)))
 
     def forward(self, x):
         return x
 
 
 # ── batch (current code pattern) ────────────────────────────
+
 
 def _batch_materialize(module: nn.Module, shm_dir: str) -> None:
     full_state_dict = module.state_dict()
@@ -94,9 +90,7 @@ def _batch_materialize(module: nn.Module, shm_dir: str) -> None:
         path = os.path.join(shm_dir, f"batch_{dtype}.bin")
         with open(path, "wb") as f:
             f.truncate(total_numel * elem_size)
-        giant = torch.from_file(
-            path, shared=True, size=total_numel, dtype=dtype, device="cpu"
-        )
+        giant = torch.from_file(path, shared=True, size=total_numel, dtype=dtype, device="cpu")
         offset = 0
         for _, tensor in param_list:
             n = tensor.numel()
@@ -120,16 +114,14 @@ def _batch_materialize(module: nn.Module, shm_dir: str) -> None:
 
 # ── streaming (fix) ─────────────────────────────────────────
 
-def _assign_param(module: nn.Module, dotted_name: str,
-                  new_tensor: torch.Tensor) -> None:
+
+def _assign_param(module: nn.Module, dotted_name: str, new_tensor: torch.Tensor) -> None:
     parts = dotted_name.rsplit(".", 1)
     parent = module.get_submodule(parts[0]) if len(parts) == 2 else module
     attr = parts[-1]
     old = getattr(parent, attr)
     if isinstance(old, nn.Parameter):
-        parent.register_parameter(
-            attr, nn.Parameter(new_tensor, requires_grad=new_tensor.requires_grad)
-        )
+        parent.register_parameter(attr, nn.Parameter(new_tensor, requires_grad=new_tensor.requires_grad))
     else:
         setattr(parent, attr, new_tensor)
 
@@ -149,9 +141,7 @@ def _streaming_materialize(module: nn.Module, shm_dir: str) -> None:
         path = os.path.join(shm_dir, f"stream_{dtype}.bin")
         with open(path, "wb") as f:
             f.truncate(total_numel * elem_size)
-        giant = torch.from_file(
-            path, shared=True, size=total_numel, dtype=dtype, device="cpu"
-        )
+        giant = torch.from_file(path, shared=True, size=total_numel, dtype=dtype, device="cpu")
         offset = 0
         for i, (name, tensor) in enumerate(param_list):
             n = tensor.numel()
@@ -171,6 +161,7 @@ def _streaming_materialize(module: nn.Module, shm_dir: str) -> None:
 
 
 # ── subprocess workers ──────────────────────────────────────
+
 
 def _worker(result_dict, param_mb, materialize_fn):
     elem_bytes = 2  # bf16
@@ -202,6 +193,7 @@ def _run_in_subprocess(materialize_fn, param_mb):
 
 # ── tests ───────────────────────────────────────────────────
 
+
 @_skip_no_procfs
 def test_batch_materialize_has_high_peak():
     """BUG REPRO: batch materialize adds ~1× model size as mmap overhead.
@@ -213,10 +205,12 @@ def test_batch_materialize_has_high_peak():
     growth = r["hwm_after"] - r["hwm_before"]
     pm = r["param_mb"]
 
-    print(f"\n[batch] hwm_before={r['hwm_before']:.0f} MB, "
-          f"hwm_after={r['hwm_after']:.0f} MB, "
-          f"growth={growth:.0f} MB, model_size={pm} MB, "
-          f"ratio={growth / pm:.2f}x")
+    print(
+        f"\n[batch] hwm_before={r['hwm_before']:.0f} MB, "
+        f"hwm_after={r['hwm_after']:.0f} MB, "
+        f"growth={growth:.0f} MB, model_size={pm} MB, "
+        f"ratio={growth / pm:.2f}x"
+    )
 
     assert growth > pm * 0.5, (
         f"Expected mmap overhead > {pm * 0.5:.0f} MB (0.5× model) "
@@ -236,10 +230,12 @@ def test_streaming_materialize_low_peak():
     growth = r["hwm_after"] - r["hwm_before"]
     pm = r["param_mb"]
 
-    print(f"\n[streaming] hwm_before={r['hwm_before']:.0f} MB, "
-          f"hwm_after={r['hwm_after']:.0f} MB, "
-          f"growth={growth:.0f} MB, model_size={pm} MB, "
-          f"ratio={growth / pm:.2f}x")
+    print(
+        f"\n[streaming] hwm_before={r['hwm_before']:.0f} MB, "
+        f"hwm_after={r['hwm_after']:.0f} MB, "
+        f"growth={growth:.0f} MB, model_size={pm} MB, "
+        f"ratio={growth / pm:.2f}x"
+    )
 
     assert growth < pm * 0.3, (
         f"Expected mmap overhead < {pm * 0.3:.0f} MB (0.3× model) "
@@ -262,9 +258,7 @@ def test_streaming_preserves_weights():
         _streaming_materialize(model_b, d2)
 
     for name in model_a.state_dict():
-        assert torch.equal(
-            model_a.state_dict()[name], model_b.state_dict()[name]
-        ), f"Mismatch on '{name}'"
+        assert torch.equal(model_a.state_dict()[name], model_b.state_dict()[name]), f"Mismatch on '{name}'"
 
 
 # ── speed ───────────────────────────────────────────────────
@@ -290,15 +284,11 @@ def _speed_worker(result_dict, param_mb, num_params, materialize_fn, repeats):
     result_dict["avg"] = sum(times) / len(times)
 
 
-def _run_speed_subprocess(materialize_fn, param_mb, num_params=NUM_PARAMS,
-                          repeats=3):
+def _run_speed_subprocess(materialize_fn, param_mb, num_params=NUM_PARAMS, repeats=3):
     ctx = mp.get_context("fork")
     mgr = ctx.Manager()
     result = mgr.dict()
-    p = ctx.Process(
-        target=_speed_worker,
-        args=(result, param_mb, num_params, materialize_fn, repeats),
-    )
+    p = ctx.Process(target=_speed_worker, args=(result, param_mb, num_params, materialize_fn, repeats))
     p.start()
     p.join(timeout=300)
     assert p.exitcode == 0, f"subprocess exited with code {p.exitcode}"
@@ -320,10 +310,12 @@ def test_streaming_not_slower_than_batch():
     r_stream = _run_speed_subprocess(_streaming_materialize, mb)
 
     ratio = r_stream["avg"] / r_batch["avg"]
-    print(f"\n[speed] model={mb} MB, num_params={NUM_PARAMS}"
-          f"  batch={r_batch['avg']:.3f}s"
-          f"  streaming={r_stream['avg']:.3f}s"
-          f"  ratio={ratio:.2f}x")
+    print(
+        f"\n[speed] model={mb} MB, num_params={NUM_PARAMS}"
+        f"  batch={r_batch['avg']:.3f}s"
+        f"  streaming={r_stream['avg']:.3f}s"
+        f"  ratio={ratio:.2f}x"
+    )
 
     assert ratio < max_slowdown, (
         f"Streaming is {ratio:.2f}x slower than batch "
