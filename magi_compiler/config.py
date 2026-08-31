@@ -429,6 +429,22 @@ def _get_parallel_topology() -> str:
     return f"ws{torch.distributed.get_world_size()}"
 
 
+def get_topology_dim(dim: str, default: int = 1) -> int:
+    """Extract a parallel dimension size from ``MAGI_COMPILE_TOPOLOGY_KEY``.
+
+    The key is a ``_``-joined string like ``cp8_dp1_ep8_tp1`` set by the
+    host framework's ParallelStateManager.  Returns *default* if the key
+    is absent or the dimension is not present.
+    """
+    import re
+
+    topo = os.environ.get("MAGI_COMPILE_TOPOLOGY_KEY", "")
+    if not topo:
+        return default
+    m = re.search(rf"(?:^|_){re.escape(dim)}(\d+)", topo)
+    return int(m.group(1)) if m else default
+
+
 def model_rank_dir_name(model_idx: int, model_tag: str | None) -> str:
     """Directory name: ``model_{idx}[_{tag}]_rank_{rank}_{topology}``.
 

@@ -32,7 +32,7 @@ from magi_compiler.utils import compilation_counter, envs, magi_logger
 from magi_compiler.utils.compile_time_monitor import CompileMonitor
 from magi_compiler.utils.host_memory import fmt_host_mem
 
-from .config import CompileConfig, CompileMode
+from .config import CompileConfig, CompileMode, get_topology_dim
 
 
 # =============================================================================
@@ -681,7 +681,7 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
         magi_logger.info('[offload] after _force_cpu: %s', fmt_host_mem())
 
         # create shared memory tensors for all parameters/buffers on CPU
-        ep_size = int(os.environ.get("ENGINE_CONFIG__EP_SIZE", os.environ.get("EP_SIZE", "1")))
+        ep_size = get_topology_dim("ep")
         if dist.is_initialized():
             local_rank = int(os.environ.get("LOCAL_RANK", 0))
             full_state_dict = self.state_dict()
