@@ -543,16 +543,6 @@ def _assign_param(module: nn.Module, dotted_name: str, new_tensor: torch.Tensor)
         setattr(parent, attr, new_tensor)
 
 
-def _create_shm_tensor(shm_path: str, param_list: list[tuple[str, torch.Tensor]], dtype: torch.dtype) -> torch.Tensor:
-    """Create a shared-memory mmap file, pack *param_list* into it, return the giant tensor."""
-    total_numel = sum(t.numel() for _, t in param_list)
-    elem_size = torch.empty(0, dtype=dtype).element_size()
-    with open(shm_path, "wb") as f:
-        f.truncate(total_numel * elem_size)
-    giant = torch.from_file(shm_path, shared=True, size=total_numel, dtype=dtype, device="cpu")
-    _pack_params_flat(giant, param_list)
-    return giant
-
 
 def _stream_copy_and_replace(module: nn.Module, giant: torch.Tensor, param_list: list[tuple[str, torch.Tensor]]) -> None:
     """Copy each param into *giant*, replace in module immediately.
