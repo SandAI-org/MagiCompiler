@@ -38,11 +38,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 
-_skip_no_dist = pytest.mark.skipif(
-    not hasattr(dist, "is_gloo_available") or not dist.is_gloo_available(), reason="requires gloo backend"
-)
-
-
 class FakeExpertBlock(nn.Module):
     """Tiny module simulating an EP-sharded expert block."""
 
@@ -163,7 +158,6 @@ def _worker_fix_verified(rank, world_size, shared_dir, seed_per_rank, result_fil
 # ───────────────────────────────────────────────────────────────
 
 
-@_skip_no_dist
 def test_shared_memory_overwrites_ep_shards():
     """
     BUG REPRO: with original shared-memory logic, rank 1's expert weights
@@ -191,7 +185,6 @@ def test_shared_memory_overwrites_ep_shards():
         )
 
 
-@_skip_no_dist
 def test_ep_fix_preserves_per_rank_shards():
     """
     FIX VERIFIED: with EP_SIZE > 1, per-rank shared-memory files ensure each
