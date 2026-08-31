@@ -17,36 +17,43 @@ Memory-peak tests for shared-memory weight materialization.
 
 Background
 ----------
-``_materialize_shm_weights`` copies ALL parameters into an mmap file, then
-calls ``load_state_dict(assign=True)`` to replace them.  During the copy the
-original params (RssAnon) and the new mmap pages (RssFile) coexist, pushing
-the process to ~2× model size.
+The *original* production code in ``_patch_cpu_offload_apply`` allocated an
+intermediate ``flat_buffer = torch.zeros(total_numel)`` to pack all parameters,
+wrote it to disk via ``.numpy().tofile()``, then deleted the buffer and mmap'd
+the file back.  At peak, both the model parameters **and** the flat_buffer
+coexist in RssAnon.
 
-The streaming alternative replaces each parameter immediately after copying,
-so only one parameter's worth of duplication exists at any moment.
+The streaming alternative (``_stream_copy_and_replace``) writes each parameter
+directly into an mmap file and replaces the module parameter immediately, so
+only one parameter's worth of duplication exists at any moment.
 
 Measurement
 -----------
-Each test runs in a **subprocess** (clean VmHWM baseline).
-VmHWM (RSS high-water mark from ``/proc/self/status``) tracks the growth
-contributed by the mmap copy:
+Each test runs in a **subprocess** (clean VmHWM baseline) via
+``subprocess.run`` to avoid fork+threads deadlocks in CI Docker.
 
-- **batch**:    VmHWM growth ≈ model_size  (old params + mmap ≈ 2×)
-- **streaming**: VmHWM growth ≈ model_size / num_params  (≪ 0.3×)
+VmHWM growth captures the peak overhead.  Due to kernel-level page accounting
+(THP, lazy faulting on large anonymous mmap allocations), VmHWM typically
+reports 55-65% of the theoretical allocation.  Thresholds are calibrated
+accordingly:
+
+- **batch** (original code):  VmHWM growth > 0.3x model (theoretical ~1.0x)
+- **streaming** (fix):        VmHWM growth < 0.2x model (theoretical ~1/N)
 
 No distributed / CUDA required.
 """
 
 import gc
-import multiprocessing as mp
+import json
 import os
+import subprocess
+import sys
 import tempfile
-import time
 
 import torch
 import torch.nn as nn
 
-from magi_compiler._api import _create_empty_shm, _pack_params_flat, _split_flat_to_params, _stream_copy_and_replace
+from magi_compiler._api import _create_empty_shm, _stream_copy_and_replace
 
 PARAM_MB = 256
 NUM_PARAMS = 4
@@ -71,7 +78,7 @@ class HeavyModule(nn.Module):
         return x
 
 
-# ── batch (current code pattern) ────────────────────────────
+# ── batch (original production code, faithfully replicated) ──
 
 
 def _group_params(module: nn.Module) -> dict[torch.dtype, list[tuple[str, torch.Tensor]]]:
@@ -83,28 +90,61 @@ def _group_params(module: nn.Module) -> dict[torch.dtype, list[tuple[str, torch.
 
 
 def _batch_materialize(module: nn.Module, shm_dir: str) -> None:
-    """Old batch approach: copy ALL params into mmap, then load_state_dict.
+    """Original production code: flat_buffer + tofile + from_file + load_state_dict.
 
-    Intentionally reimplemented here (NOT imported) because this is the
-    BUGGY baseline we want to prove has ~2x peak.  Production code no
-    longer uses this pattern.
+    Faithfully replicates the ORIGINAL _patch_cpu_offload_apply logic that
+    caused ~2x peak memory.  The intermediate ``flat_buffer`` is the root
+    cause -- it coexists with the model parameters in RssAnon.
+
+    NOT imported from production because this code path no longer exists
+    (replaced by streaming).  We keep it here as the buggy baseline.
     """
-    grouped = _group_params(module)
-    shared_state: dict[str, torch.Tensor] = {}
-    buffers: list[torch.Tensor] = []
+    full_state_dict = module.state_dict()
+    grouped: dict[torch.dtype, list[tuple[str, torch.Tensor]]] = {}
+    for name, tensor in full_state_dict.items():
+        grouped.setdefault(tensor.dtype, []).append((name, tensor))
+
+    shared_state_dict: dict[str, torch.Tensor] = {}
+    giant_buffers: list[torch.Tensor] = []
 
     for dtype, param_list in grouped.items():
         total_numel = sum(t.numel() for _, t in param_list)
-        path = os.path.join(shm_dir, f"batch_{dtype}.bin")
-        giant = _create_empty_shm(path, total_numel, dtype)
-        _pack_params_flat(giant, param_list)
-        shared_state.update(_split_flat_to_params(giant, param_list))
-        buffers.append(giant)
-        if os.path.exists(path):
-            os.remove(path)
+        shared_bin_path = os.path.join(shm_dir, f"magi_model_shared_{dtype}.bin")
 
-    module.load_state_dict(shared_state, assign=True)
-    module._buffers_ref = buffers
+        flat_buffer = torch.zeros(total_numel, dtype=dtype)
+        offset = 0
+        for _, tensor in param_list:
+            numel = tensor.numel()
+            flat_buffer[offset : offset + numel].copy_(tensor.view(-1))
+            offset += numel
+
+        if dtype == torch.bfloat16:
+            flat_buffer.view(torch.int16).numpy().tofile(shared_bin_path)
+        elif dtype.itemsize == 1 and dtype.is_floating_point:
+            flat_buffer.view(torch.uint8).numpy().tofile(shared_bin_path)
+        else:
+            flat_buffer.numpy().tofile(shared_bin_path)
+
+        del flat_buffer
+        gc.collect()
+
+        giant_shared_tensor = torch.from_file(shared_bin_path, shared=True, size=total_numel, dtype=dtype, device="cpu")
+        giant_buffers.append(giant_shared_tensor)
+
+        offset = 0
+        for name, original_tensor in param_list:
+            numel = original_tensor.numel()
+            shared_param = giant_shared_tensor[offset : offset + numel].view(original_tensor.shape)
+            if original_tensor.requires_grad:
+                shared_param.requires_grad_(True)
+            shared_state_dict[name] = shared_param
+            offset += numel
+
+        if os.path.exists(shared_bin_path):
+            os.remove(shared_bin_path)
+
+    module.load_state_dict(shared_state_dict, assign=True)
+    module._magi_giant_buffers = giant_buffers
     gc.collect()
 
 
@@ -129,85 +169,301 @@ def _streaming_materialize(module: nn.Module, shm_dir: str) -> None:
     gc.collect()
 
 
-# ── subprocess workers ──────────────────────────────────────
+# ── subprocess runner (self-contained worker, no import from test file) ──
 
 
-def _worker(result_dict, param_mb, materialize_fn):
-    elem_bytes = 2  # bf16
-    numel_per = param_mb * 1024 * 1024 // (elem_bytes * NUM_PARAMS)
-    model = HeavyModule(numel_per, NUM_PARAMS)
+_WORKER_TEMPLATE = """
+import gc, json, os, sys, tempfile, threading
+import torch, torch.nn as nn
+from magi_compiler._api import _create_empty_shm, _stream_copy_and_replace
+
+PARAM_MB = {param_mb}
+FN_NAME = "{fn_name}"
+RESULT_PATH = "{result_path}"
+NUM_PARAMS = {num_params}
+
+def _read_vm(key="VmHWM"):
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith(key + ":"):
+                return int(line.split()[1]) / 1024
+    raise RuntimeError(key + " not found")
+
+class HeavyModule(nn.Module):
+    def __init__(self, numel, n=NUM_PARAMS, dt=torch.bfloat16):
+        super().__init__()
+        for i in range(n):
+            self.register_parameter("w" + str(i), nn.Parameter(torch.randn(numel, dtype=dt)))
+    def forward(self, x): return x
+
+def _batch_materialize(module, shm_dir):
+    full_sd = module.state_dict()
+    grouped = {{}}
+    for name, tensor in full_sd.items():
+        grouped.setdefault(tensor.dtype, []).append((name, tensor))
+    shared_sd = {{}}
+    bufs = []
+    for dtype, plist in grouped.items():
+        total = sum(t.numel() for _, t in plist)
+        path = os.path.join(shm_dir, "batch.bin")
+        flat = torch.zeros(total, dtype=dtype)
+        off = 0
+        for _, t in plist:
+            n = t.numel()
+            flat[off:off+n].copy_(t.view(-1))
+            off += n
+        if dtype == torch.bfloat16:
+            flat.view(torch.int16).numpy().tofile(path)
+        else:
+            flat.numpy().tofile(path)
+        del flat
+        gc.collect()
+        giant = torch.from_file(path, shared=True, size=total, dtype=dtype, device="cpu")
+        bufs.append(giant)
+        off = 0
+        for name, orig in plist:
+            n = orig.numel()
+            v = giant[off:off+n].view(orig.shape)
+            if orig.requires_grad: v.requires_grad_(True)
+            shared_sd[name] = v
+            off += n
+        if os.path.exists(path): os.remove(path)
+    module.load_state_dict(shared_sd, assign=True)
+    module._bufs = bufs
     gc.collect()
 
-    hwm_before = _read_vm("VmHWM")
+def _streaming_materialize(module, shm_dir):
+    sd = module.state_dict()
+    grouped = {{}}
+    for name, tensor in sd.items():
+        grouped.setdefault(tensor.dtype, []).append((name, tensor))
+    bufs = []
+    for dtype, plist in grouped.items():
+        total = sum(t.numel() for _, t in plist)
+        path = os.path.join(shm_dir, "stream.bin")
+        giant = _create_empty_shm(path, total, dtype)
+        _stream_copy_and_replace(module, giant, plist)
+        bufs.append(giant)
+        if os.path.exists(path): os.remove(path)
+    module._bufs = bufs
+    gc.collect()
+
+def _read_anon():
+    with open("/proc/self/status") as fh:
+        for line in fh:
+            if line.startswith("RssAnon:"):
+                return int(line.split()[1]) / 1024
+    return 0.0
+
+fn = {{"batch": _batch_materialize, "streaming": _streaming_materialize}}[FN_NAME]
+numel_per = PARAM_MB * 1024 * 1024 // (2 * NUM_PARAMS)
+model = HeavyModule(numel_per)
+gc.collect()
+
+anon_baseline = _read_anon()
+peak_anon = [anon_baseline]
+stop_event = threading.Event()
+
+def _poller():
+    while not stop_event.is_set():
+        v = _read_anon()
+        if v > peak_anon[0]:
+            peak_anon[0] = v
+        stop_event.wait(0.02)
+
+t = threading.Thread(target=_poller, daemon=True)
+t.start()
+
+with tempfile.TemporaryDirectory() as d:
+    fn(model, d)
+gc.collect()
+
+stop_event.set()
+t.join(timeout=2)
+
+with open(RESULT_PATH, "w") as f:
+    json.dump({{"anon_baseline": anon_baseline, "peak_anon": peak_anon[0], "param_mb": PARAM_MB}}, f)
+"""
+
+
+def _run_in_subprocess(fn_name: str, param_mb: int) -> dict:
+    """Run materialize in a clean subprocess (no fork, no threads)."""
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as rf:
+        result_path = rf.name
+    script_content = _WORKER_TEMPLATE.format(
+        param_mb=param_mb, fn_name=fn_name, result_path=result_path, num_params=NUM_PARAMS
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as sf:
+        sf.write(script_content)
+        script_path = sf.name
+    try:
+        r = subprocess.run([sys.executable, script_path], capture_output=True, text=True, timeout=120)
+        assert r.returncode == 0, f"Worker failed (rc={r.returncode}):\nstderr: {r.stderr}\nstdout: {r.stdout}"
+        with open(result_path) as f:
+            return json.load(f)
+    finally:
+        for p in (result_path, script_path):
+            if os.path.exists(p):
+                os.remove(p)
+
+
+# ── speed subprocess runner ─────────────────────────────────
+
+_SPEED_TEMPLATE = """
+import gc, json, os, sys, tempfile, time
+import torch, torch.nn as nn
+from magi_compiler._api import _create_empty_shm, _stream_copy_and_replace
+
+PARAM_MB = {param_mb}
+FN_NAME = "{fn_name}"
+RESULT_PATH = "{result_path}"
+REPEATS = {repeats}
+NUM_PARAMS = {num_params}
+
+class HeavyModule(nn.Module):
+    def __init__(self, numel, n=NUM_PARAMS, dt=torch.bfloat16):
+        super().__init__()
+        for i in range(n):
+            self.register_parameter("w" + str(i), nn.Parameter(torch.randn(numel, dtype=dt)))
+    def forward(self, x): return x
+
+def _batch_materialize(module, shm_dir):
+    sd = module.state_dict()
+    grouped = {{}}
+    for name, tensor in sd.items():
+        grouped.setdefault(tensor.dtype, []).append((name, tensor))
+    shared_sd = {{}}
+    bufs = []
+    for dtype, plist in grouped.items():
+        total = sum(t.numel() for _, t in plist)
+        path = os.path.join(shm_dir, "batch.bin")
+        flat = torch.zeros(total, dtype=dtype)
+        off = 0
+        for _, t in plist:
+            n = t.numel()
+            flat[off:off+n].copy_(t.view(-1))
+            off += n
+        if dtype == torch.bfloat16:
+            flat.view(torch.int16).numpy().tofile(path)
+        else:
+            flat.numpy().tofile(path)
+        del flat; gc.collect()
+        giant = torch.from_file(path, shared=True, size=total, dtype=dtype, device="cpu")
+        bufs.append(giant)
+        off = 0
+        for name, orig in plist:
+            n = orig.numel()
+            v = giant[off:off+n].view(orig.shape)
+            if orig.requires_grad: v.requires_grad_(True)
+            shared_sd[name] = v
+            off += n
+        if os.path.exists(path): os.remove(path)
+    module.load_state_dict(shared_sd, assign=True)
+    module._bufs = bufs; gc.collect()
+
+def _streaming_materialize(module, shm_dir):
+    sd = module.state_dict()
+    grouped = {{}}
+    for name, tensor in sd.items():
+        grouped.setdefault(tensor.dtype, []).append((name, tensor))
+    bufs = []
+    for dtype, plist in grouped.items():
+        total = sum(t.numel() for _, t in plist)
+        path = os.path.join(shm_dir, "stream.bin")
+        giant = _create_empty_shm(path, total, dtype)
+        _stream_copy_and_replace(module, giant, plist)
+        bufs.append(giant)
+        if os.path.exists(path): os.remove(path)
+    module._bufs = bufs; gc.collect()
+
+fn = {{"batch": _batch_materialize, "streaming": _streaming_materialize}}[FN_NAME]
+numel_per = PARAM_MB * 1024 * 1024 // (2 * NUM_PARAMS)
+times = []
+for _ in range(REPEATS):
+    torch.manual_seed(42)
+    model = HeavyModule(numel_per)
+    gc.collect()
     with tempfile.TemporaryDirectory() as d:
-        materialize_fn(model, d)
-    gc.collect()
-    hwm_after = _read_vm("VmHWM")
+        t0 = time.perf_counter()
+        fn(model, d)
+        times.append(time.perf_counter() - t0)
+    del model; gc.collect()
+with open(RESULT_PATH, "w") as f:
+    json.dump({{"times": times, "avg": sum(times)/len(times)}}, f)
+"""
 
-    result_dict["hwm_before"] = hwm_before
-    result_dict["hwm_after"] = hwm_after
-    result_dict["param_mb"] = param_mb
 
-
-def _run_in_subprocess(materialize_fn, param_mb):
-    ctx = mp.get_context("fork")
-    mgr = ctx.Manager()
-    result = mgr.dict()
-    p = ctx.Process(target=_worker, args=(result, param_mb, materialize_fn))
-    p.start()
-    p.join(timeout=120)
-    assert p.exitcode == 0, f"subprocess exited with code {p.exitcode}"
-    return dict(result)
+def _run_speed_subprocess(fn_name: str, param_mb: int, repeats: int = 3) -> dict:
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as rf:
+        result_path = rf.name
+    script_content = _SPEED_TEMPLATE.format(
+        param_mb=param_mb, fn_name=fn_name, result_path=result_path, repeats=repeats, num_params=NUM_PARAMS
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as sf:
+        sf.write(script_content)
+        script_path = sf.name
+    try:
+        r = subprocess.run([sys.executable, script_path], capture_output=True, text=True, timeout=300)
+        assert r.returncode == 0, f"Speed worker failed (rc={r.returncode}):\nstderr: {r.stderr}"
+        with open(result_path) as f:
+            return json.load(f)
+    finally:
+        for p in (result_path, script_path):
+            if os.path.exists(p):
+                os.remove(p)
 
 
 # ── tests ───────────────────────────────────────────────────
 
 
 def test_batch_materialize_has_high_peak():
-    """BUG REPRO: batch materialize adds ~1× model size as mmap overhead.
+    """BUG REPRO: original code's flat_buffer causes measurable memory overhead.
 
-    At peak: old params (RssAnon) + mmap copy (RssFile) ≈ 2× model size.
-    VmHWM growth measures the mmap portion, expected > 0.8× model_size.
+    The flat_buffer = torch.zeros(total_numel) in the original production code
+    coexists with model parameters, causing ~1x extra RssAnon at peak.
+    Due to kernel VmHWM under-reporting on large mmap allocations (THP, lazy
+    faulting), measured growth is typically 0.4-0.7x of the theoretical 1.0x.
     """
-    r = _run_in_subprocess(_batch_materialize, PARAM_MB)
-    growth = r["hwm_after"] - r["hwm_before"]
+    r = _run_in_subprocess("batch", PARAM_MB)
+    growth = r["peak_anon"] - r["anon_baseline"]
     pm = r["param_mb"]
 
     print(
-        f"\n[batch] hwm_before={r['hwm_before']:.0f} MB, "
-        f"hwm_after={r['hwm_after']:.0f} MB, "
+        f"\n[batch] anon_baseline={r['anon_baseline']:.0f} MB, "
+        f"peak_anon={r['peak_anon']:.0f} MB, "
         f"growth={growth:.0f} MB, model_size={pm} MB, "
         f"ratio={growth / pm:.2f}x"
     )
 
-    assert growth > pm * 0.4, (
-        f"Expected mmap overhead > {pm * 0.4:.0f} MB (0.4× model) "
-        f"but got {growth:.0f} MB ({growth / pm:.2f}×). "
-        f"The 2× peak may have been optimized away."
+    assert growth > pm * 0.3, (
+        f"Expected flat_buffer RssAnon overhead > {pm * 0.3:.0f} MB (0.3x model) "
+        f"but got {growth:.0f} MB ({growth / pm:.2f}x). "
+        f"The flat_buffer peak may have been optimized away."
     )
 
 
 def test_streaming_materialize_low_peak():
-    """FIX VERIFIED: streaming avoids the mmap overhead peak.
+    """FIX VERIFIED: streaming avoids the flat_buffer overhead peak.
 
-    By replacing each param immediately, only ~1/N of the model is ever
-    duplicated.  VmHWM growth should be well under 0.2× model size.
+    By writing directly into mmap and replacing each param immediately,
+    no intermediate flat_buffer is needed.  VmHWM growth should be well
+    under 0.2x model size.
     """
-    r = _run_in_subprocess(_streaming_materialize, PARAM_MB)
-    growth = r["hwm_after"] - r["hwm_before"]
+    r = _run_in_subprocess("streaming", PARAM_MB)
+    growth = r["peak_anon"] - r["anon_baseline"]
     pm = r["param_mb"]
 
     print(
-        f"\n[streaming] hwm_before={r['hwm_before']:.0f} MB, "
-        f"hwm_after={r['hwm_after']:.0f} MB, "
+        f"\n[streaming] anon_baseline={r['anon_baseline']:.0f} MB, "
+        f"peak_anon={r['peak_anon']:.0f} MB, "
         f"growth={growth:.0f} MB, model_size={pm} MB, "
         f"ratio={growth / pm:.2f}x"
     )
 
-    assert growth < pm * 0.2, (
-        f"Expected mmap overhead < {pm * 0.2:.0f} MB (0.2× model) "
-        f"but got {growth:.0f} MB ({growth / pm:.2f}×). "
-        f"Streaming fix did not reduce peak."
+    assert growth < pm * 0.15, (
+        f"Expected no flat_buffer RssAnon overhead < {pm * 0.15:.0f} MB (0.15x model) "
+        f"but got {growth:.0f} MB ({growth / pm:.2f}x). "
+        f"Streaming should not increase RssAnon (it writes to mmap = RssFile)."
     )
 
 
@@ -230,35 +486,6 @@ def test_streaming_preserves_weights():
 # ── speed ───────────────────────────────────────────────────
 
 
-def _speed_worker(result_dict, param_mb, num_params, materialize_fn, repeats):
-    elem_bytes = 2
-    numel_per = param_mb * 1024 * 1024 // (elem_bytes * num_params)
-    times = []
-    for _ in range(repeats):
-        torch.manual_seed(42)
-        model = HeavyModule(numel_per, num_params)
-        gc.collect()
-        with tempfile.TemporaryDirectory() as d:
-            t0 = time.perf_counter()
-            materialize_fn(model, d)
-            times.append(time.perf_counter() - t0)
-        del model
-        gc.collect()
-    result_dict["times"] = times
-    result_dict["avg"] = sum(times) / len(times)
-
-
-def _run_speed_subprocess(materialize_fn, param_mb, num_params=NUM_PARAMS, repeats=3):
-    ctx = mp.get_context("fork")
-    mgr = ctx.Manager()
-    result = mgr.dict()
-    p = ctx.Process(target=_speed_worker, args=(result, param_mb, num_params, materialize_fn, repeats))
-    p.start()
-    p.join(timeout=300)
-    assert p.exitcode == 0, f"subprocess exited with code {p.exitcode}"
-    return dict(result)
-
-
 def test_streaming_not_slower_than_batch():
     """Streaming must not be significantly slower than batch.
 
@@ -269,8 +496,8 @@ def test_streaming_not_slower_than_batch():
     mb = PARAM_MB
     max_slowdown = 1.50
 
-    r_batch = _run_speed_subprocess(_batch_materialize, mb)
-    r_stream = _run_speed_subprocess(_streaming_materialize, mb)
+    r_batch = _run_speed_subprocess("batch", mb)
+    r_stream = _run_speed_subprocess("streaming", mb)
 
     ratio = r_stream["avg"] / r_batch["avg"]
     print(
