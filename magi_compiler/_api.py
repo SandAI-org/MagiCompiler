@@ -530,6 +530,18 @@ def _split_flat_to_params(flat: torch.Tensor, param_list: list[tuple[str, torch.
     return out
 
 
+def _assign_param(module: nn.Module, dotted_name: str, new_tensor: torch.Tensor) -> None:
+    """Replace a single parameter/buffer in *module* by its dotted path."""
+    parts = dotted_name.rsplit(".", 1)
+    parent = module.get_submodule(parts[0]) if len(parts) == 2 else module
+    attr = parts[-1]
+    old = getattr(parent, attr)
+    if isinstance(old, nn.Parameter):
+        parent.register_parameter(attr, nn.Parameter(new_tensor, requires_grad=new_tensor.requires_grad))
+    else:
+        setattr(parent, attr, new_tensor)
+
+
 def _create_shm_tensor(shm_path: str, param_list: list[tuple[str, torch.Tensor]], dtype: torch.dtype) -> torch.Tensor:
     """Create a shared-memory mmap file, pack *param_list* into it, return the giant tensor."""
     total_numel = sum(t.numel() for _, t in param_list)
@@ -541,49 +553,81 @@ def _create_shm_tensor(shm_path: str, param_list: list[tuple[str, torch.Tensor]]
     return giant
 
 
+def _stream_copy_and_replace(
+    module: nn.Module,
+    giant: torch.Tensor,
+    param_list: list[tuple[str, torch.Tensor]],
+) -> None:
+    """Copy each param into *giant*, replace in module immediately.
+
+    By replacing before moving to the next param, only one param's worth
+    of duplication exists at any moment (peak ≈ 1× instead of 2×).
+    """
+    offset = 0
+    for i, (name, tensor) in enumerate(param_list):
+        numel = tensor.numel()
+        giant[offset : offset + numel].copy_(tensor.view(-1))
+        view = giant[offset : offset + numel].view(tensor.shape)
+        if tensor.requires_grad:
+            view.requires_grad_(True)
+        _assign_param(module, name, view)
+        param_list[i] = (name, view)
+        offset += numel
+
+
+def _create_empty_shm(shm_path: str, total_numel: int, dtype: torch.dtype) -> torch.Tensor:
+    """Create an empty mmap file and return the mapped tensor."""
+    elem_size = torch.empty(0, dtype=dtype).element_size()
+    with open(shm_path, "wb") as f:
+        f.truncate(total_numel * elem_size)
+    return torch.from_file(shm_path, shared=True, size=total_numel, dtype=dtype, device="cpu")
+
+
 def _materialize_shm_weights(
     module: nn.Module, grouped_params: dict[torch.dtype, list[tuple[str, torch.Tensor]]], local_rank: int, per_rank: bool
 ) -> None:
     """Replace module params with pinned shared-memory tensors.
 
-    per_rank=True  (EP > 1): each rank writes its own mmap, staggered.
+    Uses streaming copy-and-replace so only one parameter is duplicated
+    at a time, keeping peak RSS near 1× model size instead of 2×.
+
+    per_rank=True  (EP > 1): each rank writes its own mmap concurrently.
     per_rank=False (EP <= 1): rank 0 writes, all ranks share pages.
     """
     cls_name = module.__class__.__name__
-    shared_state: dict[str, torch.Tensor] = {}
     buffers: list[torch.Tensor] = []
 
     if per_rank:
-        world_size = dist.get_world_size()
-        for turn in range(world_size):
-            if local_rank == turn:
-                for dtype, param_list in grouped_params.items():
-                    path = _shm_path(cls_name, dtype, rank=local_rank)
-                    giant = _create_shm_tensor(path, param_list, dtype)
-                    pin_memory_in_place(giant)
-                    buffers.append(giant)
-                    shared_state.update(_split_flat_to_params(giant, param_list))
-                    if os.path.exists(path):
-                        os.remove(path)
-            dist.barrier()
+        for dtype, param_list in grouped_params.items():
+            path = _shm_path(cls_name, dtype, rank=local_rank)
+            total_numel = sum(t.numel() for _, t in param_list)
+            giant = _create_empty_shm(path, total_numel, dtype)
+            _stream_copy_and_replace(module, giant, param_list)
+            pin_memory_in_place(giant)
+            buffers.append(giant)
+            if os.path.exists(path):
+                os.remove(path)
+        dist.barrier()
     else:
         dist.barrier()
         for dtype, param_list in grouped_params.items():
             path = _shm_path(cls_name, dtype)
             total_numel = sum(t.numel() for _, t in param_list)
             if local_rank == 0:
-                _create_shm_tensor(path, param_list, dtype)
+                giant = _create_empty_shm(path, total_numel, dtype)
+                _stream_copy_and_replace(module, giant, param_list)
             dist.barrier()
-            giant = torch.from_file(path, shared=True, size=total_numel, dtype=dtype, device="cpu")
+            if local_rank != 0:
+                giant = torch.from_file(path, shared=True, size=total_numel, dtype=dtype, device="cpu")
+                _stream_copy_and_replace(module, giant, param_list)
             pin_memory_in_place(giant)
             buffers.append(giant)
-            shared_state.update(_split_flat_to_params(giant, param_list))
             dist.barrier()
             if local_rank == 0 and os.path.exists(path):
                 os.remove(path)
 
     module._magi_giant_buffers = buffers
-    module.load_state_dict(shared_state, assign=True)
+    gc.collect()
 
 
 def _staggered_pin_memory(full_state_dict: dict[str, torch.Tensor], local_rank: int, pin_budget_gb: float):
@@ -752,6 +796,7 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
                         local_rank,
                     )
             else:
+                full_state_dict = None
                 _materialize_shm_weights(self, grouped_params, local_rank, per_rank=(ep_size > 1))
 
             del full_state_dict, grouped_params
