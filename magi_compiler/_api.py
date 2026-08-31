@@ -29,6 +29,7 @@ from magi_compiler.config import debug_dump_path, inductor_cache_dump_path, trit
 from magi_compiler.cuda.cudart import pin_memory_in_place
 from magi_compiler.magi_backend.magi_compiler_base import MagiCompileState
 from magi_compiler.utils import compilation_counter, envs, magi_logger
+from magi_compiler.utils.host_memory import fmt_host_mem
 from magi_compiler.utils.compile_time_monitor import CompileMonitor
 
 from .config import CompileConfig, CompileMode
@@ -630,94 +631,6 @@ def _materialize_shm_weights(
     gc.collect()
 
 
-def _staggered_pin_memory(full_state_dict: dict[str, torch.Tensor], local_rank: int, pin_budget_gb: float):
-    """Pin CPU tensors in coordinated waves to avoid host OOM.
-
-    Automatically determines how many ranks can pin concurrently based on
-    host RAM and per-rank parameter size.  Override with env var
-    ``MAGI_OFFLOAD_PIN_CONCURRENCY``.
-    """
-    import resource
-    import time
-
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
-
-    per_rank_bytes = sum(t.numel() * t.element_size() for t in full_state_dict.values() if t.device.type == "cpu")
-    per_rank_gb = per_rank_bytes / (1024**3)
-
-    concurrency_env = os.environ.get("MAGI_OFFLOAD_PIN_CONCURRENCY", "")
-    if concurrency_env:
-        pin_concurrency = int(concurrency_env)
-    else:
-        try:
-            with open("/proc/meminfo") as f:
-                for line in f:
-                    if line.startswith("MemTotal:"):
-                        total_ram_kb = int(line.split()[1])
-                        break
-                else:
-                    total_ram_kb = 512 * 1024 * 1024
-            total_ram_gb = total_ram_kb / (1024 * 1024)
-        except Exception:
-            total_ram_gb = 512.0
-        safe_ram_gb = total_ram_gb / 2
-        pin_concurrency = max(1, int(safe_ram_gb / per_rank_gb)) if per_rank_gb > 0 else world_size
-    pin_concurrency = min(pin_concurrency, world_size)
-
-    num_waves = (world_size + pin_concurrency - 1) // pin_concurrency
-    magi_logger.info(
-        "[Rank %d] pin_memory: world=%d per_rank=%.2f GB, " "concurrency=%d (waves=%d), RLIMIT_MEMLOCK soft=%s hard=%s",
-        local_rank,
-        world_size,
-        per_rank_gb,
-        pin_concurrency,
-        num_waves,
-        "unlimited" if soft == resource.RLIM_INFINITY else f"{soft / (1024 ** 3):.1f}GB",
-        "unlimited" if hard == resource.RLIM_INFINITY else f"{hard / (1024 ** 3):.1f}GB",
-    )
-
-    limit_bytes = int(pin_budget_gb * (1024**3))
-    my_wave = local_rank // pin_concurrency
-    for wave in range(num_waves):
-        if wave == my_wave:
-            t0 = time.perf_counter()
-            params = [
-                (name, tensor, tensor.numel() * tensor.element_size())
-                for name, tensor in full_state_dict.items()
-                if tensor.device.type == "cpu"
-            ]
-            params.sort(key=lambda x: x[2], reverse=True)
-
-            pinned_bytes = 0
-            pinned_count = 0
-            for name, tensor, size in params:
-                if pinned_bytes + size > limit_bytes:
-                    continue
-                try:
-                    pin_memory_in_place(tensor)
-                    pinned_bytes += size
-                    pinned_count += 1
-                except RuntimeError as e:
-                    magi_logger.warning("[Rank %d] pin failed at %.2f GB: %s", local_rank, pinned_bytes / (1024**3), e)
-                    break
-
-            total_bytes = sum(s for _, _, s in params)
-            magi_logger.info(
-                "[Rank %d] pin_memory DONE (wave %d/%d) %.1fs: " "%d params (%.2f / %.2f GB, budget=%.1f GB)",
-                local_rank,
-                wave + 1,
-                num_waves,
-                time.perf_counter() - t0,
-                pinned_count,
-                pinned_bytes / (1024**3),
-                total_bytes / (1024**3),
-                pin_budget_gb,
-            )
-        if dist.is_initialized():
-            dist.barrier()
-
-
 def _patch_cpu_offload_apply(cls: type[nn.Module]):
     magi_logger.info(f"Enabling CPU offload for {cls}")
     _orig_apply = cls._apply
@@ -769,6 +682,7 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
             return fn(t).cpu()
 
         _orig_apply(self, _force_cpu)
+        magi_logger.info('[offload] after _force_cpu: %s', fmt_host_mem())
 
         # create shared memory tensors for all parameters/buffers on CPU
         ep_size = int(os.environ.get("ENGINE_CONFIG__EP_SIZE", os.environ.get("EP_SIZE", "1")))
@@ -784,23 +698,13 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
                         grouped_params[dt] = []
                     grouped_params[dt].append((name, tensor))
 
-            skip_shm = os.environ.get("MAGI_OFFLOAD_SKIP_SHM", "0") == "1"
-            if skip_shm:
-                self._magi_giant_buffers = []
-                pin_budget_gb = float(os.environ.get("MAGI_OFFLOAD_PIN_BUDGET_GB", "0"))
-                if pin_budget_gb > 0:
-                    _staggered_pin_memory(full_state_dict, local_rank, pin_budget_gb)
-                else:
-                    magi_logger.info(
-                        "[Rank %d] MAGI_OFFLOAD_SKIP_SHM=1, PIN_BUDGET=0: " "params remain as unpinned CPU tensors.",
-                        local_rank,
-                    )
-            else:
-                full_state_dict = None
-                _materialize_shm_weights(self, grouped_params, local_rank, per_rank=(ep_size > 1))
+            full_state_dict = None
+            _materialize_shm_weights(self, grouped_params, local_rank, per_rank=(ep_size > 1))
+            magi_logger.info('[offload] after SHM materialize: %s', fmt_host_mem())
 
             del full_state_dict, grouped_params
             gc.collect()
+            magi_logger.info('[offload] after gc.collect: %s', fmt_host_mem())
 
         else:
 
