@@ -288,31 +288,6 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
             needs_recompile = False
             target_device = torch.cuda.current_device()
 
-            factory_functions = [
-                torch.empty,
-                torch.zeros,
-                torch.ones,
-                torch.full,
-                torch.rand,
-                torch.randn,
-                torch.arange,
-                torch.tensor,
-                torch.ops.aten.empty.memory_format,
-            ]
-
-            for node in module.graph.nodes:
-                if node.op == 'call_function':
-                    is_factory = node.target in factory_functions or (
-                        hasattr(node.target, '__name__') and node.target.__name__ in ['empty', 'zeros', 'ones', 'full']
-                    )
-
-                    if is_factory:
-                        if 'device' in node.kwargs:
-                            current_dev = node.kwargs['device']
-                            if str(current_dev) == 'cpu' or current_dev == torch.device('cpu'):
-                                node.update_kwarg('device', target_device)
-                                needs_recompile = True
-
             # Fix .to(device('cpu')) calls baked during CPU-offload tracing.
             # Without _deep_cuda, Dynamo traces with CPU tensors and specialises
             # .to(x.device) as .to(device('cpu')).  After we move example_values
@@ -341,11 +316,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                         needs_recompile = True
 
                 if node.op == 'call_function' and 'device' in node.kwargs:
-                    kdev = node.kwargs['device']
-                    is_already_handled = node.target in factory_functions or (
-                        hasattr(node.target, '__name__') and node.target.__name__ in ['empty', 'zeros', 'ones', 'full']
-                    )
-                    if not is_already_handled and _is_cpu_device(kdev):
+                    if _is_cpu_device(node.kwargs['device']):
                         node.update_kwarg('device', torch.device('cuda', target_device))
                         needs_recompile = True
 
@@ -353,37 +324,39 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
             # model_cpu_offload traces with CPU FakeTensors; Inductor autotuning
             # creates benchmark tensors on the example_value device, and the
             # codegen may pick CPU-specific paths if it sees CPU metadata.
+            def _move_to_device(val):
+                if hasattr(val, 'device') and str(val.device) == 'cpu':
+                    new_val = val.to(target_device)
+                    if isinstance(val, torch.nn.Parameter):
+                        new_val = torch.nn.Parameter(new_val, requires_grad=val.requires_grad)
+                    return new_val
+                return val
+
             cpu_fix_count = 0
             for node in module.graph.nodes:
                 ev = node.meta.get('example_value')
                 if ev is not None:
-                    if hasattr(ev, 'device') and str(ev.device) == 'cpu':
-                        new_ev = ev.to(target_device)
-                        if isinstance(ev, torch.nn.Parameter):
-                            new_ev = torch.nn.Parameter(new_ev, requires_grad=ev.requires_grad)
-                        node.meta['example_value'] = new_ev
-                        needs_recompile = True
-                        cpu_fix_count += 1
+                    if hasattr(ev, 'device'):
+                        new_ev = _move_to_device(ev)
+                        if new_ev is not ev:
+                            node.meta['example_value'] = new_ev
+                            needs_recompile = True
+                            cpu_fix_count += 1
                     elif isinstance(ev, (list, tuple)):
                         fixed_list = []
                         any_fixed = False
                         for item in ev:
-                            if hasattr(item, 'device') and str(item.device) == 'cpu':
-                                new_item = item.to(target_device)
-                                if isinstance(item, torch.nn.Parameter):
-                                    new_item = torch.nn.Parameter(new_item, requires_grad=item.requires_grad)
-                                fixed_list.append(new_item)
+                            new_item = _move_to_device(item)
+                            fixed_list.append(new_item)
+                            if new_item is not item:
                                 any_fixed = True
                                 cpu_fix_count += 1
-                            else:
-                                fixed_list.append(item)
                         if any_fixed:
                             node.meta['example_value'] = type(ev)(fixed_list)
                             needs_recompile = True
 
             if needs_recompile:
-                if os.environ.get('RANK', '0') == '0':
-                    magi_logger.info('[fix_device] fixed %d CPU example_values to cuda:%s', cpu_fix_count, target_device)
+                magi_logger.info('[fix_device] fixed %d CPU example_values to cuda:%s', cpu_fix_count, target_device)
                 module.recompile()
 
     @observe_lifecycle("piecewise_compile")
