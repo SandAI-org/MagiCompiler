@@ -41,6 +41,7 @@ import gc
 import multiprocessing as mp
 import os
 import tempfile
+import time
 
 import torch
 import torch.nn as nn
@@ -228,7 +229,6 @@ def test_streaming_preserves_weights():
 
 # ── speed ───────────────────────────────────────────────────
 
-import time
 
 
 def _speed_worker(result_dict, param_mb, num_params, materialize_fn, repeats):
