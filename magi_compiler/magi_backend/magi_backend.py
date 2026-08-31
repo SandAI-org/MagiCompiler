@@ -252,6 +252,73 @@ class CompilerManager:
         return True
 
 
+def _device_is_cpu(val) -> bool:
+    """Check whether *val* represents a CPU device (torch.device or str)."""
+    if isinstance(val, torch.device):
+        return val.type == 'cpu'
+    return isinstance(val, str) and val == 'cpu'
+
+
+def _recursive_to_device(val, target_device: int):
+    """Recursively move tensor-like *val* (or nested list/tuple) to *target_device*."""
+    if isinstance(val, (list, tuple)):
+        items = [_recursive_to_device(v, target_device) for v in val]
+        return type(val)(items) if any(n is not o for n, o in zip(items, val)) else val
+    if hasattr(val, 'device') and str(val.device) == 'cpu':
+        new_val = val.to(target_device)
+        if isinstance(val, torch.nn.Parameter):
+            new_val = torch.nn.Parameter(new_val, requires_grad=val.requires_grad)
+        return new_val
+    return val
+
+
+def fix_graph_device_placement(module: torch.nn.Module):
+    """Rewrite CPU device refs and example_values to CUDA in an FX graph."""
+    for _, child in module.named_children():
+        fix_graph_device_placement(child)
+
+    if not isinstance(module, torch.fx.GraphModule):
+        return
+
+    needs_recompile = False
+    target_device = torch.cuda.current_device()
+
+    for node in module.graph.nodes:
+        if node.op == 'call_function' and 'device' in node.kwargs:
+            if _device_is_cpu(node.kwargs['device']):
+                node.update_kwarg('device', torch.device('cuda', target_device))
+                needs_recompile = True
+
+        if node.op == 'call_method' and node.target == 'to':
+            new_args = list(node.args)
+            changed = False
+            for i, arg in enumerate(new_args):
+                if _device_is_cpu(arg):
+                    new_args[i] = torch.device('cuda', target_device)
+                    changed = True
+            if changed:
+                node.args = tuple(new_args)
+                needs_recompile = True
+            if 'device' in node.kwargs and _device_is_cpu(node.kwargs['device']):
+                node.update_kwarg('device', torch.device('cuda', target_device))
+                needs_recompile = True
+
+    cpu_fix_count = 0
+    for node in module.graph.nodes:
+        ev = node.meta.get('example_value')
+        if ev is None:
+            continue
+        new_ev = _recursive_to_device(ev, target_device)
+        if new_ev is not ev:
+            node.meta['example_value'] = new_ev
+            needs_recompile = True
+            cpu_fix_count += 1
+
+    if needs_recompile:
+        magi_logger.info('[fix_device] fixed %d CPU example_values to cuda:%s', cpu_fix_count, target_device)
+        module.recompile()
+
+
 class PiecewiseCompileInterpreter(torch.fx.Interpreter):
     """
     Code adapted from `torch.fx.passes.shape_prop.ShapeProp`.
@@ -279,82 +346,11 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         # extra_traceback is attribute of torch.fx.Interpreter, when it is True, it annoyingly dumps the torch.fx.Graph on errors.
         self.extra_traceback = False
 
-    @staticmethod
-    def _device_is_cpu(val) -> bool:
-        """Check whether *val* represents a CPU device (torch.device or str)."""
-        if isinstance(val, torch.device):
-            return val.type == 'cpu'
-        return isinstance(val, str) and val == 'cpu'
-
-    @staticmethod
-    def _recursive_to_device(val, target_device: int):
-        """Recursively move tensor-like *val* (or nested list/tuple) to *target_device*."""
-        if isinstance(val, (list, tuple)):
-            items = [PiecewiseCompileInterpreter._recursive_to_device(v, target_device) for v in val]
-            return type(val)(items) if any(n is not o for n, o in zip(items, val)) else val
-        if hasattr(val, 'device') and str(val.device) == 'cpu':
-            new_val = val.to(target_device)
-            if isinstance(val, torch.nn.Parameter):
-                new_val = torch.nn.Parameter(new_val, requires_grad=val.requires_grad)
-            return new_val
-        return val
-
-    @staticmethod
-    def _fix_graph_device_placement(module: torch.nn.Module):
-        for _, child in module.named_children():
-            PiecewiseCompileInterpreter._fix_graph_device_placement(child)
-
-        if not isinstance(module, torch.fx.GraphModule):
-            return
-
-        needs_recompile = False
-        target_device = torch.cuda.current_device()
-        _device_is_cpu = PiecewiseCompileInterpreter._device_is_cpu
-
-        # --- Rewrite hardcoded .to(cpu) / factory(device='cpu') nodes ---
-
-        for node in module.graph.nodes:
-            if node.op == 'call_function' and 'device' in node.kwargs:
-                if _device_is_cpu(node.kwargs['device']):
-                    node.update_kwarg('device', torch.device('cuda', target_device))
-                    needs_recompile = True
-
-            if node.op == 'call_method' and node.target == 'to':
-                new_args = list(node.args)
-                changed = False
-                for i, arg in enumerate(new_args):
-                    if _device_is_cpu(arg):
-                        new_args[i] = torch.device('cuda', target_device)
-                        changed = True
-                if changed:
-                    node.args = tuple(new_args)
-                    needs_recompile = True
-                if 'device' in node.kwargs and _device_is_cpu(node.kwargs['device']):
-                    node.update_kwarg('device', torch.device('cuda', target_device))
-                    needs_recompile = True
-
-        # --- Fix CPU example_values (recursive for nested list/tuple) ---
-
-        cpu_fix_count = 0
-        for node in module.graph.nodes:
-            ev = node.meta.get('example_value')
-            if ev is None:
-                continue
-            new_ev = PiecewiseCompileInterpreter._recursive_to_device(ev, target_device)
-            if new_ev is not ev:
-                node.meta['example_value'] = new_ev
-                needs_recompile = True
-                cpu_fix_count += 1
-
-        if needs_recompile:
-            magi_logger.info('[fix_device] fixed %d CPU example_values to cuda:%s', cpu_fix_count, target_device)
-            module.recompile()
-
     @observe_lifecycle("piecewise_compile")
     def run(self, *args):
         fake_args = self._build_fake_args(args)
         if self.compile_config.offload_config.model_cpu_offload:
-            self._fix_graph_device_placement(self.module)
+            fix_graph_device_placement(self.module)
             for i, arg in enumerate(fake_args):
                 if isinstance(arg, torch.Tensor):
                     fake_args[i] = arg.cuda()
