@@ -230,7 +230,6 @@ def test_streaming_preserves_weights():
 # ── speed ───────────────────────────────────────────────────
 
 
-
 def _speed_worker(result_dict, param_mb, num_params, materialize_fn, repeats):
     elem_bytes = 2
     numel_per = param_mb * 1024 * 1024 // (elem_bytes * num_params)
