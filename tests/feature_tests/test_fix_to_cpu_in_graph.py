@@ -25,6 +25,11 @@ import torch
 import torch.fx as fx
 import torch.nn as nn
 
+from magi_compiler.magi_backend.magi_backend import PiecewiseCompileInterpreter
+
+_fix = PiecewiseCompileInterpreter._fix_graph_device_placement
+_device_is_cpu = PiecewiseCompileInterpreter._device_is_cpu
+
 
 def _build_graph_with_to_cpu():
     """Build an FX graph that mirrors the offload-traced pattern:
@@ -49,36 +54,12 @@ def _build_graph_with_to_cpu():
     return gm
 
 
-def _is_cpu_device(val):
-    if isinstance(val, torch.device):
-        return val.type == "cpu"
-    if isinstance(val, str):
-        return val == "cpu"
-    return False
-
-
 def _apply_metadata_only_fix(gm, target_device=0):
     for node in gm.graph.nodes:
         ev = node.meta.get("example_value")
         if ev is not None and hasattr(ev, "device") and str(ev.device) == "cpu":
             node.meta["example_value"] = ev.to(target_device)
     gm.recompile()
-
-
-def _apply_full_fix(gm, target_device=0):
-    for node in gm.graph.nodes:
-        if node.op == "call_method" and node.target == "to":
-            new_args = list(node.args)
-            changed = False
-            for i, arg in enumerate(new_args):
-                if _is_cpu_device(arg):
-                    new_args[i] = torch.device("cuda", target_device)
-                    changed = True
-            if changed:
-                node.args = tuple(new_args)
-            if "device" in node.kwargs and _is_cpu_device(node.kwargs["device"]):
-                node.update_kwarg("device", torch.device("cuda", target_device))
-    _apply_metadata_only_fix(gm, target_device)
 
 
 def _run_with_fake_tensors(gm, cuda_device=0):
@@ -116,17 +97,17 @@ class TestFixToCpuInGraph:
     def test_full_fix_succeeds(self):
         """Rewriting .to(cpu) -> .to(cuda) + metadata fix -> no error."""
         gm = _build_graph_with_to_cpu()
-        _apply_full_fix(gm)
+        _fix(gm)
         out = _run_with_fake_tensors(gm)
         assert str(out.device).startswith("cuda")
 
     def test_no_residual_to_cpu(self):
         gm = _build_graph_with_to_cpu()
-        _apply_full_fix(gm)
+        _fix(gm)
         for node in gm.graph.nodes:
             if node.op == "call_method" and node.target == "to":
                 for arg in node.args:
-                    assert not _is_cpu_device(arg), f"Residual .to(cpu): {node}"
+                    assert not _device_is_cpu(arg), f"Residual .to(cpu): {node}"
 
     def test_to_dtype_untouched(self):
         """Rewrite must NOT affect .to(dtype) calls."""
@@ -138,7 +119,7 @@ class TestFixToCpuInGraph:
         x.meta["example_value"] = torch.randn(4, 8)
         to_bf16.meta["example_value"] = torch.randn(4, 8, dtype=torch.bfloat16)
 
-        _apply_full_fix(gm)
+        _fix(gm)
 
         for node in gm.graph.nodes:
             if node.op == "call_method" and node.target == "to":
