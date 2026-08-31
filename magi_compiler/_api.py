@@ -543,7 +543,6 @@ def _assign_param(module: nn.Module, dotted_name: str, new_tensor: torch.Tensor)
         setattr(parent, attr, new_tensor)
 
 
-
 def _stream_copy_and_replace(module: nn.Module, giant: torch.Tensor, param_list: list[tuple[str, torch.Tensor]]) -> None:
     """Copy each param into *giant*, replace in module immediately.
 
