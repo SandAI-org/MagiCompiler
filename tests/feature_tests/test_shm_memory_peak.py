@@ -171,7 +171,7 @@ def test_batch_materialize_has_high_peak():
     """BUG REPRO: batch materialize adds ~1× model size as mmap overhead.
 
     At peak: old params (RssAnon) + mmap copy (RssFile) ≈ 2× model size.
-    VmHWM growth measures the mmap portion, expected > 0.5× model_size.
+    VmHWM growth measures the mmap portion, expected > 0.8× model_size.
     """
     r = _run_in_subprocess(_batch_materialize, PARAM_MB)
     growth = r["hwm_after"] - r["hwm_before"]
@@ -184,8 +184,8 @@ def test_batch_materialize_has_high_peak():
         f"ratio={growth / pm:.2f}x"
     )
 
-    assert growth > pm * 0.5, (
-        f"Expected mmap overhead > {pm * 0.5:.0f} MB (0.5× model) "
+    assert growth > pm * 0.8, (
+        f"Expected mmap overhead > {pm * 0.8:.0f} MB (0.8× model) "
         f"but got {growth:.0f} MB ({growth / pm:.2f}×). "
         f"The 2× peak may have been optimized away."
     )
@@ -195,7 +195,7 @@ def test_streaming_materialize_low_peak():
     """FIX VERIFIED: streaming avoids the mmap overhead peak.
 
     By replacing each param immediately, only ~1/N of the model is ever
-    duplicated.  VmHWM growth should be well under 0.3× model size.
+    duplicated.  VmHWM growth should be well under 0.2× model size.
     """
     r = _run_in_subprocess(_streaming_materialize, PARAM_MB)
     growth = r["hwm_after"] - r["hwm_before"]
@@ -208,8 +208,8 @@ def test_streaming_materialize_low_peak():
         f"ratio={growth / pm:.2f}x"
     )
 
-    assert growth < pm * 0.3, (
-        f"Expected mmap overhead < {pm * 0.3:.0f} MB (0.3× model) "
+    assert growth < pm * 0.2, (
+        f"Expected mmap overhead < {pm * 0.2:.0f} MB (0.2× model) "
         f"but got {growth:.0f} MB ({growth / pm:.2f}×). "
         f"Streaming fix did not reduce peak."
     )
