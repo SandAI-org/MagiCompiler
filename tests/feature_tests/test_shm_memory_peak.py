@@ -45,12 +45,7 @@ import tempfile
 import torch
 import torch.nn as nn
 
-from magi_compiler._api import (
-    _create_empty_shm,
-    _pack_params_flat,
-    _split_flat_to_params,
-    _stream_copy_and_replace,
-)
+from magi_compiler._api import _create_empty_shm, _pack_params_flat, _split_flat_to_params, _stream_copy_and_replace
 
 PARAM_MB = 512
 NUM_PARAMS = 4

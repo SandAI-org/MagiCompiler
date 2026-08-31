@@ -25,10 +25,8 @@ import torch
 import torch.fx as fx
 import torch.nn as nn
 
-from magi_compiler.magi_backend.magi_backend import (
-    _device_is_cpu,
-    fix_graph_device_placement as _fix,
-)
+from magi_compiler.magi_backend.magi_backend import _device_is_cpu
+from magi_compiler.magi_backend.magi_backend import fix_graph_device_placement as _fix
 
 
 def _build_graph_with_to_cpu():

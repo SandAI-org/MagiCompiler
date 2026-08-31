@@ -60,9 +60,8 @@ def _group_params(module: nn.Module) -> dict[torch.dtype, list[tuple[str, torch.
 def _run_materialize(model, local_rank, shared_dir, per_rank):
     """Call production _materialize_shm_weights with env patched to use tmpdir."""
     grouped = _group_params(model)
-    with (
-        patch("magi_compiler.utils.envs.MAGI_SHARED_BIN_PATH", shared_dir),
-        patch("magi_compiler._api.pin_memory_in_place", lambda t: t),
+    with patch("magi_compiler.utils.envs.MAGI_SHARED_BIN_PATH", shared_dir), patch(
+        "magi_compiler._api.pin_memory_in_place", lambda t: t
     ):
         _materialize_shm_weights(model, grouped, local_rank=local_rank, per_rank=per_rank)
 
@@ -159,8 +158,7 @@ def test_ep_fix_preserves_per_rank_shards():
 
         assert r0["matches_own"], "rank 0 should keep its own weights"
         assert r1["matches_own"], (
-            "FIX FAILED: rank 1 should keep its own weights when per_rank=True, "
-            "but they were overwritten."
+            "FIX FAILED: rank 1 should keep its own weights when per_rank=True, " "but they were overwritten."
         )
         assert not torch.equal(r0["weight"], r1["weight"]), (
             "With per_rank=True, each rank should have DIFFERENT expert weights. "
