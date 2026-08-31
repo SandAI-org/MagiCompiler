@@ -280,6 +280,26 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         self.extra_traceback = False
 
     @staticmethod
+    def _device_is_cpu(val) -> bool:
+        """Check whether *val* represents a CPU device (torch.device or str)."""
+        if isinstance(val, torch.device):
+            return val.type == 'cpu'
+        return isinstance(val, str) and val == 'cpu'
+
+    @staticmethod
+    def _recursive_to_device(val, target_device: int):
+        """Recursively move tensor-like *val* (or nested list/tuple) to *target_device*."""
+        if isinstance(val, (list, tuple)):
+            items = [PiecewiseCompileInterpreter._recursive_to_device(v, target_device) for v in val]
+            return type(val)(items) if any(n is not o for n, o in zip(items, val)) else val
+        if hasattr(val, 'device') and str(val.device) == 'cpu':
+            new_val = val.to(target_device)
+            if isinstance(val, torch.nn.Parameter):
+                new_val = torch.nn.Parameter(new_val, requires_grad=val.requires_grad)
+            return new_val
+        return val
+
+    @staticmethod
     def _fix_graph_device_placement(module: torch.nn.Module):
         for _, child in module.named_children():
             PiecewiseCompileInterpreter._fix_graph_device_placement(child)
@@ -289,17 +309,13 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
 
         needs_recompile = False
         target_device = torch.cuda.current_device()
-
-        def _is_cpu_device(val):
-            if isinstance(val, torch.device):
-                return val.type == 'cpu'
-            return isinstance(val, str) and val == 'cpu'
+        _device_is_cpu = PiecewiseCompileInterpreter._device_is_cpu
 
         # --- Rewrite hardcoded .to(cpu) / factory(device='cpu') nodes ---
 
         for node in module.graph.nodes:
             if node.op == 'call_function' and 'device' in node.kwargs:
-                if _is_cpu_device(node.kwargs['device']):
+                if _device_is_cpu(node.kwargs['device']):
                     node.update_kwarg('device', torch.device('cuda', target_device))
                     needs_recompile = True
 
@@ -307,35 +323,24 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                 new_args = list(node.args)
                 changed = False
                 for i, arg in enumerate(new_args):
-                    if _is_cpu_device(arg):
+                    if _device_is_cpu(arg):
                         new_args[i] = torch.device('cuda', target_device)
                         changed = True
                 if changed:
                     node.args = tuple(new_args)
                     needs_recompile = True
-                if 'device' in node.kwargs and _is_cpu_device(node.kwargs['device']):
+                if 'device' in node.kwargs and _device_is_cpu(node.kwargs['device']):
                     node.update_kwarg('device', torch.device('cuda', target_device))
                     needs_recompile = True
 
         # --- Fix CPU example_values (recursive for nested list/tuple) ---
-
-        def _move_to_device(val):
-            if isinstance(val, (list, tuple)):
-                items = [_move_to_device(v) for v in val]
-                return type(val)(items) if any(n is not o for n, o in zip(items, val)) else val
-            if hasattr(val, 'device') and str(val.device) == 'cpu':
-                new_val = val.to(target_device)
-                if isinstance(val, torch.nn.Parameter):
-                    new_val = torch.nn.Parameter(new_val, requires_grad=val.requires_grad)
-                return new_val
-            return val
 
         cpu_fix_count = 0
         for node in module.graph.nodes:
             ev = node.meta.get('example_value')
             if ev is None:
                 continue
-            new_ev = _move_to_device(ev)
+            new_ev = PiecewiseCompileInterpreter._recursive_to_device(ev, target_device)
             if new_ev is not ev:
                 node.meta['example_value'] = new_ev
                 needs_recompile = True
