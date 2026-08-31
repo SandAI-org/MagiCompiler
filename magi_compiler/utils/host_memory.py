@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 
-
 def get_host_mem_gb() -> dict[str, float]:
     """Read /proc/self/status and return key memory metrics in GiB.
 
