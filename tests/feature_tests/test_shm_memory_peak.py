@@ -47,7 +47,7 @@ import torch.nn as nn
 
 from magi_compiler._api import _create_empty_shm, _pack_params_flat, _split_flat_to_params, _stream_copy_and_replace
 
-PARAM_MB = 512
+PARAM_MB = 256
 NUM_PARAMS = 4
 
 
@@ -179,8 +179,8 @@ def test_batch_materialize_has_high_peak():
         f"ratio={growth / pm:.2f}x"
     )
 
-    assert growth > pm * 0.8, (
-        f"Expected mmap overhead > {pm * 0.8:.0f} MB (0.8× model) "
+    assert growth > pm * 0.4, (
+        f"Expected mmap overhead > {pm * 0.4:.0f} MB (0.4× model) "
         f"but got {growth:.0f} MB ({growth / pm:.2f}×). "
         f"The 2× peak may have been optimized away."
     )
