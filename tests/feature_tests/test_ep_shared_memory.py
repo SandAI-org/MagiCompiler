@@ -140,14 +140,15 @@ def _worker_fix_verified(rank, world_size, shared_dir, seed_per_rank, result_fil
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "29502"
     os.environ["LOCAL_RANK"] = str(rank)
-    os.environ["ENGINE_CONFIG__EP_SIZE"] = str(world_size)
+    os.environ["MAGI_COMPILE_TOPOLOGY_KEY"] = f"cp1_dp1_ep{world_size}_tp1"
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
     torch.manual_seed(seed_per_rank[rank])
     model = FakeExpertBlock(num_experts=4, dim=8)
     original_weight = model.expert_weight.data.clone()
 
-    ep_size = int(os.environ.get("ENGINE_CONFIG__EP_SIZE", "1"))
+    from magi_compiler.config import get_topology_dim
+    ep_size = get_topology_dim("ep")
     _shm_write_read(model, local_rank=rank, shared_dir=shared_dir, per_rank=(ep_size > 1))
 
     weight_after = model.state_dict()["expert_weight"]
