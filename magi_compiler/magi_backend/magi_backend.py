@@ -301,6 +301,11 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                 return False
 
             for node in module.graph.nodes:
+                if node.op == 'call_function' and 'device' in node.kwargs:
+                    if _is_cpu_device(node.kwargs['device']):
+                        node.update_kwarg('device', torch.device('cuda', target_device))
+                        needs_recompile = True
+
                 if node.op == 'call_method' and node.target == 'to':
                     new_args = list(node.args)
                     changed = False
@@ -312,11 +317,6 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                         node.args = tuple(new_args)
                         needs_recompile = True
                     if 'device' in node.kwargs and _is_cpu_device(node.kwargs['device']):
-                        node.update_kwarg('device', torch.device('cuda', target_device))
-                        needs_recompile = True
-
-                if node.op == 'call_function' and 'device' in node.kwargs:
-                    if _is_cpu_device(node.kwargs['device']):
                         node.update_kwarg('device', torch.device('cuda', target_device))
                         needs_recompile = True
 
