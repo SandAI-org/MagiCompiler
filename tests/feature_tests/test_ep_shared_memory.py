@@ -32,11 +32,17 @@ import gc
 import os
 import tempfile
 
-import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
+
+from magi_compiler._api import (
+    _create_empty_shm,
+    _pack_params_flat,
+    _split_flat_to_params,
+    _stream_copy_and_replace,
+)
 
 class FakeExpertBlock(nn.Module):
     """Tiny module simulating an EP-sharded expert block."""
@@ -49,60 +55,49 @@ class FakeExpertBlock(nn.Module):
         return x @ self.expert_weight.T
 
 
-def _shm_write_read(module, local_rank, shared_dir, per_rank):
-    """
-    Core shared-memory logic extracted from _patch_cpu_offload_apply.
-
-    per_rank=False → original buggy path (rank 0 writes, all read same file).
-    per_rank=True  → fixed path (each rank writes its own file).
-    """
-    full_state_dict = module.state_dict()
+def _group_params(module: nn.Module) -> dict[torch.dtype, list[tuple[str, torch.Tensor]]]:
     grouped: dict[torch.dtype, list[tuple[str, torch.Tensor]]] = {}
-    for name, tensor in full_state_dict.items():
-        dt = tensor.dtype
-        grouped.setdefault(dt, []).append((name, tensor))
+    for name, tensor in module.state_dict().items():
+        grouped.setdefault(tensor.dtype, []).append((name, tensor))
+    return grouped
 
-    writer_rank = local_rank if per_rank else 0
-    shared_state = {}
 
-    for dtype, param_list in grouped.items():
-        dtype_str = str(dtype).split(".")[-1]
-        suffix = f"_rank{local_rank}" if per_rank else ""
-        shared_path = os.path.join(shared_dir, f"shared_{dtype_str}{suffix}.bin")
-        total_numel = sum(t.numel() for _, t in param_list)
+def _shm_write_read(module, local_rank, shared_dir, per_rank):
+    """Mirrors _materialize_shm_weights using production helpers.
 
-        if local_rank == writer_rank:
-            flat = torch.zeros(total_numel, dtype=dtype)
-            off = 0
-            for _, t in param_list:
-                n = t.numel()
-                flat[off : off + n].copy_(t.view(-1))
-                off += n
-            if dtype == torch.bfloat16:
-                flat.view(torch.int16).numpy().tofile(shared_path)
-            else:
-                flat.numpy().tofile(shared_path)
-            del flat
-            gc.collect()
+    per_rank=False → original buggy path (rank 0 writes, all read same file
+                     via load_state_dict — every rank gets rank 0's weights).
+    per_rank=True  → fixed path (each rank writes its own file, uses
+                     _stream_copy_and_replace to keep its own weights).
+    """
+    grouped = _group_params(module)
 
-        dist.barrier()
-
-        giant = torch.from_file(shared_path, shared=True, size=total_numel, dtype=dtype, device="cpu")
-        off = 0
-        for name, orig in param_list:
-            n = orig.numel()
-            shared_state[name] = giant[off : off + n].view(orig.shape)
-            off += n
-
-        dist.barrier()
-        if per_rank:
+    if per_rank:
+        for dtype, param_list in grouped.items():
+            suffix = f"_rank{local_rank}"
+            shared_path = os.path.join(shared_dir, f"shared_{str(dtype).split('.')[-1]}{suffix}.bin")
+            total_numel = sum(t.numel() for _, t in param_list)
+            giant = _create_empty_shm(shared_path, total_numel, dtype)
+            _stream_copy_and_replace(module, giant, param_list)
+            dist.barrier()
             if os.path.exists(shared_path):
                 os.remove(shared_path)
-        else:
+    else:
+        shared_state = {}
+        for dtype, param_list in grouped.items():
+            shared_path = os.path.join(shared_dir, f"shared_{str(dtype).split('.')[-1]}.bin")
+            total_numel = sum(t.numel() for _, t in param_list)
+            if local_rank == 0:
+                giant = _create_empty_shm(shared_path, total_numel, dtype)
+                _pack_params_flat(giant, param_list)
+            dist.barrier()
+            if local_rank != 0:
+                giant = torch.from_file(shared_path, shared=True, size=total_numel, dtype=dtype, device="cpu")
+            shared_state.update(_split_flat_to_params(giant, param_list))
+            dist.barrier()
             if local_rank == 0 and os.path.exists(shared_path):
                 os.remove(shared_path)
-
-    module.load_state_dict(shared_state, assign=True)
+        module.load_state_dict(shared_state, assign=True)
 
 
 # ───────────────────────────────────────────────────────────────
