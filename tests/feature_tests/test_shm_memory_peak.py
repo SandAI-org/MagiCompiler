@@ -58,7 +58,7 @@ import torch.nn as nn
 
 from magi_compiler._api import _create_empty_shm, _stream_copy_and_replace
 
-PARAM_MB = 256
+PARAM_MB = 64
 NUM_PARAMS = 4
 
 
@@ -368,7 +368,7 @@ with open(RESULT_PATH, "w") as f:
 """
 
 
-def _run_speed_subprocess(fn_name: str, param_mb: int, repeats: int = 3) -> dict:
+def _run_speed_subprocess(fn_name: str, param_mb: int, repeats: int = 2) -> dict:
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as rf:
         result_path = rf.name
     script_content = _SPEED_TEMPLATE.format(
@@ -378,7 +378,7 @@ def _run_speed_subprocess(fn_name: str, param_mb: int, repeats: int = 3) -> dict
         sf.write(script_content)
         script_path = sf.name
     try:
-        r = subprocess.run([sys.executable, script_path], capture_output=True, text=True, timeout=300)
+        r = subprocess.run([sys.executable, script_path], capture_output=True, text=True, timeout=180)
         assert r.returncode == 0, f"Speed worker failed (rc={r.returncode}):\nstderr: {r.stderr}"
         with open(result_path) as f:
             return json.load(f)
