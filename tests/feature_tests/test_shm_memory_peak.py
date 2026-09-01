@@ -21,7 +21,7 @@ The *original* production code in ``_patch_cpu_offload_apply`` allocated an
 intermediate ``flat_buffer = torch.zeros(total_numel)`` to pack all parameters,
 wrote it to disk via ``.numpy().tofile()``, then deleted the buffer and mmap'd
 the file back.  At peak, both the model parameters **and** the flat_buffer
-coexist in RssAnon.
+coexist in anonymous memory.
 
 The streaming alternative (``_stream_copy_and_replace``) writes each parameter
 directly into an mmap file and replaces the module parameter immediately, so
@@ -29,16 +29,19 @@ only one parameter's worth of duplication exists at any moment.
 
 Measurement
 -----------
-Each test runs in a **subprocess** (clean VmHWM baseline) via
+Each test runs in a **subprocess** (clean memory baseline) via
 ``subprocess.run`` to avoid fork+threads deadlocks in CI Docker.
 
-VmHWM growth captures the peak overhead.  Due to kernel-level page accounting
-(THP, lazy faulting on large anonymous mmap allocations), VmHWM typically
-reports 55-65% of the theoretical allocation.  Thresholds are calibrated
-accordingly:
+Memory is measured via ``/proc/self/smaps_rollup`` ``Anonymous`` field, which
+performs an accurate page-table walk.  This is preferred over ``RssAnon`` from
+``/proc/self/status``, which uses per-CPU batched counters and systematically
+under-reports by ~40% on multi-core machines.
 
-- **batch** (original code):  VmHWM growth > 0.3x model (theoretical ~1.0x)
-- **streaming** (fix):        VmHWM growth < 0.2x model (theoretical ~1/N)
+Peak is captured **deterministically** at the exact code point where the
+flat_buffer coexists with model parameters (no polling thread needed).
+
+- **batch** (original code):  Anonymous growth >= 0.8x model size
+- **streaming** (fix):        Anonymous growth < 0.1x model size
 
 No distributed / CUDA required.
 """
@@ -57,15 +60,6 @@ from magi_compiler._api import _create_empty_shm, _stream_copy_and_replace
 
 PARAM_MB = 256
 NUM_PARAMS = 4
-
-
-def _read_vm(key: str = "VmHWM") -> float:
-    """Read a VmXxx field from /proc/self/status (MB)."""
-    with open("/proc/self/status") as f:
-        for line in f:
-            if line.startswith(key + ":"):
-                return int(line.split()[1]) / 1024
-    raise RuntimeError(f"{key} not found")
 
 
 class HeavyModule(nn.Module):
@@ -94,7 +88,7 @@ def _batch_materialize(module: nn.Module, shm_dir: str) -> None:
 
     Faithfully replicates the ORIGINAL _patch_cpu_offload_apply logic that
     caused ~2x peak memory.  The intermediate ``flat_buffer`` is the root
-    cause -- it coexists with the model parameters in RssAnon.
+    cause -- it coexists with the model parameters in Anonymous memory.
 
     NOT imported from production because this code path no longer exists
     (replaced by streaming).  We keep it here as the buggy baseline.
@@ -169,11 +163,11 @@ def _streaming_materialize(module: nn.Module, shm_dir: str) -> None:
     gc.collect()
 
 
-# ── subprocess runner (self-contained worker, no import from test file) ──
+# ── subprocess runner (deterministic peak via smaps_rollup Anonymous) ────
 
 
 _WORKER_TEMPLATE = """
-import gc, json, os, sys, tempfile, threading
+import gc, json, os, sys, tempfile
 import torch, torch.nn as nn
 from magi_compiler._api import _create_empty_shm, _stream_copy_and_replace
 
@@ -182,12 +176,12 @@ FN_NAME = "{fn_name}"
 RESULT_PATH = "{result_path}"
 NUM_PARAMS = {num_params}
 
-def _read_vm(key="VmHWM"):
-    with open("/proc/self/status") as f:
-        for line in f:
-            if line.startswith(key + ":"):
+def _read_smaps_anon():
+    with open("/proc/self/smaps_rollup") as fh:
+        for line in fh:
+            if line.startswith("Anonymous:"):
                 return int(line.split()[1]) / 1024
-    raise RuntimeError(key + " not found")
+    return 0.0
 
 class HeavyModule(nn.Module):
     def __init__(self, numel, n=NUM_PARAMS, dt=torch.bfloat16):
@@ -196,13 +190,14 @@ class HeavyModule(nn.Module):
             self.register_parameter("w" + str(i), nn.Parameter(torch.randn(numel, dtype=dt)))
     def forward(self, x): return x
 
-def _batch_materialize(module, shm_dir):
+def _batch_with_peak(module, shm_dir):
     full_sd = module.state_dict()
     grouped = {{}}
     for name, tensor in full_sd.items():
         grouped.setdefault(tensor.dtype, []).append((name, tensor))
     shared_sd = {{}}
     bufs = []
+    peak = 0.0
     for dtype, plist in grouped.items():
         total = sum(t.numel() for _, t in plist)
         path = os.path.join(shm_dir, "batch.bin")
@@ -212,6 +207,7 @@ def _batch_materialize(module, shm_dir):
             n = t.numel()
             flat[off:off+n].copy_(t.view(-1))
             off += n
+        peak = max(peak, _read_smaps_anon())
         if dtype == torch.bfloat16:
             flat.view(torch.int16).numpy().tofile(path)
         else:
@@ -231,58 +227,37 @@ def _batch_materialize(module, shm_dir):
     module.load_state_dict(shared_sd, assign=True)
     module._bufs = bufs
     gc.collect()
+    return peak
 
-def _streaming_materialize(module, shm_dir):
+def _streaming_with_peak(module, shm_dir):
     sd = module.state_dict()
     grouped = {{}}
     for name, tensor in sd.items():
         grouped.setdefault(tensor.dtype, []).append((name, tensor))
     bufs = []
+    peak = _read_smaps_anon()
     for dtype, plist in grouped.items():
         total = sum(t.numel() for _, t in plist)
         path = os.path.join(shm_dir, "stream.bin")
         giant = _create_empty_shm(path, total, dtype)
         _stream_copy_and_replace(module, giant, plist)
+        peak = max(peak, _read_smaps_anon())
         bufs.append(giant)
         if os.path.exists(path): os.remove(path)
     module._bufs = bufs
     gc.collect()
+    return peak
 
-def _read_anon():
-    with open("/proc/self/status") as fh:
-        for line in fh:
-            if line.startswith("RssAnon:"):
-                return int(line.split()[1]) / 1024
-    return 0.0
-
-fn = {{"batch": _batch_materialize, "streaming": _streaming_materialize}}[FN_NAME]
+fn = {{"batch": _batch_with_peak, "streaming": _streaming_with_peak}}[FN_NAME]
 numel_per = PARAM_MB * 1024 * 1024 // (2 * NUM_PARAMS)
 model = HeavyModule(numel_per)
 gc.collect()
-
-anon_baseline = _read_anon()
-peak_anon = [anon_baseline]
-stop_event = threading.Event()
-
-def _poller():
-    while not stop_event.is_set():
-        v = _read_anon()
-        if v > peak_anon[0]:
-            peak_anon[0] = v
-        stop_event.wait(0.02)
-
-t = threading.Thread(target=_poller, daemon=True)
-t.start()
-
+anon_baseline = _read_smaps_anon()
 with tempfile.TemporaryDirectory() as d:
-    fn(model, d)
+    peak_anon = fn(model, d)
 gc.collect()
-
-stop_event.set()
-t.join(timeout=2)
-
 with open(RESULT_PATH, "w") as f:
-    json.dump({{"anon_baseline": anon_baseline, "peak_anon": peak_anon[0], "param_mb": PARAM_MB}}, f)
+    json.dump({{"anon_baseline": anon_baseline, "peak_anon": peak_anon, "param_mb": PARAM_MB}}, f)
 """
 
 
@@ -420,9 +395,8 @@ def test_batch_materialize_has_high_peak():
     """BUG REPRO: original code's flat_buffer causes measurable memory overhead.
 
     The flat_buffer = torch.zeros(total_numel) in the original production code
-    coexists with model parameters, causing ~1x extra RssAnon at peak.
-    Due to kernel VmHWM under-reporting on large mmap allocations (THP, lazy
-    faulting), measured growth is typically 0.4-0.7x of the theoretical 1.0x.
+    coexists with model parameters, causing ~1x extra Anonymous memory at peak.
+    Measured via smaps_rollup Anonymous (accurate page-table walk).
     """
     r = _run_in_subprocess("batch", PARAM_MB)
     growth = r["peak_anon"] - r["anon_baseline"]
@@ -435,8 +409,8 @@ def test_batch_materialize_has_high_peak():
         f"ratio={growth / pm:.2f}x"
     )
 
-    assert growth > pm * 0.3, (
-        f"Expected flat_buffer RssAnon overhead > {pm * 0.3:.0f} MB (0.3x model) "
+    assert growth > pm * 0.8, (
+        f"Expected flat_buffer Anonymous overhead > {pm * 0.8:.0f} MB (0.8x model) "
         f"but got {growth:.0f} MB ({growth / pm:.2f}x). "
         f"The flat_buffer peak may have been optimized away."
     )
@@ -446,8 +420,8 @@ def test_streaming_materialize_low_peak():
     """FIX VERIFIED: streaming avoids the flat_buffer overhead peak.
 
     By writing directly into mmap and replacing each param immediately,
-    no intermediate flat_buffer is needed.  VmHWM growth should be well
-    under 0.2x model size.
+    no intermediate flat_buffer is needed.  Anonymous growth should be
+    near zero (old params freed as they are replaced by mmap-backed views).
     """
     r = _run_in_subprocess("streaming", PARAM_MB)
     growth = r["peak_anon"] - r["anon_baseline"]
@@ -460,10 +434,10 @@ def test_streaming_materialize_low_peak():
         f"ratio={growth / pm:.2f}x"
     )
 
-    assert growth < pm * 0.15, (
-        f"Expected no flat_buffer RssAnon overhead < {pm * 0.15:.0f} MB (0.15x model) "
+    assert growth < pm * 0.1, (
+        f"Expected no flat_buffer Anonymous overhead < {pm * 0.1:.0f} MB (0.1x model) "
         f"but got {growth:.0f} MB ({growth / pm:.2f}x). "
-        f"Streaming should not increase RssAnon (it writes to mmap = RssFile)."
+        f"Streaming should not increase Anonymous memory."
     )
 
 
