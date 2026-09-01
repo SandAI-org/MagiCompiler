@@ -161,12 +161,19 @@ jobs:
                     sh -c "rm -rf ./* ./.[!.]* 2>/dev/null; true"
                 rm -rf "$PR_WORKSPACE"
 
-    # ── Test shards: 4 parallel jobs after build ──────────────────────
-    # Split rationale:
-    #   perf    – GPU timing-sensitive, isolated for independent rerun
-    #   api     – heavy torch.compile / inductor compilation
-    #   feature – FSDP overlap / CUDA graph / cache / mixed GPU+CPU
-    #   depyf   – mostly CPU-only bytecode decompile roundtrips
+    # ── Test shards ───────────────────────────────────────────────────
+    # 7 parallel shards after build.  Each shard picks the least-loaded
+    # GPU via nvidia-smi at startup to minimise contention when multiple
+    # shards land on the same physical runner.
+    #
+    # Shard split rationale:
+    #   perf           – GPU timing-sensitive, isolated for independent rerun
+    #   api            – heavy torch.compile / custom-op registration
+    #   feature-fsdp   – FSDP overlap (torchrun subprocess tests)
+    #   feature-cache  – cache invariant / topology / artifact management
+    #   feature-pass   – inductor passes & CUTLASS fusion
+    #   feature-runtime– CUDA graph, symbolic shapes, profiling, offload
+    #   depyf          – mostly CPU-only bytecode decompile roundtrips
 
     test:
         name: ${{ matrix.shard }} (${{ inputs.pytorch-label }})
@@ -181,8 +188,14 @@ jobs:
                     paths: tests/perf_tests/
                 -   shard: api
                     paths: tests/api_tests/ tests/model_tests/
-                -   shard: feature
-                    paths: tests/feature_tests/ tests/torch_native_tests/
+                -   shard: feature-fsdp
+                    paths: tests/feature_tests/fsdp/
+                -   shard: feature-cache
+                    paths: tests/feature_tests/cache/
+                -   shard: feature-pass
+                    paths: tests/feature_tests/pass/
+                -   shard: feature-runtime
+                    paths: tests/feature_tests/ tests/torch_native_tests/ --ignore=tests/feature_tests/fsdp --ignore=tests/feature_tests/cache --ignore=tests/feature_tests/pass
                 -   shard: depyf
                     paths: tests/magi_depyf/
         container:
@@ -203,13 +216,22 @@ jobs:
                 shell: bash
                 working-directory: /app
         steps:
+        -   name: Pick least-loaded GPU
+            run: |
+                GPU_ID=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits \
+                    | sort -t',' -k2 -n | head -1 | cut -d',' -f1 | tr -d ' ')
+                echo "CUDA_VISIBLE_DEVICES=${GPU_ID}" >> "$GITHUB_ENV"
+                echo "Selected GPU ${GPU_ID}"
+                nvidia-smi -i "${GPU_ID}" --query-gpu=name,memory.total,memory.used --format=csv,noheader
+
         -   name: Check environment
             run: |
                 python3 -c "
                 import torch, magi_compiler
                 print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}')
-                print(f'GPU: {torch.cuda.get_device_name(0)} x{torch.cuda.device_count()}')
+                print(f'GPU: {torch.cuda.get_device_name(0)} (CUDA_VISIBLE_DEVICES={__import__(\"os\").environ.get(\"CUDA_VISIBLE_DEVICES\", \"all\")})')
                 assert torch.cuda.is_available()
                 "
+
         -   name: Run ${{ matrix.shard }} tests
             run: pytest -v ${{ matrix.paths }} --tb=short
