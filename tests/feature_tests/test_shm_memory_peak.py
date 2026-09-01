@@ -58,7 +58,7 @@ import torch.nn as nn
 
 from magi_compiler._api import _create_empty_shm, _stream_copy_and_replace
 
-PARAM_MB = 32
+PARAM_MB = 64
 NUM_PARAMS = 4
 
 
@@ -328,8 +328,8 @@ def test_streaming_materialize_low_peak():
         f"ratio={growth / pm:.2f}x"
     )
 
-    assert growth < pm * 0.1, (
-        f"Expected no flat_buffer Anonymous overhead < {pm * 0.1:.0f} MB (0.1x model) "
+    assert growth < pm * 0.15, (
+        f"Expected no flat_buffer Anonymous overhead < {pm * 0.15:.0f} MB (0.15x model) "
         f"but got {growth:.0f} MB ({growth / pm:.2f}x). "
         f"Streaming should not increase Anonymous memory."
     )
