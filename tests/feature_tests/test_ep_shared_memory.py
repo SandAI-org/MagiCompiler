@@ -36,7 +36,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 
-from magi_compiler._api import _materialize_shm_weights
+from magi_compiler._api import _compute_weights_fingerprint, _materialize_shm_weights
 
 
 class FakeExpertBlock(nn.Module):
@@ -164,3 +164,63 @@ def test_ep_fix_preserves_per_rank_shards():
             "With per_rank=True, each rank should have DIFFERENT expert weights. "
             "If they're equal, the per-rank shm path did not work correctly."
         )
+
+# ───────────────────────────────────────────────────────────────
+#  Fingerprint tests
+# ───────────────────────────────────────────────────────────────
+
+
+def _group_params_for_fp(module):
+    grouped = {}
+    for name, param in module.named_parameters():
+        grouped.setdefault(param.dtype, []).append((name, param.data))
+    return grouped
+
+
+def test_fingerprint_identical_models():
+    """Two models with the same seed produce the same fingerprint."""
+    torch.manual_seed(42)
+    m1 = FakeExpertBlock(num_experts=4, dim=8)
+    torch.manual_seed(42)
+    m2 = FakeExpertBlock(num_experts=4, dim=8)
+
+    fp1 = _compute_weights_fingerprint(_group_params_for_fp(m1))
+    fp2 = _compute_weights_fingerprint(_group_params_for_fp(m2))
+    assert fp1 == fp2, "Identical models should have identical fingerprints"
+
+
+def test_fingerprint_different_models():
+    """Two models with different seeds produce different fingerprints."""
+    torch.manual_seed(42)
+    m1 = FakeExpertBlock(num_experts=4, dim=8)
+    torch.manual_seed(123)
+    m2 = FakeExpertBlock(num_experts=4, dim=8)
+
+    fp1 = _compute_weights_fingerprint(_group_params_for_fp(m1))
+    fp2 = _compute_weights_fingerprint(_group_params_for_fp(m2))
+    assert fp1 != fp2, "Models with different weights should have different fingerprints"
+
+
+def test_fingerprint_is_deterministic():
+    """Calling fingerprint twice on the same model gives the same result."""
+    torch.manual_seed(42)
+    m = FakeExpertBlock(num_experts=4, dim=8)
+    g = _group_params_for_fp(m)
+
+    fp1 = _compute_weights_fingerprint(g)
+    fp2 = _compute_weights_fingerprint(g)
+    assert fp1 == fp2, "Fingerprint should be deterministic"
+
+
+def test_fingerprint_detects_single_element_change():
+    """Changing one element in one parameter changes the fingerprint."""
+    torch.manual_seed(42)
+    m1 = FakeExpertBlock(num_experts=4, dim=8)
+    torch.manual_seed(42)
+    m2 = FakeExpertBlock(num_experts=4, dim=8)
+    m2.expert_weight.data[0, 0] += 1.0
+
+    fp1 = _compute_weights_fingerprint(_group_params_for_fp(m1))
+    fp2 = _compute_weights_fingerprint(_group_params_for_fp(m2))
+    assert fp1 != fp2, "Single element change should be detected"
+

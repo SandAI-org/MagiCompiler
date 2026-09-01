@@ -14,6 +14,7 @@
 
 import functools
 import gc
+import hashlib
 import inspect
 import os
 from contextlib import contextmanager
@@ -569,6 +570,44 @@ def _create_empty_shm(shm_path: str, total_numel: int, dtype: torch.dtype) -> to
     return torch.from_file(shm_path, shared=True, size=total_numel, dtype=dtype, device="cpu")
 
 
+
+def _compute_weights_fingerprint(
+    grouped_params: dict[torch.dtype, list[tuple[str, torch.Tensor]]],
+) -> bytes:
+    """Fast fingerprint of all weight data for cross-rank comparison.
+
+    Hashes param names, shapes, dtypes, and a head+tail sample of each
+    tensor (512 elements each).  Total data hashed is ~2 KB per param,
+    so even for thousands of params this takes < 1 s.
+    """
+    h = hashlib.sha256()
+    all_params: list[tuple[str, torch.Tensor]] = []
+    for param_list in grouped_params.values():
+        all_params.extend(param_list)
+    all_params.sort(key=lambda x: x[0])
+    for name, tensor in all_params:
+        h.update(name.encode())
+        h.update(f"{tensor.shape},{tensor.dtype}".encode())
+        flat = tensor.contiguous().view(-1)
+        sample_n = min(512, flat.numel())
+        h.update(flat[:sample_n].float().numpy().tobytes())
+        if flat.numel() > 512:
+            h.update(flat[-sample_n:].float().numpy().tobytes())
+    return h.digest()
+
+
+def _all_ranks_same_weights(
+    grouped_params: dict[torch.dtype, list[tuple[str, torch.Tensor]]],
+) -> bool:
+    """Return True if every rank holds identical weights (by fingerprint)."""
+    local_hash = _compute_weights_fingerprint(grouped_params)
+    hash_tensor = torch.frombuffer(bytearray(local_hash), dtype=torch.uint8).clone()
+    world_size = dist.get_world_size()
+    gathered = [torch.empty_like(hash_tensor) for _ in range(world_size)]
+    dist.all_gather(gathered, hash_tensor)
+    return all(torch.equal(gathered[0], g) for g in gathered[1:])
+
+
 def _materialize_shm_weights(
     module: nn.Module, grouped_params: dict[torch.dtype, list[tuple[str, torch.Tensor]]], local_rank: int, per_rank: bool
 ) -> None:
@@ -578,7 +617,7 @@ def _materialize_shm_weights(
     at a time, keeping peak RSS near 1× model size instead of 2×.
 
     per_rank=True  (default): each rank writes its own mmap concurrently.
-    per_rank=False (shm_share_weights=True): rank 0 writes, all ranks map.
+    per_rank=False (all ranks identical): rank 0 writes, all ranks map.
     """
     cls_name = module.__class__.__name__
     buffers: list[torch.Tensor] = []
@@ -670,7 +709,6 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
         magi_logger.info('[offload] after _force_cpu: %s', fmt_host_mem())
 
         # create shared memory tensors for all parameters/buffers on CPU
-        shm_share = os.environ.get("MAGI_COMPILE_OFFLOAD_CONFIG__SHM_SHARE_WEIGHTS", "0").lower() in ("1", "true")
         if dist.is_initialized():
             local_rank = int(os.environ.get("LOCAL_RANK", 0))
             full_state_dict = self.state_dict()
@@ -684,7 +722,18 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
                     grouped_params[dt].append((name, tensor))
 
             full_state_dict = None
-            _materialize_shm_weights(self, grouped_params, local_rank, per_rank=(not shm_share))
+
+            # Determine per_rank mode: env override > auto-detect via fingerprint
+            force_env = os.environ.get("MAGI_COMPILE_OFFLOAD_CONFIG__FORCE_PER_RANK_WEIGHTS")
+            if force_env is not None:
+                per_rank = force_env.lower() in ("1", "true")
+                magi_logger.info('[offload] per_rank=%s (env override FORCE_PER_RANK_WEIGHTS)', per_rank)
+            else:
+                same = _all_ranks_same_weights(grouped_params)
+                per_rank = not same
+                magi_logger.info('[offload] per_rank=%s (auto-detected, all_same=%s)', per_rank, same)
+
+            _materialize_shm_weights(self, grouped_params, local_rank, per_rank=per_rank)
             magi_logger.info('[offload] after SHM materialize: %s', fmt_host_mem())
 
             del full_state_dict, grouped_params
