@@ -165,6 +165,7 @@ def test_ep_fix_preserves_per_rank_shards():
             "If they're equal, the per-rank shm path did not work correctly."
         )
 
+
 # ───────────────────────────────────────────────────────────────
 #  Fingerprint tests
 # ───────────────────────────────────────────────────────────────
@@ -223,4 +224,3 @@ def test_fingerprint_detects_single_element_change():
     fp1 = _compute_weights_fingerprint(_group_params_for_fp(m1))
     fp2 = _compute_weights_fingerprint(_group_params_for_fp(m2))
     assert fp1 != fp2, "Single element change should be detected"
-

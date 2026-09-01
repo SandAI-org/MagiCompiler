@@ -570,10 +570,7 @@ def _create_empty_shm(shm_path: str, total_numel: int, dtype: torch.dtype) -> to
     return torch.from_file(shm_path, shared=True, size=total_numel, dtype=dtype, device="cpu")
 
 
-
-def _compute_weights_fingerprint(
-    grouped_params: dict[torch.dtype, list[tuple[str, torch.Tensor]]],
-) -> bytes:
+def _compute_weights_fingerprint(grouped_params: dict[torch.dtype, list[tuple[str, torch.Tensor]]]) -> bytes:
     """Fast fingerprint of all weight data for cross-rank comparison.
 
     Hashes param names, shapes, dtypes, and a head+tail sample of each
@@ -596,9 +593,7 @@ def _compute_weights_fingerprint(
     return h.digest()
 
 
-def _all_ranks_same_weights(
-    grouped_params: dict[torch.dtype, list[tuple[str, torch.Tensor]]],
-) -> bool:
+def _all_ranks_same_weights(grouped_params: dict[torch.dtype, list[tuple[str, torch.Tensor]]]) -> bool:
     """Return True if every rank holds identical weights (by fingerprint)."""
     local_hash = _compute_weights_fingerprint(grouped_params)
     hash_tensor = torch.frombuffer(bytearray(local_hash), dtype=torch.uint8).clone()
