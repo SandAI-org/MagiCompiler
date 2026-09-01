@@ -161,11 +161,18 @@ jobs:
                     sh -c "rm -rf ./* ./.[!.]* 2>/dev/null; true"
                 rm -rf "$PR_WORKSPACE"
 
-    test:
-        name: Test (${{ inputs.pytorch-label }})
+    # ── Test jobs: 4 parallel shards after build ──────────────────────
+    # Split rationale:
+    #   perf   – GPU timing-sensitive, isolated for independent rerun
+    #   api    – heavy torch.compile / inductor compilation
+    #   feature – FSDP overlap / CUDA graph / cache / mixed GPU+CPU
+    #   depyf  – mostly CPU-only bytecode decompile roundtrips
+
+    test-perf:
+        name: Perf (${{ inputs.pytorch-label }})
         needs: build
         runs-on: [self-hosted, magi-compiler]
-        timeout-minutes: 40
+        timeout-minutes: 25
         container:
             image: ${{ needs.build.outputs.image_tag }}
             credentials:
@@ -184,19 +191,91 @@ jobs:
                 shell: bash
                 working-directory: /app
         steps:
-        -   name: Check environment (torch & CUDA)
-            run: |
-                python3 -c "
-                import torch
-                print(f'PyTorch version: {torch.__version__}')
-                assert torch.cuda.is_available(), 'CUDA is not available on this runner'
-                print(f'CUDA version: {torch.version.cuda}')
-                print(f'GPU: {torch.cuda.get_device_name(0)}')
-                print(f'GPU count: {torch.cuda.device_count()}')
+        -   name: Check environment
+            run: python3 -c "import torch; assert torch.cuda.is_available(); import magi_compiler; print('OK')"
+        -   name: Run perf tests
+            run: pytest -v tests/perf_tests/ --tb=short
 
-                import magi_compiler
-                print(f'MagiCompiler: OK')
-                "
+    test-api:
+        name: API (${{ inputs.pytorch-label }})
+        needs: build
+        runs-on: [self-hosted, magi-compiler]
+        timeout-minutes: 25
+        container:
+            image: ${{ needs.build.outputs.image_tag }}
+            credentials:
+                username: ${{ secrets.CCR_USERNAME }}
+                password: ${{ secrets.CCR_PASSWORD }}
+            options: --gpus all --ipc=host --shm-size=2g
+        env:
+            http_proxy: ${{ secrets.HTTP_PROXY }}
+            https_proxy: ${{ secrets.HTTPS_PROXY }}
+            no_proxy: localhost,127.0.0.1,::1
+            NCCL_NVLS_ENABLE: 0
+            PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+            PIP_TRUSTED_HOST: pypi.tuna.tsinghua.edu.cn
+        defaults:
+            run:
+                shell: bash
+                working-directory: /app
+        steps:
+        -   name: Check environment
+            run: python3 -c "import torch; assert torch.cuda.is_available(); import magi_compiler; print('OK')"
+        -   name: Run API & model tests
+            run: pytest -v tests/api_tests/ tests/model_tests/ --tb=short
 
-        -   name: Run MagiCompiler tests
-            run: pytest -v tests/ --tb=short
+    test-feature:
+        name: Feature (${{ inputs.pytorch-label }})
+        needs: build
+        runs-on: [self-hosted, magi-compiler]
+        timeout-minutes: 25
+        container:
+            image: ${{ needs.build.outputs.image_tag }}
+            credentials:
+                username: ${{ secrets.CCR_USERNAME }}
+                password: ${{ secrets.CCR_PASSWORD }}
+            options: --gpus all --ipc=host --shm-size=2g
+        env:
+            http_proxy: ${{ secrets.HTTP_PROXY }}
+            https_proxy: ${{ secrets.HTTPS_PROXY }}
+            no_proxy: localhost,127.0.0.1,::1
+            NCCL_NVLS_ENABLE: 0
+            PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+            PIP_TRUSTED_HOST: pypi.tuna.tsinghua.edu.cn
+        defaults:
+            run:
+                shell: bash
+                working-directory: /app
+        steps:
+        -   name: Check environment
+            run: python3 -c "import torch; assert torch.cuda.is_available(); import magi_compiler; print('OK')"
+        -   name: Run feature & torch-native tests
+            run: pytest -v tests/feature_tests/ tests/torch_native_tests/ --tb=short
+
+    test-depyf:
+        name: Depyf (${{ inputs.pytorch-label }})
+        needs: build
+        runs-on: [self-hosted, magi-compiler]
+        timeout-minutes: 25
+        container:
+            image: ${{ needs.build.outputs.image_tag }}
+            credentials:
+                username: ${{ secrets.CCR_USERNAME }}
+                password: ${{ secrets.CCR_PASSWORD }}
+            options: --gpus all --ipc=host --shm-size=2g
+        env:
+            http_proxy: ${{ secrets.HTTP_PROXY }}
+            https_proxy: ${{ secrets.HTTPS_PROXY }}
+            no_proxy: localhost,127.0.0.1,::1
+            NCCL_NVLS_ENABLE: 0
+            PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+            PIP_TRUSTED_HOST: pypi.tuna.tsinghua.edu.cn
+        defaults:
+            run:
+                shell: bash
+                working-directory: /app
+        steps:
+        -   name: Check environment
+            run: python3 -c "import torch; assert torch.cuda.is_available(); import magi_compiler; print('OK')"
+        -   name: Run depyf tests
+            run: pytest -v tests/magi_depyf/ --tb=short
