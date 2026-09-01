@@ -32,7 +32,7 @@ from magi_compiler.utils import compilation_counter, envs, magi_logger
 from magi_compiler.utils.compile_time_monitor import CompileMonitor
 from magi_compiler.utils.host_memory import fmt_host_mem
 
-from .config import CompileConfig, CompileMode, get_topology_dim
+from .config import CompileConfig, CompileMode
 
 
 # =============================================================================
@@ -577,8 +577,8 @@ def _materialize_shm_weights(
     Uses streaming copy-and-replace so only one parameter is duplicated
     at a time, keeping peak RSS near 1× model size instead of 2×.
 
-    per_rank=True  (EP > 1): each rank writes its own mmap concurrently.
-    per_rank=False (EP <= 1): rank 0 writes, all ranks share pages.
+    per_rank=True  (default): each rank writes its own mmap concurrently.
+    per_rank=False (shm_share_weights=True): rank 0 writes, all ranks map.
     """
     cls_name = module.__class__.__name__
     buffers: list[torch.Tensor] = []
@@ -670,7 +670,7 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
         magi_logger.info('[offload] after _force_cpu: %s', fmt_host_mem())
 
         # create shared memory tensors for all parameters/buffers on CPU
-        ep_size = get_topology_dim("ep")
+        shm_share = os.environ.get("MAGI_COMPILE_OFFLOAD_CONFIG__SHM_SHARE_WEIGHTS", "0").lower() in ("1", "true")
         if dist.is_initialized():
             local_rank = int(os.environ.get("LOCAL_RANK", 0))
             full_state_dict = self.state_dict()
@@ -684,7 +684,7 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
                     grouped_params[dt].append((name, tensor))
 
             full_state_dict = None
-            _materialize_shm_weights(self, grouped_params, local_rank, per_rank=(ep_size > 1))
+            _materialize_shm_weights(self, grouped_params, local_rank, per_rank=(not shm_share))
             magi_logger.info('[offload] after SHM materialize: %s', fmt_host_mem())
 
             del full_state_dict, grouped_params

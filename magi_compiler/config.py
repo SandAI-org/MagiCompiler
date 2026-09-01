@@ -196,6 +196,16 @@ class OffloadConfig(BaseModel):
     )
     bandwidth_safety_factor: float = Field(0.9, description="The safety factor for the H2D bandwidth.")
     max_prefetch_lookahead: int = Field(2, description="Max layers to prefetch ahead. 0 disables prefetch to save GPU memory.")
+    shm_share_weights: bool = Field(
+        False,
+        description=(
+            "When True, rank 0 writes a single shared-memory file and all ranks map it "
+            "(valid only when every rank holds identical weights). When False (default), "
+            "each rank writes its own file, which is required for expert parallelism "
+            "where ranks hold different weight shards. "
+            "Env var: MAGI_COMPILE_OFFLOAD_CONFIG__SHM_SHARE_WEIGHTS (1/0/true/false)."
+        ),
+    )
 
 
 class FSDPConfig(BaseModel):
@@ -427,22 +437,6 @@ def _get_parallel_topology() -> str:
     if not torch.distributed.is_initialized():
         return "ws1"
     return f"ws{torch.distributed.get_world_size()}"
-
-
-def get_topology_dim(dim: str, default: int = 1) -> int:
-    """Extract a parallel dimension size from ``MAGI_COMPILE_TOPOLOGY_KEY``.
-
-    The key is a ``_``-joined string like ``cp8_dp1_ep8_tp1`` set by the
-    host framework's ParallelStateManager.  Returns *default* if the key
-    is absent or the dimension is not present.
-    """
-    import re
-
-    topo = os.environ.get("MAGI_COMPILE_TOPOLOGY_KEY", "")
-    if not topo:
-        return default
-    m = re.search(rf"(?:^|_){re.escape(dim)}(\d+)", topo)
-    return int(m.group(1)) if m else default
 
 
 def model_rank_dir_name(model_idx: int, model_tag: str | None) -> str:
