@@ -216,13 +216,13 @@ jobs:
                 shell: bash
                 working-directory: /app
         steps:
-        -   name: Pick least-loaded GPU
+        -   name: Pick 2 least-loaded GPUs
             run: |
-                GPU_ID=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits \
-                    | sort -t',' -k2 -n | head -1 | cut -d',' -f1 | tr -d ' ')
-                echo "CUDA_VISIBLE_DEVICES=${GPU_ID}" >> "$GITHUB_ENV"
-                echo "Selected GPU ${GPU_ID}"
-                nvidia-smi -i "${GPU_ID}" --query-gpu=name,memory.total,memory.used --format=csv,noheader
+                GPUS=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits \
+                    | sort -t',' -k2 -n | head -2 | cut -d',' -f1 | tr -d ' ' | paste -sd,)
+                echo "CUDA_VISIBLE_DEVICES=${GPUS}" >> "$GITHUB_ENV"
+                echo "Selected GPUs: ${GPUS}"
+                nvidia-smi -i "${GPUS}" --query-gpu=index,name,memory.total,memory.used --format=csv,noheader
 
         -   name: Check environment
             run: |
