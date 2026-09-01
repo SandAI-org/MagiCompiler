@@ -711,4 +711,13 @@ def offload(obj):
         return {k: offload(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return type(obj)(offload(i) for i in obj)
+    if isinstance(obj, nn.Module):
+        return obj
+    if hasattr(obj, '__dict__') and not isinstance(obj, (str, int, float, bool, type)):
+        for k, v in vars(obj).items():
+            offloaded = offload(v)
+            if offloaded is not v:
+                if isinstance(v, torch.Tensor):
+                    magi_logger.info('[offload] %s.%s: %s -> cpu', type(obj).__name__, k, v.device)
+                setattr(obj, k, offloaded)
     return obj
