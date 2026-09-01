@@ -162,7 +162,7 @@ jobs:
                 rm -rf "$PR_WORKSPACE"
 
     # ── Test shards ───────────────────────────────────────────────────
-    # 7 parallel shards after build.  Each shard picks the least-loaded
+    # 8 parallel shards after build.  Each shard picks the least-loaded
     # GPU via nvidia-smi at startup to minimise contention when multiple
     # shards land on the same physical runner.
     #
@@ -186,8 +186,10 @@ jobs:
                 include:
                 -   shard: perf
                     paths: tests/perf_tests/
-                -   shard: api
-                    paths: tests/api_tests/ tests/model_tests/
+                -   shard: api-core
+                    paths: tests/api_tests/test_magi_compile.py tests/api_tests/test_nested_compile.py tests/api_tests/test_dynamic_int_inputs.py tests/model_tests/
+                -   shard: api-custom-op
+                    paths: tests/api_tests/test_register_custom_op.py
                 -   shard: feature-fsdp
                     paths: tests/feature_tests/fsdp/
                 -   shard: feature-cache
