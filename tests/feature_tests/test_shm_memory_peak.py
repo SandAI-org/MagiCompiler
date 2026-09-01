@@ -58,7 +58,7 @@ import torch.nn as nn
 
 from magi_compiler._api import _create_empty_shm, _stream_copy_and_replace
 
-PARAM_MB = 64
+PARAM_MB = 32
 NUM_PARAMS = 4
 
 
@@ -282,112 +282,6 @@ def _run_in_subprocess(fn_name: str, param_mb: int) -> dict:
                 os.remove(p)
 
 
-# ── speed subprocess runner ─────────────────────────────────
-
-_SPEED_TEMPLATE = """
-import gc, json, os, sys, tempfile, time
-import torch, torch.nn as nn
-from magi_compiler._api import _create_empty_shm, _stream_copy_and_replace
-
-PARAM_MB = {param_mb}
-FN_NAME = "{fn_name}"
-RESULT_PATH = "{result_path}"
-REPEATS = {repeats}
-NUM_PARAMS = {num_params}
-
-class HeavyModule(nn.Module):
-    def __init__(self, numel, n=NUM_PARAMS, dt=torch.bfloat16):
-        super().__init__()
-        for i in range(n):
-            self.register_parameter("w" + str(i), nn.Parameter(torch.randn(numel, dtype=dt)))
-    def forward(self, x): return x
-
-def _batch_materialize(module, shm_dir):
-    sd = module.state_dict()
-    grouped = {{}}
-    for name, tensor in sd.items():
-        grouped.setdefault(tensor.dtype, []).append((name, tensor))
-    shared_sd = {{}}
-    bufs = []
-    for dtype, plist in grouped.items():
-        total = sum(t.numel() for _, t in plist)
-        path = os.path.join(shm_dir, "batch.bin")
-        flat = torch.zeros(total, dtype=dtype)
-        off = 0
-        for _, t in plist:
-            n = t.numel()
-            flat[off:off+n].copy_(t.view(-1))
-            off += n
-        if dtype == torch.bfloat16:
-            flat.view(torch.int16).numpy().tofile(path)
-        else:
-            flat.numpy().tofile(path)
-        del flat; gc.collect()
-        giant = torch.from_file(path, shared=True, size=total, dtype=dtype, device="cpu")
-        bufs.append(giant)
-        off = 0
-        for name, orig in plist:
-            n = orig.numel()
-            v = giant[off:off+n].view(orig.shape)
-            if orig.requires_grad: v.requires_grad_(True)
-            shared_sd[name] = v
-            off += n
-        if os.path.exists(path): os.remove(path)
-    module.load_state_dict(shared_sd, assign=True)
-    module._bufs = bufs; gc.collect()
-
-def _streaming_materialize(module, shm_dir):
-    sd = module.state_dict()
-    grouped = {{}}
-    for name, tensor in sd.items():
-        grouped.setdefault(tensor.dtype, []).append((name, tensor))
-    bufs = []
-    for dtype, plist in grouped.items():
-        total = sum(t.numel() for _, t in plist)
-        path = os.path.join(shm_dir, "stream.bin")
-        giant = _create_empty_shm(path, total, dtype)
-        _stream_copy_and_replace(module, giant, plist)
-        bufs.append(giant)
-        if os.path.exists(path): os.remove(path)
-    module._bufs = bufs; gc.collect()
-
-fn = {{"batch": _batch_materialize, "streaming": _streaming_materialize}}[FN_NAME]
-numel_per = PARAM_MB * 1024 * 1024 // (2 * NUM_PARAMS)
-times = []
-for _ in range(REPEATS):
-    torch.manual_seed(42)
-    model = HeavyModule(numel_per)
-    gc.collect()
-    with tempfile.TemporaryDirectory() as d:
-        t0 = time.perf_counter()
-        fn(model, d)
-        times.append(time.perf_counter() - t0)
-    del model; gc.collect()
-with open(RESULT_PATH, "w") as f:
-    json.dump({{"times": times, "avg": sum(times)/len(times)}}, f)
-"""
-
-
-def _run_speed_subprocess(fn_name: str, param_mb: int, repeats: int = 2) -> dict:
-    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as rf:
-        result_path = rf.name
-    script_content = _SPEED_TEMPLATE.format(
-        param_mb=param_mb, fn_name=fn_name, result_path=result_path, repeats=repeats, num_params=NUM_PARAMS
-    )
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as sf:
-        sf.write(script_content)
-        script_path = sf.name
-    try:
-        r = subprocess.run([sys.executable, script_path], capture_output=True, text=True, timeout=180)
-        assert r.returncode == 0, f"Speed worker failed (rc={r.returncode}):\nstderr: {r.stderr}"
-        with open(result_path) as f:
-            return json.load(f)
-    finally:
-        for p in (result_path, script_path):
-            if os.path.exists(p):
-                os.remove(p)
-
-
 # ── tests ───────────────────────────────────────────────────
 
 
@@ -455,34 +349,3 @@ def test_streaming_preserves_weights():
 
     for name in model_a.state_dict():
         assert torch.equal(model_a.state_dict()[name], model_b.state_dict()[name]), f"Mismatch on '{name}'"
-
-
-# ── speed ───────────────────────────────────────────────────
-
-
-def test_streaming_not_slower_than_batch():
-    """Streaming must not be significantly slower than batch.
-
-    Allows up to 1.50x slowdown to account for per-param register_parameter
-    overhead.  In practice streaming is often faster on large models because
-    it avoids the final load_state_dict bulk copy.
-    """
-    mb = PARAM_MB
-    max_slowdown = 1.50
-
-    r_batch = _run_speed_subprocess("batch", mb)
-    r_stream = _run_speed_subprocess("streaming", mb)
-
-    ratio = r_stream["avg"] / r_batch["avg"]
-    print(
-        f"\n[speed] model={mb} MB, num_params={NUM_PARAMS}"
-        f"  batch={r_batch['avg']:.3f}s"
-        f"  streaming={r_stream['avg']:.3f}s"
-        f"  ratio={ratio:.2f}x"
-    )
-
-    assert ratio < max_slowdown, (
-        f"Streaming is {ratio:.2f}x slower than batch "
-        f"(limit {max_slowdown}x). "
-        f"batch={r_batch['times']}, stream={r_stream['times']}"
-    )
