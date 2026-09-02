@@ -72,3 +72,18 @@ def build_graph_module(fake_mode, *, placeholder_vals=(), placeholder_meta_key="
         x = graph.call_function(torch.ops.aten.relu.default, args=(x,))
     graph.output((x,))
     return fx.GraphModule(torch.nn.Module(), graph)
+
+
+@pytest.fixture(autouse=True)
+def _reset_compile_state():
+    """Reset torch.compile / dynamo state between tests to prevent cross-test pollution.
+
+    On PT 2.12, accumulated CUDA context from compiled Triton kernels can
+    produce asynchronous illegal-memory-access errors that cascade across
+    tests.  Synchronising and resetting after every test surfaces the real
+    culprit instead of blaming a later, innocent test.
+    """
+    yield
+    torch._dynamo.reset()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
