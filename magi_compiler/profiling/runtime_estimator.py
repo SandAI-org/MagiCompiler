@@ -60,6 +60,7 @@ from .materialize_inputs import apply_materialize_inputs, get_materialize_inputs
 # Dedicated GLOO (CPU) group for the cost sync, built once -- keeps it off the
 # NCCL process groups the forward uses (cannot desync weight-gather / CP comms).
 
+
 def snode_issues_collective(snode: BaseSchedulerNode) -> bool:
     """
     True if replaying / running this snode issues NCCL (collective AG, or a
@@ -70,7 +71,6 @@ def snode_issues_collective(snode: BaseSchedulerNode) -> bool:
     if not isinstance(snode, ExternKernelSchedulerNode):
         return False
     return _extern_has_internal_collective(snode)
-
 
 
 def _get_cost_sync_group():
