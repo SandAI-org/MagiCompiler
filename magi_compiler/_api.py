@@ -757,6 +757,8 @@ def _patch_cpu_offload_apply(cls: type[nn.Module], conf: CompileConfig):
 
 def offload(obj):
     if isinstance(obj, torch.Tensor):
+        if obj.is_meta:
+            return obj
         return obj.cpu()
     if isinstance(obj, dict):
         return {k: offload(v) for k, v in obj.items()}
