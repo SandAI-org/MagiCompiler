@@ -19,24 +19,9 @@
 ``test_dynamic_nd_tiling.py`` (ND_TilingWorkaroundPass decision logic).
 """
 
-import os
-
 import pytest
 import torch
 import torch.fx as fx
-
-
-def pytest_collection_modifyitems(items):
-    """Sort collected tests by filename basename to preserve alphabetical order.
-
-    Moving test files into subdirectories (cache/, fsdp/, pass/) changes
-    pytest's default collection order (subdirs before root files).  On
-    PT 2.12, the altered order causes CUTLASS-compiled CUDA kernels to
-    leave stale context that triggers illegal-memory-access cascades in
-    later Triton-autotune tests.  Sorting by basename restores the flat
-    alphabetical order that the pre-reorganisation layout had.
-    """
-    items.sort(key=lambda item: (os.path.basename(str(item.fspath)), item.name))
 
 
 @pytest.fixture
