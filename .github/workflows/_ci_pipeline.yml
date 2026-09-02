@@ -161,11 +161,45 @@ jobs:
                     sh -c "rm -rf ./* ./.[!.]* 2>/dev/null; true"
                 rm -rf "$PR_WORKSPACE"
 
+    # ── Test shards ───────────────────────────────────────────────────
+    # 8 parallel shards after build.  Each shard picks the least-loaded
+    # GPU via nvidia-smi at startup to minimise contention when multiple
+    # shards land on the same physical runner.
+    #
+    # Shard split rationale:
+    #   perf           – GPU timing-sensitive, isolated for independent rerun
+    #   api            – heavy torch.compile / custom-op registration
+    #   feature-fsdp   – FSDP overlap (torchrun subprocess tests)
+    #   feature-cache  – cache invariant / topology / artifact management
+    #   feature-pass   – inductor passes & CUTLASS fusion
+    #   feature-runtime– CUDA graph, symbolic shapes, profiling, offload
+    #   depyf          – mostly CPU-only bytecode decompile roundtrips
+
     test:
-        name: Test (${{ inputs.pytorch-label }})
+        name: ${{ matrix.shard }} (${{ inputs.pytorch-label }})
         needs: build
         runs-on: [self-hosted, magi-compiler]
-        timeout-minutes: 40
+        timeout-minutes: 25
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                -   shard: perf
+                    paths: tests/perf_tests/
+                -   shard: api-core
+                    paths: tests/api_tests/test_magi_compile.py tests/api_tests/test_nested_compile.py tests/api_tests/test_dynamic_int_inputs.py tests/model_tests/
+                -   shard: api-custom-op
+                    paths: tests/api_tests/test_register_custom_op.py
+                -   shard: feature-fsdp
+                    paths: tests/feature_tests/fsdp/
+                -   shard: feature-cache
+                    paths: tests/feature_tests/cache/
+                -   shard: feature-pass
+                    paths: tests/feature_tests/pass/
+                -   shard: feature-runtime
+                    paths: tests/feature_tests/ tests/torch_native_tests/ --ignore=tests/feature_tests/fsdp --ignore=tests/feature_tests/cache --ignore=tests/feature_tests/pass
+                -   shard: depyf
+                    paths: tests/magi_depyf/
         container:
             image: ${{ needs.build.outputs.image_tag }}
             credentials:
@@ -184,19 +218,22 @@ jobs:
                 shell: bash
                 working-directory: /app
         steps:
-        -   name: Check environment (torch & CUDA)
+        -   name: Pick 2 least-loaded GPUs
+            run: |
+                GPUS=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits \
+                    | sort -t',' -k2 -n | head -2 | cut -d',' -f1 | tr -d ' ' | paste -sd,)
+                echo "CUDA_VISIBLE_DEVICES=${GPUS}" >> "$GITHUB_ENV"
+                echo "Selected GPUs: ${GPUS}"
+                nvidia-smi -i "${GPUS}" --query-gpu=index,name,memory.total,memory.used --format=csv,noheader
+
+        -   name: Check environment
             run: |
                 python3 -c "
-                import torch
-                print(f'PyTorch version: {torch.__version__}')
-                assert torch.cuda.is_available(), 'CUDA is not available on this runner'
-                print(f'CUDA version: {torch.version.cuda}')
-                print(f'GPU: {torch.cuda.get_device_name(0)}')
-                print(f'GPU count: {torch.cuda.device_count()}')
-
-                import magi_compiler
-                print(f'MagiCompiler: OK')
+                import torch, magi_compiler
+                print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}')
+                print(f'GPU: {torch.cuda.get_device_name(0)} (CUDA_VISIBLE_DEVICES={__import__(\"os\").environ.get(\"CUDA_VISIBLE_DEVICES\", \"all\")})')
+                assert torch.cuda.is_available()
                 "
 
-        -   name: Run MagiCompiler tests
-            run: pytest -v tests/ --tb=short
+        -   name: Run ${{ matrix.shard }} tests
+            run: pytest -v ${{ matrix.paths }} --tb=short
