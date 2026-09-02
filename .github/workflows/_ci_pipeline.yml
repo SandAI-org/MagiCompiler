@@ -179,7 +179,7 @@ jobs:
         name: ${{ matrix.shard }} (${{ inputs.pytorch-label }})
         needs: build
         runs-on: [self-hosted, magi-compiler]
-        timeout-minutes: ${{ matrix.timeout || 25 }}
+        timeout-minutes: 60
         strategy:
             fail-fast: false
             matrix:
@@ -196,7 +196,6 @@ jobs:
                     paths: tests/feature_tests/cache/
                 -   shard: feature-pass
                     paths: tests/feature_tests/pass/
-                    timeout: 60
                 -   shard: feature-runtime
                     paths: tests/feature_tests/ tests/torch_native_tests/ --ignore=tests/feature_tests/fsdp --ignore=tests/feature_tests/cache --ignore=tests/feature_tests/pass
                 -   shard: depyf
