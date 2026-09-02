@@ -59,8 +59,6 @@ from .materialize_inputs import apply_materialize_inputs, get_materialize_inputs
 
 # Dedicated GLOO (CPU) group for the cost sync, built once -- keeps it off the
 # NCCL process groups the forward uses (cannot desync weight-gather / CP comms).
-_COST_SYNC_GROUP = "uninit"
-
 
 def snode_issues_collective(snode: BaseSchedulerNode) -> bool:
     """
@@ -74,18 +72,11 @@ def snode_issues_collective(snode: BaseSchedulerNode) -> bool:
     return _extern_has_internal_collective(snode)
 
 
-def _get_cost_sync_group():
-    global _COST_SYNC_GROUP
-    import torch.distributed as dist
 
-    if _COST_SYNC_GROUP != "uninit":
-        return _COST_SYNC_GROUP
-    try:
-        _COST_SYNC_GROUP = dist.new_group(backend="gloo")
-    except Exception as exc:  # noqa: BLE001
-        magi_logger.warning("cost-sync: gloo group unavailable (%s); using default group", exc)
-        _COST_SYNC_GROUP = None
-    return _COST_SYNC_GROUP
+def _get_cost_sync_group():
+    from magi_compiler.utils.dist_utils import get_cpu_gloo_group
+
+    return get_cpu_gloo_group()
 
 
 @dataclasses.dataclass

@@ -595,11 +595,13 @@ def _compute_weights_fingerprint(grouped_params: dict[torch.dtype, list[tuple[st
 
 def _all_ranks_same_weights(grouped_params: dict[torch.dtype, list[tuple[str, torch.Tensor]]]) -> bool:
     """Return True if every rank holds identical weights (by fingerprint)."""
+    from magi_compiler.utils.dist_utils import get_cpu_gloo_group
+
     local_hash = _compute_weights_fingerprint(grouped_params)
     hash_tensor = torch.frombuffer(bytearray(local_hash), dtype=torch.uint8).clone()
     world_size = dist.get_world_size()
     gathered = [torch.empty_like(hash_tensor) for _ in range(world_size)]
-    dist.all_gather(gathered, hash_tensor)
+    dist.all_gather(gathered, hash_tensor, group=get_cpu_gloo_group())
     return all(torch.equal(gathered[0], g) for g in gathered[1:])
 
 
