@@ -51,6 +51,7 @@ EXPECTED = {
 def model_with_clean_cache():
     """Build a transformer model with an isolated Magi cache directory."""
 
+    torch._dynamo.reset()
     with tempfile.TemporaryDirectory() as tmp_dir:
         with patch.dict(os.environ, {"MAGI_COMPILE_CACHE_ROOT_DIR": tmp_dir}):
             transformer_config = TransformerConfig(
