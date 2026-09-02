@@ -216,7 +216,7 @@ def _magi_compile_class(
         raise AttributeError(f"{cls.__name__} has no callable method '{method_name}'")
 
     if issubclass(cls, nn.Module) and conf.offload_config.model_cpu_offload:
-        _patch_cpu_offload_apply(cls)
+        _patch_cpu_offload_apply(cls, conf)
 
     old_init = cls.__init__
 
@@ -650,7 +650,7 @@ def _materialize_shm_weights(
     gc.collect()
 
 
-def _patch_cpu_offload_apply(cls: type[nn.Module]):
+def _patch_cpu_offload_apply(cls: type[nn.Module], conf: CompileConfig):
     magi_logger.info(f"Enabling CPU offload for {cls}")
     _orig_apply = cls._apply
 
@@ -718,11 +718,11 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
 
             full_state_dict = None
 
-            # Determine per_rank mode: env override > auto-detect via fingerprint
-            force_env = os.environ.get("MAGI_COMPILE_OFFLOAD_CONFIG__FORCE_PER_RANK_WEIGHTS")
-            if force_env is not None:
-                per_rank = force_env.lower() in ("1", "true")
-                magi_logger.info('[offload] per_rank=%s (env override FORCE_PER_RANK_WEIGHTS)', per_rank)
+            # Determine per_rank mode: config override > auto-detect via fingerprint
+            force = conf.offload_config.force_per_rank_weights
+            if force is not None:
+                per_rank = force
+                magi_logger.info('[offload] per_rank=%s (config force_per_rank_weights)', per_rank)
             else:
                 same = _all_ranks_same_weights(grouped_params)
                 per_rank = not same
