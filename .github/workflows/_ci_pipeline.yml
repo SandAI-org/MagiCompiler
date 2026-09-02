@@ -166,9 +166,15 @@ jobs:
     # GPU via nvidia-smi at startup to minimise contention when multiple
     # shards land on the same physical runner.
     #
+    # IMPORTANT: the union of all shard paths must cover tests/.
+    # When adding a new test directory, assign it to a shard here.
+    # Covered: api_tests, example_inference, feature_tests,
+    #          magi_depyf, model_tests, perf_tests, torch_native_tests
+    #
     # Shard split rationale:
     #   perf           – GPU timing-sensitive, isolated for independent rerun
-    #   api            – heavy torch.compile / custom-op registration
+    #   api-core       – torch.compile / nested compile / example inference
+    #   api-custom-op  – magi_register_custom_op (heavy, standalone)
     #   feature-fsdp   – FSDP overlap (torchrun subprocess tests)
     #   feature-cache  – cache invariant / topology / artifact management
     #   feature-pass   – inductor passes & CUTLASS fusion
@@ -187,7 +193,7 @@ jobs:
                 -   shard: perf
                     paths: tests/perf_tests/
                 -   shard: api-core
-                    paths: tests/api_tests/test_magi_compile.py tests/api_tests/test_nested_compile.py tests/api_tests/test_dynamic_int_inputs.py tests/model_tests/
+                    paths: tests/api_tests/test_magi_compile.py tests/api_tests/test_nested_compile.py tests/api_tests/test_dynamic_int_inputs.py tests/model_tests/ tests/example_inference/
                 -   shard: api-custom-op
                     paths: tests/api_tests/test_register_custom_op.py
                 -   shard: feature-fsdp
@@ -221,17 +227,18 @@ jobs:
         -   name: Pick 2 least-loaded GPUs
             run: |
                 GPUS=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits \
-                    | sort -t',' -k2 -n | head -2 | cut -d',' -f1 | tr -d ' ' | paste -sd,)
+                    | sort -t',' -k2 -n | head -2 | cut -d',' -f1 | tr -d ' ' | paste -sd, 2>/dev/null) || true
+                if [ -z "$GPUS" ]; then GPUS="0,1"; echo "nvidia-smi failed, falling back to GPUs 0,1"; fi
                 echo "CUDA_VISIBLE_DEVICES=${GPUS}" >> "$GITHUB_ENV"
                 echo "Selected GPUs: ${GPUS}"
-                nvidia-smi -i "${GPUS}" --query-gpu=index,name,memory.total,memory.used --format=csv,noheader
+                nvidia-smi -i "${GPUS}" --query-gpu=index,name,memory.total,memory.used --format=csv,noheader || true
 
         -   name: Check environment
             run: |
                 python3 -c "
-                import torch, magi_compiler
+                import os, torch, magi_compiler
                 print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}')
-                print(f'GPU: {torch.cuda.get_device_name(0)} (CUDA_VISIBLE_DEVICES={__import__(\"os\").environ.get(\"CUDA_VISIBLE_DEVICES\", \"all\")})')
+                print(f'GPU: {torch.cuda.get_device_name(0)} (CUDA_VISIBLE_DEVICES={os.environ.get(\"CUDA_VISIBLE_DEVICES\", \"all\")})')
                 assert torch.cuda.is_available()
                 "
 
