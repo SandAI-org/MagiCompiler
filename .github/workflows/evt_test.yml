@@ -1,53 +1,34 @@
 name: EVT CUTLASS Test
 
 # CUTLASS EVT epilogue-fusion tests need ~35 min of nvcc compilation
-# per PyTorch version. Triggered independently via `ci:evt` label so
-# they don't block the regular `ci:run` pipeline.
+# per PyTorch version.  Run manually from the Actions tab when needed.
+#
+# Usage: Actions -> EVT CUTLASS Test -> Run workflow
+#   ref: branch name, tag, or SHA to test
 
 on:
-    pull_request_target:
-        types: [labeled]
-        branches:
-        -   main
+    workflow_dispatch:
+        inputs:
+            ref:
+                description: Git ref to test (branch, tag, or SHA)
+                required: false
+                default: main
+                type: string
 
 concurrency:
-    group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+    group: ${{ github.workflow }}-${{ inputs.ref }}
     cancel-in-progress: true
 
 jobs:
-    guard:
-        name: Check ci:evt label
-        runs-on: ubuntu-latest
-        permissions:
-            pull-requests: write
-        steps:
-        -   name: Require ci:evt label
-            run: |
-                if [ "${{ github.event.label.name }}" != "ci:evt" ]; then
-                  echo "::notice::Skipped: label is not ci:evt."
-                  exit 1
-                fi
-        -   name: Remove ci:evt label
-            uses: actions/github-script@v7
-            with:
-                script: |
-                    await github.rest.issues.removeLabel({
-                        owner: context.repo.owner,
-                        repo: context.repo.repo,
-                        issue_number: context.issue.number,
-                        name: 'ci:evt'
-                    });
-
     pt29:
         name: PyTorch 2.9
-        needs: guard
         uses: ./.github/workflows/_ci_pipeline.yml
         with:
             kind: pr
-            workspace: /home/niubility2/cenzhiyao/ci/magi-compiler-workspaces/evt-${{ github.event.pull_request.number }}-pt29
-            head-sha: ${{ github.event.pull_request.head.sha }}
-            base-sha: ${{ github.event.pull_request.base.sha }}
-            pr-number: ${{ github.event.pull_request.number }}
+            workspace: /home/niubility2/cenzhiyao/ci/magi-compiler-workspaces/evt-${{ github.run_id }}-pt29
+            head-sha: ${{ inputs.ref }}
+            base-sha: ''
+            pr-number: evt
             base-image: nvcr.io/nvidia/pytorch:25.10-py3
             pytorch-label: pt29
             test-override: tests/feature_tests/pass/test_matmul_epilogue_fusion.py
@@ -55,14 +36,13 @@ jobs:
 
     pt212:
         name: PyTorch 2.12
-        needs: guard
         uses: ./.github/workflows/_ci_pipeline.yml
         with:
             kind: pr
-            workspace: /home/niubility2/cenzhiyao/ci/magi-compiler-workspaces/evt-${{ github.event.pull_request.number }}-pt212
-            head-sha: ${{ github.event.pull_request.head.sha }}
-            base-sha: ${{ github.event.pull_request.base.sha }}
-            pr-number: ${{ github.event.pull_request.number }}
+            workspace: /home/niubility2/cenzhiyao/ci/magi-compiler-workspaces/evt-${{ github.run_id }}-pt212
+            head-sha: ${{ inputs.ref }}
+            base-sha: ''
+            pr-number: evt
             base-image: nvcr.io/nvidia/pytorch:26.05-py3
             pytorch-label: pt212
             test-override: tests/feature_tests/pass/test_matmul_epilogue_fusion.py
