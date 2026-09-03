@@ -196,6 +196,17 @@ class OffloadConfig(BaseModel):
     )
     bandwidth_safety_factor: float = Field(0.9, description="The safety factor for the H2D bandwidth.")
     max_prefetch_lookahead: int = Field(2, description="Max layers to prefetch ahead. 0 disables prefetch to save GPU memory.")
+    force_per_rank_weights: bool | None = Field(
+        None,
+        description=(
+            "Override for per-rank shared memory mode.  When None (default), "
+            "MagiCompiler auto-detects by comparing weight fingerprints across "
+            "ranks: if all ranks hold identical weights, a single shared mmap is "
+            "used; otherwise each rank writes its own file.  Set to True to force "
+            "per-rank mode (e.g. expert parallelism), or False to force sharing.  "
+            "Env var: MAGI_COMPILE_OFFLOAD_CONFIG__FORCE_PER_RANK_WEIGHTS (1/0/true/false)."
+        ),
+    )
 
 
 class FSDPConfig(BaseModel):
