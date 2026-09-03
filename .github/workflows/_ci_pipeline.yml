@@ -179,7 +179,7 @@ jobs:
         name: ${{ matrix.shard }} (${{ inputs.pytorch-label }})
         needs: build
         runs-on: [self-hosted, magi-compiler]
-        timeout-minutes: 60
+        timeout-minutes: 25
         strategy:
             fail-fast: false
             matrix:
