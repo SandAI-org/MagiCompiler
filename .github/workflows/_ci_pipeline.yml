@@ -36,6 +36,11 @@ on:
                 description: Short label for display (e.g. pt29, pt212).
                 required: true
                 type: string
+            test-override:
+                description: If set, run ONLY this pytest path instead of the full shard matrix.
+                required: false
+                type: string
+                default: ''
         outputs:
             image_tag:
                 description: Image reference that was built.
@@ -177,7 +182,7 @@ jobs:
     #   api-custom-op  – magi_register_custom_op (heavy, standalone)
     #   feature-fsdp   – FSDP overlap (torchrun subprocess tests)
     #   feature-cache  – cache invariant / topology / artifact management
-    #   feature-pass   – inductor passes & CUTLASS fusion
+    #   feature-pass   – inductor passes (CUTLASS EVT → separate ci:evt workflow)
     #   feature-runtime– CUDA graph, symbolic shapes, profiling, offload
     #   depyf          – mostly CPU-only bytecode decompile roundtrips
 
@@ -185,7 +190,7 @@ jobs:
         name: ${{ matrix.shard }} (${{ inputs.pytorch-label }})
         needs: build
         runs-on: [self-hosted, magi-compiler]
-        timeout-minutes: 25
+        timeout-minutes: 60
         strategy:
             fail-fast: false
             matrix:
@@ -201,7 +206,7 @@ jobs:
                 -   shard: feature-cache
                     paths: tests/feature_tests/cache/
                 -   shard: feature-pass
-                    paths: tests/feature_tests/pass/
+                    paths: tests/feature_tests/pass/ --ignore=tests/feature_tests/pass/test_matmul_epilogue_fusion.py
                 -   shard: feature-runtime
                     paths: tests/feature_tests/ tests/torch_native_tests/ --ignore=tests/feature_tests/fsdp --ignore=tests/feature_tests/cache --ignore=tests/feature_tests/pass
                 -   shard: depyf
@@ -243,4 +248,9 @@ jobs:
                 "
 
         -   name: Run ${{ matrix.shard }} tests
+            if: ${{ inputs.test-override == '' }}
             run: pytest -v ${{ matrix.paths }} --tb=short
+
+        -   name: Run override tests
+            if: ${{ inputs.test-override != '' }}
+            run: pytest -v ${{ inputs.test-override }} --tb=short

@@ -14,6 +14,7 @@
 
 import functools
 import gc
+import hashlib
 import inspect
 import os
 from contextlib import contextmanager
@@ -30,6 +31,7 @@ from magi_compiler.cuda.cudart import pin_memory_in_place
 from magi_compiler.magi_backend.magi_compiler_base import MagiCompileState
 from magi_compiler.utils import compilation_counter, envs, magi_logger
 from magi_compiler.utils.compile_time_monitor import CompileMonitor
+from magi_compiler.utils.host_memory import fmt_host_mem
 
 from .config import CompileConfig, CompileMode
 
@@ -214,7 +216,7 @@ def _magi_compile_class(
         raise AttributeError(f"{cls.__name__} has no callable method '{method_name}'")
 
     if issubclass(cls, nn.Module) and conf.offload_config.model_cpu_offload:
-        _patch_cpu_offload_apply(cls)
+        _patch_cpu_offload_apply(cls, conf)
 
     old_init = cls.__init__
 
@@ -500,7 +502,162 @@ def _check_dynamic_arg_dims(inferred_dims: dict[str, int | list[int]], target_fu
         assert base_k in inspect.signature(target_func).parameters, f"Argument {base_k} (from {k}) not found in {target_func}"
 
 
-def _patch_cpu_offload_apply(cls: type[nn.Module]):
+def _shm_path(cls_name: str, dtype: torch.dtype, rank: int | None = None) -> str:
+    """Build the /dev/shm path for a shared weight file."""
+    dtype_str = str(dtype).split(".")[-1]
+    suffix = f"_rank{rank}" if rank is not None else ""
+    return f"{envs.MAGI_SHARED_BIN_PATH}/magi_model_shared_{dtype_str}_{cls_name}{suffix}.bin"
+
+
+def _pack_params_flat(flat: torch.Tensor, param_list: list[tuple[str, torch.Tensor]]) -> None:
+    """Copy a list of named tensors into a contiguous flat buffer."""
+    offset = 0
+    for _, tensor in param_list:
+        numel = tensor.numel()
+        flat[offset : offset + numel].copy_(tensor.view(-1))
+        offset += numel
+
+
+def _split_flat_to_params(flat: torch.Tensor, param_list: list[tuple[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    """Return views into *flat* shaped like the original parameters."""
+    out: dict[str, torch.Tensor] = {}
+    offset = 0
+    for name, orig in param_list:
+        numel = orig.numel()
+        view = flat[offset : offset + numel].view(orig.shape)
+        if orig.requires_grad:
+            view.requires_grad_(True)
+        out[name] = view
+        offset += numel
+    return out
+
+
+def _assign_param(module: nn.Module, dotted_name: str, new_tensor: torch.Tensor) -> None:
+    """Replace a single parameter/buffer in *module* by its dotted path."""
+    parts = dotted_name.rsplit(".", 1)
+    parent = module.get_submodule(parts[0]) if len(parts) == 2 else module
+    attr = parts[-1]
+    old = getattr(parent, attr)
+    if isinstance(old, nn.Parameter):
+        parent.register_parameter(attr, nn.Parameter(new_tensor, requires_grad=new_tensor.requires_grad))
+    else:
+        setattr(parent, attr, new_tensor)
+
+
+def _stream_copy_and_replace(module: nn.Module, giant: torch.Tensor, param_list: list[tuple[str, torch.Tensor]]) -> None:
+    """Copy each param into *giant*, replace in module immediately.
+
+    By replacing before moving to the next param, only one param's worth
+    of duplication exists at any moment (peak ≈ 1× instead of 2×).
+    """
+    offset = 0
+    for i, (name, tensor) in enumerate(param_list):
+        numel = tensor.numel()
+        giant[offset : offset + numel].copy_(tensor.view(-1))
+        view = giant[offset : offset + numel].view(tensor.shape)
+        if tensor.requires_grad:
+            view.requires_grad_(True)
+        _assign_param(module, name, view)
+        param_list[i] = (name, view)
+        offset += numel
+
+
+def _create_empty_shm(shm_path: str, total_numel: int, dtype: torch.dtype) -> torch.Tensor:
+    """Create an empty mmap file and return the mapped tensor."""
+    elem_size = torch.empty(0, dtype=dtype).element_size()
+    with open(shm_path, "wb") as f:
+        f.truncate(total_numel * elem_size)
+    return torch.from_file(shm_path, shared=True, size=total_numel, dtype=dtype, device="cpu")
+
+
+def _compute_weights_fingerprint(grouped_params: dict[torch.dtype, list[tuple[str, torch.Tensor]]]) -> bytes:
+    """Fast fingerprint of all weight data for cross-rank comparison.
+
+    Hashes param names, shapes, dtypes, and a head+tail sample of each
+    tensor (512 elements each).  Total data hashed is ~2 KB per param,
+    so even for thousands of params this takes < 1 s.
+    """
+    h = hashlib.sha256()
+    all_params: list[tuple[str, torch.Tensor]] = []
+    for param_list in grouped_params.values():
+        all_params.extend(param_list)
+    all_params.sort(key=lambda x: x[0])
+    for name, tensor in all_params:
+        h.update(name.encode())
+        h.update(f"{tensor.shape},{tensor.dtype}".encode())
+        flat = tensor.contiguous().view(-1)
+        sample_n = min(512, flat.numel())
+        h.update(flat[:sample_n].float().numpy().tobytes())
+        if flat.numel() > 512:
+            h.update(flat[-sample_n:].float().numpy().tobytes())
+    return h.digest()
+
+
+def _all_ranks_same_weights(grouped_params: dict[torch.dtype, list[tuple[str, torch.Tensor]]]) -> bool:
+    """Return True if every rank holds identical weights (by fingerprint)."""
+    from magi_compiler.utils.dist_utils import get_cpu_gloo_group
+
+    group = get_cpu_gloo_group()
+    if group is None:
+        magi_logger.warning('[offload] gloo group unavailable, assuming per_rank=True (safe default)')
+        return False
+
+    local_hash = _compute_weights_fingerprint(grouped_params)
+    hash_tensor = torch.frombuffer(bytearray(local_hash), dtype=torch.uint8).clone()
+    world_size = dist.get_world_size()
+    gathered = [torch.empty_like(hash_tensor) for _ in range(world_size)]
+    dist.all_gather(gathered, hash_tensor, group=group)
+    return all(torch.equal(gathered[0], g) for g in gathered[1:])
+
+
+def _materialize_shm_weights(
+    module: nn.Module, grouped_params: dict[torch.dtype, list[tuple[str, torch.Tensor]]], local_rank: int, per_rank: bool
+) -> None:
+    """Replace module params with pinned shared-memory tensors.
+
+    Uses streaming copy-and-replace so only one parameter is duplicated
+    at a time, keeping peak RSS near 1× model size instead of 2×.
+
+    per_rank=True  (default): each rank writes its own mmap concurrently.
+    per_rank=False (all ranks identical): rank 0 writes, all ranks map.
+    """
+    cls_name = module.__class__.__name__
+    buffers: list[torch.Tensor] = []
+
+    if per_rank:
+        for dtype, param_list in grouped_params.items():
+            path = _shm_path(cls_name, dtype, rank=local_rank)
+            total_numel = sum(t.numel() for _, t in param_list)
+            giant = _create_empty_shm(path, total_numel, dtype)
+            _stream_copy_and_replace(module, giant, param_list)
+            pin_memory_in_place(giant)
+            buffers.append(giant)
+            if os.path.exists(path):
+                os.remove(path)
+        dist.barrier()
+    else:
+        dist.barrier()
+        for dtype, param_list in grouped_params.items():
+            path = _shm_path(cls_name, dtype)
+            total_numel = sum(t.numel() for _, t in param_list)
+            if local_rank == 0:
+                giant = _create_empty_shm(path, total_numel, dtype)
+                _stream_copy_and_replace(module, giant, param_list)
+            dist.barrier()
+            if local_rank != 0:
+                giant = torch.from_file(path, shared=True, size=total_numel, dtype=dtype, device="cpu")
+                _stream_copy_and_replace(module, giant, param_list)
+            pin_memory_in_place(giant)
+            buffers.append(giant)
+            dist.barrier()
+            if local_rank == 0 and os.path.exists(path):
+                os.remove(path)
+
+    module._magi_giant_buffers = buffers
+    gc.collect()
+
+
+def _patch_cpu_offload_apply(cls: type[nn.Module], conf: CompileConfig):
     magi_logger.info(f"Enabling CPU offload for {cls}")
     _orig_apply = cls._apply
 
@@ -532,10 +689,26 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
                 return _orig_apply(self, fn)
 
         # move all parameters/buffers to CPU
+        # Optimized: skip GPU roundtrip when tensor is already on CPU and fn
+        # only changes device (not dtype). The roundtrip was originally needed
+        # for cases where fn includes dtype conversion (e.g. model.to(dtype=fp16)),
+        # but the common offload path is just model.cuda() with no dtype change.
+        _dtype_target_cache: dict = {}
+
         def _force_cpu(t):
+            if t.device.type == "cpu":
+                dt = t.dtype
+                if dt not in _dtype_target_cache:
+                    probe = torch.empty(0, dtype=dt, device="cpu")
+                    _dtype_target_cache[dt] = fn(probe).dtype
+                target_dt = _dtype_target_cache[dt]
+                if target_dt == dt:
+                    return t
+                return t.to(dtype=target_dt)
             return fn(t).cpu()
 
         _orig_apply(self, _force_cpu)
+        magi_logger.info('[offload] after _force_cpu: %s', fmt_host_mem())
 
         # create shared memory tensors for all parameters/buffers on CPU
         if dist.is_initialized():
@@ -550,61 +723,24 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
                         grouped_params[dt] = []
                     grouped_params[dt].append((name, tensor))
 
-            shared_state_dict = {}
-            self._magi_giant_buffers = []
+            full_state_dict = None
 
-            dist.barrier()
+            # Determine per_rank mode: config override > auto-detect via fingerprint
+            force = conf.offload_config.force_per_rank_weights
+            if force is not None:
+                per_rank = force
+                magi_logger.info('[offload] per_rank=%s (config force_per_rank_weights)', per_rank)
+            else:
+                same = _all_ranks_same_weights(grouped_params)
+                per_rank = not same
+                magi_logger.info('[offload] per_rank=%s (auto-detected, all_same=%s)', per_rank, same)
 
-            for dtype, param_list in grouped_params.items():
-                dtype_str = str(dtype).split(".")[-1]
-                shared_bin_path = f"{envs.MAGI_SHARED_BIN_PATH}/magi_model_shared_{dtype_str}_{self.__class__.__name__}.bin"
+            _materialize_shm_weights(self, grouped_params, local_rank, per_rank=per_rank)
+            magi_logger.info('[offload] after SHM materialize: %s', fmt_host_mem())
 
-                total_numel = sum(t.numel() for _, t in param_list)
-
-                if local_rank == 0:
-                    flat_buffer = torch.zeros(total_numel, dtype=dtype)
-                    offset = 0
-                    for _, tensor in param_list:
-                        numel = tensor.numel()
-                        flat_buffer[offset : offset + numel].copy_(tensor.view(-1))
-                        offset += numel
-
-                    if dtype == torch.bfloat16:
-                        flat_buffer.view(torch.int16).numpy().tofile(shared_bin_path)
-                    elif dtype.itemsize == 1 and dtype.is_floating_point:
-                        # fp8
-                        flat_buffer.view(torch.uint8).numpy().tofile(shared_bin_path)
-                    else:
-                        flat_buffer.numpy().tofile(shared_bin_path)
-
-                    del flat_buffer
-                    gc.collect()
-
-                dist.barrier()
-
-                giant_shared_tensor = torch.from_file(
-                    shared_bin_path, shared=True, size=total_numel, dtype=dtype, device="cpu"
-                )
-                self._magi_giant_buffers.append(giant_shared_tensor)
-
-                pin_memory_in_place(giant_shared_tensor)
-
-                offset = 0
-                for name, original_tensor in param_list:
-                    numel = original_tensor.numel()
-                    shared_param = giant_shared_tensor[offset : offset + numel].view(original_tensor.shape)
-
-                    if original_tensor.requires_grad:
-                        shared_param.requires_grad_(True)
-
-                    shared_state_dict[name] = shared_param
-                    offset += numel
-
-                dist.barrier()
-                if local_rank == 0 and os.path.exists(shared_bin_path):
-                    os.remove(shared_bin_path)
-
-            self.load_state_dict(shared_state_dict, assign=True)
+            del full_state_dict, grouped_params
+            gc.collect()
+            magi_logger.info('[offload] after gc.collect: %s', fmt_host_mem())
 
         else:
 
@@ -621,9 +757,20 @@ def _patch_cpu_offload_apply(cls: type[nn.Module]):
 
 def offload(obj):
     if isinstance(obj, torch.Tensor):
+        if obj.is_meta:
+            return obj
         return obj.cpu()
     if isinstance(obj, dict):
         return {k: offload(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return type(obj)(offload(i) for i in obj)
+    if isinstance(obj, nn.Module):
+        return obj
+    if hasattr(obj, '__dict__') and not isinstance(obj, (str, int, float, bool, type)):
+        for k, v in vars(obj).items():
+            offloaded = offload(v)
+            if offloaded is not v:
+                if isinstance(v, torch.Tensor):
+                    magi_logger.info('[offload] %s.%s: %s -> cpu', type(obj).__name__, k, v.device)
+                setattr(obj, k, offloaded)
     return obj
