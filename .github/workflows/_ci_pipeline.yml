@@ -176,10 +176,10 @@ jobs:
     # Covered: api_tests, example_inference, feature_tests,
     #          magi_depyf, model_tests, perf_tests, torch_native_tests
     #
-    # Shard split rationale:
+    # Shard split rationale (8 shards):
     #   perf           – GPU timing-sensitive, isolated for independent rerun
-    #   api-core       – torch.compile / nested compile / example inference
-    #   api-custom-op  – magi_register_custom_op (heavy, standalone)
+    #   api            – magi_compile API surface (compile / nested / custom-op / dynamic)
+    #   model          – model-level e2e: MLP train/infer, RMSNorm, Qwen inference
     #   feature-fsdp   – FSDP overlap (torchrun subprocess tests)
     #   feature-cache  – cache invariant / topology / artifact management
     #   feature-pass   – inductor passes (CUTLASS EVT → separate ci:evt workflow)
@@ -197,10 +197,10 @@ jobs:
                 include:
                 -   shard: perf
                     paths: tests/perf_tests/
-                -   shard: api-core
-                    paths: tests/api_tests/test_magi_compile.py tests/api_tests/test_nested_compile.py tests/api_tests/test_dynamic_int_inputs.py tests/model_tests/ tests/example_inference/
-                -   shard: api-custom-op
-                    paths: tests/api_tests/test_register_custom_op.py
+                -   shard: api
+                    paths: tests/api_tests/
+                -   shard: model
+                    paths: tests/model_tests/ tests/example_inference/
                 -   shard: feature-fsdp
                     paths: tests/feature_tests/fsdp/
                 -   shard: feature-cache

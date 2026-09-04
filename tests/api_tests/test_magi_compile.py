@@ -664,7 +664,7 @@ class TestPerformanceImprovementConsistency:
         compiled_times = [t_class, t_func, t_inst, t_mtd]
         max_compiled = max(compiled_times)
         min_compiled = min(compiled_times)
-        assert max_compiled / min_compiled < 2.5, (
+        assert max_compiled / min_compiled < 1.2, (
             "Magi entry timings diverged too much: "
             f"class={t_class:.4f}s, function={t_func:.4f}s, instance={t_inst:.4f}s, method={t_mtd:.4f}s"
         )
@@ -686,7 +686,7 @@ class TestPerformanceImprovementConsistency:
         nm_times = [t_nm_class, t_nm_inst, t_nm_mtd]
         max_nm = max(nm_times)
         min_nm = min(nm_times)
-        assert max_nm / min_nm < 2.5, (
+        assert max_nm / min_nm < 1.2, (
             "Non-module entry timings diverged too much: "
             f"class={t_nm_class:.4f}s, instance={t_nm_inst:.4f}s, method={t_nm_mtd:.4f}s"
         )
