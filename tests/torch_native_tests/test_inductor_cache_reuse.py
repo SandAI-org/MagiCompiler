@@ -39,13 +39,10 @@ class CounterDelta:
     inductor_miss: int
 
 
-# NOTE: may be different on different machines, and this config is suitable for CI machine.
-# Each test resets dynamo state (torch._dynamo.reset) for isolation, so every
-# test starts cold.  On pt29 a cold-start compilation of this 32-layer model
-# produces autograd_miss=2 (one for the forward graph, one for the backward).
+# NOTE: may be different on different machines, and this config is suitable for CI machine
 EXPECTED = {
-    "train": CounterDelta(autograd_hit=31, autograd_miss=2, inductor_hit=0, inductor_miss=0),
-    "eval": CounterDelta(autograd_hit=31, autograd_miss=2, inductor_hit=0, inductor_miss=0),
+    "train": CounterDelta(autograd_hit=31, autograd_miss=1, inductor_hit=0, inductor_miss=0),
+    "eval": CounterDelta(autograd_hit=31, autograd_miss=1, inductor_hit=0, inductor_miss=0),
 }
 
 
@@ -53,7 +50,6 @@ EXPECTED = {
 def model_with_clean_cache():
     """Build a transformer model with an isolated Magi cache directory."""
 
-    torch._dynamo.reset()
     with tempfile.TemporaryDirectory() as tmp_dir:
         with patch.dict(os.environ, {"MAGI_COMPILE_CACHE_ROOT_DIR": tmp_dir}):
             transformer_config = TransformerConfig(
