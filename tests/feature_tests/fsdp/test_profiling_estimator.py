@@ -705,14 +705,18 @@ def _ce_group_name() -> str:
 
 def _register_shards(shapes, dtype=torch.bfloat16):
     """Register ``shapes`` as real symmetric-memory shards, filled distinctly."""
-    from magi_compiler.symm_mem import alloc_shard, publish
+    import torch.distributed as dist
+
+    from magi_compiler.symm_mem import alloc_shard
 
     shards = []
     for i, shape in enumerate(shapes):
         s = alloc_shard(shape, dtype, torch.device("cuda", 0), _ce_group_name())
         s.fill_(i + 1)
         shards.append(s)
-    publish()
+    # A peer read is only legal once every rank has filled its shard.
+    torch.cuda.synchronize()
+    dist.barrier()
     return shards
 
 

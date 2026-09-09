@@ -14,8 +14,9 @@
 
 """Symmetric-memory windows for copy-engine weight all-gather.
 
-Shards are suballocated from pooled windows; runtime gathers look them up by
-device pointer. Which weights get an allocation is ``bind``'s job.
+A window is a plain addressable region: open one, then read any slot in it by
+``(offset, shape)``. Deciding what goes where -- and keeping that decision
+identical on every rank -- belongs to the caller; for weights that is ``bind``.
 """
 
 from __future__ import annotations
@@ -23,85 +24,73 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-import torch.distributed as dist
-
-from magi_compiler.utils import magi_logger
 
 
 class SymmBuffer:
-    """One symmetric-memory window, suballocated to many weight shards.
+    """One symmetric-memory window, addressed by element offset.
 
-    The driver caps windows at 128 per process regardless of size, so pooling is
-    required. Every rank walks the same plan, so offset ``k`` is the same shard
-    on every peer.
+    The driver caps windows at 128 per process regardless of size, so callers
+    pool many shards into one window. An offset names the same bytes on every
+    rank, which is what makes a peer read meaningful -- so a caller that hands
+    out slots must hand out the same ones on every rank.
     """
 
-    # 256 bf16 elems = 512B, which the copy engine wants for peak throughput.
-    ALIGN = 256
-
-    def __init__(self, dtype: torch.dtype, device: torch.device, group_name: str) -> None:
+    def __init__(
+        self, dtype: torch.dtype, device: torch.device, group_name: str, numel: int, buf: torch.Tensor, handle
+    ) -> None:
+        """Wrap an already-rendezvous'd window.  Callers want ``open``."""
         self.dtype = dtype
         self.device = device
         self.group_name = group_name
-        self.buf: torch.Tensor | None = None
-        self.handle = None
-        self._reserved = 0
-        self._cursor = 0
+        self.numel = numel
+        self.buf = buf
+        self.handle = handle
 
-    def reserve(self, numel: int) -> None:
-        """Book space for one shard.  Call for every member before ``commit``."""
-        self._reserved += self._round(numel)
+    @classmethod
+    def open(cls, dtype: torch.dtype, device: torch.device, group_name: str, numel: int) -> SymmBuffer:
+        """Allocate and rendezvous a window of ``numel`` elements.
 
-    def commit(self) -> None:
-        """Open the window.  One ``rendezvous`` for every shard it will hold."""
+        Collective: every rank must open the same windows in the same order.
+        """
         import torch.distributed._symmetric_memory as symm_mem
 
-        symm_mem.enable_symm_mem_for_group(self.group_name)
-        self.buf = symm_mem.empty(self._reserved, dtype=self.dtype, device=self.device)
-        self.handle = symm_mem.rendezvous(self.buf, self.group_name)
+        symm_mem.enable_symm_mem_for_group(group_name)
+        buf = symm_mem.empty(numel, dtype=dtype, device=device)
+        handle = symm_mem.rendezvous(buf, group_name)
+        return cls(dtype, device, group_name, numel, buf, handle)
 
-    def take(self, shape: torch.Size | tuple[int, ...]) -> torch.Tensor:
-        """Hand out the next slot as a tensor whose storage starts at the slot.
+    def get_tensor(self, offset: int, shape: torch.Size | tuple[int, ...], *, rank: int | None = None) -> torch.Tensor:
+        """The slot at ``offset`` elements in, on ``rank`` (default: this rank).
 
-        Not a slice of ``buf``: Dynamo memoized ``storage_offset == 0`` for these
-        parameters, and a mid-window slice would contradict the shape env.
+        Not a slice of ``buf``: the returned tensor's storage starts at the slot.
+        Dynamo memoized ``storage_offset == 0`` for bound parameters, and a
+        mid-window slice would contradict the shape env.
         """
+        shape = tuple(int(s) for s in shape)
         numel = 1
         for s in shape:
-            numel *= int(s)
-        off = self._cursor
-        self._cursor += self._round(numel)
-        if self._cursor > self._reserved:
+            numel *= s
+        if offset < 0 or offset + numel > self.numel:
             raise RuntimeError(
-                f"symmetric buffer overflow: wanted {self._cursor} elems, reserved {self._reserved}. "
-                "The sizing walk and the dispensing walk must visit the same shards in the same order."
+                f"symmetric window overflow: {shape} at offset {offset} needs {offset + numel} "
+                f"elems of a {self.numel}-elem window"
             )
-        return self.handle.get_buffer(self.handle.rank, tuple(int(s) for s in shape), self.dtype, off)
+        return self.handle.get_buffer(self.handle.rank if rank is None else rank, shape, self.dtype, offset)
 
-    @property
-    def nbytes(self) -> int:
-        return self._reserved * self.dtype.itemsize
-
-    def offset_of(self, t: torch.Tensor) -> int:
-        return (t.data_ptr() - self.buf.data_ptr()) // self.buf.element_size()
-
-    def peer_views(self, t: torch.Tensor) -> list[torch.Tensor]:
-        """``world_size`` views of the same shard, one per rank.
+    def peer_tensors(self, offset: int, shape: torch.Size | tuple[int, ...]) -> list[torch.Tensor]:
+        """``world_size`` views of one slot, one per rank.
 
         They borrow the window mapping; ``self.buf`` keeps it alive.
         """
-        off, shape = self.offset_of(t), tuple(int(s) for s in t.shape)
-        return [self.handle.get_buffer(r, shape, self.dtype, off) for r in range(self.handle.world_size)]
+        return [self.get_tensor(offset, shape, rank=r) for r in range(self.handle.world_size)]
+
+    @property
+    def nbytes(self) -> int:
+        return self.numel * self.dtype.itemsize
 
     def contains(self, t: torch.Tensor) -> bool:
-        if self.buf is None:
-            return False
         base = self.buf.data_ptr()
         return base <= t.data_ptr() < base + self.nbytes
-
-    @classmethod
-    def _round(cls, numel: int) -> int:
-        return (numel + cls.ALIGN - 1) // cls.ALIGN * cls.ALIGN
 
 
 @dataclass(frozen=True)
@@ -124,54 +113,24 @@ class ShardEntry:
 
 _SHARD_REGISTRY: dict[int, ShardEntry] = {}
 _BUFFERS: list[SymmBuffer] = []
-_UNPUBLISHED = False
 
 
-def open_buffer(dtype: torch.dtype, device: torch.device, group_name: str, numels) -> SymmBuffer:
-    """Open one window big enough for ``numels``, and track it for ``publish``."""
-    global _UNPUBLISHED
-    buffer = SymmBuffer(dtype, device, group_name)
-    for numel in numels:
-        buffer.reserve(int(numel))
-    buffer.commit()
+def open_buffer(dtype: torch.dtype, device: torch.device, group_name: str, numel: int) -> SymmBuffer:
+    """Open one window of ``numel`` elements, and keep it alive for the process.
+
+    Whoever writes the window owes its peers a barrier before they read it; that
+    is the writer's business, not the registry's.
+    """
+    buffer = SymmBuffer.open(dtype, device, group_name, numel)
     _BUFFERS.append(buffer)
-    _UNPUBLISHED = True
     return buffer
 
 
-def register_shard(local: torch.Tensor, buffer: SymmBuffer) -> ShardEntry:
+def register_shard(local: torch.Tensor, buffer: SymmBuffer, offset: int) -> ShardEntry:
     """Record a slot so the run-time gather can find its peer views."""
-    entry = ShardEntry(buffer=buffer, offset=buffer.offset_of(local), local=local, peer_views=tuple(buffer.peer_views(local)))
+    entry = ShardEntry(buffer=buffer, offset=offset, local=local, peer_views=tuple(buffer.peer_tensors(offset, local.shape)))
     _SHARD_REGISTRY[local.data_ptr()] = entry
     return entry
-
-
-def alloc_shard(shape, dtype: torch.dtype, device: torch.device, group_name: str) -> torch.Tensor:
-    """One shard in a window of its own. Tests and the cost model only -- binding a whole model must pool."""
-    shape = tuple(int(s) for s in shape)
-    numel = 1
-    for s in shape:
-        numel *= s
-
-    buffer = open_buffer(dtype, device, group_name, (numel,))
-    shard = buffer.take(shape)
-    register_shard(shard, buffer)
-    return shard
-
-
-def group_name_of(t) -> str:
-    """The process group a sharded parameter must rendezvous on.
-
-    Never defaulted to WORLD: dense and expert weights may sit on different meshes.
-    """
-    mesh = getattr(t, "device_mesh", None)
-    names = getattr(mesh, "_dim_group_names", None) if mesh is not None else None
-    if not names:
-        raise RuntimeError(
-            f"cannot resolve the process group of {type(t).__name__} (device_mesh={mesh!r}); "
-            "copy-engine binding needs the mesh dim the weight is sharded over"
-        )
-    return names[0]
 
 
 def lookup_shard(data_ptr: int) -> ShardEntry | None:
@@ -192,26 +151,20 @@ def find_shard_by_layout(shape, dtype: torch.dtype) -> torch.Tensor | None:
     return None
 
 
-def publish() -> None:
-    """Barrier so every rank has copied its shards in before any peer reads.
-
-    Once per bind, not per step: the weights never change again.
-    """
-    global _UNPUBLISHED
-    if not _UNPUBLISHED:
-        return
-    if dist.is_available() and dist.is_initialized():
-        torch.cuda.synchronize()
-        dist.barrier()
-    _UNPUBLISHED = False
-    magi_logger.info(
-        "SymmBuffer: published %d shard(s), %.1f MiB total", len(_BUFFERS), sum(b.nbytes for b in _BUFFERS) / 2**20
-    )
-
-
 def reset_registry() -> None:
     """Drop every window and shard.  Tests only -- frees the symmetric allocations."""
-    global _UNPUBLISHED
     _SHARD_REGISTRY.clear()
     _BUFFERS.clear()
-    _UNPUBLISHED = False
+
+
+def alloc_shard(shape, dtype: torch.dtype, device: torch.device, group_name: str) -> torch.Tensor:
+    """One shard in a window of its own. Tests and the cost model only -- binding a whole model must pool."""
+    shape = tuple(int(s) for s in shape)
+    numel = 1
+    for s in shape:
+        numel *= s
+
+    buffer = open_buffer(dtype, device, group_name, numel)
+    shard = buffer.get_tensor(0, shape)
+    register_shard(shard, buffer, 0)
+    return shard

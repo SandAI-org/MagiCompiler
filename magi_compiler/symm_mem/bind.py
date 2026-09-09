@@ -30,7 +30,7 @@ import torch.fx as fx
 
 from magi_compiler.utils import magi_logger
 
-from .symm_buffer import group_name_of, lookup_shard, open_buffer, publish, register_shard
+from .symm_buffer import lookup_shard, open_buffer, register_shard
 
 _AGREEMENT_GROUP: tuple[Any, Any] = (None, None)
 """``(the default process group it was built for, the gloo group)``."""
@@ -73,7 +73,6 @@ def bind_graph_weights(
         return set()
 
     allocated = _move(plan)
-    publish()
 
     served = {c.gather for c in plan if c.gather is not None}
     magi_logger.info(
@@ -108,7 +107,6 @@ def bind_parameters(params: Iterable[Any], min_shard_bytes: int = 0) -> int:
         return 0
 
     _move(plan)
-    publish()
     return len(plan)
 
 
@@ -183,6 +181,21 @@ def _unbindable(param: Any, min_shard_bytes: int) -> str | None:
     return None
 
 
+def group_name_of(t) -> str:
+    """The process group a sharded parameter must rendezvous on.
+
+    Never defaulted to WORLD: dense and expert weights may sit on different meshes.
+    """
+    mesh = getattr(t, "device_mesh", None)
+    names = getattr(mesh, "_dim_group_names", None) if mesh is not None else None
+    if not names:
+        raise RuntimeError(
+            f"cannot resolve the process group of {type(t).__name__} (device_mesh={mesh!r}); "
+            "copy-engine binding needs the mesh dim the weight is sharded over"
+        )
+    return names[0]
+
+
 _WINDOW_BYTES = 4 << 30
 """Cap on one symmetric window (4 GiB).
 
@@ -224,8 +237,36 @@ def _windows(plan: list[BindCandidate]) -> list[list[BindCandidate]]:
     return windows
 
 
+_ALIGN_BYTES = 512
+"""Every shard starts on a multiple of this many bytes.
+
+512B is what the copy engine wants for peak throughput. It is a property of the
+transport, not of the window, so it belongs here with the rest of the layout
+decision.
+"""
+
+
+def _layout(members: list[BindCandidate]) -> tuple[list[int], int]:
+    """Each shard's element offset within its window, and the window's numel.
+
+    Offsets and total come out of the same walk, so the window cannot disagree
+    with what is dispensed from it. Ranks agree on the layout because they agree
+    on the plan (``_agree_across_ranks``), which is what makes offset ``k`` the
+    same shard on every peer.
+    """
+    # Offsets are element counts, and one window holds one dtype, so the byte
+    # alignment is a fixed stride for the whole window.
+    align = _ALIGN_BYTES // members[0].local.element_size()
+    offsets: list[int] = []
+    total = 0
+    for c in members:
+        offsets.append(total)
+        total += (c.local.numel() + align - 1) // align * align
+    return offsets, total
+
+
 def _move(plan: list[BindCandidate]) -> int:
-    """Allocate, fill and repoint every shard. Returns the new allocation count.
+    """Allocate, fill, repoint and publish every shard. Returns the new allocation count.
 
     Symmetric memory cannot reuse the caching allocator's blocks, so each window
     ends with ``empty_cache``. An allocation failure is fatal: ranks have already
@@ -235,8 +276,9 @@ def _move(plan: list[BindCandidate]) -> int:
     allocated = 0
     for i, members in enumerate(windows):
         head = members[0]
+        offsets, window_numel = _layout(members)
         try:
-            buffer = open_buffer(head.local.dtype, head.local.device, head.group_name, (c.local.numel() for c in members))
+            buffer = open_buffer(head.local.dtype, head.local.device, head.group_name, window_numel)
         except RuntimeError:
             free, total = torch.cuda.mem_get_info()
             magi_logger.error(
@@ -255,15 +297,19 @@ def _move(plan: list[BindCandidate]) -> int:
             )
             raise
 
-        for c in members:
-            symm = buffer.take(c.local.shape)
+        for c, offset in zip(members, offsets):
+            symm = buffer.get_tensor(offset, c.local.shape)
             symm.copy_(c.local)
-            register_shard(symm, buffer)
+            register_shard(symm, buffer, offset)
             # In place: Dynamo already guarded these exact objects.
             c.local.data = symm
             allocated += 1
 
         torch.cuda.empty_cache()
+
+    if dist.is_available() and dist.is_initialized():
+        torch.cuda.synchronize()
+        dist.barrier()
     return allocated
 
 
