@@ -43,19 +43,26 @@ _WAIT = torch.ops._c10d_functional.wait_tensor.default
 def _build_ag_graph(specs, world=2, group="grp0"):
     """Build an fx graph of independent weight all-gathers.
 
-    ``specs``: list of dicts, each ``{shape, dtype, compute_before?}``.  For each spec
-    we emit  weight_shard placeholder -> all_gather_into_tensor (tagged
+    ``specs``: list of dicts, each ``{shape, dtype, compute_before?, local_shape?}``.
+    For each spec we emit  weight_shard placeholder -> all_gather_into_tensor (tagged
     magi_fsdp_weight_ag) -> wait_tensor.  A spec with ``compute_before`` inserts an
     opaque compute op (aten.relu here) between gathers, which must NOT break the
     bucket (whole-graph bucketing has no region boundaries).  ALL placeholders are
     declared first (as in a real traced graph) so the hoisted coalesced launch stays
     topologically valid.
+
+    ``shape`` is the chunk every rank agrees on, so the gathered output is
+    ``chunk * world`` rows.  ``local_shape`` overrides only the placeholder, which is
+    how a trailing rank of an uneven ``Shard(0)`` looks: fewer rows locally, same
+    gathered size.  That is the one thing a bucketing decision must not depend on.
     """
+    from magi_compiler.passes.fsdp_overlap.node_meta import mark_weight_ag
+
     g = fx.Graph()
     locs = []
     for i, s in enumerate(specs):
         loc = g.placeholder(f"w{i}_weight_shard")
-        loc.meta["example_value"] = torch.empty(*s["shape"], dtype=s["dtype"], device="meta")
+        loc.meta["example_value"] = torch.empty(*s.get("local_shape", s["shape"]), dtype=s["dtype"], device="meta")
         locs.append(loc)
 
     outs = []
@@ -70,7 +77,7 @@ def _build_ag_graph(specs, world=2, group="grp0"):
         gathered = torch.empty(chunk * world, *rest, dtype=s["dtype"], device="meta")
         ag = g.call_function(_AG, (loc, world, group))
         ag.meta["example_value"] = gathered
-        ag.meta["magi_fsdp_weight_ag"] = True
+        mark_weight_ag(ag, uneven=False)
         w = g.call_function(_WAIT, (ag,))
         w.meta["example_value"] = gathered
         outs.append(w)
@@ -143,6 +150,38 @@ def test_bucket_size_bytes_caps_run():
     n2 = bucket_weight_all_gather_coalesced(gm2, bucket_size_bytes=128)
     assert n2 == 2
     assert _n(gm2, _AG_COALESCED) == 2
+
+
+def _bucket_sizes(gm) -> list[int]:
+    return [len(n.args[0]) for n in gm.graph.nodes if n.op == "call_function" and n.target is _AG_COALESCED]
+
+
+def test_bucket_cap_does_not_depend_on_the_local_shard_length():
+    """Where the byte cap cuts a bucket must be the same on every rank, and it must not
+    take a pad to make that true.
+
+    A rank that fits an extra member submits a coalesced launch with a membership its
+    peers never submit, and the collective never completes.  Graphs from this repo's
+    lowering are safe either way, because an uneven ``Shard(0)`` is padded back up to
+    ``chunk`` before the gather -- but ``_gathers_a_weight`` also matches gathers that
+    were never lowered here and have no pad, so the accounting is taken from the
+    gathered size instead of the input's.
+
+    4 gathers, 64 B per rank each (8x8 bf16 gathered over world=2); a 144 B cap fits
+    two of them and not three.  In the ``tail`` graph this rank owns 1 row instead of
+    4 for the second weight, with no pad to hide it, and must still cut in the same
+    place.
+    """
+    even = [{"shape": (4, 8), "dtype": torch.bfloat16} for _ in range(4)]
+    tail = [dict(s) for s in even]
+    tail[1]["local_shape"] = (1, 8)
+
+    gm_even, gm_tail = _build_ag_graph(even), _build_ag_graph(tail)
+    n_even = bucket_weight_all_gather_coalesced(gm_even, bucket_size_bytes=144)
+    n_tail = bucket_weight_all_gather_coalesced(gm_tail, bucket_size_bytes=144)
+
+    assert (n_even, n_tail) == (2, 2)
+    assert _bucket_sizes(gm_even) == _bucket_sizes(gm_tail) == [2, 2]
 
 
 def test_compute_between_gathers_does_not_break_bucket():

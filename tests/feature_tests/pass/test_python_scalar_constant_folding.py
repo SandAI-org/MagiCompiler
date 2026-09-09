@@ -107,9 +107,9 @@ def test_recaptured_negated_float_constant_is_folded_before_split(monkeypatch):
     split_calls: list[torch.fx.GraphModule] = []
     original_split = magi_backend_module.MagiBackend._split_graph
 
-    def capture_split(self, graph):
+    def capture_split(self, graph, example_inputs):
         split_calls.append(graph)
-        return original_split(self, graph)
+        return original_split(self, graph, example_inputs)
 
     monkeypatch.setattr(magi_backend_module.MagiBackend, "_split_graph", capture_split)
 

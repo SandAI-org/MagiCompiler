@@ -14,12 +14,15 @@
 
 from __future__ import annotations
 
+import inspect
 import math
 
 import torch
 import torch.fx as fx
 
 from magi_compiler.utils import magi_logger
+
+from .node_meta import mark_weight_ag
 
 # The functional collectives we lower a SimpleFSDP weight gather into.
 _ALL_GATHER = torch.ops._c10d_functional.all_gather_into_tensor.default
@@ -31,6 +34,32 @@ _TO_COPY = torch.ops.aten._to_copy.default
 
 def _is_prim(node: fx.Node, name: str) -> bool:
     return node.op == "call_function" and getattr(node.target, "__name__", None) == name
+
+
+def _is_redistribute(node: fx.Node) -> bool:
+    """A SimpleFSDP ``param.redistribute(...)``, in either shape Dynamo emits for it.
+
+    Through torch 2.9 the non-proxyable arguments were captured in an on-the-fly
+    function named ``prim_redistribute``; from 2.12 Dynamo traces the method call
+    itself and the placements and dtypes ride along in ``kwargs``.  Matching only
+    the older shape leaves the newer graph silently un-lowered: no marked gather,
+    so the copy-engine rewrite and the bucketing find nothing to work with.
+    """
+    return _is_prim(node, "prim_redistribute") or (node.op == "call_method" and node.target == "redistribute")
+
+
+def _is_to_local(node: fx.Node) -> bool:
+    return _is_prim(node, "prim_to_local") or (node.op == "call_method" and node.target == "to_local")
+
+
+def _forward_dtype(node: fx.Node):
+    """The dtype SimpleFSDP casts the shard to before gathering it, or None."""
+    if node.op == "call_method":
+        return node.kwargs.get("forward_dtype")
+    try:
+        return inspect.getclosurevars(node.target).nonlocals.get("kwargs_as_value", {}).get("forward_dtype")
+    except Exception:  # noqa: BLE001 - a prim without the expected closure is simply unannotated
+        return None
 
 
 def _input_is_weight(node: fx.Node) -> bool:
@@ -49,10 +78,10 @@ def _dtensor_meta(node: fx.Node):
 
 
 def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
-    """Rewrite SimpleFSDP weight ``prim_redistribute`` + ``prim_to_local`` pairs
-    into explicit functional collectives, so the launch and the wait become two
-    distinct FX nodes that a later graph-split pass can place in *different*
-    submods (enabling cross-boundary overlap with the MoE op).
+    """Rewrite SimpleFSDP weight redistribute + to_local pairs into explicit
+    functional collectives, so the launch and the wait become two distinct FX
+    nodes that a later graph-split pass can place in *different* submods
+    (enabling cross-boundary overlap with the MoE op).
 
     For one ``Shard(0)`` weight (full dim0 ``F``, world ``W``, local shard the
     input placeholder's ``_local_tensor``), this emits the exact sequence Inductor
@@ -74,13 +103,13 @@ def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
     skipped = 0
 
     for node in list(graph.graph.nodes):
-        if not _is_prim(node, "prim_redistribute"):
+        if not _is_redistribute(node):
             continue
         if not _input_is_weight(node):
             continue
 
-        # prim_to_local consumer (the node whose output the rest of the graph uses).
-        to_local = next((u for u in node.users if _is_prim(u, "prim_to_local")), None)
+        # to_local consumer (the node whose output the rest of the graph uses).
+        to_local = next((u for u in node.users if _is_to_local(u)), None)
         if to_local is None:
             skipped += 1
             continue
@@ -115,13 +144,7 @@ def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
         chunk = math.ceil(F / world)
 
         # forward_dtype: cast the local shard before the gather (matches torchtitan).
-        fwd_dtype = None
-        try:
-            import inspect
-
-            fwd_dtype = inspect.getclosurevars(node.target).nonlocals.get("kwargs_as_value", {}).get("forward_dtype")
-        except Exception:
-            fwd_dtype = None
+        fwd_dtype = _forward_dtype(node)
 
         with graph.graph.inserting_before(node):
             # The weight placeholder is still a Shard(0) DTensor; the functional
@@ -152,9 +175,7 @@ def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
 
             ag = graph.graph.call_function(_ALL_GATHER, (cur, world, group_name))
             ag.meta["example_value"] = local.new_empty((world * chunk, *local.shape[1:]), dtype=cur_dtype)
-            # Mark as a SimpleFSDP weight gather so the per-submod bucketing pass
-            # can coalesce these into a single all_gather_into_tensor_coalesced.
-            ag.meta["magi_fsdp_weight_ag"] = True
+            mark_weight_ag(ag, uneven=world * chunk != F)
 
             wait = graph.graph.call_function(_WAIT, (ag,))
             wait.meta["example_value"] = local.new_empty((world * chunk, *local.shape[1:]), dtype=cur_dtype)
@@ -176,8 +197,6 @@ def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
         graph.graph.lint()
         graph.recompile()
     magi_logger.info(
-        "FSDP redistribute lowering: lowered %d weight prim_redistribute -> explicit collectives (skipped %d)",
-        lowered,
-        skipped,
+        "FSDP redistribute lowering: lowered %d weight redistribute -> explicit collectives (skipped %d)", lowered, skipped
     )
     return lowered

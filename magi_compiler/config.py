@@ -256,12 +256,27 @@ class FSDPConfig(BaseModel):
         ),
     )
     comm_overlap_window_scale: float = Field(
-        1.5,
+        1.0,
         ge=1.0,
         description=(
             "Multiplier on each collective's estimated runtime when sizing its compute window "
             "(need = comm * scale + margin): collectives are measured in isolation but run concurrent "
             "with the compute that hides them (~1.4-1.5x slower in-situ on 8xH100)."
+        ),
+    )
+    transport: Literal["nccl", "copy_engine"] = Field(
+        "nccl",
+        description=(
+            "Weight all-gather path. 'nccl': SM kernels. 'copy_engine': bind weights into "
+            "symmetric memory and gather with peer copy-engine reads (0 SM, no per-step barrier). "
+            "Needs NVLink on the FSDP mesh dim and static weights; unbound weights stay on NCCL."
+        ),
+    )
+    symm_min_shard_mib: int = Field(
+        0,
+        ge=0,
+        description=(
+            "Minimum local-shard MiB to bind for copy_engine. Smaller shards stay on NCCL. " "0 = bind every eligible weight."
         ),
     )
 

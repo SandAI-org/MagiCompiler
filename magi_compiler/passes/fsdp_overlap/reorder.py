@@ -28,9 +28,13 @@ Not enough upstream compute -> as-early-as-legal (never worse than raise_comms).
 Algorithm: two-pointer back-to-front sweep.  Gathers are visited in reverse
 program order; a single compute pointer walks backward continuously and is never
 reset, so each gather claims a disjoint run of compute (serializing the single
-NCCL stream) and targets only decrease.  All moves are applied in one stable-sort
-rebuild and validated once (``_validate_full``) -- the Inductor driver does NOT
-repair the returned order, so it must be a valid topological order.
+transfer stream) and targets only decrease.  Compute is claimed a whole node at a
+time, so the gather that stops in front of a long kernel leaves most of it unused;
+that remainder carries to the next gather instead of being discarded, which is
+what keeps a 95us collective from spending a 33ms attention.  All moves are
+applied in one stable-sort rebuild and validated once (``_validate_full``) -- the
+Inductor driver does NOT repair the returned order, so it must be a valid
+topological order.
 
 Handles both lowering forms: plain all_gather (1 launch / 1 wait) and coalesced
 (1 packed launch + N MultiOutput members moved together as one block + N waits).
@@ -51,7 +55,21 @@ from magi_compiler.utils import magi_logger
 
 _AG = torch.ops._c10d_functional.all_gather_into_tensor.default
 _AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
-_WEIGHT_AG_OPS = (_AG, _AG_COALESCED)
+
+
+def _ce_ag_ops():
+    """Copy-engine gather ops, imported lazily so this pass stays importable
+    without a CUDA build."""
+    try:
+        from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER, CE_ALL_GATHER_COALESCED
+
+        return tuple(op for op in (CE_ALL_GATHER, CE_ALL_GATHER_COALESCED) if op is not None)
+    except Exception:  # noqa: BLE001
+        return ()
+
+
+_CE_AG_OPS = _ce_ag_ops()
+_WEIGHT_AG_OPS = tuple(op for op in (_AG, _AG_COALESCED, *_CE_AG_OPS) if op is not None)
 
 # Default extra headroom (ns) added to each collective's runtime when sizing the
 # compute window, absorbing estimator error + kernel-launch latency so the wait
@@ -59,17 +77,41 @@ _WEIGHT_AG_OPS = (_AG, _AG_COALESCED)
 _DEFAULT_WINDOW_MARGIN_NS = 5_000.0
 
 
+def _is_ce_ag_ir(node) -> bool:
+    """
+    ``magi::ce_all_gather`` lowers to an ordinary FallbackKernel, so
+    Inductor's ``is_collective`` does not recognize it.
+    """
+    return getattr(node, "op_overload", None) in _CE_AG_OPS
+
+
+def _is_ce_ag_coalesced(node) -> bool:
+    try:
+        from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER_COALESCED
+    except Exception:  # noqa: BLE001
+        return False
+    return CE_ALL_GATHER_COALESCED is not None and getattr(node, "op_overload", None) is CE_ALL_GATHER_COALESCED
+
+
+def _is_gather_ir(node) -> bool:
+    return node is not None and (is_collective(node) or _is_ce_ag_ir(node))
+
+
 def _leaf_collective_node(snode: BaseSchedulerNode):
     """The underlying collective IR node for a (possibly grouped) snode, or None."""
     node = getattr(snode, "node", None)
-    if node is not None and is_collective(node):
+    if _is_gather_ir(node):
         return node
     # GroupedSchedulerNode: find the collective child.
     for child in getattr(snode, "snodes", []) or []:
         cn = getattr(child, "node", None)
-        if cn is not None and is_collective(cn):
+        if _is_gather_ir(cn):
             return cn
     return None
+
+
+def _issues_transfer(snode: BaseSchedulerNode) -> bool:
+    return contains_collective(snode) or _leaf_collective_node(snode) is not None
 
 
 def _is_weight_gather(snode: BaseSchedulerNode) -> bool:
@@ -107,12 +149,13 @@ def _collective_kind_key(snode: BaseSchedulerNode) -> tuple:
 
 def _collective_skeleton(order: list[BaseSchedulerNode]) -> tuple[list[int], list[tuple]]:
     """The graph's collective skeleton: indices (ascending) and rank-comparable
-    kinds of every snode that ISSUES NCCL -- functional collectives plus custom ops
-    with an internal collective . This sequence is what must stay rank-identical;
-    the compute between two consecutive entries is rank-private."""
+    kinds of every snode that issues a transfer -- functional NCCL collectives,
+    custom ops with an internal collective, and copy-engine / symmetric-memory
+    gathers.  This sequence is what must stay rank-identical; the compute
+    between two consecutive entries is rank-private."""
     from magi_compiler.profiling.runtime_estimator import snode_issues_collective
 
-    idx = [i for i, s in enumerate(order) if snode_issues_collective(s)]
+    idx = [i for i, s in enumerate(order) if snode_issues_collective(s) or _issues_transfer(s)]
     return idx, [_collective_kind_key(order[i]) for i in idx]
 
 
@@ -212,7 +255,7 @@ class FsdpOverlapReorder:
 
     @staticmethod
     def _is_compute(snode: BaseSchedulerNode) -> bool:
-        return not contains_collective(snode) and not contains_wait(snode)
+        return not _issues_transfer(snode) and not contains_wait(snode)
 
     # -- main -------------------------------------------------------------
     def __call__(self, snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
@@ -247,7 +290,7 @@ class FsdpOverlapReorder:
         if hasattr(self._cost_fn, "warm_and_sync") and getattr(self._cost_fn, "_sync_across_ranks", False):
             try:
                 for s in order:
-                    if self._is_compute(s) or contains_collective(s):
+                    if self._is_compute(s) or _issues_transfer(s):
                         self._cost(s)
                 n_changed = self._cost_fn.warm_and_sync()
                 self._cost_cache = {}  # re-read synced costs
@@ -279,25 +322,25 @@ class FsdpOverlapReorder:
 
         targets: dict = {}  # launch -> target index (in original order space)
         compute_idx = len(order)  # scan compute strictly below this
+        carry = 0.0  # runtime the previous gather left unspent in its boundary node
         for launch, group, fc_idx, comm_runtime, lower in reversed(plans):
             cur = index_of[launch]
             # Start just before the launch, but no later than where the previous
             # (later) gather already consumed compute down to.
             compute_idx = min(compute_idx, cur)
             need = comm_runtime * self.comm_overlap_window_scale + self.comm_overlap_window_margin_ns
-            acc = 0.0
+            acc = carry_in = carry
             t = compute_idx
-            while t > lower:
+            while acc < need and t > lower:
                 s = order[t - 1]
                 if self._is_compute(s):
                     acc += self._cost(s)
                 t -= 1
-                if acc >= need:
-                    break
             # target == cur means no upstream compute left (graph head or previous
             # gather claimed it); target >= lower keeps real producers before it.
             target = max(lower, t)
             targets[launch] = (target, group)
+            carry = max(0.0, acc - need)
             compute_idx = target  # next (earlier) gather resumes from actual placement
             # Per-gather placement decision, the record that answers "why didn't
             # this gather move earlier":
@@ -306,18 +349,24 @@ class FsdpOverlapReorder:
             #   lower     = earliest LEGAL index (real-dep floor) it could move to
             #   fc_idx    = first real consumer (the wait's user)
             #   comm      = the gather's runtime it needs to hide
-            #   acc_upstream = compute actually found in [target, cur] to hide it
+            #   carry_in  = capacity inherited from the later gather's boundary node
+            #               (target==cur with a large carry_in means it was already
+            #               covered and did not have to move at all)
+            #   acc_upstream = carry_in plus the compute found in [target, cur]
             #   verdict   = hidden (acc>=need) | COMPUTE-LIMITED (ran out of upstream
             #               compute before covering comm -- i.e. hit `lower` or the
             #               previous gather's placement first)
             magi_logger.debug(
-                "FSDP overlap placement: launch cur=%d -> target=%d fc=%d lower=%d | "
-                "comm=%.1fus acc_upstream=%.1fus need=%.1fus %s",
+                "FSDP overlap placement: launch %s(%s) cur=%d -> target=%d fc=%d lower=%d | "
+                "comm=%.1fus carry_in=%.1fus acc_upstream=%.1fus need=%.1fus %s",
+                launch.get_name(),
+                getattr(_leaf_collective_node(launch), "op_overload", "?"),
                 cur,
                 target,
                 fc_idx,
                 lower,
                 comm_runtime / 1e3,
+                carry_in / 1e3,
                 acc / 1e3,
                 need / 1e3,
                 "hidden" if acc >= need else "COMPUTE-LIMITED",
@@ -476,7 +525,7 @@ class FsdpOverlapReorder:
             target, group = targets[launch]
             slot_lo = max(lowers[launch], skel_idx[q - 1] + 1 if q > 0 else 0)
             slot_hi = skel_idx[q] if q < len(skel_idx) else index_of[launch]
-            new_target = min(max(target, slot_lo), slot_hi)
+            new_target = min(max(target, slot_lo), max(slot_hi, slot_lo))
             targets[launch] = (new_target, group)
             magi_logger.debug(
                 "FSDP overlap slot consensus: launch cur=%d slot=%d/%d (mine=%s) target %d -> %d [%d, %d]",
@@ -500,27 +549,48 @@ class FsdpOverlapReorder:
         """
         group = [launch]
         node = _leaf_collective_node(launch)
-        if node is not None and getattr(node, "op_overload", None) is _AG_COALESCED:
-            produced = set(launch.get_buffer_names())
+        produced = set(launch.get_buffer_names())
+        if node is not None and (getattr(node, "op_overload", None) is _AG_COALESCED or _is_ce_ag_coalesced(node)):
             for s in order:
                 if _is_multi_output(s) and any((not _is_fake_dep(d)) and d.name in produced for d in s.unmet_dependencies):
+                    group.append(s)
+            if _is_ce_ag_coalesced(node):
+                for s in order:
+                    if s is launch or s in group or contains_wait(s) or not self._is_transparent(s):
+                        continue
+                    deps = [d for d in s.unmet_dependencies if not _is_fake_dep(d)]
+                    if deps and all(d.name in produced for d in deps):
+                        group.append(s)
+        elif _is_ce_ag_ir(node):
+            for s in order:
+                if s is launch or contains_wait(s) or not self._is_transparent(s):
+                    continue
+                deps = [d for d in s.unmet_dependencies if not _is_fake_dep(d)]
+                if deps and all(d.name in produced for d in deps):
                     group.append(s)
         return group
 
     # -- consumer discovery ----------------------------------------------
     def _wait_snodes(self, group, order, users) -> list[BaseSchedulerNode]:
-        produced: set[str] = set()
-        for s in group:
-            produced |= set(s.get_buffer_names())
-        waits = []
-        seen = set()
-        for b in produced:
-            for u in users.get(b, ()):  # readers of the launch/member buffers
+        """The waits guarding this launch, reached through any alias layer.
+
+        Searching only the launch's direct readers was enough while every gather
+        was an Inductor collective; a custom-op gather puts an alias snode between
+        the launch and its wait, and missing the wait silently drops the gather
+        from the placement plan altogether.
+        """
+        stack = [b for s in group for b in s.get_buffer_names()]
+        waits: list[BaseSchedulerNode] = []
+        seen: set = set()
+        while stack:
+            for u in users.get(stack.pop(), ()):
                 if u in seen:
                     continue
                 seen.add(u)
                 if contains_wait(u):
                     waits.append(u)
+                elif self._is_transparent(u):
+                    stack.extend(u.get_buffer_names())
         return waits
 
     def _first_consumer_index(self, launch, group, order, users) -> int | None:

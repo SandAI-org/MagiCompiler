@@ -22,6 +22,8 @@ import torch.fx as fx
 
 from magi_compiler.utils import magi_logger
 
+from .node_meta import is_ce_bound, is_uneven_shard, is_weight_ag, mark_ce_bound, mark_weight_ag
+
 _ALL_GATHER = torch.ops._c10d_functional.all_gather_into_tensor.default
 _ALL_GATHER_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
 _WAIT = torch.ops._c10d_functional.wait_tensor.default
@@ -64,19 +66,18 @@ def _is_weight_all_gather(node: fx.Node) -> bool:
     """A SimpleFSDP weight ``all_gather_into_tensor`` launch."""
     if node.op != "call_function" or node.target is not _ALL_GATHER:
         return False
-    if node.meta.get("magi_fsdp_weight_ag"):
+    if is_weight_ag(node):
         return True
     return _gathers_a_weight(node)
 
 
 def _local_shard_bytes(ag: fx.Node) -> int:
-    """Bytes of the local (pre-gather) shard feeding a weight all_gather -- i.e. how
-    much this rank contributes to the collective.  Used to cap coalesced bucket size."""
-    loc = ag.args[0]
-    m = loc.meta.get("example_value")
+    """Bytes one rank contributes to a weight all_gather"""
+    m = ag.meta.get("example_value")
     if m is None:
         return 0
-    return int(m.numel()) * int(m.element_size())
+    _loc, world, _group = ag.args
+    return int(m.numel()) * int(m.element_size()) // int(world)
 
 
 def _split_by_dtype_and_size(
@@ -157,8 +158,9 @@ def _coalesce_one_bucket(graph: fx.GraphModule, node_index: dict[fx.Node, int], 
     with graph.graph.inserting_before(first_ag):
         coalesced = graph.graph.call_function(_ALL_GATHER_COALESCED, (list(locals_), world, group_name))
         coalesced.meta["example_value"] = list(ag_metas)
-        coalesced.meta["magi_fsdp_weight_ag"] = True
-        coalesced.meta["magi_fsdp_weight_ag_coalesced"] = True
+        mark_weight_ag(coalesced, uneven=any(is_uneven_shard(ag) for ag in ag_nodes))
+        if all(is_ce_bound(ag) for ag in ag_nodes):
+            mark_ce_bound(coalesced)
 
         outs = []
         for i, am in enumerate(ag_metas):
@@ -177,7 +179,7 @@ def _coalesce_one_bucket(graph: fx.GraphModule, node_index: dict[fx.Node, int], 
         graph.graph.erase_node(ag_old)
 
 
-def bucket_weight_all_gather_coalesced(graph: fx.GraphModule, bucket_size_bytes: int = 0) -> int:
+def bucket_weight_all_gather_coalesced(graph: fx.GraphModule, bucket_size_bytes: int = 0, split_by=None) -> int:
     """Coalesce the SimpleFSDP weight all-gathers over the WHOLE graph: per process
     group, walk them in program order and cut a new bucket at every dtype change or
     when the accumulated local-shard bytes would exceed ``bucket_size_bytes``
@@ -193,22 +195,26 @@ def bucket_weight_all_gather_coalesced(graph: fx.GraphModule, bucket_size_bytes:
     are re-pointed from each old wait to ``wait_i``; the launch + getitems stay
     together so ``FsdpOverlapReorder`` later moves them as one unit.
 
+    ``split_by(node)`` adds a second bucket key, used in copy-engine mode to keep
+    bound and unbound gathers apart -- a bucket is one submission, so it cannot span
+    two transports.
+
     Runs after redistribute lowering (via ``lower_and_bucket_full_graph``).
     Returns the number of coalesced buckets created.
     """
     node_index = {n: i for i, n in enumerate(graph.graph.nodes)}
 
-    # Key by group_name only; dtype breaks buckets positionally inside
-    # _split_by_dtype_and_size (strict program-adjacency).
-    groups: dict[str, list[fx.Node]] = defaultdict(list)
+    # Key by (group_name, transport class); dtype breaks buckets positionally
+    # inside _split_by_dtype_and_size (strict program-adjacency).
+    groups: dict[tuple, list[fx.Node]] = defaultdict(list)
     for node in graph.graph.nodes:
         if not _is_weight_all_gather(node):
             continue
         _, _world, group_name = node.args
-        groups[group_name].append(node)
+        groups[(group_name, split_by(node) if split_by is not None else None)].append(node)
 
     buckets = 0
-    for group_name, ag_nodes in groups.items():
+    for ag_nodes in groups.values():
         for sub in _split_by_dtype_and_size(ag_nodes, node_index, bucket_size_bytes):
             if len(sub) < 2:
                 continue  # single weight -> keep its own all_gather (nothing to coalesce)

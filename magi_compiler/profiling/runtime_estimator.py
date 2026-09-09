@@ -45,7 +45,7 @@ Triton stays analytical while free symbols exist.
 """
 
 import dataclasses
-from typing import Any
+from typing import Any, Optional
 
 import torch
 from torch._inductor.runtime.benchmarking import benchmarker
@@ -90,21 +90,81 @@ class ProfileEntry:
     reuse_count: int = 0  # how many later snodes reused this entry
 
 
+def _fx_node_of(node) -> Optional[torch.fx.Node]:
+    """The fx node an IR node was lowered from.
+
+    ``origin_node`` is left unset by several ExternKernel subclasses -- notably
+    ``UserDefinedTritonKernel``, whose lowering builds it with positional args
+    only.  ``ExternKernel.__init__`` always records the node being lowered as
+    ``fx_node``, so fall back to that; without it every user-defined Triton
+    kernel is unreplayable and silently costs 0.
+    """
+    if node is None:
+        return None
+    origin = node.get_origin_node() if hasattr(node, "get_origin_node") else None
+    if origin is not None:
+        return origin
+    fx_node = getattr(node, "fx_node", None)
+    return fx_node if isinstance(fx_node, torch.fx.Node) else None
+
+
+def _iter_tensor_metas(value):
+    """Every FakeTensor meta reachable from an fx arg, recursing into containers.
+
+    The user-defined Triton HOP passes its tensors inside a nested ``kwargs``
+    dict, so a flat scan over ``args``/``kwargs`` sees no shapes at all.
+    """
+    if isinstance(value, torch.fx.Node):
+        ev = value.meta.get("val")
+        if isinstance(ev, torch.Tensor):
+            yield ev
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_tensor_metas(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_tensor_metas(item)
+
+
+def _fx_target_name(fx_node: Optional[torch.fx.Node], node) -> str:
+    """Op identity string.  All user-defined Triton kernels share one HOP target,
+    so qualify it with the kernel's own name -- otherwise hundreds of distinct
+    kernels collapse onto a single cache entry."""
+    if fx_node is None:
+        return type(node).__name__ if node is not None else "?"
+    target = str(fx_node.target)
+    kernel_name = _triton_kernel_name(fx_node)
+    return f"{target}:{kernel_name}" if kernel_name else target
+
+
+def _triton_kernel_name(fx_node: torch.fx.Node) -> Optional[str]:
+    """Name of the user-defined Triton kernel this node launches, if any."""
+    kernel_idx = (fx_node.kwargs or {}).get("kernel_idx")
+    if not isinstance(kernel_idx, int):
+        return None
+    try:
+        from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
+
+        kernel = kernel_side_table.get_kernel(kernel_idx)
+    except Exception:  # noqa: BLE001
+        return str(kernel_idx)
+    fn = getattr(kernel, "fn", kernel)
+    return getattr(fn, "__name__", None) or str(kernel_idx)
+
+
 def _snode_label(snode: BaseSchedulerNode, max_shapes: int = 3) -> str:
     """Human-readable identity for the profile table: op target + first few input
     shapes (for logs only; the cache key is ``_structural_key``)."""
     node = getattr(snode, "node", None)
-    origin = node.get_origin_node() if (node is not None and hasattr(node, "get_origin_node")) else None
-    target = str(getattr(origin, "target", type(node).__name__ if node is not None else "?"))
+    origin = _fx_node_of(node)
+    target = _fx_target_name(origin, node)
     target = target.split("(")[0].split(" ")[-1][-40:]
     shapes = []
     if origin is not None:
-        for a in (*origin.args, *getattr(origin, "kwargs", {}).values()):
-            ev = a.meta.get("val") if isinstance(a, torch.fx.Node) else None
-            if isinstance(ev, torch.Tensor):
-                shapes.append("x".join(str(x) for x in _static(ev.shape)))
-                if len(shapes) >= max_shapes:
-                    break
+        for ev in _iter_tensor_metas((*origin.args, *getattr(origin, "kwargs", {}).values())):
+            shapes.append("x".join(str(x) for x in _static(ev.shape)))
+            if len(shapes) >= max_shapes:
+                break
     return f"{target}[{','.join(shapes)}]" if shapes else target
 
 
@@ -126,14 +186,12 @@ def _structural_key(snode: BaseSchedulerNode) -> tuple | None:
         node = getattr(n, "node", None)
         if node is None:
             return None
-        origin = node.get_origin_node() if hasattr(node, "get_origin_node") else None
-        target = str(getattr(origin, "target", type(node).__name__))
+        origin = _fx_node_of(node)
+        target = _fx_target_name(origin, node)
         shapes: list[Any] = []
         if origin is not None:
-            for a in (*origin.args, *origin.kwargs.values()):
-                ev = a.meta.get("val") if isinstance(a, torch.fx.Node) else None
-                if isinstance(ev, torch.Tensor):
-                    shapes.append((tuple(_static(ev.shape)), str(ev.dtype)))
+            for ev in _iter_tensor_metas((*origin.args, *origin.kwargs.values())):
+                shapes.append((tuple(_static(ev.shape)), str(ev.dtype)))
         parts.append((target, tuple(shapes)))
     return tuple(parts)
 
@@ -216,19 +274,15 @@ def _realize_arg(v):
     return v
 
 
-def _measure_extern(snode: ExternKernelSchedulerNode, fixed_iters: bool = False) -> float:
-    """Time an extern (matmul / custom-op) snode by replaying its aten op.
-
-    ``fixed_iters=True``: constant iteration count with CUDA events instead of the
-    duration-adaptive benchmarker.  Required for ops with an INTERNAL collective
-    (CP all_to_all inside attention/MoE): adaptive iteration counts differ per rank
-    -> NCCL count mismatch -> deadlock.
+def _extern_replay_fn(snode: ExternKernelSchedulerNode):
+    """A callable that runs this extern's aten op on rebuilt inputs, or None.
 
     Replay inputs: generic ``_realize_arg``, then an optional same-signature
-    hook (``materialize_inputs``) that rebuilds value-consistent metadata."""
-    fx_node = snode.node.get_origin_node()
+    hook (``materialize_inputs``) that rebuilds value-consistent metadata.
+    """
+    fx_node = _fx_node_of(snode.node)
     if fx_node is None:
-        return 0.0
+        return None
     target = fx_node.target
 
     args = tuple(_realize_arg(a) for a in fx_node.args)
@@ -248,22 +302,45 @@ def _measure_extern(snode: ExternKernelSchedulerNode, fixed_iters: bool = False)
         with torch.no_grad():
             return _call()
 
-    if not fixed_iters:
-        fn()  # warmup / correctness
-        return benchmarker.benchmark_gpu(fn) * 1e6  # ms -> ns
-    # Fixed-iteration timing (lockstep-safe for internal collectives).
-    _WARMUP, _ITERS = 3, 10
-    for _ in range(_WARMUP):
+    return fn
+
+
+def _measure_extern(snode: ExternKernelSchedulerNode, fixed_iters: bool = False) -> float:
+    """Time an extern (matmul / custom-op) snode by replaying its aten op.
+
+    ``fixed_iters=True``: constant iteration count with CUDA events instead of the
+    duration-adaptive benchmarker.  Required for ops with an INTERNAL collective
+    (CP all_to_all inside attention/MoE): adaptive iteration counts differ per rank
+    -> NCCL count mismatch -> deadlock."""
+    fn = _extern_replay_fn(snode)
+    if fn is None:
+        # Never report 0: an unreplayable op is unknown, not free, and a silent 0
+        # makes the overlap pass treat a real kernel as a gap it can hoist across.
+        raise RuntimeError(f"{snode.get_name()}: no replayable fx node, cannot measure")
+    if fixed_iters:
+        return _time_fixed(fn)
+    fn()  # warmup / correctness
+    return benchmarker.benchmark_gpu(fn) * 1e6  # ms -> ns
+
+
+def _time_fixed(fn, warmup: int = 3, iters: int = 10) -> float:
+    """CUDA-event timing over a FIXED iteration count, in nanoseconds.
+
+    Fixed, not adaptive: anything that issues a collective must issue the same
+    number of them on every rank, or the NCCL counts diverge and the ranks
+    deadlock inside what is supposed to be a measurement.
+    """
+    for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
-    for _ in range(_ITERS):
+    for _ in range(iters):
         fn()
     end.record()
     torch.cuda.synchronize()
-    return (start.elapsed_time(end) / _ITERS) * 1e6  # ms/iter -> ns
+    return (start.elapsed_time(end) / iters) * 1e6  # ms/iter -> ns
 
 
 def _op_name(target) -> str:
@@ -326,6 +403,103 @@ def _collective_spec(node):
     return op, group_name, group_size, specs
 
 
+def _ce_ag_ops():
+    """Copy-engine gather ops, or empty when the runtime is unavailable."""
+    try:
+        from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER, CE_ALL_GATHER_COALESCED
+
+        return tuple(op for op in (CE_ALL_GATHER, CE_ALL_GATHER_COALESCED) if op is not None)
+    except Exception:  # noqa: BLE001
+        return ()
+
+
+def _leaf_ce_ag(snode: BaseSchedulerNode):
+    """The copy-engine gather IR node inside ``snode``, or None.
+
+    It is an ordinary FallbackKernel, not a ``_CollectiveKernel``, so none of
+    Inductor's collective predicates see it.
+    """
+    ops = _ce_ag_ops()
+    if not ops:
+        return None
+    for n in (getattr(snode, "node", None), *(getattr(c, "node", None) for c in getattr(snode, "snodes", []) or [])):
+        if n is not None and getattr(n, "op_overload", None) in ops:
+            return n
+    return None
+
+
+def _is_ce_ag_coalesced_ir(node) -> bool:
+    try:
+        from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER_COALESCED
+    except Exception:  # noqa: BLE001
+        return False
+    return CE_ALL_GATHER_COALESCED is not None and getattr(node, "op_overload", None) is CE_ALL_GATHER_COALESCED
+
+
+def _ce_ag_spec(node):
+    """(shapes, dtype, group_size, group_name). Use ``constant_args``; ``get_origin_node()`` is unset and would cost 0."""
+    args = getattr(node, "constant_args", None)
+    if not args or len(args) < 2:
+        return None
+    group_size, group_name = args[-2:]
+    ins = list(node.inputs)
+    if not ins:
+        return None
+    shapes = tuple(tuple(_concrete_size(s) for s in inp.layout.size) for inp in ins)
+    return shapes, ins[0].layout.dtype, int(group_size), str(group_name)
+
+
+def _ce_ag_launch_wait(snode: BaseSchedulerNode):
+    """``(launch, wait)`` replaying a copy-engine gather, or None.
+
+    Split in two rather than one fused closure so the cost model can time
+    ``wait(launch())`` as a unit.
+    """
+    from magi_compiler.symm_mem import find_shard_by_layout
+
+    node = _leaf_ce_ag(snode)
+    spec = _ce_ag_spec(node) if node is not None else None
+    if spec is None:
+        return None
+    shapes, dtype, group_size, group_name = spec
+    shards = [find_shard_by_layout(shape, dtype) for shape in shapes]
+    if any(s is None for s in shards):
+        magi_logger.warning(
+            "No registered symmetric shard with layout %s/%s; the copy-engine gather keeps its "
+            "analytical cost and its overlap window may be mis-sized",
+            shapes,
+            dtype,
+        )
+        return None
+    from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER, CE_ALL_GATHER_COALESCED
+
+    if _is_ce_ag_coalesced_ir(node):
+        op = CE_ALL_GATHER_COALESCED
+        return (lambda: op(shards, group_size, group_name)), lambda outs: [_WAIT(o) for o in outs]
+    return (lambda: CE_ALL_GATHER(shards[0], group_size, group_name)), _WAIT
+
+
+def _measure_ce_ag(snode: BaseSchedulerNode) -> float:
+    """Time ``wait(launch())``. Launch-only is ~3us CPU issue; copies run on a side stream."""
+    pair = _ce_ag_launch_wait(snode)
+    if pair is None:
+        return 0.0
+    launch, wait = pair
+    return _time_fixed(lambda: wait(launch()))
+
+
+def _ce_ag_label(snode: BaseSchedulerNode) -> str:
+    node = _leaf_ce_ag(snode)
+    spec = _ce_ag_spec(node) if node is not None else None
+    if spec is None:
+        return _snode_label(snode)
+    shapes, _dtype, group_size, _gn = spec
+    shape0 = "x".join(str(x) for x in shapes[0])
+    if len(shapes) > 1:
+        return f"ce_all_gather_coalesced(ws={group_size},n={len(shapes)},{shape0})"
+    return f"ce_all_gather(ws={group_size},{shape0})"
+
+
 def _collective_label(snode: BaseSchedulerNode) -> str:
     """Readable identity of a collective: op name, world size, #inputs + first shape."""
     node = _leaf_collective(snode)
@@ -337,43 +511,26 @@ def _collective_label(snode: BaseSchedulerNode) -> str:
     return f"all_gather(ws={group_size},n={len(specs)},{shape0})"
 
 
-def _measure_collective_op(snode: BaseSchedulerNode) -> float:
-    """Replay the functional all-gather (+wait) on real tensors and time it."""
+def _nccl_launch_wait(snode: BaseSchedulerNode):
+    """``(launch, wait)`` replaying a functional all-gather, or None."""
     node = _leaf_collective(snode)
-    if node is None:
-        return 0.0
-    spec = _collective_spec(node)
+    spec = _collective_spec(node) if node is not None else None
     if spec is None:
-        return 0.0
+        return None
     op, group_name, group_size, specs = spec
-
     ins = [torch.empty(shape, dtype=dt, device=dev) for shape, dt, dev in specs]
     if op is _AG_COALESCED:
+        return (lambda: _AG_COALESCED(ins, group_size, group_name), lambda outs: [_WAIT(o) for o in outs])
+    return (lambda: _AG(ins[0], group_size, group_name)), _WAIT
 
-        def fn():
-            outs = _AG_COALESCED(ins, group_size, group_name)
-            for o in outs:
-                _WAIT(o)
 
-    else:
-
-        def fn():
-            _WAIT(_AG(ins[0], group_size, group_name))
-
-    # Fixed iteration count on all ranks -- an adaptive benchmarker would issue
-    # different numbers of collectives per rank -> NCCL count mismatch -> deadlock.
-    _WARMUP, _ITERS = 3, 10
-    for _ in range(_WARMUP):
-        fn()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(_ITERS):
-        fn()
-    end.record()
-    torch.cuda.synchronize()
-    return (start.elapsed_time(end) / _ITERS) * 1e6  # ms/iter -> ns
+def _measure_collective_op(snode: BaseSchedulerNode) -> float:
+    """Replay the functional all-gather (+wait) on real tensors and time it."""
+    pair = _nccl_launch_wait(snode)
+    if pair is None:
+        return 0.0
+    launch, wait = pair
+    return _time_fixed(lambda: wait(launch()))
 
 
 class ProfilingRuntimeEstimator:
@@ -465,8 +622,10 @@ class ProfilingRuntimeEstimator:
             snode = self._key_snode.get(k)
             dist.barrier(group=group)
             # snode is non-None on every rank by measurable_reprs construction.
-            local_ns[k] = self._measure_one(snode)
-            measured_here.add(k)
+            ns, ok = self._measure_one(snode)
+            local_ns[k] = ns
+            if ok:
+                measured_here.add(k)
             dist.barrier(group=group)
 
         gathered: list = [None] * world
@@ -504,22 +663,25 @@ class ProfilingRuntimeEstimator:
         self._key_snode.clear()  # drop snode refs (unpicklable) once sync is done
         return n
 
-    def _measure_one(self, snode: BaseSchedulerNode) -> float:
+    def _measure_one(self, snode: BaseSchedulerNode) -> tuple[float, bool]:
         """Lockstep-safe single measurement (fixed iters for anything containing a
-        collective); never raises -- falls back to the analytical estimate."""
+        collective).  Never raises; returns ``(ns, measured)`` so the caller can
+        tell a real timing from the analytical fallback."""
         try:
+            if _leaf_ce_ag(snode) is not None:
+                return _measure_ce_ag(snode), True
             if contains_collective(snode):
-                return _measure_collective_op(snode)
+                return _measure_collective_op(snode), True
             if isinstance(snode, ExternKernelSchedulerNode):
                 fixed = _extern_has_internal_collective(snode)
                 with _shapeenv_sandbox(), _suppress_guards():
                     ns = _measure_extern(snode, fixed_iters=fixed)
                 self.n_measured += 1
-                return ns
-            return self._measure(snode)
+                return ns, True
+            return self._measure(snode), True
         except BaseException as exc:  # noqa: BLE001
-            magi_logger.debug("warm/sync measure fell back to analytical for %s: %s", snode.get_name(), exc)
-            return _safe_analytical(snode)
+            magi_logger.warning("warm/sync measure fell back to analytical for %s: %s", snode.get_name(), exc)
+            return _safe_analytical(snode), False
 
     def summary(self) -> str:
         """One line per distinct op + a machine-parseable ``ESTLINE`` tag
@@ -547,6 +709,29 @@ class ProfilingRuntimeEstimator:
 
         if _is_multi_output_unpack(snode):
             return 0.0
+
+        if _leaf_ce_ag(snode) is not None:
+            node = _leaf_ce_ag(snode)
+            spec = _ce_ag_spec(node)
+            if spec is None:
+                return _safe_analytical(snode)
+            shapes, dtype, group_size, _gn = spec
+            ckey = ("ce_ag", group_size, shapes, str(dtype))
+            entry = self._table.get(ckey)
+            if entry is not None:
+                entry.reuse_count += 1
+                self.n_cache_hits += 1
+                return entry.ns
+            ns = _safe_analytical(snode)
+            self._table[ckey] = ProfileEntry(ns=ns, kind="ce_ag", label=_ce_ag_label(snode), measured=False)
+            if self._sync_across_ranks:
+                self._key_snode[ckey] = snode
+            else:
+                ns = _measure_ce_ag(snode)
+                self._table[ckey].ns = ns
+                self._table[ckey].measured = True
+                self.n_measured += 1
+            return ns
 
         if contains_collective(snode):
             cnode = _leaf_collective(snode)
