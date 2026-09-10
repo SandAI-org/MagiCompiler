@@ -618,22 +618,20 @@ def _materialize_shm_weights(
     Uses streaming copy-and-replace so only one parameter is duplicated
     at a time, keeping peak RSS near 1× model size instead of 2×.
 
-    per_rank=True  (default): each rank writes its own mmap concurrently.
-    per_rank=False (all ranks identical): rank 0 writes, all ranks map.
+    per_rank=True  (default): each rank gets a plain pinned tensor (no mmap/shmem
+    needed because no cross-rank sharing occurs).
+    per_rank=False (all ranks identical): rank 0 writes an mmap, all ranks map.
     """
     cls_name = module.__class__.__name__
     buffers: list[torch.Tensor] = []
 
     if per_rank:
         for dtype, param_list in grouped_params.items():
-            path = _shm_path(cls_name, dtype, rank=local_rank)
             total_numel = sum(t.numel() for _, t in param_list)
-            giant = _create_empty_shm(path, total_numel, dtype)
+            giant = torch.empty(total_numel, dtype=dtype, device="cpu")
             _stream_copy_and_replace(module, giant, param_list)
             pin_memory_in_place(giant)
             buffers.append(giant)
-            if os.path.exists(path):
-                os.remove(path)
         dist.barrier()
     else:
         dist.barrier()
