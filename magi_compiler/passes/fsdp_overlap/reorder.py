@@ -31,7 +31,10 @@ reset, so each gather claims a disjoint run of compute (serializing the single
 transfer stream) and targets only decrease.  Compute is claimed a whole node at a
 time, so the gather that stops in front of a long kernel leaves most of it unused;
 that remainder carries to the next gather instead of being discarded, which is
-what keeps a 95us collective from spending a 33ms attention.  All moves are
+what keeps a 95us collective from spending a 33ms attention.  The remainder is
+dropped once the sweep reaches a gather that already sits upstream of the node
+holding it -- that compute is outside such a gather's window, and counting it
+would report the gather as covered and leave it unmoved.  All moves are
 applied in one stable-sort rebuild and validated once (``_validate_full``) -- the
 Inductor driver does NOT repair the returned order, so it must be a valid
 topological order.
@@ -323,18 +326,25 @@ class FsdpOverlapReorder:
         targets: dict = {}  # launch -> target index (in original order space)
         compute_idx = len(order)  # scan compute strictly below this
         carry = 0.0  # runtime the previous gather left unspent in its boundary node
+        # Index of that boundary node: its leftover is only real for gathers that
+        # still sit at or after it.
+        carry_idx = len(order)
         for launch, group, fc_idx, comm_runtime, lower in reversed(plans):
             cur = index_of[launch]
             # Start just before the launch, but no later than where the previous
             # (later) gather already consumed compute down to.
             compute_idx = min(compute_idx, cur)
             need = comm_runtime * self.comm_overlap_window_scale + self.comm_overlap_window_margin_ns
+            if cur < carry_idx:
+                carry = 0.0
+                carry_idx = compute_idx
             acc = carry_in = carry
             t = compute_idx
             while acc < need and t > lower:
                 s = order[t - 1]
                 if self._is_compute(s):
                     acc += self._cost(s)
+                    carry_idx = t - 1  # last node claimed; holds this gather's leftover
                 t -= 1
             # target == cur means no upstream compute left (graph head or previous
             # gather claimed it); target >= lower keeps real producers before it.
@@ -351,14 +361,16 @@ class FsdpOverlapReorder:
             #   comm      = the gather's runtime it needs to hide
             #   carry_in  = capacity inherited from the later gather's boundary node
             #               (target==cur with a large carry_in means it was already
-            #               covered and did not have to move at all)
+            #               covered and did not have to move at all); 0 when this
+            #               gather already sat upstream of that boundary node
+            #   carry_idx = boundary node this gather leaves its own remainder in
             #   acc_upstream = carry_in plus the compute found in [target, cur]
             #   verdict   = hidden (acc>=need) | COMPUTE-LIMITED (ran out of upstream
             #               compute before covering comm -- i.e. hit `lower` or the
             #               previous gather's placement first)
             magi_logger.debug(
                 "FSDP overlap placement: launch %s(%s) cur=%d -> target=%d fc=%d lower=%d | "
-                "comm=%.1fus carry_in=%.1fus acc_upstream=%.1fus need=%.1fus %s",
+                "comm=%.1fus carry_in=%.1fus carry_idx=%d acc_upstream=%.1fus need=%.1fus %s",
                 launch.get_name(),
                 getattr(_leaf_collective_node(launch), "op_overload", "?"),
                 cur,
@@ -367,6 +379,7 @@ class FsdpOverlapReorder:
                 lower,
                 comm_runtime / 1e3,
                 carry_in / 1e3,
+                carry_idx,
                 acc / 1e3,
                 need / 1e3,
                 "hidden" if acc >= need else "COMPUTE-LIMITED",
