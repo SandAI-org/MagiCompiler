@@ -32,8 +32,13 @@ Three families of checks:
      ``magi_epilogue.matmul_fused_epilogue`` node.
   3. Negative fallback: shapes / dtypes / chains the EVT pass does NOT
      support must keep the original ``aten.mm`` and run through cuBLAS.
+
+This file sets ``MAGI_EVT_MAX_TILES=1`` so JIT compiles a single tile
+instead of the full autotune list. Numerical checks still run; they do
+not assert that the fastest tile was chosen.
 """
 
+import os
 from typing import Optional
 
 import pytest
@@ -44,6 +49,11 @@ import torch.nn.functional as F
 
 from magi_compiler.api import magi_compile
 from magi_compiler.config import get_compile_config
+
+# Correctness tests do not need the full autotune tile set. One candidate
+# cuts CUTLASS template instantiations ~6-8x. Production is unchanged
+# unless MAGI_EVT_MAX_TILES is set in the environment.
+os.environ.setdefault("MAGI_EVT_MAX_TILES", "1")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -332,20 +342,22 @@ def test_evt_unary_activations_fuse(epi_name, epi_fn, atol, rtol):
 
 
 @_EVT_CAPABLE
-def test_evt_relu_native():
-    """Plain ``aten.relu`` variants must fuse and preserve emitted output dtype."""
+def test_evt_relu_mm_plus_1d_bias():
+    """``relu((mm + bias_N).float())`` — 1-D bias as RowBroadcast, fp32 relu out."""
 
-    class Fp32Relu(nn.Module):
+    class M(nn.Module):
         def __init__(self):
             super().__init__()
             self.weight = nn.Parameter(torch.randn(_N, _K))
+            self.bias = nn.Parameter(torch.randn(_N))
 
         def forward(self, a):
-            return torch.relu(torch.mm(a, self.weight.permute(1, 0)).float())
+            return torch.relu((torch.mm(a, self.weight.permute(1, 0)) + self.bias).float())
 
     _compile_and_check(
-        Fp32Relu(),
+        M(),
         (_input_a(),),
+        atol=1.5,
         expect_fused=1,
         expect_kinds=["evt_col"],
         expect_out_dtype=torch.float32,
@@ -444,56 +456,12 @@ def test_evt_mm_add_sub_with_alpha(case_name, op, other_kind, alpha):
 
 
 @_EVT_CAPABLE
-def test_evt_mm_plus_1d_bias():
-    """``silu(mm + bias_N)`` — 1-D bias as RowBroadcast extras."""
+def test_evt_aux_loads_padded_and_repeated_fuse():
+    """Padded-stride AuxLoad + repeated / multiple extras in one fused chain.
 
-    class M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.randn(_N, _K))
-            self.bias = nn.Parameter(torch.randn(_N))
-
-        def forward(self, a):
-            y = torch.mm(a, self.weight.permute(1, 0)) + self.bias
-            return high_precision_silu(y, out_dtype=torch.bfloat16)
-
-    _compile_and_check(
-        M(),
-        (_input_a(),),
-        atol=1.5,
-        expect_fused=1,
-        expect_kinds=["evt_col"],
-        expect_out_dtype=torch.bfloat16,
-        expect_actual_dtype=torch.bfloat16,
-    )
-
-
-@_EVT_CAPABLE
-def test_evt_aux_load_padded_stride():
-    """AuxLoad with padded row stride (stride(0) > N) must fuse and read correctly."""
-
-    class M(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = nn.Parameter(torch.randn(_N, _K))
-
-        def forward(self, a, gate):
-            y = torch.mm(a, self.weight.permute(1, 0)) * gate
-            return y.to(torch.bfloat16)
-
-    a = _input_a()
-    N_padded = _N + 64
-    gate_buf = torch.randn(_M, N_padded, device="cuda", dtype=torch.bfloat16)
-    gate = gate_buf[:, :_N]  # shape (_M, _N), stride (N_padded, 1)
-    assert gate.stride() == (N_padded, 1), f"Expected padded stride, got {gate.stride()}"
-    _compile_and_check(
-        M(), (a, gate), atol=0.0, rtol=0.1, expect_fused=1, expect_kinds=["evt_col"], dynamic_arg_dims={"a": 0, "gate": 0}
-    )
-
-
-@_EVT_CAPABLE
-def test_evt_multiple_and_repeated_aux_loads_fuse():
-    """Multiple AuxLoad extras, with one tensor reused at multiple EVT positions."""
+    ``gate`` is a (M, N) view of a wider buffer (stride(0) > N). It is also
+    reused at two EVT positions, alongside two distinct AuxLoad tensors.
+    """
 
     class M(nn.Module):
         def __init__(self):
@@ -505,7 +473,10 @@ def test_evt_multiple_and_repeated_aux_loads_fuse():
             return (y * gate + gate + r1 + r2).to(torch.bfloat16)
 
     a = _input_a()
-    gate = torch.randn(_M, _N, device="cuda", dtype=torch.bfloat16)
+    N_padded = _N + 64
+    gate_buf = torch.randn(_M, N_padded, device="cuda", dtype=torch.bfloat16)
+    gate = gate_buf[:, :_N]  # shape (_M, _N), stride (N_padded, 1)
+    assert gate.stride() == (N_padded, 1), f"Expected padded stride, got {gate.stride()}"
     r1 = torch.randn(_M, _N, device="cuda", dtype=torch.bfloat16)
     r2 = torch.randn(_M, _N, device="cuda", dtype=torch.bfloat16)
     _compile_and_check(
@@ -1048,6 +1019,104 @@ def test_evt_codegen_sm80_per_node_compute_dtype():
     assert "VisitorCompute<" in src
     assert "cutlass::bfloat16_t, cutlass::bfloat16_t" in src
     assert "float, float" in src
+
+
+def _evt_tile_invocations(src: str) -> int:
+    return len([line for line in src.splitlines() if line.startswith("    EVT_TILE_CANDIDATE(")])
+
+
+def test_evt_max_tiles_env_limits_codegen(monkeypatch):
+    """MAGI_EVT_MAX_TILES=1 must emit exactly one tile candidate per arch."""
+    monkeypatch.setenv("MAGI_EVT_MAX_TILES", "1")
+    from magi_compiler.passes.piecewise_graph.fusion.evt_ir import Accum, Compute, Store
+    from magi_compiler.passes.piecewise_graph.fusion.sm80.evt_codegen import render_evt_cu as render_sm80
+    from magi_compiler.passes.piecewise_graph.fusion.sm90.evt_codegen import render_evt_cu as render_sm90
+
+    ir = Store(Compute("silu", (Accum(),)), "bfloat16")
+    for src in (render_sm80(ir, "bfloat16", "bfloat16"), render_sm90(ir, "bfloat16", "bfloat16")):
+        assert _evt_tile_invocations(src) == 1
+
+
+def test_evt_max_tiles_unset_keeps_full_bucket(monkeypatch):
+    """Unset MAGI_EVT_MAX_TILES must keep the full medium-bucket candidate list."""
+    monkeypatch.delenv("MAGI_EVT_MAX_TILES", raising=False)
+    from magi_compiler.passes.piecewise_graph.fusion.evt_ir import Accum, Compute, Store
+    from magi_compiler.passes.piecewise_graph.fusion.sm80.evt_codegen import _TILE_CANDIDATES_SM120
+    from magi_compiler.passes.piecewise_graph.fusion.sm80.evt_codegen import render_evt_cu as render_sm80
+    from magi_compiler.passes.piecewise_graph.fusion.sm90.evt_codegen import _TILE_CANDIDATES_SM90
+    from magi_compiler.passes.piecewise_graph.fusion.sm90.evt_codegen import render_evt_cu as render_sm90
+
+    ir = Store(Compute("silu", (Accum(),)), "bfloat16")
+    assert _evt_tile_invocations(render_sm80(ir, "bfloat16", "bfloat16")) == len(_TILE_CANDIDATES_SM120["medium"])
+    assert _evt_tile_invocations(render_sm90(ir, "bfloat16", "bfloat16")) == len(_TILE_CANDIDATES_SM90["medium"])
+
+
+@_EVT_CAPABLE
+def test_evt_nvcc_compile_cache_is_hit(monkeypatch):
+    """Same IR must hit the nvcc cache: memory reuse, (N, K) sharing, and on-disk .so.
+
+    ``cpp_extension.load`` is the nvcc entry point. After a cold JIT it must
+    not be called again for the same IR/align, including a different (N, K)
+    and a reload after dropping the process-level module dicts.
+    """
+    from pathlib import Path
+
+    import torch.utils.cpp_extension as cpp_extension
+
+    from magi_compiler.passes.piecewise_graph.fusion import evt_runtime as rt
+    from magi_compiler.passes.piecewise_graph.fusion.evt_ir import Accum, Compute, Store, to_canonical_json
+
+    load_calls: list = []
+    real_load = cpp_extension.load
+
+    def counting_load(*args, **kwargs):
+        load_calls.append(kwargs.get("name", args[0] if args else "?"))
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(cpp_extension, "load", counting_load)
+
+    ir_json = to_canonical_json(Store(Compute("silu", (Accum(),)), "bfloat16"))
+    dt = torch.bfloat16
+    compile_kw = dict(ir_json=ir_json, a_dtype=dt, b_dtype=dt, b_layout="col", m_bucket="medium")
+
+    rt._MODULE_CACHE.clear()
+    rt._MODULE_FAST_CACHE.clear()
+    rt._DISPATCH_CACHE.clear()
+
+    mod1 = rt._compile_evt_module(**compile_kw)
+    assert len(load_calls) == 1, f"cold JIT should nvcc once, got {load_calls}"
+    assert hasattr(mod1, "evt_matmul_out")
+    sos = list(Path(get_compile_config().cache_root_dir).rglob("magi_evt_*.so"))
+    assert sos, "cold JIT must write an on-disk EVT .so"
+
+    mod2 = rt._compile_evt_module(**compile_kw)
+    assert mod2 is mod1
+    assert len(load_calls) == 1, f"in-process cache missed; extra nvcc {load_calls}"
+
+    # Same IR, different problem N — align is still 128-bit, must share the .so.
+    entry = rt._resolve_dispatch("evt_col", ir_json, dt, dt, 1032, 1024, "medium", dt)
+    assert entry.is_evt
+    assert len(load_calls) == 1, f"different (N, K) recompiled; extra nvcc {load_calls}"
+
+    rt._MODULE_CACHE.clear()
+    rt._MODULE_FAST_CACHE.clear()
+    rt._DISPATCH_CACHE.clear()
+    mod3 = rt._compile_evt_module(**compile_kw)
+    assert len(load_calls) == 1, f"on-disk .so miss fell back to nvcc; extra {load_calls}"
+    assert hasattr(mod3, "evt_matmul_out")
+
+
+def test_evt_codegen_autotune_is_per_nk_map():
+    """Generated runners must cache autotune winners by (N, K), not one sticky idx."""
+    from magi_compiler.passes.piecewise_graph.fusion.evt_ir import Accum, Compute, Store
+    from magi_compiler.passes.piecewise_graph.fusion.sm80.evt_codegen import render_evt_cu as render_sm80
+    from magi_compiler.passes.piecewise_graph.fusion.sm90.evt_codegen import render_evt_cu as render_sm90
+
+    ir = Store(Compute("silu", (Accum(),)), "bfloat16")
+    for src in (render_sm80(ir, "bfloat16", "bfloat16"), render_sm90(ir, "bfloat16", "bfloat16")):
+        assert "best_idx_map_" in src
+        assert "lookup_or_autotune" in src
+        assert "int best_idx_ = -1" not in src
 
 
 def test_evt_codegen_sm90_per_node_compute_dtype():

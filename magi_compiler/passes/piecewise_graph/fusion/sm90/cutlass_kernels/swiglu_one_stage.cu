@@ -25,10 +25,11 @@
 //   B : (N, K)   bf16 row-major   (torch.nn.Linear weight convention; N even)
 //   D : (M, N/2) bf16 row-major   (strided view of (M, ldd) host-padded buffer)
 //
-// AUTOTUNE: at first call per (M, N, K) tuple the runner times every
-// registered (TileShape, Stages) candidate and caches the fastest one. The
-// candidate set targets H100's ~228 KiB dynamic-smem budget; per-stage smem
-// for Sm90DualGemm = (BM + 2*BN) * BK * 2 (bf16) * stages.
+// AUTOTUNE: first call per (N_out, K) times every registered
+// (TileShape, Stages) candidate and caches the winner in best_idx_map_.
+// Different M inside one bucket reuse that choice. The candidate set
+// targets H100's ~228 KiB dynamic-smem budget; per-stage smem for
+// Sm90DualGemm = (BM + 2*BN) * BK * 2 (bf16) * stages.
 //
 // Built by magi_compiler/passes/piecewise_graph/fusion/cutlass_fusion/
 // evt_runtime.py::_compile_swiglu_dual when the live device's compute
@@ -41,7 +42,9 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <cstdint>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include "cutlass/cutlass.h"
@@ -227,11 +230,20 @@ class SwSm90Impl : public SwSm90Concept {
 // AutoTune runner — first call per (M, N_out, K) shape times all candidates.
 ////////////////////////////////////////////////////////////////////////////////
 
+#ifndef MAGI_EVT_MAX_TILES
+#define MAGI_EVT_MAX_TILES 0
+#endif
+
 #define SW_SM90_TILE(bm, bn, bk, stages, label)                                 \
-  configs_.push_back(std::make_unique<                                            \
-      SwSm90Impl<DualGemmConfigSm90<                                             \
-          cute::Shape<cute::Int<bm>, cute::Int<bn>, cute::Int<bk>>,               \
-          stages>>>(label))
+  do {                                                                          \
+    if (MAGI_EVT_MAX_TILES <= 0                                                 \
+        || static_cast<int>(configs_.size()) < MAGI_EVT_MAX_TILES) {           \
+      configs_.push_back(std::make_unique<                                       \
+          SwSm90Impl<DualGemmConfigSm90<                                        \
+              cute::Shape<cute::Int<bm>, cute::Int<bn>, cute::Int<bk>>,          \
+              stages>>>(label));                                                \
+    }                                                                           \
+  } while (0)
 
 class SwSm90AutoTuneRunner {
  public:
@@ -317,13 +329,9 @@ class SwSm90AutoTuneRunner {
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.device().index()).stream();
 
-    // Single autotune per module. The .cu is compiled per (m_bucket, N, K,
-    // alignA, alignB, alignC) on the Python side — every distinct shape
-    // bucket gets its own runner instance with isolated `best_idx_`.
-    if (best_idx_ < 0) {
-      best_idx_ = autotune(ea, stream);
-    }
-    int idx = best_idx_;
+    // One .so is shared across all (N, K) for this (bucket, align). Autotune
+    // winners live in best_idx_map_ so a new shape only re-times candidates.
+    int idx = lookup_or_autotune(ea, stream);
 
     auto& gemm = configs_[idx];
     size_t ws_sz = gemm->get_workspace_size(ea);
@@ -344,6 +352,22 @@ class SwSm90AutoTuneRunner {
   int num_configs() const { return (int)configs_.size(); }
 
  private:
+  static uint64_t nk_key(int N_out, int K) {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(N_out)) << 32)
+           | static_cast<uint32_t>(K);
+  }
+
+  int lookup_or_autotune(const SwArgs& ea, cudaStream_t stream) {
+    const uint64_t key = nk_key(ea.N_out, ea.K);
+    auto it = best_idx_map_.find(key);
+    if (it != best_idx_map_.end()) {
+      return it->second;
+    }
+    int idx = autotune(ea, stream);
+    best_idx_map_.emplace(key, idx);
+    return idx;
+  }
+
   int autotune(const SwArgs& ea, cudaStream_t stream) {
     int best_idx = -1;
     float best_time = 1e30f;
@@ -387,7 +411,7 @@ class SwSm90AutoTuneRunner {
   }
 
   std::vector<std::unique_ptr<SwSm90Concept>> configs_;
-  int best_idx_ = -1;     // -1 = not yet autotuned; sticky after first call.
+  std::unordered_map<uint64_t, int> best_idx_map_;  // (N_out, K) → tile index
   at::Tensor ws_;
 };
 

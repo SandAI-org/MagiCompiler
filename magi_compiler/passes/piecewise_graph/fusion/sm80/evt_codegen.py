@@ -29,6 +29,7 @@ from ..common.codegen_shared import (
     _DTYPE_TO_CUTLASS,
     _VALID_ALIGN_BITS,
     _emit_custom_functor,
+    limit_tile_candidates,
 )
 from ..evt_ir import Accum, AuxLoad, ColBroadcast, Compute, RowBroadcast, Store, walk_leaves
 
@@ -68,7 +69,7 @@ _TILE_CANDIDATES_5090 = _TILE_CANDIDATES_SM120
 
 def _emit_tile_candidates(m_bucket: str) -> str:
     """Emit C++ EVT_TILE_CANDIDATE(...) statements for the given M bucket."""
-    candidates = _TILE_CANDIDATES_SM120.get(m_bucket, _TILE_CANDIDATES_SM120["medium"])
+    candidates = limit_tile_candidates(_TILE_CANDIDATES_SM120.get(m_bucket, _TILE_CANDIDATES_SM120["medium"]))
     lines = []
     for bm, bn, bk, wm, wn, wk, stages, label in candidates:
         lines.append(f'    EVT_TILE_CANDIDATE({bm}, {bn}, {bk}, {wm}, {wn}, {wk}, ' f'{stages}, "{label}");')
@@ -208,6 +209,7 @@ _KERNEL_PREAMBLE = """\
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <math.h>
@@ -312,8 +314,9 @@ struct EvtConfig {{
 }};
 
 ////////////////////////////////////////////////////////////////////////////////
-// Autotune runner — one candidate per tile/warp/stages combination; first call
-// at a new (M, N, K) tuple times every candidate and caches the winner.
+// Autotune runner — one candidate per tile/warp/stages combination. First call
+// at each (N, K) times every candidate; later calls with the same (N, K) reuse
+// the cached winner. Different M inside one bucket share that choice.
 ////////////////////////////////////////////////////////////////////////////////
 
 struct EvtArgs {{
@@ -484,15 +487,10 @@ class EvtAutoTuneRunner {{
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.device().index()).stream();
 
-    // Single autotune per module. The .cu is compiled per (IR, M-bucket,
-    // b_layout, N, K) on the Python side — every distinct weight (N, K)
-    // gets its own .cu, so this runner instance hosts exactly one (N, K)
-    // and one bucket of M values. Autotune once on the first call; all
-    // subsequent calls (any M inside the bucket) reuse `best_idx_`.
-    if (best_idx_ < 0) {{
-      best_idx_ = autotune(ea, stream);
-    }}
-    int idx = best_idx_;
+    // One .so is shared across all (N, K) for this (IR, bucket, layout,
+    // align). Autotune winners live in best_idx_map_ so a new shape only
+    // re-times candidates — it does not trigger another nvcc.
+    int idx = lookup_or_autotune(ea, stream);
 
     auto& gemm = configs_[idx];
     size_t ws_sz = gemm->get_workspace_size(ea);
@@ -511,6 +509,22 @@ class EvtAutoTuneRunner {{
   int num_configs() const {{ return (int)configs_.size(); }}
 
  private:
+  static uint64_t nk_key(int N, int K) {{
+    return (static_cast<uint64_t>(static_cast<uint32_t>(N)) << 32)
+           | static_cast<uint32_t>(K);
+  }}
+
+  int lookup_or_autotune(const EvtArgs& ea, cudaStream_t stream) {{
+    const uint64_t key = nk_key(ea.N, ea.K);
+    auto it = best_idx_map_.find(key);
+    if (it != best_idx_map_.end()) {{
+      return it->second;
+    }}
+    int idx = autotune(ea, stream);
+    best_idx_map_.emplace(key, idx);
+    return idx;
+  }}
+
   int autotune(const EvtArgs& ea, cudaStream_t stream) {{
     int best_idx = -1;
     float best_time = 1e30f;
@@ -582,7 +596,7 @@ class EvtAutoTuneRunner {{
   }}
 
   std::vector<std::unique_ptr<EvtConcept>> configs_;
-  int best_idx_ = -1;     // -1 = not yet autotuned; sticky after first call.
+  std::unordered_map<uint64_t, int> best_idx_map_;  // (N, K) → tile index
   at::Tensor ws_;
 }};
 
