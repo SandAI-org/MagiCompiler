@@ -103,7 +103,13 @@ jobs:
                 git config --global user.name "CI"
 
                 script_path=".github/scripts/checkout_pr.py"
-                api_url="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${script_path}?ref=${HEAD_SHA}"
+                # HEAD_SHA may be a fork ref (user:branch) which is not a valid
+                # ref for the Contents API.  Try HEAD_SHA first; fall back to main.
+                script_ref="${HEAD_SHA}"
+                if [[ "$script_ref" == *:* ]]; then
+                    script_ref="refs/heads/main"
+                fi
+                api_url="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${script_path}?ref=${script_ref}"
 
                 mkdir -p .github/scripts
                 for attempt in $(seq 1 10); do
