@@ -43,6 +43,7 @@ import torch
 
 from magi_compiler.config import get_compile_config
 
+from .common.codegen_shared import max_tile_candidates
 from .evt_ir import Accum, AuxLoad, ColBroadcast, Compute, RowBroadcast, Store
 from .sm80.evt_codegen import render_evt_cu as _render_evt_cu_sm80
 from .sm90.evt_codegen import render_evt_cu as _render_evt_cu_sm90
@@ -288,29 +289,29 @@ def _compile_evt_module(
     b_dtype: torch.dtype,
     b_layout: str = "row",
     m_bucket: str = "medium",
-    N: int = 0,
-    K: int = 0,
     alignment_a_bits: int = 128,
     alignment_b_bits: int = 128,
     alignment_c_bits: int = 128,
 ):
     """Render + JIT-compile the EVT kernel for ``ir_json``. Process-level cached.
 
-    Each distinct (N, K) gets its own module so autotune state is isolated.
+    (N, K) are launch-time problem sizes and do not change the generated .cu;
+    the C++ runner caches autotune winners in a per-(N, K) map. Alignment
+    bits stay in the key because they are baked into the CUTLASS typedefs.
     """
     arch = _device_arch_tag()
+    tiles = max_tile_candidates()
     fast_key = (
         ir_json,
         a_dtype,
         b_dtype,
         b_layout,
         m_bucket,
-        N,
-        K,
         alignment_a_bits,
         alignment_b_bits,
         alignment_c_bits,
         arch,
+        tiles,
     )
     cached = _MODULE_FAST_CACHE.get(fast_key)
     if cached is not None:
@@ -320,23 +321,21 @@ def _compile_evt_module(
         raise ValueError(f"b_layout must be 'row' or 'col', got {b_layout!r}")
     a_str = _DTYPE_TO_STR[a_dtype]
     b_str = _DTYPE_TO_STR[b_dtype]
-    extended = json.dumps(
-        {
-            "ir": ir_json,
-            "a": a_str,
-            "b": b_str,
-            "b_layout": b_layout,
-            "m_bucket": m_bucket,
-            "N": int(N),
-            "K": int(K),
-            "alignA_bits": int(alignment_a_bits),
-            "alignB_bits": int(alignment_b_bits),
-            "alignC_bits": int(alignment_c_bits),
-            "arch": arch,
-            "version": 10,
-        },
-        sort_keys=True,
-    ).encode("utf-8")
+    payload = {
+        "ir": ir_json,
+        "a": a_str,
+        "b": b_str,
+        "b_layout": b_layout,
+        "m_bucket": m_bucket,
+        "alignA_bits": int(alignment_a_bits),
+        "alignB_bits": int(alignment_b_bits),
+        "alignC_bits": int(alignment_c_bits),
+        "arch": arch,
+        "version": 11,
+    }
+    if tiles is not None:
+        payload["max_tiles"] = tiles
+    extended = json.dumps(payload, sort_keys=True).encode("utf-8")
     key = hashlib.sha256(extended).hexdigest()
 
     cached = _MODULE_CACHE.get(key)
@@ -476,17 +475,16 @@ def _node_from_dict(d):
     raise ValueError(f"Unknown IR kind {kind!r}")
 
 
-# Per-(m_bucket, N, K, align) cache — separate modules so each runner has its
-# own autotune state (best_idx_).
+# Per-(m_bucket, align) cache. (N, K) are launch-time sizes; the C++ runner
+# stores autotune winners in a per-(N_out, K) map inside one shared module.
 _SWIGLU_FAST_CACHE: dict = {}
 _SWIGLU_BUILD_LOCKS: dict = {}
 
 
-def _compile_swiglu_dual(
-    m_bucket: str, N: int, K: int, alignment_a_bits: int = 128, alignment_b_bits: int = 128, alignment_c_bits: int = 128
-):
-    """Lazy-load a per-(bucket, N, K, align) DualGemm kernel module."""
-    fast_key = (m_bucket, int(N), int(K), int(alignment_a_bits), int(alignment_b_bits), int(alignment_c_bits))
+def _compile_swiglu_dual(m_bucket: str, alignment_a_bits: int = 128, alignment_b_bits: int = 128, alignment_c_bits: int = 128):
+    """Lazy-load a per-(bucket, align) DualGemm kernel module."""
+    tiles = max_tile_candidates()
+    fast_key = (m_bucket, int(alignment_a_bits), int(alignment_b_bits), int(alignment_c_bits), tiles)
     cached = _SWIGLU_FAST_CACHE.get(fast_key)
     if cached is not None:
         return cached
@@ -510,9 +508,10 @@ def _compile_swiglu_dual(
         if not os.path.exists(src):
             raise FileNotFoundError(f"vendored swiglu source not found: {src}")
         cache_root = get_compile_config().cache_root_dir
-        # Build dir embeds (arch, bucket, N, K, align) — stale cross-arch
-        # binaries cause cudaErrorInvalidDeviceFunction.
-        build_tag = f"{m_bucket}_N{N}_K{K}" f"_aA{alignment_a_bits}_aB{alignment_b_bits}_aC{alignment_c_bits}"
+        # Build dir embeds (arch, bucket, align, optional tile cap).
+        # Stale cross-arch binaries cause cudaErrorInvalidDeviceFunction.
+        tiles_tag = f"_tiles{tiles}" if tiles is not None else ""
+        build_tag = f"{m_bucket}_aA{alignment_a_bits}_aB{alignment_b_bits}_aC{alignment_c_bits}{tiles_tag}"
         build_dir = os.path.join(cache_root, "evt_kernels", arch_tag, f"swiglu_dual_{build_tag}")
         os.makedirs(build_dir, exist_ok=True)
         mod_name = f"magi_swiglu_dual_{build_tag}"
@@ -557,6 +556,7 @@ def _compile_swiglu_dual(
                     f"-DMAGI_SWIGLU_ALIGN_A_BITS={int(alignment_a_bits)}",
                     f"-DMAGI_SWIGLU_ALIGN_B_BITS={int(alignment_b_bits)}",
                     f"-DMAGI_SWIGLU_ALIGN_C_BITS={int(alignment_c_bits)}",
+                    *([f"-DMAGI_EVT_MAX_TILES={int(tiles)}"] if tiles is not None else []),
                 ],
                 build_directory=build_dir,
                 verbose=False,
@@ -569,8 +569,9 @@ def _compile_swiglu_dual(
 
 # ── Dispatch fast-cache ──────────────────────────────────────────────────────
 # Collapses out_dtype_from_id → _m_bucket → _compile_* → mod.attr-lookup
-# into a single dict.get(). Keyed by (kind, ir_json, dtypes, N, K, m_bucket,
-# out_dtype); reaches steady state after the first call per (site, bucket).
+# into a single dict.get(). Keyed by (kind, ir_json, dtypes, B sizes,
+# m_bucket, out_dtype) so alignment is still derived per shape; the
+# compiled .so is shared across (N, K) that hash to the same align.
 class _DispatchEntry:
     __slots__ = ("kernel_call", "is_evt", "out_dtype")
 
@@ -593,7 +594,7 @@ def _resolve_dispatch(kind, ir_json, a_dtype, b_dtype, N_w, K_w, m_bucket, out_d
         # K alignment also covers ldB=2K.
         align_bits = _runtime_align_bits(K_w, a_dtype)
         mod = _compile_swiglu_dual(
-            m_bucket, N_w, K_w, alignment_a_bits=align_bits, alignment_b_bits=align_bits, alignment_c_bits=alignment_c_bits
+            m_bucket, alignment_a_bits=align_bits, alignment_b_bits=align_bits, alignment_c_bits=alignment_c_bits
         )
         sw7 = json.loads(ir_json) if ir_json else {}
         sw7_alpha = float(sw7.get("alpha", 1.702))
@@ -620,8 +621,6 @@ def _resolve_dispatch(kind, ir_json, a_dtype, b_dtype, N_w, K_w, m_bucket, out_d
         b_dtype,
         b_layout=b_layout,
         m_bucket=m_bucket,
-        N=N_w,
-        K=K_w,
         alignment_a_bits=alignment_a_bits,
         alignment_b_bits=alignment_b_bits,
         alignment_c_bits=alignment_c_bits,

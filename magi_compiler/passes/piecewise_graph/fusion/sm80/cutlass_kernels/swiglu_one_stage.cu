@@ -30,10 +30,11 @@
 // smem stages; their accumulators stay in registers and a custom
 // SwigluCombine epilogue functor combines them and writes only D.
 //
-// AUTOTUNE: at first call per (M, N, K) tuple the runner times every
-// registered (TileShape, WarpShape, Stages) candidate and caches the
-// fastest one. Candidate set is sized to the sm_120 / Ada SMEM budget
-// (~96 KB per CTA); see SwAutoTuneRunner for SMEM math.
+// AUTOTUNE: first call per (N_out, K) times every registered
+// (TileShape, WarpShape, Stages) candidate and caches the winner in
+// best_idx_map_. Different M inside one bucket reuse that choice.
+// Candidate set is sized to the sm_120 / Ada SMEM budget (~96 KB per
+// CTA); see SwAutoTuneRunner for SMEM math.
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -41,6 +42,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <cstdint>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -240,12 +242,21 @@ class SwImpl : public SwConcept {
 // AutoTune runner — first call per (M, N_out, K) shape times all candidates.
 ////////////////////////////////////////////////////////////////////////////////
 
+#ifndef MAGI_EVT_MAX_TILES
+#define MAGI_EVT_MAX_TILES 0
+#endif
+
 #define SW_TILE(tb_m, tb_n, tb_k, wa_m, wa_n, wa_k, stages, label)            \
-  configs_.push_back(std::make_unique<                                          \
-      SwImpl<DualGemmConfig<                                                   \
-          cutlass::gemm::GemmShape<tb_m, tb_n, tb_k>,                           \
-          cutlass::gemm::GemmShape<wa_m, wa_n, wa_k>,                           \
-          stages>>>(label))
+  do {                                                                         \
+    if (MAGI_EVT_MAX_TILES <= 0                                                \
+        || static_cast<int>(configs_.size()) < MAGI_EVT_MAX_TILES) {          \
+      configs_.push_back(std::make_unique<                                     \
+          SwImpl<DualGemmConfig<                                               \
+              cutlass::gemm::GemmShape<tb_m, tb_n, tb_k>,                       \
+              cutlass::gemm::GemmShape<wa_m, wa_n, wa_k>,                       \
+              stages>>>(label));                                               \
+    }                                                                          \
+  } while (0)
 
 class SwAutoTuneRunner {
  public:
@@ -322,15 +333,9 @@ class SwAutoTuneRunner {
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.device().index()).stream();
 
-    // Single autotune per module. The .cu is compiled per (M-bucket, N, K)
-    // on the Python side — every distinct weight (N, K) gets its own .cu,
-    // so this runner instance hosts exactly one (N, K) and one bucket. The
-    // first call autotunes; all subsequent calls (any M in the bucket)
-    // reuse `best_idx_`.
-    if (best_idx_ < 0) {
-      best_idx_ = autotune(ea, stream);
-    }
-    int idx = best_idx_;
+    // One .so is shared across all (N, K) for this (bucket, align). Autotune
+    // winners live in best_idx_map_ so a new shape only re-times candidates.
+    int idx = lookup_or_autotune(ea, stream);
 
     auto& gemm = configs_[idx];
     size_t ws_sz = gemm->get_workspace_size(ea);
@@ -351,6 +356,22 @@ class SwAutoTuneRunner {
   int num_configs() const { return (int)configs_.size(); }
 
  private:
+  static uint64_t nk_key(int N_out, int K) {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(N_out)) << 32)
+           | static_cast<uint32_t>(K);
+  }
+
+  int lookup_or_autotune(const SwArgs& ea, cudaStream_t stream) {
+    const uint64_t key = nk_key(ea.N_out, ea.K);
+    auto it = best_idx_map_.find(key);
+    if (it != best_idx_map_.end()) {
+      return it->second;
+    }
+    int idx = autotune(ea, stream);
+    best_idx_map_.emplace(key, idx);
+    return idx;
+  }
+
   int autotune(const SwArgs& ea, cudaStream_t stream) {
     int best_idx = -1;
     float best_time = 1e30f;
@@ -397,7 +418,7 @@ class SwAutoTuneRunner {
   }
 
   std::vector<std::unique_ptr<SwConcept>> configs_;
-  int best_idx_ = -1;     // -1 = not yet autotuned; sticky after first call.
+  std::unordered_map<uint64_t, int> best_idx_map_;  // (N_out, K) → tile index
   at::Tensor ws_;
 };
 

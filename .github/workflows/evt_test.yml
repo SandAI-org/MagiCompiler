@@ -1,6 +1,6 @@
 name: EVT CUTLASS Test
 
-# CUTLASS EVT epilogue-fusion tests need ~35 min of nvcc compilation
+# CUTLASS EVT epilogue-fusion tests need ~17 min of nvcc compilation
 # per PyTorch version.  Run manually from the Actions tab when needed.
 #
 # Usage: Actions -> EVT CUTLASS Test -> Run workflow
