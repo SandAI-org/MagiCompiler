@@ -1051,6 +1051,61 @@ def test_evt_max_tiles_unset_keeps_full_bucket(monkeypatch):
     assert _evt_tile_invocations(render_sm90(ir, "bfloat16", "bfloat16")) == len(_TILE_CANDIDATES_SM90["medium"])
 
 
+@_EVT_CAPABLE
+def test_evt_nvcc_compile_cache_is_hit(monkeypatch):
+    """Same IR must hit the nvcc cache: memory reuse, (N, K) sharing, and on-disk .so.
+
+    ``cpp_extension.load`` is the nvcc entry point. After a cold JIT it must
+    not be called again for the same IR/align, including a different (N, K)
+    and a reload after dropping the process-level module dicts.
+    """
+    from pathlib import Path
+
+    import torch.utils.cpp_extension as cpp_extension
+
+    from magi_compiler.passes.piecewise_graph.fusion import evt_runtime as rt
+    from magi_compiler.passes.piecewise_graph.fusion.evt_ir import Accum, Compute, Store, to_canonical_json
+
+    load_calls: list = []
+    real_load = cpp_extension.load
+
+    def counting_load(*args, **kwargs):
+        load_calls.append(kwargs.get("name", args[0] if args else "?"))
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(cpp_extension, "load", counting_load)
+
+    ir_json = to_canonical_json(Store(Compute("silu", (Accum(),)), "bfloat16"))
+    dt = torch.bfloat16
+    compile_kw = dict(ir_json=ir_json, a_dtype=dt, b_dtype=dt, b_layout="col", m_bucket="medium")
+
+    rt._MODULE_CACHE.clear()
+    rt._MODULE_FAST_CACHE.clear()
+    rt._DISPATCH_CACHE.clear()
+
+    mod1 = rt._compile_evt_module(**compile_kw)
+    assert len(load_calls) == 1, f"cold JIT should nvcc once, got {load_calls}"
+    assert hasattr(mod1, "evt_matmul_out")
+    sos = list(Path(get_compile_config().cache_root_dir).rglob("magi_evt_*.so"))
+    assert sos, "cold JIT must write an on-disk EVT .so"
+
+    mod2 = rt._compile_evt_module(**compile_kw)
+    assert mod2 is mod1
+    assert len(load_calls) == 1, f"in-process cache missed; extra nvcc {load_calls}"
+
+    # Same IR, different problem N — align is still 128-bit, must share the .so.
+    entry = rt._resolve_dispatch("evt_col", ir_json, dt, dt, 1032, 1024, "medium", dt)
+    assert entry.is_evt
+    assert len(load_calls) == 1, f"different (N, K) recompiled; extra nvcc {load_calls}"
+
+    rt._MODULE_CACHE.clear()
+    rt._MODULE_FAST_CACHE.clear()
+    rt._DISPATCH_CACHE.clear()
+    mod3 = rt._compile_evt_module(**compile_kw)
+    assert len(load_calls) == 1, f"on-disk .so miss fell back to nvcc; extra {load_calls}"
+    assert hasattr(mod3, "evt_matmul_out")
+
+
 def test_evt_codegen_autotune_is_per_nk_map():
     """Generated runners must cache autotune winners by (N, K), not one sticky idx."""
     from magi_compiler.passes.piecewise_graph.fusion.evt_ir import Accum, Compute, Store
