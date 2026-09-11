@@ -16,7 +16,38 @@
 
 from __future__ import annotations
 
+import os
 import textwrap
+from typing import Sequence, TypeVar
+
+_T = TypeVar("_T")
+
+
+def max_tile_candidates() -> int | None:
+    """Return ``MAGI_EVT_MAX_TILES`` when set to a positive int, else ``None``.
+
+    Tests set this to 1 so nvcc instantiates a single tile instead of the
+    full autotune list. Unset in production (unlimited).
+    """
+    raw = os.environ.get("MAGI_EVT_MAX_TILES")
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        n = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"MAGI_EVT_MAX_TILES must be a positive int, got {raw!r}") from exc
+    if n < 1:
+        raise ValueError(f"MAGI_EVT_MAX_TILES must be >= 1, got {n}")
+    return n
+
+
+def limit_tile_candidates(candidates: Sequence[_T]) -> list[_T]:
+    """Slice ``candidates`` to ``MAGI_EVT_MAX_TILES`` when that env is set."""
+    n = max_tile_candidates()
+    if n is None:
+        return list(candidates)
+    return list(candidates)[:n]
+
 
 _DTYPE_TO_CUTLASS = {"bfloat16": "cutlass::bfloat16_t", "float16": "cutlass::half_t", "float32": "float"}
 
