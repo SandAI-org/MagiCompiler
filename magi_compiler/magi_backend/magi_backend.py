@@ -668,8 +668,8 @@ class MagiBackend:
         magi_logger.info(f"Setting up FX-level graph split with ops: {fx_split_ops=}")
         magi_logger.info(f"Resolved splitting ops for FX-level graph split: {resolved_ops=}")
 
-        # Step 1.4: whole-graph FSDP overlap.
-        if self.compile_config.fsdp_config.enable_fsdp:
+        # Step 1.4: whole-graph FSDP overlap (only for fullgraph models).
+        if self.compile_config.fsdp_config.enable_fsdp and self.compile_config.disable_graph_split:
             self._apply_fsdp_fullgraph_overlap(graph)
 
         # Step 2: split graph by ops, we split graph based on resolved_ops, which becomes the partitioned single graph.
