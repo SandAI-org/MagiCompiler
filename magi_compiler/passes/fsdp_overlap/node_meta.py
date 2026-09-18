@@ -31,6 +31,14 @@ UNEVEN_SHARD = "magi_fsdp_uneven_shard"
 # Weight gather whose shard now lives in symmetric memory. Set by binding only.
 CE_BOUND = "magi_ce_bound"
 
+# On the node that produces a weight's local shard (the ``to_local``): the
+# host-pool slot its bytes were moved to. Set by host-offload binding only.
+HOST_SLOT = "magi_host_offload_slot"
+
+# On a weight gather whose shard is host-offloaded, so bucketing can keep
+# offloaded and resident gathers in separate buckets.
+HOST_OFFLOADED = "magi_host_offloaded"
+
 
 def is_weight_ag(node: fx.Node) -> bool:
     return bool(node.meta.get(WEIGHT_AG))
@@ -55,3 +63,20 @@ def mark_weight_ag(node: fx.Node, *, uneven: bool) -> None:
 
 def mark_ce_bound(node: fx.Node) -> None:
     node.meta[CE_BOUND] = True
+
+
+def host_slot(node: fx.Node) -> int | None:
+    """The host-pool slot of the shard this node produces, or None."""
+    return node.meta.get(HOST_SLOT)
+
+
+def is_host_offloaded(node: fx.Node) -> bool:
+    return bool(node.meta.get(HOST_OFFLOADED))
+
+
+def mark_host_slot(node: fx.Node, slot: int) -> None:
+    node.meta[HOST_SLOT] = slot
+
+
+def mark_host_offloaded(node: fx.Node) -> None:
+    node.meta[HOST_OFFLOADED] = True

@@ -74,6 +74,41 @@ def _ce_ag_ops():
 _CE_AG_OPS = _ce_ag_ops()
 _WEIGHT_AG_OPS = tuple(op for op in (_AG, _AG_COALESCED, *_CE_AG_OPS) if op is not None)
 
+
+def _h2d_ops():
+    """Host-to-device weight load ops, imported lazily so this pass stays
+    importable without a CUDA build."""
+    try:
+        from magi_compiler.offload.h2d_op import H2D_LOAD, H2D_LOAD_COALESCED
+
+        return (H2D_LOAD, H2D_LOAD_COALESCED)
+    except Exception:  # noqa: BLE001
+        return ()
+
+
+_H2D_OPS = _h2d_ops()
+
+
+def _is_h2d_load(snode: BaseSchedulerNode) -> bool:
+    """``magi::h2d_load`` lowers to an ordinary FallbackKernel, so nothing in
+    Inductor marks it as a transfer.
+
+    It must be recognized here for one reason: it occupies the PCIe lane, not the
+    compute stream, so counting its runtime as compute that hides an all-gather
+    would double-spend the same microseconds on two different transfers.  It is
+    deliberately NOT part of the collective skeleton -- a load issues no NCCL
+    work, and putting it there would make two ranks that merely offload different
+    weights look like two structurally different graphs.
+    """
+    node = getattr(snode, "node", None)
+    if getattr(node, "op_overload", None) in _H2D_OPS:
+        return True
+    for child in getattr(snode, "snodes", []) or []:
+        if getattr(getattr(child, "node", None), "op_overload", None) in _H2D_OPS:
+            return True
+    return False
+
+
 # Default extra headroom (ns) added to each collective's runtime when sizing the
 # compute window, absorbing estimator error + kernel-launch latency so the wait
 # rarely stalls.  Overridable via the reorder pass constructor.
@@ -217,7 +252,15 @@ class FsdpOverlapReorder:
         comm_overlap_window_margin_ns: float = _DEFAULT_WINDOW_MARGIN_NS,
         cost_fn=None,
         comm_overlap_window_scale: float = 1.0,
+        move_prep_chain: bool = False,
     ) -> None:
+        # Host offload puts an h2d_load + its wait between the weight placeholder
+        # and the gather.  Those are real data producers, so ``lower`` lands one
+        # slot below the launch and the gather can no longer move at all unless
+        # the whole prep chain travels with it.  Off by default: for a graph
+        # without offload this would also start hoisting dtype casts and pads
+        # that today stay put, and that is a separate change from this one.
+        self.move_prep_chain = move_prep_chain
         self.comm_overlap_window_margin_ns = comm_overlap_window_margin_ns
         # need = comm * scale + margin: collectives are measured in isolation but
         # run concurrent with the compute that hides them (~1.4-1.5x slower on
@@ -240,6 +283,7 @@ class FsdpOverlapReorder:
         new = FsdpOverlapReorder.__new__(FsdpOverlapReorder)
         new.comm_overlap_window_margin_ns = self.comm_overlap_window_margin_ns
         new.comm_overlap_window_scale = self.comm_overlap_window_scale
+        new.move_prep_chain = self.move_prep_chain
         new._cost_fn = self._cost_fn
         new._cost_cache = {}
         memo[id(self)] = new
@@ -258,7 +302,7 @@ class FsdpOverlapReorder:
 
     @staticmethod
     def _is_compute(snode: BaseSchedulerNode) -> bool:
-        return not _issues_transfer(snode) and not contains_wait(snode)
+        return not _issues_transfer(snode) and not _is_h2d_load(snode) and not contains_wait(snode)
 
     # -- main -------------------------------------------------------------
     def __call__(self, snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
@@ -310,7 +354,7 @@ class FsdpOverlapReorder:
         plans = []  # (launch, group, fc_idx, comm_runtime, lower)
         lowers: dict = {}  # launch -> earliest legal index (real-dep floor)
         for launch in launches_in_order:
-            group = self._launch_group(launch, order, buf_to_snode, users)
+            group = self._launch_group(launch, order, buf_to_snode, users, index_of)
             fc_idx = self._first_consumer_index(launch, group, order, users)
             if fc_idx is None:
                 continue
@@ -553,12 +597,13 @@ class FsdpOverlapReorder:
             )
 
     # -- group detection --------------------------------------------------
-    def _launch_group(self, launch, order, buf_to_snode, users) -> list[BaseSchedulerNode]:
+    def _launch_group(self, launch, order, buf_to_snode, users, index_of) -> list[BaseSchedulerNode]:
         """The snodes that must move together with the launch.
 
         Coalesced: packed collective + its MultiOutput members (they depend on the
         packed buffer and must stay immediately after it, before any wait).
         no-bucket: just the launch (the wait stays put).
+        With ``move_prep_chain``: plus the upstream shard prep (see _prep_chain).
         """
         group = [launch]
         node = _leaf_collective_node(launch)
@@ -581,7 +626,55 @@ class FsdpOverlapReorder:
                 deps = [d for d in s.unmet_dependencies if not _is_fake_dep(d)]
                 if deps and all(d.name in produced for d in deps):
                     group.append(s)
+        if self.move_prep_chain:
+            group.extend(self._prep_chain(group, buf_to_snode, index_of))
         return group
+
+    @staticmethod
+    def _prep_chain(group, buf_to_snode, index_of) -> list[BaseSchedulerNode]:
+        """The UPSTREAM shard-prep snodes that have to travel with the launch.
+
+        A weight's path from placeholder to gather can hold an ``h2d_load``, its
+        wait, a dtype cast and an uneven-shard pad.  Every one of them is a real
+        buffer producer, so ``_earliest_legal_index`` pins the launch just below
+        them: leaving them behind does not make the hoist illegal, it makes it
+        impossible.
+
+        Moving a producer earlier is always legal for its readers, so there is no
+        "all users inside the group" condition here -- the cost of a longer live
+        range is the in-flight budget's business, not correctness'.  The condition
+        that does matter is that a traveller reads nothing but graph inputs and
+        other travellers: a node that touches an activation would be compute we
+        are simultaneously counting as compute that hides this gather.  Anything
+        failing that is dropped, and ``_earliest_legal_index`` then simply reports
+        a higher floor -- a shorter hoist, never a wrong one.
+        """
+        members = set(group)
+        stack = list(group)
+        reached: set[BaseSchedulerNode] = set()
+        while stack:
+            for d in stack.pop().unmet_dependencies:
+                if _is_fake_dep(d):
+                    continue
+                prod = buf_to_snode.get(d.name)
+                if prod is None or prod in members or prod in reached:
+                    continue
+                if _issues_transfer(prod) and not _is_h2d_load(prod):
+                    continue  # a real collective is not prep; it has a plan of its own
+                reached.add(prod)
+                stack.append(prod)
+
+        # Program order, so every producer is classified before its consumers and
+        # one pass settles the cascade of a dropped node's dependents.
+        keep: set[BaseSchedulerNode] = set()
+        for s in sorted(reached, key=lambda n: index_of[n]):
+            if all(
+                buf_to_snode.get(d.name) in (None, s) or buf_to_snode.get(d.name) in keep
+                for d in s.unmet_dependencies
+                if not _is_fake_dep(d)
+            ):
+                keep.add(s)
+        return sorted(keep, key=lambda n: index_of[n])
 
     # -- consumer discovery ----------------------------------------------
     def _wait_snodes(self, group, order, users) -> list[BaseSchedulerNode]:
@@ -591,7 +684,14 @@ class FsdpOverlapReorder:
         was an Inductor collective; a custom-op gather puts an alias snode between
         the launch and its wait, and missing the wait silently drops the gather
         from the placement plan altogether.
+
+        A wait that is itself a group member is stepped over rather than
+        reported: with host offload the group contains the ``h2d_load`` and the
+        wait that guards it, and that wait sits UPSTREAM of the gather.  Stopping
+        there would report the gather's own launch as its first consumer, which
+        reads as a zero-width overlap window in every log this pass emits.
         """
+        members = set(group)
         stack = [b for s in group for b in s.get_buffer_names()]
         waits: list[BaseSchedulerNode] = []
         seen: set = set()
@@ -600,9 +700,9 @@ class FsdpOverlapReorder:
                 if u in seen:
                     continue
                 seen.add(u)
-                if contains_wait(u):
+                if contains_wait(u) and u not in members:
                     waits.append(u)
-                elif self._is_transparent(u):
+                elif u in members or self._is_transparent(u):
                     stack.extend(u.get_buffer_names())
         return waits
 
@@ -661,52 +761,60 @@ class FsdpOverlapReorder:
         return barrier
 
     def _earliest_legal_index(self, group, order, index_of, buf_to_snode, op_to_snode) -> int:
-        """1 + max index of any REAL (non-fake buffer) producer the group needs.
-
-        Deliberately NOT ``snode.ancestors``: that set is polluted by the fake
-        ``WeakDep`` edges Inductor inserts between collectives for comm-stream
-        serialization.  Weight gathers read independent param shards -- there is no
-        real gather->gather dependency -- so counting the WeakDep would pin the
-        launch right after the previous collective and forbid the very hoist this
-        pass exists for.  A gather's only real producer is its weight-shard
-        placeholder (+ to_local/pad/cast chain), so real ``lower`` is ~0."""
-        group_set = set(group)
-        lo = 0
-        for s in group:
-            for d in s.unmet_dependencies:  # buffer names
-                if _is_fake_dep(d):  # WeakDep / StarDep -- ordering hint, not data
-                    continue
-                prod = buf_to_snode.get(d.name)
-                if prod is None or prod in group_set:
-                    continue
-                lo = max(lo, index_of.get(prod, 0) + 1)
-        return lo
+        return earliest_legal_index(group, index_of, buf_to_snode)
 
     def _validate_full(self, new_order, op_to_snode, buf_to_snode, users) -> bool:
-        """Valid topological order w.r.t. REAL data deps: every node's non-fake
-        buffer producers precede it (the driver does not repair the order, so a
-        violation would silently miscompile).  Checking direct producers per node
-        is a complete validation of the real-dep DAG.  ``snode.ancestors`` is NOT
-        used -- it includes the fake WeakDep edges this pass intentionally crosses
-        (see ``_earliest_legal_index``); an ancestors check would false-reject
-        every legal hoist.  WeakDep is advisory, not a correctness constraint."""
-        pos = {s: i for i, s in enumerate(new_order)}
-        for s in new_order:
-            sp = pos[s]
-            for d in s.unmet_dependencies:  # buffer names
-                if _is_fake_dep(d):  # WeakDep / StarDep -- advisory ordering, not data
-                    continue
-                prod = buf_to_snode.get(d.name)
-                if prod is s:  # fused snode may name its own internal buffers
-                    continue
-                if prod is not None and pos.get(prod, -1) >= sp:
-                    magi_logger.debug(
-                        "validate fail: %s@%d needs buffer-dep %s@%d (buf %s)",
-                        s.get_name(),
-                        sp,
-                        prod.get_name(),
-                        pos.get(prod, -1),
-                        d.name,
-                    )
-                    return False
-        return True
+        return validate_topological_order(new_order, buf_to_snode)
+
+
+def earliest_legal_index(group, index_of, buf_to_snode) -> int:
+    """1 + max index of any REAL (non-fake buffer) producer the group needs.
+
+    Deliberately NOT ``snode.ancestors``: that set is polluted by the fake
+    ``WeakDep`` edges Inductor inserts between collectives for comm-stream
+    serialization.  Weight gathers read independent param shards -- there is no
+    real gather->gather dependency -- so counting the WeakDep would pin the
+    launch right after the previous collective and forbid the very hoist this
+    pass exists for.  A gather's only real producer is its weight-shard
+    placeholder (+ to_local/pad/cast chain), so real ``lower`` is ~0."""
+    group_set = set(group)
+    lo = 0
+    for s in group:
+        for d in s.unmet_dependencies:  # buffer names
+            if _is_fake_dep(d):  # WeakDep / StarDep -- ordering hint, not data
+                continue
+            prod = buf_to_snode.get(d.name)
+            if prod is None or prod in group_set:
+                continue
+            lo = max(lo, index_of.get(prod, 0) + 1)
+    return lo
+
+
+def validate_topological_order(new_order, buf_to_snode) -> bool:
+    """Valid topological order w.r.t. REAL data deps: every node's non-fake
+    buffer producers precede it (the driver does not repair the order, so a
+    violation would silently miscompile).  Checking direct producers per node
+    is a complete validation of the real-dep DAG.  ``snode.ancestors`` is NOT
+    used -- it includes the fake WeakDep edges this pass intentionally crosses
+    (see ``earliest_legal_index``); an ancestors check would false-reject
+    every legal hoist.  WeakDep is advisory, not a correctness constraint."""
+    pos = {s: i for i, s in enumerate(new_order)}
+    for s in new_order:
+        sp = pos[s]
+        for d in s.unmet_dependencies:  # buffer names
+            if _is_fake_dep(d):  # WeakDep / StarDep -- advisory ordering, not data
+                continue
+            prod = buf_to_snode.get(d.name)
+            if prod is s:  # fused snode may name its own internal buffers
+                continue
+            if prod is not None and pos.get(prod, -1) >= sp:
+                magi_logger.debug(
+                    "validate fail: %s@%d needs buffer-dep %s@%d (buf %s)",
+                    s.get_name(),
+                    sp,
+                    prod.get_name(),
+                    pos.get(prod, -1),
+                    d.name,
+                )
+                return False
+    return True

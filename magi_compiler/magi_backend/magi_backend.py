@@ -615,8 +615,11 @@ class MagiBackend:
            (the analytical roofline is unusable for our sizing decisions).
         3. Install the latest-safe-launch reorder pass, REPLACING PyTorch's builtin
            raise_comms/sink_waits, and enable reorder_for_compute_comm_overlap.
+        4. With host offload on, append the second-phase pass that pulls each
+           weight load back out of the block phase 3 moved it in.
         """
         fsdp_cfg = self.compile_config.fsdp_config
+        offload_cfg = self.compile_config.offload_config
         assert (
             self.compile_config.disable_graph_split
         ), "fsdp_config.enable_fullgraph_overlap requires disable_graph_split=True"
@@ -624,7 +627,19 @@ class MagiBackend:
             self.compile_config.cudagraph_mode == CudaGraphMode.NONE
         ), "fsdp_config.enable_fullgraph_overlap requires cudagraph_mode=NONE"
 
-        from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder, lower_and_bucket_full_graph
+        host_offload = offload_cfg.graph_weight_offload
+        if host_offload:
+            assert not offload_cfg.model_cpu_offload, (
+                "offload_config.graph_weight_offload and offload_config.model_cpu_offload both offload "
+                "the model's weights, through a compile-time graph rewrite and a runtime wrapper "
+                "respectively; enable exactly one"
+            )
+            assert fsdp_cfg.transport == "nccl", (
+                "offload_config.graph_weight_offload requires fsdp_config.transport='nccl': a "
+                "copy-engine gather reads its peers' device-resident shards, which offloading frees"
+            )
+
+        from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder, H2dLoadReorder, lower_and_bucket_full_graph
         from magi_compiler.profiling import ProfilingRuntimeEstimator
 
         bucket_size_bytes = int(fsdp_cfg.bucket_size_mib) * 1024 * 1024
@@ -635,6 +650,8 @@ class MagiBackend:
             transport=fsdp_cfg.transport,
             example_inputs=example_inputs,
             min_shard_bytes=int(fsdp_cfg.symm_min_shard_mib) * 1024 * 1024,
+            host_offload=host_offload,
+            offload_min_shard_bytes=int(offload_cfg.offload_min_shard_mib * 1024 * 1024),
         )
         magi_logger.info(
             "FSDP fullgraph overlap: transport=%s bucket_mode=%s bucket_size=%d MiB created %d buckets",
@@ -656,9 +673,29 @@ class MagiBackend:
             comm_overlap_window_margin_ns=fsdp_cfg.comm_overlap_window_margin_ns,
             cost_fn=cost_fn,
             comm_overlap_window_scale=fsdp_cfg.comm_overlap_window_scale,
+            move_prep_chain=host_offload,
         )
+        passes = [reorder]
+        if host_offload:
+            from magi_compiler.offload import host_pool
+
+            # Phase 1 moves the load, its wait and the gather as one block, which
+            # leaves the transfer fully exposed in front of the gather; phase 2 is
+            # what opens a compute window in between.  Separate passes because the
+            # two lanes are separate hardware: the same compute may hide a PCIe
+            # load and an NVLink gather at once, so neither sweep may spend the
+            # other's budget.
+            passes.append(
+                H2dLoadReorder(
+                    bandwidth_bytes_per_ns=host_pool.h2d_bandwidth_bytes_per_ns(offload_cfg.offload_h2d_bandwidth_gbps),
+                    window_margin_ns=fsdp_cfg.comm_overlap_window_margin_ns,
+                    window_scale=fsdp_cfg.comm_overlap_window_scale,
+                    max_resident_bytes=int(offload_cfg.offload_max_resident_mib) * 1024 * 1024,
+                    cost_fn=cost_fn,
+                )
+            )
         self.inductor_compile_config["reorder_for_compute_comm_overlap"] = True
-        self.inductor_compile_config["reorder_for_compute_comm_overlap_passes"] = [reorder]
+        self.inductor_compile_config["reorder_for_compute_comm_overlap_passes"] = passes
 
     @observe_lifecycle("graph_split")
     def _split_graph(self, graph: fx.GraphModule, example_inputs) -> tuple[fx.GraphModule, list[SplitItem]]:
