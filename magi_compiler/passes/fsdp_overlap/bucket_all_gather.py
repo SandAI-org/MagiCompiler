@@ -16,13 +16,22 @@ from __future__ import annotations
 
 import operator
 from collections import defaultdict, deque
+from typing import Any
 
 import torch
 import torch.fx as fx
 
 from magi_compiler.utils import magi_logger
 
-from .node_meta import is_ce_bound, is_uneven_shard, is_weight_ag, mark_ce_bound, mark_weight_ag
+from .node_meta import (
+    is_ce_bound,
+    is_host_offloaded,
+    is_uneven_shard,
+    is_weight_ag,
+    mark_ce_bound,
+    mark_host_offloaded,
+    mark_weight_ag,
+)
 
 _ALL_GATHER = torch.ops._c10d_functional.all_gather_into_tensor.default
 _ALL_GATHER_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
@@ -57,7 +66,22 @@ def _gathers_a_weight(node: fx.Node) -> bool:
             q.extend(dep.all_input_nodes)
         elif dep.op == "call_function":
             nm = getattr(dep.target, "__name__", "") or str(dep.target)
-            if any(t in nm for t in ("constant_pad_nd", "_to_copy", "convert_element_type", "view", "reshape", "clone")):
+            # h2d_load / wait_tensor: host offload puts them between the shard and
+            # the gather, so a walk that stops at them stops one node short of the
+            # parameter it is looking for.
+            if any(
+                t in nm
+                for t in (
+                    "constant_pad_nd",
+                    "_to_copy",
+                    "convert_element_type",
+                    "view",
+                    "reshape",
+                    "clone",
+                    "h2d_load",
+                    "wait_tensor",
+                )
+            ):
                 q.extend(dep.all_input_nodes)
     return False
 
@@ -161,6 +185,8 @@ def _coalesce_one_bucket(graph: fx.GraphModule, node_index: dict[fx.Node, int], 
         mark_weight_ag(coalesced, uneven=any(is_uneven_shard(ag) for ag in ag_nodes))
         if all(is_ce_bound(ag) for ag in ag_nodes):
             mark_ce_bound(coalesced)
+        if all(is_host_offloaded(ag) for ag in ag_nodes):
+            mark_host_offloaded(coalesced)
 
         outs = []
         for i, am in enumerate(ag_metas):
@@ -180,10 +206,17 @@ def _coalesce_one_bucket(graph: fx.GraphModule, node_index: dict[fx.Node, int], 
 
 
 def bucket_weight_all_gather_coalesced(graph: fx.GraphModule, bucket_size_bytes: int = 0, split_by=None) -> int:
-    """Coalesce the SimpleFSDP weight all-gathers over the WHOLE graph: per process
-    group, walk them in program order and cut a new bucket at every dtype change or
-    when the accumulated local-shard bytes would exceed ``bucket_size_bytes``
-    (0 = no cap).  Each bucket of >= 2 gathers becomes::
+    """Coalesce the SimpleFSDP weight all-gathers that are NEIGHBOURS in the graph.
+
+    A bucket is drawn from a run of launches that are consecutive in program
+    order on ONE mesh, capped at ``bucket_size_bytes`` of accumulated local-shard
+    bytes (0 = no cap) and cut at every dtype change.  Another mesh's gather ends
+    the run; a run of one is left as its own plain all_gather.
+
+    Adjacency is the load-bearing word.  Fusing two gathers makes the earlier
+    one's shard, and the unsharded output it becomes, live until the later one's
+    consumer; do that across a mesh boundary and a bucket can span most of the
+    model.  Each bucket of >= 2 gathers becomes::
 
         coalesced = all_gather_into_tensor_coalesced([local_0..local_{N-1}], W, group)
         out_i     = getitem(coalesced, i)   # same shape as the member's old output
@@ -195,31 +228,51 @@ def bucket_weight_all_gather_coalesced(graph: fx.GraphModule, bucket_size_bytes:
     are re-pointed from each old wait to ``wait_i``; the launch + getitems stay
     together so ``FsdpOverlapReorder`` later moves them as one unit.
 
-    ``split_by(node)`` adds a second bucket key, used in copy-engine mode to keep
-    bound and unbound gathers apart -- a bucket is one submission, so it cannot span
-    two transports.
+    ``split_by(node)`` adds a second bucket key, used in copy-engine and host-offload
+    mode to keep gathers of different kinds apart -- a bucket is one submission, so
+    it cannot span two transports.
 
     Runs after redistribute lowering (via ``lower_and_bucket_full_graph``).
     Returns the number of coalesced buckets created.
     """
     node_index = {n: i for i, n in enumerate(graph.graph.nodes)}
 
-    # Key by (group_name, transport class); dtype breaks buckets positionally
-    # inside _split_by_dtype_and_size (strict program-adjacency).
-    groups: dict[tuple, list[fx.Node]] = defaultdict(list)
+    # Runs of launches that are adjacent in the GRAPH, cut wherever the mesh
+    # changes.  Keying by group alone made two gathers on one mesh "neighbours"
+    # with hundreds of another mesh's gathers between them, and fusing those
+    # drags the earlier shard -- and the unsharded output it becomes -- across
+    # everything in between: on a 40-layer MoE, layer 0's attention weight shared
+    # a bucket with layer 30's, holding gigabytes of gathered weight for most of
+    # a forward.
+    #
+    # ``split_by`` deliberately does NOT cut a run.  It marks a gather that has
+    # to travel differently (unbound from the copy engine, resident rather than
+    # offloaded), and those are isolated single gathers sitting between their
+    # neighbours, not a stretch of the model.  Letting one of them end the run
+    # would split the bucket around it and cost throughput for nothing.
+    runs: list[list[fx.Node]] = []
+    last_group = object()
     for node in graph.graph.nodes:
         if not _is_weight_all_gather(node):
             continue
         _, _world, group_name = node.args
-        groups[(group_name, split_by(node) if split_by is not None else None)].append(node)
+        if group_name == last_group:
+            runs[-1].append(node)
+        else:
+            runs.append([node])
+            last_group = group_name
 
     buckets = 0
-    for ag_nodes in groups.values():
-        for sub in _split_by_dtype_and_size(ag_nodes, node_index, bucket_size_bytes):
-            if len(sub) < 2:
-                continue  # single weight -> keep its own all_gather (nothing to coalesce)
-            _coalesce_one_bucket(graph, node_index, sub)
-            buckets += 1
+    for run in runs:
+        by_kind: dict[Any, list[fx.Node]] = defaultdict(list)
+        for node in run:
+            by_kind[split_by(node) if split_by is not None else None].append(node)
+        for ag_nodes in by_kind.values():
+            for sub in _split_by_dtype_and_size(ag_nodes, node_index, bucket_size_bytes):
+                if len(sub) < 2:
+                    continue  # single weight -> keep its own all_gather (nothing to coalesce)
+                _coalesce_one_bucket(graph, node_index, sub)
+                buckets += 1
 
     if buckets:
         graph.graph.lint()

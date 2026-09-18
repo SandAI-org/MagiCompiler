@@ -207,6 +207,50 @@ class OffloadConfig(BaseModel):
             "Env var: MAGI_COMPILE_OFFLOAD_CONFIG__FORCE_PER_RANK_WEIGHTS (1/0/true/false)."
         ),
     )
+    graph_weight_offload: bool = Field(
+        False,
+        description=(
+            "Compile-time CPU offload of SimpleFSDP weight shards, scheduled at snode granularity. "
+            "Parks each selected local shard in pinned host memory and loads it back inside the graph "
+            "with magi::h2d_load, placed far enough upstream for compute to hide the transfer before "
+            "its all-gather launches -- but never so far that its shard is still live where the next "
+            "one's begins, so at most one shard is ever in flight. A weight that cannot be scheduled "
+            "under that rule stays resident instead, since loading something nothing can hide costs "
+            "PCIe every forward and buys nothing; offload_max_resident_mib caps how much of that the "
+            "pass may keep. Requires fsdp_config.enable_fsdp=True and transport='nccl'; "
+            "mutually exclusive with model_cpu_offload (the runtime-wrapper path) because the two "
+            "offload the same bytes through different mechanisms."
+        ),
+    )
+    offload_min_shard_mib: float = Field(
+        1.0,
+        ge=0.0,
+        description=(
+            "Minimum local-shard MiB to offload. Below this the transfer is dominated by fixed DMA "
+            "overhead rather than bandwidth, so it costs schedule slack and frees almost nothing."
+        ),
+    )
+    offload_max_resident_mib: int = Field(
+        0,
+        ge=0,
+        description=(
+            "Cap on the weight MiB the placement pass may leave resident per GPU. The pass first "
+            "picks the fastest schedule, which keeps any weight it cannot hide behind compute -- "
+            "loading such a weight is pure cost every forward. Where that asks for more device "
+            "memory than you have, this cap pulls weights back into the offload plan, choosing the "
+            "ones whose loads fit in a window the schedule already left idle so the bus is free. "
+            "0 = no cap: take the fastest schedule and accept its residency."
+        ),
+    )
+    offload_h2d_bandwidth_gbps: float = Field(
+        0.0,
+        ge=0.0,
+        description=(
+            "Override the measured host-to-device bandwidth (GB/s) used to size each load's overlap "
+            "window. 0 = calibrate once per process with a pinned probe. Under-estimating is the "
+            "safe direction: it hoists loads further than needed."
+        ),
+    )
 
 
 class FSDPConfig(BaseModel):
