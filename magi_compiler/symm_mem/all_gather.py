@@ -20,6 +20,7 @@ from functools import lru_cache
 import torch
 import torch._C._distributed_c10d as _c10d
 
+from magi_compiler.cuda.event_work import EventWork as _EventWork
 from magi_compiler.utils import magi_logger
 
 from .symm_buffer import lookup_shard
@@ -108,18 +109,6 @@ def _batcher() -> BatchMemcpy | None:
     except (AttributeError, OSError) as exc:
         magi_logger.warning("cudaMemcpyBatchAsync unavailable (%s); falling back to per-copy submission", exc)
         return None
-
-
-class _EventWork(_c10d.Work):
-    """c10d Work whose ``wait()`` is a stream wait on the copy-engine event."""
-
-    def __init__(self, event: torch.cuda.Event) -> None:
-        super().__init__()
-        self._event = event
-
-    def wait(self, timeout=None) -> bool:  # noqa: ARG002 - c10d's signature
-        torch.cuda.current_stream().wait_event(self._event)
-        return True
 
 
 @lru_cache(maxsize=1)
