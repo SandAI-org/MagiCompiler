@@ -18,11 +18,11 @@ Driven through a ``torchrun`` subprocess (fsdp_overlap_helper/offload_e2e_helper
 because the chain needs a process group inside a real compile -- same pattern as
 test_fsdp_overlap_e2e.py.
 
-Offload binds whatever the redistribute lowering exposed, so if the installed
-SimpleFSDP emits a shape the lowering does not match, there is nothing to offload
-and the numeric check would pass on an ordinary graph.  The helper prints
-``OFFLOAD_SKIPPED`` in that case and these tests skip rather than report a green
-run for a chain that never executed.
+Offload tags whatever host-first parked and the redistribute lowering exposed,
+so if the installed SimpleFSDP emits a shape the lowering does not match, there
+is nothing to offload and the numeric check would pass on an ordinary graph.
+The helper prints ``OFFLOAD_SKIPPED`` in that case and these tests skip rather
+than report a green run for a chain that never executed.
 """
 
 import os
@@ -197,10 +197,9 @@ def test_offload_multi_rank():
 def test_host_first_never_puts_the_weights_on_the_device():
     """The number offload exists to lower, measured rather than inferred.
 
-    Loading is where peak device memory used to be decided: every shard was
-    materialized on the GPU and filled there, and only the first compile moved
-    them off. Nothing about the steady state showed it, which is why the load
-    phase is measured separately here.
+    Loading is where peak device memory is decided: the shards are
+    materialized in host memory and filled there, so the load phase should
+    cost no device memory. That is why it is measured separately here.
     """
     p = _run(1, "--host-first")
     out = _check(p)
@@ -210,30 +209,6 @@ def test_host_first_never_puts_the_weights_on_the_device():
     weights = _marker(p.stdout, "OFFLOAD_LOAD", "weights_mib")
     assert weights > 1, "the shape under test is supposed to have weights worth offloading"
     assert peak < 0.5, f"materializing and filling the model should cost no device memory, cost {peak} MiB"
-
-
-@requires_cuda
-@requires_torchrun
-def test_host_first_reaches_the_same_steady_state():
-    """Only the path to the steady state changes, never the steady state itself.
-
-    Everything downstream of the handoff -- the graph, the loads, which weights
-    the placement pass keeps resident -- is supposed to be identical to the
-    bind-at-compile path. If it is not, the two are separate features with
-    separate bugs rather than one feature with a faster loader.
-
-    The bandwidth is pinned because the two runs are compared against each
-    other: the probe is a real measurement of a shared bus, and the placement
-    pass sizes every overlap window from it, so letting each run measure its own
-    compares two different schedules.
-    """
-    pinned = ("--h2d-gbps", "25")
-    host_first = _check(_run(1, "--host-first", *pinned))
-    legacy = _check(_run(1, *pinned))
-
-    for field in ("mib", "shards", "promoted_mib"):
-        assert _marker(host_first, "OFFLOAD_FREED", field) == _marker(legacy, "OFFLOAD_FREED", field), field
-    assert _marker(host_first, "OFFLOAD_LOAD", "peak_mib") < _marker(legacy, "OFFLOAD_LOAD", "peak_mib")
 
 
 @requires_cuda

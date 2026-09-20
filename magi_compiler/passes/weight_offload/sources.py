@@ -73,11 +73,11 @@ class OffloadCandidate:
     """One weight whose bytes could live in host memory."""
 
     holder: fx.Node  # the node whose output is the weight; the load goes right after it
-    local: Any  # the live tensor whose storage moves
+    local: Any  # the live stand-in the slot is keyed on
     name: str  # the parameter it came from, for the placement logs
     nbytes: int
     tag: fx.Node | None = None  # node to mark offloaded, so later passes can tell
-    slot: int | None = None  # already bound by an earlier compile of the same model
+    slot: int | None = None  # host-pool slot from adopt; None = never parked
     group: Any = None  # ProcessGroup of the DTensor mesh; None = no cross-rank vote
 
 
@@ -136,26 +136,22 @@ def resolve(graph: fx.GraphModule, node: fx.Node, placeholder_examples: Mapping[
     return None
 
 
-def unusable(local: Any, min_bytes: int) -> str | None:
-    """Why these bytes cannot be parked in host memory, or None if they can.
+def parked_slot(local: Any, min_bytes: int) -> tuple[int | None, str | None]:
+    """The host-pool slot for ``local``, or ``(None, why)`` if it cannot be loaded.
 
-    Checks that hold for any weight; a source adds its own on top.
+    A weight reaches the pool only through host-first materialization.  Collect
+    never copies a resident shard off the device.
     """
-    from torch._subclasses.fake_tensor import FakeTensor
+    from . import host_pool
 
     if not isinstance(local, torch.Tensor):
-        return "graph input is not a tensor"
-    if isinstance(local, FakeTensor) or local.is_meta:
-        return "graph input is a fake/meta tensor"
-    if local.device.type != "cuda":
-        return f"weight already lives on {local.device.type}"
-    if not local.is_contiguous():
-        return "weight is not contiguous"
-    if local.untyped_storage().nbytes() == 0:
-        return "weight storage was already freed"
-    if local.numel() * local.element_size() < min_bytes:
-        return "weight is below the size floor"
-    return None
+        return None, "graph input is not a tensor"
+    slot = host_pool.slot_of(local)
+    if slot is None:
+        return None, "weight was not materialized in host memory"
+    if host_pool.slot_bytes(slot) < min_bytes:
+        return None, "weight is below the size floor"
+    return slot, None
 
 
 @dataclass
@@ -196,26 +192,18 @@ class PlainParamSource:
             if not node.users:
                 continue
 
-            slot = host_pool.slot_of(live)
-            if slot is None:
-                why = unusable(live, min_bytes)
-                if why is not None:
-                    skipped[why] += 1
-                    continue
+            slot, why = parked_slot(live, min_bytes)
+            if why is not None:
+                skipped[why] += 1
+                continue
             # A tied weight reaches the graph as two placeholders, and each one
             # needs its own load: the splice repoints the readers of the node it
-            # was given, so a second node left untagged would read the storage
-            # the first one's binding freed.  The nodes are distinct by
-            # construction here, so there is nothing to dedupe -- binding once
-            # per shard is the binder's job.
+            # was given, so a second node left untagged would read the empty
+            # stand-in.  The nodes are distinct by construction here, so there
+            # is nothing to dedupe -- the shard was adopted once.
             candidates.append(
                 OffloadCandidate(
-                    holder=node,
-                    local=live,
-                    name=param_name(node),
-                    nbytes=live.numel() * live.element_size(),
-                    tag=None,
-                    slot=slot,
+                    holder=node, local=live, name=param_name(node), nbytes=host_pool.slot_bytes(slot), tag=None, slot=slot
                 )
             )
         return candidates, skipped
@@ -284,18 +272,6 @@ def shard_holder(gather: fx.Node) -> fx.Node | None:
         found = walk_back_to_holder(inp, _is_to_local)
         if found is not None:
             return found
-    return None
-
-
-def _not_a_shard(param: Any) -> str | None:
-    """Why this parameter is not a single ``Shard(0)`` DTensor, or None."""
-    from torch.distributed.tensor import DTensor, Shard
-
-    if not isinstance(param, DTensor):
-        return "graph input is not a DTensor"
-    placements = param.placements
-    if len(placements) != 1 or not isinstance(placements[0], Shard) or placements[0].dim != 0:
-        return f"placement {tuple(placements)} is not a single Shard(0)"
     return None
 
 
@@ -407,25 +383,21 @@ class FsdpShardSource:
                 continue
 
             local = getattr(param, "_local_tensor", None)
-            # A shard an earlier compile of this same model already bound.  It is
-            # a candidate again, not a skip: every graph over these parameters
-            # needs its own load, and the bytes are gone from the device either
-            # way.  This only shows up on a model compiled for more than one
-            # shape, where skipping it leaves the second graph gathering freed
-            # storage -- an illegal access, far from here and with nothing
-            # pointing back.
-            slot = host_pool.slot_of(local) if local is not None else None
-            if slot is None:
-                why = _not_a_shard(param) or unusable(local, min_bytes)
-                if why is not None:
-                    skipped[why] += 1
-                    continue
+            # A shard an earlier compile of this same model already adopted.  It
+            # is a candidate again, not a skip: every graph over these
+            # parameters needs its own load.  Skipping it leaves the second
+            # graph gathering an empty stand-in -- an illegal access, far from
+            # here and with nothing pointing back.
+            slot, why = parked_slot(local, min_bytes)
+            if why is not None:
+                skipped[why] += 1
+                continue
 
             # By holder, not by shard.  A weight two all-gathers read has two
             # holders, and each one needs its own load: the splice repoints the
             # readers of the holder it was given, so a second holder left
-            # untagged would gather storage the first one's binding freed.
-            # Binding still happens once per shard -- that is the binder's job.
+            # untagged would gather the empty stand-in.  The shard was adopted
+            # once.
             if holder in seen:
                 skipped["gather shares a holder with an earlier weight"] += 1
                 continue
@@ -435,7 +407,7 @@ class FsdpShardSource:
                     holder=holder,
                     local=local,
                     name=param_name(holder.args[0]),
-                    nbytes=local.numel() * local.element_size(),
+                    nbytes=host_pool.slot_bytes(slot),
                     tag=node,
                     slot=slot,
                     group=mesh_group(param),
@@ -475,19 +447,17 @@ class FsdpShardSource:
             local = getattr(param, "_local_tensor", None)
             if local is None:
                 continue
-            slot = host_pool.slot_of(local)
-            if slot is None:
-                why = unusable(local, min_bytes)
-                if why is not None:
-                    skipped[why] += 1
-                    continue
+            slot, why = parked_slot(local, min_bytes)
+            if why is not None:
+                skipped[why] += 1
+                continue
             seen.add(node)
             candidates.append(
                 OffloadCandidate(
                     holder=node,
                     local=local,
                     name=param_name(src),
-                    nbytes=local.numel() * local.element_size(),
+                    nbytes=host_pool.slot_bytes(slot),
                     # No gather to tag: bucketing splits offloaded gathers from
                     # resident ones, and this weight has neither.
                     tag=None,

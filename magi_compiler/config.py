@@ -219,10 +219,10 @@ class OffloadConfig(BaseModel):
             "PCIe every forward and buys nothing; offload_max_resident_mib caps how much of that the "
             "pass may keep. Works with SimpleFSDP (transport='nccl') and with unsharded "
             "nn.Parameter models. Mutually exclusive with model_cpu_offload (the runtime-wrapper "
-            "path) because the two offload the same bytes through different mechanisms. With "
-            "host_first_materialize on (the default) the weights never reach the device at all: "
-            "a meta-built model's to_empty hands back pinned host memory and the checkpoint "
-            "loads into it directly."
+            "path) because the two offload the same bytes through different mechanisms. "
+            "host_first_materialize (the default) is how the weights enter the host pool: a "
+            "meta-built model's to_empty hands back pinned host memory and the checkpoint "
+            "loads into it directly, so they never occupy a device byte."
         ),
     )
     host_first_materialize: bool = Field(
@@ -230,12 +230,9 @@ class OffloadConfig(BaseModel):
         description=(
             "Build the offloadable weights of a @magi_compile'd module in pinned host memory rather "
             "than on the device, by intercepting the to_empty that materializes a meta-built model. "
-            "Applies to SimpleFSDP DTensor shards and to unsharded nn.Parameter weights. Without it "
-            "the loader fills every weight on the GPU and binding copies them off at the first "
-            "compile, so peak device memory is the whole model -- the one number offload exists to "
-            "lower -- and the bytes cross PCIe three times instead of once. Set False to fall back "
-            "to that bind-at-compile behaviour; it is the only difference, since the steady state, the "
-            "graph and the residency decision are identical either way. Ignored unless "
+            "Applies to SimpleFSDP DTensor shards and to unsharded nn.Parameter weights. This is "
+            "the only way a weight enters the host pool; without it those weights stay on the "
+            "device and graph_weight_offload will not load them. Ignored unless "
             "graph_weight_offload is on."
         ),
     )

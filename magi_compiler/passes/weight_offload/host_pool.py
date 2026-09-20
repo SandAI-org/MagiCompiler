@@ -20,21 +20,19 @@ weights.  Pinning is what makes the load asynchronous at all -- a pageable sourc
 forces ``cudaMemcpyAsync`` to stage through a driver bounce buffer synchronously,
 which would leave nothing for the reorder pass to overlap.
 
-A shard is addressed by an integer ``slot``, not by a pointer.  The symmetric
-memory registry can key off ``data_ptr`` because the shard stays live; binding
-here *frees* the shard's CUDA storage, so its address stops being a usable key
-and the slot has to ride along in the graph instead.
+A shard is addressed by an integer ``slot``, not by a pointer.  Adopt pairs a
+filled host buffer with a storage-free CUDA stand-in; the stand-in's address is
+not a usable key, so the slot rides along in the graph instead.
 
-Slots are minted in this process at bind/adopt time (0, 1, 2, …).  They are
+Slots are minted in this process at adopt time (0, 1, 2, …).  They are
 not reused across compiles via the artifact cache: a cached kernel would bake
 someone else's integers.  The backend therefore always compiles the loads
 against the pool sitting in *this* process.
 
-There are two ways in.  ``bind_many`` takes a shard that is already on the
-device and copies it off, which is what a model loaded the ordinary way needs.
-``reserve`` + ``adopt`` take a shard that was never there at all -- the loader
-reads the checkpoint straight into the reservation -- which is what keeps the
-device high-water mark at the resident set instead of the whole model.
+The only way in is ``reserve`` + ``adopt``: the loader reads the checkpoint
+straight into a pinned reservation, and the shard never occupies a device byte.
+That is what keeps the device high-water mark at the resident set instead of
+the whole model.
 
 The process holds one :class:`HostPool`.  ``magi::h2d_load`` reads it at
 runtime by the slot integers baked into the graph.
@@ -85,11 +83,10 @@ class HostShard:
 class HostPool:
     """Pinned-host slab allocator + slot table for one process.
 
-    Bind and adopt are idempotent on tensor identity: a second compile of the
-    same parameters must reuse the slot the first one minted, not copy from
-    already-freed storage into a new one.  ``_resident`` and the device
-    tensor's storage are the same question -- ``restore_all`` / ``make_resident``
-    always update both.
+    Adopt is idempotent on tensor identity: a second compile of the same
+    stand-in must reuse the slot the first one minted.  ``_resident`` and the
+    device tensor's storage are the same question -- ``restore_all`` /
+    ``make_resident`` always update both.
     """
 
     def __init__(self) -> None:
@@ -162,71 +159,13 @@ class HostPool:
                 "artifact replayed in a fresh process, or reset() between compile and run."
             ) from None
 
-    def bind_many(self, locals_: Sequence[torch.Tensor], names: Sequence[str] | None = None) -> list[int]:
-        """Park every shard in pinned host memory and free its CUDA storage.
-
-        Batched rather than per-shard because the device storage can only be
-        dropped once the copy has landed, and a model has thousands of weights:
-        one sync for the whole batch instead of one per weight.
-
-        Already-bound tensors (same object identity) return their existing slot.
-        Binding twice used to copy from the storage the first call just freed
-        and mint a second slot of garbage -- which is how a second compile of
-        the same model silently served empty weights.
-
-        The shard tensors themselves are not replaced -- only their storage is
-        resized to zero, the same in-place trick ``simple_fsdp.offload`` uses --
-        so Dynamo's guards on the parameter objects stay valid and the shape
-        metadata the graph was traced with survives.  Returns one slot per
-        input, in order.
-        """
-        name_list = list(names or [])
-        slots: list[int | None] = [None] * len(locals_)
-        aliases: list[tuple[int, int]] = []  # (result index, first-fresh index)
-        fresh: list[tuple[int, torch.Tensor]] = []
-        seen_fresh: dict[int, int] = {}
-
-        for i, local in enumerate(locals_):
-            existing = self._by_tensor.get(id(local))
-            if existing is not None:
-                slots[i] = existing
-                continue
-            first = seen_fresh.get(id(local))
-            if first is not None:
-                aliases.append((i, first))
-                continue
-            seen_fresh[id(local)] = i
-            fresh.append((i, local))
-
-        if fresh:
-            staged: list[tuple[int, torch.Tensor, torch.Tensor, int]] = []
-            for i, local in fresh:
-                host = self._slab_for(local.dtype, local.numel()).view(local.shape)
-                host.copy_(local, non_blocking=True)
-                staged.append((i, host, local, local.untyped_storage().nbytes()))
-
-            torch.cuda.synchronize()
-
-            for i, host, local, nbytes in staged:
-                local.untyped_storage().resize_(0)
-                name = name_list[i] if i < len(name_list) else ""
-                slots[i] = self._register(host, local, nbytes, name)
-            torch.cuda.empty_cache()
-
-        for dest, src in aliases:
-            slots[dest] = slots[src]
-
-        return [int(s) for s in slots]
-
     def reserve(self, shape: Sequence[int], dtype: torch.dtype, name: str = "") -> torch.Tensor:
         """Pinned host storage for a shard that has no device copy yet.
 
-        The other way into the pool.  ``bind_many`` starts from a shard that is
-        already on the device and pays a D2H copy to get it off; this starts from
-        nothing, so a checkpoint can be read straight into host memory and the
-        shard never occupies a device byte in the first place.  There is no slot
-        yet: a slot pairs a host buffer with the device tensor that stands in
-        for it in the graph, and that tensor does not exist until :meth:`adopt`.
+        A checkpoint can be read straight into the reservation, so the shard
+        never occupies a device byte.  There is no slot yet: a slot pairs a
+        host buffer with the device tensor that stands in for it in the graph,
+        and that tensor does not exist until :meth:`adopt`.
         """
         numel = 1
         for d in shape:
@@ -239,10 +178,9 @@ class HostPool:
     def adopt(self, host: torch.Tensor, device_tensor: torch.Tensor, name: str = "") -> int:
         """Pair a filled host buffer with a storage-free device tensor.  Returns its slot.
 
-        The counterpart to ``bind_many`` for a shard that was never on the
-        device: no copy, because the bytes are already where they belong, and no
-        ``resize_(0)``, because ``device_tensor`` is expected to arrive empty --
-        it exists only to carry shape, dtype and device into the graph.
+        No copy: the bytes are already where they belong.  No ``resize_(0)``:
+        ``device_tensor`` is expected to arrive empty -- it exists only to carry
+        shape, dtype and device into the graph.
 
         Re-adopting the same device tensor returns the slot already minted for
         it.  A second compile must not create a second slot over the same
@@ -254,13 +192,13 @@ class HostPool:
         if device_tensor.untyped_storage().nbytes() != 0:
             raise ValueError(
                 f"host offload: adopt({name!r}) wants a device tensor with no storage behind it, but got "
-                f"{device_tensor.untyped_storage().nbytes()} byte(s).  Use bind_many for a shard that still "
-                "holds its bytes on the device."
+                f"{device_tensor.untyped_storage().nbytes()} byte(s).  A tensor that still holds device "
+                "bytes is not an offload candidate -- materialize it in host memory instead."
             )
         return self._register(host, device_tensor, host.numel() * host.element_size(), name)
 
     def slot_of(self, local: torch.Tensor) -> int | None:
-        """The slot this shard was bound to by an earlier compile, or None."""
+        """The slot this stand-in was adopted under, or None."""
         return self._by_tensor.get(id(local))
 
     def name_of(self, slot: int) -> str:
@@ -466,10 +404,6 @@ _POOL = HostPool()
 
 def default_pool() -> HostPool:
     return _POOL
-
-
-def bind_many(locals_: Sequence[torch.Tensor], names: Sequence[str] | None = None) -> list[int]:
-    return _POOL.bind_many(locals_, names)
 
 
 def reserve(shape: Sequence[int], dtype: torch.dtype, name: str = "") -> torch.Tensor:

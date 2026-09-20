@@ -12,15 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Move weights into host memory, and load them back inside the graph.
+"""Tag already-parked weights, and load them back inside the graph.
 
-Two steps, deliberately separate:
+Weights reach the host pool only through host-first materialization
+(``reserve`` + ``adopt``).  Two steps, deliberately separate:
 
 ``bind_weights_to_host``
-    asks the source which weights qualify, intersects the pick with peers in
-    each shard group (per-candidate, not WORLD-wide all-or-nothing), moves
-    the bytes into the host pool and tags the graph.  Nothing about the
-    graph's shape changes yet, so a failure here is a no-op.
+    asks the source which parked weights the graph should load, intersects
+    the pick with peers in each shard group (per-candidate, not WORLD-wide
+    all-or-nothing), and tags the graph.  Nothing about the graph's shape
+    changes, and no bytes move -- a failure here is a no-op.
 
 ``insert_h2d_loads``
     splices ``magi::h2d_load`` + ``wait_tensor`` in behind each tagged weight.
@@ -54,8 +55,8 @@ _WAIT = torch.ops._c10d_functional.wait_tensor.default
 def _candidate_key(c: OffloadCandidate) -> tuple:
     """Identity a peer rank can match without sharing tensor objects.
 
-    Name + holder + layout, not ``slot is None``: one rank may already have
-    parked the shard (host-first) while another still needs to bind it.
+    Name + holder + layout, not the per-process slot integer: ranks vote on
+    identity, and each process's pool minted its own slots.
     """
     return (c.name, c.holder.name, tuple(c.local.shape), str(c.local.dtype))
 
@@ -146,14 +147,14 @@ def _describe(skipped: Counter) -> str:
 def bind_weights_to_host(
     graph: fx.GraphModule, example_inputs: Sequence[Any] | None, source: WeightSource, *, min_bytes: int = 0
 ) -> int:
-    """Move the selected weights into the host pool and tag the graph.
+    """Tag already-parked weights on the graph so a later splice can load them.
 
-    Returns how many weights are now served from host memory.  Failures are
-    logged and dropped, never raised: the un-offloaded graph is always a valid
-    fallback.
+    A weight reaches the pool only through host-first materialization.  This
+    step does not copy or free anything.  Failures are logged and dropped,
+    never raised: the un-offloaded graph is always a valid fallback.
+
+    Returns how many weights are now served from host memory.
     """
-    from . import host_pool
-
     placeholders = graph.graph.find_nodes(op="placeholder")
     placeholder_examples: Mapping[str, Any] = dict(zip((n.name for n in placeholders), example_inputs or ()))
 
@@ -161,56 +162,34 @@ def bind_weights_to_host(
 
     # Before the empty check, so every rank still enters each of its groups.
     plan = _align_across_ranks(plan, placeholder_examples, skipped)
-    if not plan:
+    parked: list[OffloadCandidate] = []
+    for c in plan:
+        if c.slot is None:
+            skipped["weight was not materialized in host memory"] += 1
+            continue
+        parked.append(c)
+    if not parked:
         magi_logger.info("host offload: nothing to offload (%s)", _describe(skipped))
         return 0
 
-    # Two ways a weight gets here, and the difference is the whole point of
-    # host-first materialization: bytes copied off the device now, versus bytes
-    # the loader read into host memory that never cost a device one.  Split
-    # before binding, which is what fills the empty slots in.
-    #
-    # One binding per shard, but a slot for every candidate: a weight two
-    # gathers read appears twice, and binding it twice would have the second
-    # copy read the storage the first one just freed.
-    fresh: list[OffloadCandidate] = []
-    by_shard: dict[int, OffloadCandidate] = {}
-    for c in plan:
-        if c.slot is not None:
-            continue
-        first = by_shard.setdefault(id(c.local), c)
-        if first is c:
-            fresh.append(c)
-    early = [c for c in plan if c.slot is not None]
-    if fresh:
-        bound = host_pool.bind_many([c.local for c in fresh], names=[c.name for c in fresh])
-        for c, slot in zip(fresh, bound):
-            c.slot = slot
-        for c in plan:
-            if c.slot is None:
-                c.slot = by_shard[id(c.local)].slot
-    for c in plan:
+    for c in parked:
         mark_host_slot(c.holder, c.slot)
         if c.tag is not None:
             mark_host_offloaded(c.tag)
 
-    sizes = sorted(c.nbytes for c in plan)
+    sizes = sorted(c.nbytes for c in parked)
     magi_logger.info(
-        "host offload: %d weight(s) served from host memory -- %d parked now (%.1f MiB freed on device), "
-        "%d already there (%.1f MiB never allocated on it); sizes %.1f / %.1f / %.1f MiB "
-        "(min/median/max, floor %.1f); %s",
-        len(plan),
-        len(fresh),
-        sum(c.nbytes for c in fresh) / 2**20,
-        len(early),
-        sum(c.nbytes for c in early) / 2**20,
+        "host offload: %d weight(s) served from host memory (%.1f MiB never allocated on device); "
+        "sizes %.1f / %.1f / %.1f MiB (min/median/max, floor %.1f); %s",
+        len(parked),
+        sum(c.nbytes for c in parked) / 2**20,
         sizes[0] / 2**20,
         sizes[len(sizes) // 2] / 2**20,
         sizes[-1] / 2**20,
         min_bytes / 2**20,
         _describe(skipped),
     )
-    return len(plan)
+    return len(parked)
 
 
 def apply_weight_offload(

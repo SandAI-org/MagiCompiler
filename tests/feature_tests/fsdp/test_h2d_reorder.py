@@ -35,6 +35,16 @@ from magi_compiler.passes.weight_offload.h2d_reorder import H2dLoadReorder
 _MIB = 1 << 20
 
 
+def _park(tensor: torch.Tensor, name: str = "") -> int:
+    """Put ``tensor`` in the host pool the production way: reserve, fill, empty, adopt."""
+    from magi_compiler.passes.weight_offload import host_pool
+
+    host = host_pool.reserve(tuple(tensor.shape), tensor.dtype, name=name)
+    host.copy_(tensor.detach())
+    tensor.untyped_storage().resize_(0)
+    return host_pool.adopt(host, tensor, name=name)
+
+
 class _Dep:
     def __init__(self, name):
         self.name = name
@@ -195,7 +205,7 @@ def test_only_one_shard_is_ever_live():
     host_pool.reset()
     try:
         shards = [torch.randn(8 * _MIB // 2, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
-        s0, s1 = host_pool.bind_many(shards)
+        s0, s1 = _park(shards[0]), _park(shards[1])
         order = [
             _compute("c0", 5e6),
             _compute("c1", 5e6),
@@ -229,11 +239,11 @@ def test_residency_cap_pulls_a_weight_back_into_an_idle_window():
     from magi_compiler.passes.weight_offload import host_pool
 
     def run(cap):
-        # Fresh shards each time: binding frees their storage, so a tensor can
-        # only be bound once.
+        # Fresh shards each time: adopt empties their storage, so a tensor can
+        # only be parked once.
         host_pool.reset()
         shards = [torch.randn(8 * _MIB // 2, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
-        s0, s1 = host_pool.bind_many(shards)
+        s0, s1 = _park(shards[0]), _park(shards[1])
         order = [
             _compute("c0", 5e6),
             _compute("c1", 5e6),
@@ -270,7 +280,7 @@ def test_loads_far_enough_apart_both_survive():
     host_pool.reset()
     try:
         shards = [torch.randn(2 * _MIB // 2, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
-        s0, s1 = host_pool.bind_many(shards)
+        s0, s1 = _park(shards[0]), _park(shards[1])
         order = [
             _compute("c0", 5e6),
             _load("ld0", 2, slots=[s0]),
@@ -379,7 +389,7 @@ def test_live_ranges_never_overlap_however_tight_the_chain():
     host_pool.reset()
     try:
         shards = [torch.randn(4 * _MIB // 2, device="cuda", dtype=torch.bfloat16) for _ in range(4)]
-        slots = host_pool.bind_many(shards)
+        slots = [_park(s) for s in shards]
         order = [_compute("c0", 9e6)]
         for i, slot in enumerate(slots):
             order += [_load(f"ld{i}", 4, slots=[slot]), _wait(f"w{i}", f"ld{i}"), _compute(f"m{i}", 3e6)]
@@ -407,7 +417,7 @@ def test_frontier_uses_last_user_not_last_wait():
     host_pool.reset()
     try:
         shards = [torch.randn(4 * _MIB // 2, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
-        s0, s1 = host_pool.bind_many(shards)
+        s0, s1 = _park(shards[0]), _park(shards[1])
         order = [
             _compute("c0", 5e6),
             _load("ld0", 4, slots=[s0]),
@@ -434,7 +444,7 @@ def test_a_lone_load_is_never_promoted():
     host_pool.reset()
     try:
         shard = torch.randn(2 * _MIB // 2, device="cuda", dtype=torch.bfloat16)
-        (slot,) = host_pool.bind_many([shard])
+        slot = _park(shard)
         # No compute upstream at all: unhideable, but alone.
         order = [_load("ld", 2, slots=[slot]), _wait("w", "ld"), _compute("user", 1e6, deps=["w"])]
         _reorder(order)
