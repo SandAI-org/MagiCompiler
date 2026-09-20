@@ -42,6 +42,16 @@ def clean_pool():
     host_pool.reset()
 
 
+def _park(tensor: torch.Tensor, name: str = "") -> int:
+    """Put ``tensor`` in the host pool the production way: reserve, fill, empty, adopt."""
+    from magi_compiler.passes.weight_offload import host_pool
+
+    host = host_pool.reserve(tuple(tensor.shape), tensor.dtype, name=name)
+    host.copy_(tensor.detach())
+    tensor.untyped_storage().resize_(0)
+    return host_pool.adopt(host, tensor, name=name)
+
+
 def _linear_graph(*params):
     """``x`` and some weights in, one matmul per weight out.
 
@@ -78,11 +88,12 @@ def test_a_plain_parameter_is_offloaded_without_any_fsdp():
     from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
 
     w = torch.nn.Parameter(torch.randn(256, 256, device="cuda", dtype=torch.bfloat16))
+    _park(w, name="layers.0.weight")
     gm, examples = _linear_graph(w)
 
     source = PlainParamSource()
     assert bind_weights_to_host(gm, examples, source, min_bytes=0) == 1
-    assert w.untyped_storage().nbytes() == 0, "the device storage must actually be released"
+    assert w.untyped_storage().nbytes() == 0, "the stand-in must stay empty"
     assert insert_h2d_loads(gm, source) == 1
 
     (load,) = _nodes(gm, H2D_LOAD)
@@ -99,6 +110,7 @@ def test_only_parameters_are_taken_not_activations():
     """Every graph input looks alike; only the ones that are the same every
     forward are worth moving."""
     w = torch.nn.Parameter(torch.randn(256, 256, device="cuda", dtype=torch.bfloat16))
+    _park(w)
     gm, examples = _linear_graph(w)
     # x's "live value" is a plain tensor, not a Parameter.
     examples[0] = torch.randn(8, 256, device="cuda", dtype=torch.bfloat16)
@@ -115,6 +127,8 @@ def test_weights_group_by_first_use_not_by_declaration():
     from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD, H2D_LOAD_COALESCED
 
     params = [torch.nn.Parameter(torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)) for _ in range(4)]
+    for p in params:
+        _park(p)
     gm, examples = _linear_graph(*params)
 
     # Room for two weights per load (128 KiB each).
@@ -136,6 +150,8 @@ def test_one_load_per_weight_when_no_group_cap_is_set():
     from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
 
     params = [torch.nn.Parameter(torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)) for _ in range(3)]
+    for p in params:
+        _park(p)
     gm, examples = _linear_graph(*params)
 
     source = PlainParamSource()
@@ -145,12 +161,22 @@ def test_one_load_per_weight_when_no_group_cap_is_set():
 
 
 @requires_cuda
-def test_the_size_floor_still_applies():
+def test_an_unparked_parameter_is_not_offloaded():
+    """Collect never copies a resident weight off the device."""
     small = torch.nn.Parameter(torch.randn(16, 16, device="cuda", dtype=torch.bfloat16))
     gm, examples = _linear_graph(small)
 
-    assert bind_weights_to_host(gm, examples, PlainParamSource(), min_bytes=4 << 20) == 0
+    assert bind_weights_to_host(gm, examples, PlainParamSource(), min_bytes=0) == 0
     assert small.untyped_storage().nbytes() > 0
+
+
+@requires_cuda
+def test_the_size_floor_still_applies_to_a_parked_parameter():
+    small = torch.nn.Parameter(torch.randn(16, 16, device="cuda", dtype=torch.bfloat16))
+    _park(small)
+    gm, examples = _linear_graph(small)
+
+    assert bind_weights_to_host(gm, examples, PlainParamSource(), min_bytes=4 << 20) == 0
 
 
 @requires_cuda
@@ -164,14 +190,13 @@ def test_offload_survives_a_real_inductor_compile_without_fsdp():
 
     assert not dist.is_initialized(), "this test exists to prove offload needs no process group"
 
-    from magi_compiler.passes.weight_offload import host_pool
     from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
 
     w = torch.nn.Parameter(torch.randn(512, 256, device="cuda", dtype=torch.bfloat16), requires_grad=False)
     x = torch.randn(64, 512, device="cuda", dtype=torch.bfloat16)
     ref = x @ w.detach().clone()
 
-    (slot,) = host_pool.bind_many([w.data], names=["w"])
+    slot = _park(w, name="w")
 
     def f(weight, inp):
         return inp @ _WAIT(H2D_LOAD(weight, slot))
@@ -295,8 +320,9 @@ def test_plain_handoff_swaps_in_a_storage_free_device_stand_in():
 def test_a_pre_parked_plain_parameter_needs_no_binding():
     """The join between host-first and PlainParamSource.
 
-    After handoff the Parameter is CUDA with empty storage.  ``unusable`` would
-    reject it for that; ``slot_of`` has to recognize it as already bound.
+    After handoff the Parameter is CUDA with empty storage.  ``parked_slot``
+    has to recognize it as already adopted -- otherwise the graph would read
+    the empty stand-in.
     """
     from magi_compiler.passes.weight_offload import host_pool
     from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
@@ -311,7 +337,7 @@ def test_a_pre_parked_plain_parameter_needs_no_binding():
     gm, examples = _linear_graph(w)
     source = PlainParamSource()
     assert bind_weights_to_host(gm, examples, source, min_bytes=0) == 1
-    assert host_pool.num_bound() == 2, "binding a pre-parked Parameter must not park it a second time"
+    assert host_pool.num_bound() == 2, "tagging a pre-parked Parameter must not adopt it a second time"
     assert insert_h2d_loads(gm, source) == 1
 
     (load,) = _nodes(gm, H2D_LOAD)

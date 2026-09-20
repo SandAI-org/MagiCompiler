@@ -14,19 +14,12 @@
 
 """Build a compiled module's weights in host memory, so they are never on the device.
 
-Offload used to run backwards.  The loader materialized every shard on the GPU
-and filled it from the checkpoint; the first forward then compiled the module,
-and only there did binding copy the bytes back to the host and free the device
-storage.  The steady state was right and the path to it was not: peak memory was
-the whole model, which is the one number offload exists to lower, and the bytes
-crossed PCIe three times to end up where the checkpoint could have put them once.
-
-The fix is to move the decision earlier than the loader.  ``to_empty`` is the
-single place a meta-built model turns into real storage, so a patched ``_apply``
-hands back pinned host memory for the weights that offload is going to want
-anyway.  The checkpoint reads straight into it.  Nothing about the loader
+``to_empty`` is the single place a meta-built model turns into real storage, so a
+patched ``_apply`` hands back pinned host memory for the weights that offload is
+going to want.  The checkpoint reads straight into it.  Nothing about the loader
 changes: it still sees DTensors of the right global shape, dtype and sharding,
-and ``dcp.load`` still writes them in place.
+and ``dcp.load`` still writes them in place.  Peak device memory stays at the
+resident set instead of the whole model.
 
 Two properties make this safe rather than clever:
 
@@ -37,11 +30,10 @@ Two properties make this safe rather than clever:
   reach this code and keep their device storage.
 * **The graph never sees a host tensor.**  :func:`handoff` runs on the first
   call, before Dynamo traces: each parked weight becomes a CUDA tensor with
-  zero-length storage, which is the exact shape binding would have left behind,
-  and the host buffer is adopted into the pool under its slot.  From there the
-  existing path takes over unchanged -- ``slot_of`` finds the shard already
-  bound, ``h2d_load`` fetches it, and ``H2dLoadReorder`` decides which ones go
-  back to the device because nothing could hide their transfer.
+  zero-length storage, and the host buffer is adopted into the pool under its
+  slot.  From there ``slot_of`` finds the shard, ``h2d_load`` fetches it, and
+  ``H2dLoadReorder`` decides which ones go back to the device because nothing
+  could hide their transfer.
 
 The same path covers an unsharded ``nn.Parameter``.  There is no local shard
 and no mesh: the parameter itself is what gets reserved, adopted, and later
