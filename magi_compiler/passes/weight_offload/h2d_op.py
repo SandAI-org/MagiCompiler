@@ -21,9 +21,10 @@ makes the load schedulable -- Inductor lowers the op to a ``FallbackKernel`` and
 the wait to a ``_WaitKernel``, which are two snodes the reorder passes can move
 independently, rather than one opaque blocking copy.
 
-``shard`` is the parameter's local tensor with its storage already freed by
-``host_pool.bind``; it is here to carry shape/dtype/device and to give the graph
-a real data edge from the weight placeholder.  The bytes come from ``slot``.
+``shard`` is the parameter's local stand-in -- a CUDA tensor whose storage was
+never filled, after host-first adopt.  It is here to carry shape/dtype/device
+and to give the graph a real data edge from the weight placeholder.  The bytes
+come from ``slot``.
 """
 
 from __future__ import annotations

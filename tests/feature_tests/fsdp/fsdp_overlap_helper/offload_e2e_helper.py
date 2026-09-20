@@ -17,24 +17,19 @@
 Chain under test (magi_backend._apply_fsdp_fullgraph_overlap with
 ``offload_config.graph_weight_offload``)::
 
-  lowering -> host binding -> h2d_load insertion -> bucketing
+    lowering -> tag parked slots -> h2d_load insertion -> bucketing
            -> FsdpOverlapReorder (phase 1) -> H2dLoadReorder (phase 2)
 
-The load-bearing question this answers is whether a shard whose CUDA storage has
-been freed survives as an Inductor graph input: the graph still carries it, for
-its shape and for the data edge from the parameter, but there are no bytes behind
-it until ``magi::h2d_load`` puts some there.  Nothing downstream of Dynamo has an
-opinion about that in theory; this is where we find out in practice.
-
-``--host-first`` runs the same chain against a model that was never on the device
-to begin with: built on meta, materialized through the patched ``to_empty`` into
-pinned host memory, and filled there.  What that is supposed to buy is the load
-peak, so the peak is measured and reported rather than inferred.
+Weights are built on meta, materialized through the patched ``to_empty`` into
+pinned host memory, and filled there.  The load-bearing question is whether a
+storage-free CUDA stand-in survives as an Inductor graph input: the graph still
+carries it, for its shape and for the data edge from the parameter, but there
+are no bytes behind it until ``magi::h2d_load`` puts some there.
 
 Run: torchrun --nproc_per_node=N .../offload_e2e_helper.py [--bucket-mode ...]
 
 Markers printed on rank 0 (grepped by the test):
-  OFFLOAD_CONFIG world=<n> bucket_mode=<m> host_first=<bool>
+  OFFLOAD_CONFIG world=<n> bucket_mode=<m> host_first=True
   OFFLOAD_LOAD peak_mib=<f> weights_mib=<f>
   OFFLOAD_FREED mib=<f>  shards=<n>
   OFFLOAD_COMPILED
@@ -118,8 +113,7 @@ def main() -> None:
     # 0 = take the fastest schedule and accept its residency; a cap pulls weights
     # back into the offload plan, into windows the schedule already left idle.
     ap.add_argument("--max-resident-mib", type=int, default=0)
-    # Build on meta and materialize the shards straight into host memory, rather
-    # than filling them on the device and copying them off at the first compile.
+    # Accepted for older invocations; host-first is the only materialization path.
     ap.add_argument("--host-first", action="store_true")
     # 0 = probe the bus. A test comparing two runs has to pin it: the probe is a
     # real measurement, it moves with whatever else is on the machine, and the
@@ -136,7 +130,7 @@ def main() -> None:
     os.environ.setdefault("MAGI_LOGGING_LEVEL", "INFO")
 
     if rank == 0:
-        print(f"OFFLOAD_CONFIG world={world} bucket_mode={args.bucket_mode} host_first={args.host_first}", flush=True)
+        print(f"OFFLOAD_CONFIG world={world} bucket_mode={args.bucket_mode} host_first=True", flush=True)
 
     from torchtitan.experiments.simple_fsdp.simple_fsdp import data_parallel
 
@@ -157,43 +151,31 @@ def main() -> None:
         cfg.fsdp_config.bucket_size_mib = args.bucket_size_mib
         cfg.fsdp_config.cost_mode = args.cost_mode
         cfg.offload_config.graph_weight_offload = True
-        cfg.offload_config.host_first_materialize = args.host_first
+        cfg.offload_config.host_first_materialize = True
         cfg.offload_config.offload_min_shard_mib = args.min_shard_mib
         cfg.offload_config.offload_max_resident_mib = args.max_resident_mib
         cfg.offload_config.offload_h2d_bandwidth_gbps = args.h2d_gbps
         return cfg
 
-    if args.host_first:
-        # The reference is what the checkpoint would be, so it has to be off the
-        # device before the peak is measured -- otherwise the thing under test is
-        # competing with a full copy of the model it is supposed to replace.
-        ref = ref.cpu()
-        torch.cuda.empty_cache()
+    # The reference is what the checkpoint would be, so it has to be off the
+    # device before the peak is measured -- otherwise the thing under test is
+    # competing with a full copy of the model it is supposed to replace.
+    ref = ref.cpu()
+    torch.cuda.empty_cache()
 
-        with torch.device("meta"):
-            model = TinyModel(hidden, n_layers=args.n_layers).to(torch.bfloat16)
-        model = data_parallel(model, mesh, mode="fully_shard", ac_mode=args.ac_mode)
-        compiled = magi_compile(model, config_patch=_patch, dynamic_arg_dims={"x": 0})
+    with torch.device("meta"):
+        model = TinyModel(hidden, n_layers=args.n_layers).to(torch.bfloat16)
+    model = data_parallel(model, mesh, mode="fully_shard", ac_mode=args.ac_mode)
+    compiled = magi_compile(model, config_patch=_patch, dynamic_arg_dims={"x": 0})
 
-        torch.cuda.reset_peak_memory_stats()
-        # The delta, not the absolute peak: what is under test is what
-        # materializing and filling the model costs, and the process is holding
-        # unrelated tensors (the input, the eager reference output) either way.
-        base = torch.cuda.memory_allocated()
-        model.to_empty(device=torch.device("cuda", dev))
-        weights_mib = _fill_shards(model, ref, rank, world)
-        peak_mib = (torch.cuda.max_memory_allocated() - base) / 2**20
-    else:
-        torch.cuda.reset_peak_memory_stats()
-        base = torch.cuda.memory_allocated()
-        model = TinyModel(hidden, n_layers=args.n_layers).to(dev).to(torch.bfloat16)
-        with torch.no_grad():
-            for (_, dst), (_, src) in zip(model.named_parameters(), ref.named_parameters()):
-                dst.copy_(src)
-        model = data_parallel(model, mesh, mode="fully_shard", ac_mode=args.ac_mode)
-        compiled = magi_compile(model, config_patch=_patch, dynamic_arg_dims={"x": 0})
-        weights_mib = sum(p.numel() * p.element_size() for p in ref.parameters()) / 2**20 / world
-        peak_mib = (torch.cuda.max_memory_allocated() - base) / 2**20
+    torch.cuda.reset_peak_memory_stats()
+    # The delta, not the absolute peak: what is under test is what
+    # materializing and filling the model costs, and the process is holding
+    # unrelated tensors (the input, the eager reference output) either way.
+    base = torch.cuda.memory_allocated()
+    model.to_empty(device=torch.device("cuda", dev))
+    weights_mib = _fill_shards(model, ref, rank, world)
+    peak_mib = (torch.cuda.max_memory_allocated() - base) / 2**20
 
     log(f"OFFLOAD_LOAD peak_mib={peak_mib:.2f} weights_mib={weights_mib:.2f}", rank)
 
@@ -210,7 +192,7 @@ def main() -> None:
             flush=True,
         )
         if host_pool.num_bound() == 0:
-            # Offload binds what the redistribute lowering exposed, so zero shards
+            # Offload tags what the redistribute lowering exposed, so zero shards
             # means the lowering found nothing -- which is a property of the
             # installed SimpleFSDP, not of this run.  Say so explicitly: a numeric
             # check on an un-offloaded graph passes for the wrong reason.
