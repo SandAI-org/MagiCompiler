@@ -66,11 +66,40 @@ def _issue_loads(shards: list[torch.Tensor], slots: list[int]) -> list[torch.Ten
     # device copies from there instead, which turns this into a D2D copy without
     # any other part of the op, the graph or the schedule having to know.
     hosts = [host_pool.source(slot) for slot in slots]
+    for shard, host, slot in zip(shards, hosts, slots):
+        if tuple(shard.shape) != tuple(host.shape) or shard.dtype != host.dtype:
+            raise RuntimeError(
+                f"magi::h2d_load slot {slot} ({host_pool.name_of(slot)!r}) is "
+                f"{tuple(host.shape)} {host.dtype}, but the graph asked for "
+                f"{tuple(shard.shape)} {shard.dtype}. The compiled artifact's slot "
+                "ids do not match this process's host pool."
+            )
     # Allocated on the COMPUTE stream, deliberately: the caching allocator ties a
     # block to the stream it was allocated on, and these buffers are consumed by
     # compute.  ``record_stream`` below is what tells it the load stream wrote
     # them, so a freed block is not handed out before the copy lands.
     outs = [torch.empty(h.shape, dtype=h.dtype, device=s.device) for s, h in zip(shards, hosts)]
+
+    if all(host_pool.is_resident(slot) for slot in slots):
+        # Nothing to hide and nothing to wait for: every shard in this group is
+        # already on the device, so the transfer is a short D2D hop rather than
+        # a trip across PCIe.  Doing it inline on the compute stream skips two
+        # cross-stream synchronizations, the event and its Work registration --
+        # all of which exist to overlap a transfer that no longer happens.  The
+        # ``wait_tensor`` downstream then finds no Work and is a no-op.
+        #
+        # The buffer is still a real copy, and that is not an oversight: a
+        # promoted slot's source IS the shard the graph handed us, so returning
+        # it would make this op's output alias a graph input.  Inductor does not
+        # allocate a fallback kernel's output but does put it in the reuse pool,
+        # so the next same-sized allocation would take over the parameter's
+        # storage and the following kernel would write into the weight.
+        #
+        # Whole group or nothing.  Promotion is per load and a load is a bucket,
+        # so a mixed group does not arise.
+        for out, host in zip(outs, hosts):
+            out.copy_(host)
+        return outs
 
     stream = h2d_stream()
     # The shards' own producers are on the compute stream; ordering after them

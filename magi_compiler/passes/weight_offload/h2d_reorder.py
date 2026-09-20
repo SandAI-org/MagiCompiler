@@ -37,14 +37,17 @@ weight i+1 freely claims the same compute that hides the gather of weight i,
 because PCIe and NVLink are different hardware.  That is why this is a second
 sweep with its own compute pointer rather than more items in the first one.
 
-Hoisting is bounded by one rule: **at most one shard is live on the device at a
-time**.  A shard occupies memory from where its load runs until its gather reads
-it, so an unconstrained sweep would stack those intervals and rebuild, on the
-device, most of the residency that offloading just paid PCIe to remove.  A load
-that cannot be placed under the rule is handed back to the device rather than
-forced in, which removes its transfer instead of leaving a stall.  The cost is
-that some compute runs with the PCIe lane idle -- accepted deliberately: bounded
-memory is the point, overlap is the bonus.
+Hoisting is bounded by one rule: **at most one load is live on the device at a
+time** (one ``h2d_load``, which may be a whole FSDP bucket).  Those bytes occupy
+memory from where the load runs until the last snode that still reads them --
+the gather for a shard, the last matmul for an ungathered or unsharded weight --
+not until the wait that only means the copy has landed.  An unconstrained sweep
+would stack those intervals and rebuild, on the device, most of the residency
+that offloading just paid PCIe to remove.  A load that cannot be placed under
+the rule is handed back to the device rather than forced in, which removes its
+transfer instead of leaving a stall.  The cost is that some compute runs with
+the PCIe lane idle -- accepted deliberately: bounded memory is the point,
+overlap is the bonus.
 
 Three consequences worth stating, because they are what make the split cheap:
 
@@ -75,7 +78,8 @@ def magi_logger_enabled_for_debug() -> bool:
     return logging.getLogger("magi_compiler").isEnabledFor(logging.DEBUG)
 
 
-from .reorder import _H2D_OPS, _is_h2d_load, _issues_transfer, earliest_legal_index, validate_topological_order
+from ..snode_utils import earliest_legal_index, is_multi_output, issues_transfer, validate_topological_order
+from .ops import H2D_OPS, is_h2d_load, slots_of
 
 _DEFAULT_WINDOW_MARGIN_NS = 5_000.0
 
@@ -99,12 +103,8 @@ def _load_bytes(group: list[BaseSchedulerNode]) -> int:
     sizing a whole bucket's window from one member would under-count it by the
     bucket factor.
     """
-    unpacks = [s for s in group if _is_multi_output(s)]
+    unpacks = [s for s in group if is_multi_output(s)]
     return sum(_snode_bytes(s) for s in (unpacks or group[:1]))
-
-
-def _is_multi_output(snode: BaseSchedulerNode) -> bool:
-    return type(getattr(snode, "node", None)).__name__ == "MultiOutput"
 
 
 @dataclass
@@ -115,27 +115,16 @@ class _Plan:
     group: list  # the load plus the alias snodes that must travel with it
     slots: list[int]  # host-pool slots this load pulls
     wait_idx: int  # earliest wait: the load's hard upper bound
-    dead_idx: int  # last wait: where the shard stops occupying device memory
+    # Last snode that still reads this load's bytes (gather, matmul, ...).
+    # The wait is only a floor: it means the copy has landed, not that the
+    # buffer is free.  Sweep, peak and bubbles all use this.
+    last_user: int
     need: float  # ns of compute that would fully hide the transfer
     lower: int  # earliest legal index (real-dep floor)
     nbytes: int
     exposed: float  # ns of transfer the sweep could not cover; set by _sweep
     promoted: bool = False  # shards put back on the device; transfer is now D2D
     relieved: bool = False  # re-offloaded into an idle window to meet the cap
-
-
-def _slots_of(snode: BaseSchedulerNode) -> list[int]:
-    """The host-pool slots a load node pulls.
-
-    Inductor flattens a custom op's non-tensor arguments into ``constant_args``,
-    and both load ops take exactly one such argument -- the slot, or the list of
-    them -- so this is the whole of it for the plain and the coalesced form alike.
-    """
-    node = getattr(snode, "node", None)
-    try:
-        return [int(a) for a in getattr(node, "constant_args", ())]
-    except (TypeError, ValueError):  # not an int arg: not a shape this pass knows
-        return []
 
 
 class H2dLoadReorder:
@@ -191,14 +180,14 @@ class H2dLoadReorder:
 
     @staticmethod
     def _is_compute(snode: BaseSchedulerNode) -> bool:
-        return not _issues_transfer(snode) and not _is_h2d_load(snode) and not contains_wait(snode)
+        return not issues_transfer(snode) and not is_h2d_load(snode) and not contains_wait(snode)
 
     def __call__(self, snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         self._cost_cache = {}
         order = list(snodes)
-        loads = [s for s in order if _is_h2d_load(s)]
+        loads = [s for s in order if is_h2d_load(s)]
         if not loads:
-            magi_logger.debug("h2d load reorder: no weight load among %d snodes (known ops: %s)", len(order), _H2D_OPS)
+            magi_logger.debug("h2d load reorder: no weight load among %d snodes (known ops: %s)", len(order), H2D_OPS)
             return order
 
         buf_to_snode = {b: s for s in order for b in s.get_buffer_names()}
@@ -255,7 +244,7 @@ class H2dLoadReorder:
     @staticmethod
     def _weights_of(plan) -> str:
         """The parameters behind one load, as the placement log wants them."""
-        from magi_compiler.offload import host_pool
+        from . import host_pool
 
         names = [host_pool.name_of(s) for s in plan.slots]
         names = [n for n in names if n] or ["?"]
@@ -273,7 +262,7 @@ class H2dLoadReorder:
             return
         magi_logger.debug(
             "h2d load placement (%d loads over %d snodes; 'at' is where the load ended up, "
-            "'dead' where its shard is freed):",
+            "'last_user' the last snode that still reads its bytes):",
             len(plans),
             n_snodes,
         )
@@ -288,14 +277,14 @@ class H2dLoadReorder:
                 verdict = f"EXPOSED {p.exposed / 1e3:.1f}us"
             at = targets.get(p.load, index_of[p.load])
             magi_logger.debug(
-                "  %-10s %2d shard(s) %7.1f MiB  at %5d (from %5d, floor %5d)  dead %5d  " "need %6.1fms  %-45s  %s",
+                "  %-10s %2d slot(s) %7.1f MiB  at %5d (from %5d, floor %5d)  last_user %5d  " "need %6.1fms  %-45s  %s",
                 p.load.get_name(),
                 len(p.slots),
                 p.nbytes / 2**20,
                 at,
                 index_of[p.load],
                 p.lower,
-                p.dead_idx,
+                p.last_user,
                 p.need / 1e6,
                 verdict,
                 self._weights_of(p),
@@ -328,10 +317,29 @@ class H2dLoadReorder:
                 seen.add(u)
                 if contains_wait(u):
                     waits.append(u)
-                elif _is_multi_output(u):
+                elif is_multi_output(u):
                     group.append(u)
                     stack.extend(u.get_buffer_names())
         return group, waits
+
+    @staticmethod
+    def _last_user_index(group, waits, users, index_of) -> int:
+        """Latest snode that still reads this load's bytes.
+
+        The wait only means the copy has landed.  Direct users of the load /
+        unpack / wait buffers are the ones that still hold those bytes -- a
+        gather for a shard, a matmul for an ungathered or plain weight.  Group
+        members (the load and its unpacks) travel with the load, so they do not
+        count: their final position is the placement, not a consumer.
+        """
+        last = max(index_of[w] for w in waits)
+        skip = set(group)
+        for src in (*group, *waits):
+            for name in src.get_buffer_names():
+                for u in users.get(name, ()):
+                    if u not in skip:
+                        last = max(last, index_of[u])
+        return last
 
     def _plan(self, loads, order, index_of, buf_to_snode, users) -> list[_Plan]:
         """One entry per load, in program order, skipping the ones with no wait.
@@ -351,12 +359,10 @@ class H2dLoadReorder:
                 _Plan(
                     load=load,
                     group=group,
-                    slots=_slots_of(load),
+                    slots=slots_of(load),
                     # The earliest wait: the load has to precede every one of them.
                     wait_idx=min(index_of[w] for w in waits),
-                    # The last one: a coalesced bucket's shards stay allocated
-                    # until every member has been gathered.
-                    dead_idx=max(index_of[w] for w in waits),
+                    last_user=self._last_user_index(group, waits, users, index_of),
                     need=need,
                     lower=earliest_legal_index(group, index_of, buf_to_snode),
                     nbytes=_load_bytes(group),
@@ -367,7 +373,7 @@ class H2dLoadReorder:
 
     # -- placement --------------------------------------------------------
     def _sweep(self, plans, order, index_of) -> dict:
-        """Latest-safe-launch, back to front, with one shard live at a time.
+        """Latest-safe-launch, back to front, with one load live at a time.
 
         The two-pointer part is ``FsdpOverlapReorder``'s, for the same reason:
         one PCIe stream means the loads are serialized against each other, so
@@ -378,15 +384,15 @@ class H2dLoadReorder:
 
         What is added here is the ``frontier``.  Having placed one load, the next
         one to move is not necessarily its immediate predecessor: if that load's
-        shard would still be live where the placed one now starts, it is left
-        alone and the sweep looks further back for one whose shard has already
-        died -- which may be several loads back, or none.
+        last user would still be reading it where the placed one now starts, it
+        is left alone and the sweep looks further back for one whose bytes are
+        already unused -- which may be several loads back, or none.
 
         A load left alone is not left exposed: its weight goes back on the device
         and stays there.  Loading a weight that nothing can hide is pure cost
         every single forward, so this is both the faster answer and the simpler
         one, and it is why the sweep needs no separate notion of a buffer count.
-        Keeping at most one shard in flight falls out of the same rule.
+        Keeping at most one load in flight falls out of the same rule.
 
         This produces the fastest schedule.  When the residency it asks for is
         more than the caller can afford, ``_relieve`` puts some of it back --
@@ -396,11 +402,11 @@ class H2dLoadReorder:
         compute_idx = len(order)
         carry = 0.0
         carry_idx = len(order)
-        frontier = len(order)  # where the next-later load's shard comes alive
+        frontier = len(order)  # where the next-later load's bytes come alive
 
         for plan in reversed(plans):
-            if plan.dead_idx > frontier:
-                # Its shard would still be live when the next one's is allocated.
+            if plan.last_user > frontier:
+                # Something still reads this load where the next one would start.
                 plan.promoted = True
                 continue
 
@@ -427,7 +433,7 @@ class H2dLoadReorder:
 
     @staticmethod
     def _inflight_peak(plans, targets) -> int:
-        """Most shard bytes alive at once, over a sweep of the placed live ranges.
+        """Most load bytes alive at once, over a sweep of the placed live ranges.
 
         One bucket under the sweep's rule alone; more once a residency cap has
         put loads back into idle windows, which is exactly the trade the cap
@@ -438,7 +444,7 @@ class H2dLoadReorder:
             at = targets.get(p.load)
             if at is not None:
                 events.append((at, p.nbytes))
-                events.append((p.dead_idx, -p.nbytes))
+                events.append((p.last_user, -p.nbytes))
         events.sort()
         peak = live = 0
         for _idx, delta in events:
@@ -455,13 +461,13 @@ class H2dLoadReorder:
         window it does not need -- so they are the free space: a transfer put
         here competes with no other transfer for the bus.
         """
-        placed = sorted((t, by_load[load].dead_idx) for load, t in targets.items())
+        placed = sorted((t, by_load[load].last_user) for load, t in targets.items())
         out: list[tuple[int, int]] = []
-        prev_dead = 0
-        for start, dead in placed:
-            if start > prev_dead:
-                out.append((prev_dead, start))
-            prev_dead = max(prev_dead, dead)
+        prev_end = 0
+        for start, end in placed:
+            if start > prev_end:
+                out.append((prev_end, start))
+            prev_end = max(prev_end, end)
         return out
 
     def _relieve(self, plans, targets, index_of) -> None:
@@ -515,9 +521,9 @@ class H2dLoadReorder:
         device-to-device now.  That is what lets this decision be made during
         scheduling without invalidating the artifact being scheduled.
         """
-        from magi_compiler.offload import host_pool
+        from . import host_pool
 
-        nbytes = 0
+        slots: list[int] = []
         for p in plans:
             if not p.promoted:
                 continue
@@ -526,9 +532,8 @@ class H2dLoadReorder:
                 # just a transfer this pass could not improve.
                 p.promoted = False
                 continue
-            for slot in p.slots:
-                nbytes += host_pool.make_resident(slot)
-        return nbytes
+            slots.extend(p.slots)
+        return host_pool.make_resident_many(slots)
 
     @staticmethod
     def _rebuild(order, targets, index_of, groups) -> list[BaseSchedulerNode]:
