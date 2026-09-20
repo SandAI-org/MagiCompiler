@@ -213,13 +213,30 @@ class OffloadConfig(BaseModel):
             "Compile-time CPU offload of SimpleFSDP weight shards, scheduled at snode granularity. "
             "Parks each selected local shard in pinned host memory and loads it back inside the graph "
             "with magi::h2d_load, placed far enough upstream for compute to hide the transfer before "
-            "its all-gather launches -- but never so far that its shard is still live where the next "
-            "one's begins, so at most one shard is ever in flight. A weight that cannot be scheduled "
+            "its all-gather launches -- but never so far that this load's bytes are still being read "
+            "where the next load begins, so at most one load (one bucket) is ever in flight. A weight that cannot be scheduled "
             "under that rule stays resident instead, since loading something nothing can hide costs "
             "PCIe every forward and buys nothing; offload_max_resident_mib caps how much of that the "
-            "pass may keep. Requires fsdp_config.enable_fsdp=True and transport='nccl'; "
-            "mutually exclusive with model_cpu_offload (the runtime-wrapper path) because the two "
-            "offload the same bytes through different mechanisms."
+            "pass may keep. Works with SimpleFSDP (transport='nccl') and with unsharded "
+            "nn.Parameter models. Mutually exclusive with model_cpu_offload (the runtime-wrapper "
+            "path) because the two offload the same bytes through different mechanisms. With "
+            "host_first_materialize on (the default) the weights never reach the device at all: "
+            "a meta-built model's to_empty hands back pinned host memory and the checkpoint "
+            "loads into it directly."
+        ),
+    )
+    host_first_materialize: bool = Field(
+        True,
+        description=(
+            "Build the offloadable weights of a @magi_compile'd module in pinned host memory rather "
+            "than on the device, by intercepting the to_empty that materializes a meta-built model. "
+            "Applies to SimpleFSDP DTensor shards and to unsharded nn.Parameter weights. Without it "
+            "the loader fills every weight on the GPU and binding copies them off at the first "
+            "compile, so peak device memory is the whole model -- the one number offload exists to "
+            "lower -- and the bytes cross PCIe three times instead of once. Set False to fall back "
+            "to that bind-at-compile behaviour; it is the only difference, since the steady state, the "
+            "graph and the residency decision are identical either way. Ignored unless "
+            "graph_weight_offload is on."
         ),
     )
     offload_min_shard_mib: float = Field(
@@ -228,6 +245,17 @@ class OffloadConfig(BaseModel):
         description=(
             "Minimum local-shard MiB to offload. Below this the transfer is dominated by fixed DMA "
             "overhead rather than bandwidth, so it costs schedule slack and frees almost nothing."
+        ),
+    )
+    offload_group_mib: int = Field(
+        0,
+        ge=0,
+        description=(
+            "Cap on the MiB of weights merged into one load, for models WITHOUT FSDP (with FSDP the "
+            "loads mirror the all-gather buckets instead). Merging amortizes the ~10us of CPU each "
+            "load pays for its stream sync, event and Work registration, which on a model with "
+            "hundreds of weights is milliseconds sitting in front of the first one. 0 = one load "
+            "per weight."
         ),
     )
     offload_max_resident_mib: int = Field(

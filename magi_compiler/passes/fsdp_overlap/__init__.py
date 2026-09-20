@@ -12,45 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from magi_compiler.passes.weight_offload.sources import FsdpShardSource, shard_holder
+
 from .bucket_all_gather import bucket_weight_all_gather_coalesced
 from .copy_engine import bind_weights_for_copy_engine, copy_engine_weight_candidates, rewrite_weight_ag_to_copy_engine
-from .h2d_reorder import H2dLoadReorder
 from .lower_and_bucket import lower_and_bucket_full_graph
-from .node_meta import (
-    CE_BOUND,
-    HOST_OFFLOADED,
-    HOST_SLOT,
-    UNEVEN_SHARD,
-    WEIGHT_AG,
-    host_slot,
-    is_ce_bound,
-    is_host_offloaded,
-    is_uneven_shard,
-    is_weight_ag,
-)
+from .node_meta import CE_BOUND, UNEVEN_SHARD, WEIGHT_AG, is_ce_bound, is_uneven_shard, is_weight_ag
 from .redistribute_lowering import lower_prim_redistribute_to_collectives
 from .reorder import FsdpOverlapReorder
-from .weight_offload import bind_weights_to_host, insert_h2d_loads
 
 __all__ = [
     "bind_weights_for_copy_engine",
-    "bind_weights_to_host",
     "bucket_weight_all_gather_coalesced",
     "copy_engine_weight_candidates",
-    "insert_h2d_loads",
     "lower_prim_redistribute_to_collectives",
     "lower_and_bucket_full_graph",
     "rewrite_weight_ag_to_copy_engine",
     "FsdpOverlapReorder",
-    "H2dLoadReorder",
+    "FsdpShardSource",
+    "shard_holder",
     "CE_BOUND",
-    "HOST_OFFLOADED",
-    "HOST_SLOT",
     "UNEVEN_SHARD",
     "WEIGHT_AG",
-    "host_slot",
     "is_ce_bound",
-    "is_host_offloaded",
     "is_uneven_shard",
     "is_weight_ag",
 ]

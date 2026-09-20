@@ -241,6 +241,18 @@ def _magi_compile_bound_method(
     if getattr(instance, installed_attr, False):
         return instance
 
+    if (
+        isinstance(instance, nn.Module)
+        and conf.offload_config.graph_weight_offload
+        and conf.offload_config.host_first_materialize
+    ):
+        from magi_compiler.passes.weight_offload import patch_materialize
+
+        # Here rather than at first call: the weights this module will be
+        # compiled against are materialized while the model is being built,
+        # which is long before anything calls forward.
+        patch_materialize(instance, conf)
+
     old_method = getattr(instance, method_name)
 
     @torch.compiler.disable()
@@ -260,6 +272,14 @@ def _magi_compile_bound_method(
 
         if torch.compiler.is_compiling():
             return old_method(*args, **kwargs)
+
+        # Before tracing and before every fast path, because all three read the
+        # weights: a shard still sitting in host memory would be lowered into CPU
+        # kernels, or replayed against an artifact that expects it on the device.
+        # A no-op after the first call, and when host-first is off.
+        from magi_compiler.passes.weight_offload import handoff_if_pending
+
+        handoff_if_pending(instance)
 
         return _run_orchestration(state, args, kwargs)
 

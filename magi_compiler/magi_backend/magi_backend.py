@@ -208,29 +208,33 @@ class CompilerManager:
             global compilation_start_time
             compilation_start_time = time.time()
 
-        # Step1: Try loading from the cache
+        # Step1: Try loading from the cache.
+        # Host-offload slots are minted in this process at bind time and baked
+        # into the kernel.  Replaying an artifact would use another process's
+        # integers against this pool, so offload always compiles fresh.
         cache_entry = CacheEntry(runtime_shape, graph_index, self.compiler.name)
-        compiled_graph = self.load(graph, example_inputs, cache_entry)
-        if compiled_graph is not None:
-            return compiled_graph
+        if not self.compile_config.offload_config.graph_weight_offload:
+            compiled_graph = self.load(graph, example_inputs, cache_entry)
+            if compiled_graph is not None:
+                return compiled_graph
 
-        if self.compile_config.assert_cache_hit:
-            if cache_entry not in self.cache:
-                raise RuntimeError(
-                    f"MAGI_COMPILE_ASSERT_CACHE_HIT: cache miss for runtime_shape={runtime_shape} "
-                    f"graph_index={graph_index}. The pre-baked compile cache does not cover this subgraph."
-                )
-            cache_handle = self.cache[cache_entry]
-            if cache_handle.restart_analysis_count == 0:
-                raise RuntimeError(
-                    f"MAGI_COMPILE_ASSERT_CACHE_HIT: cache load failed for runtime_shape={runtime_shape} "
-                    f"graph_index={graph_index}. Cache entry exists but artifact could not be loaded "
-                    f"(restart_analysis_count=0)."
-                )
-            # restart_analysis_count > 0 — restart-analysis replay in progress.
-            # Fall through to normal compile path: standalone_compile will trigger
-            # TensorifyScalarRestartAnalysis (same as bake), dynamo re-traces, and
-            # on retry load() succeeds (graph shape matches cached artifact).
+            if self.compile_config.assert_cache_hit:
+                if cache_entry not in self.cache:
+                    raise RuntimeError(
+                        f"MAGI_COMPILE_ASSERT_CACHE_HIT: cache miss for runtime_shape={runtime_shape} "
+                        f"graph_index={graph_index}. The pre-baked compile cache does not cover this subgraph."
+                    )
+                cache_handle = self.cache[cache_entry]
+                if cache_handle.restart_analysis_count == 0:
+                    raise RuntimeError(
+                        f"MAGI_COMPILE_ASSERT_CACHE_HIT: cache load failed for runtime_shape={runtime_shape} "
+                        f"graph_index={graph_index}. Cache entry exists but artifact could not be loaded "
+                        f"(restart_analysis_count=0)."
+                    )
+                # restart_analysis_count > 0 — restart-analysis replay in progress.
+                # Fall through to normal compile path: standalone_compile will trigger
+                # TensorifyScalarRestartAnalysis (same as bake), dynamo re-traces, and
+                # on retry load() succeeds (graph shape matches cached artifact).
 
         # Step2: Compile the graph
         key = f"artifact_shape_{runtime_shape}_subgraph_{graph_index}"
@@ -604,6 +608,113 @@ class MagiBackend:
         self.local_magi_cache_path.mkdir(parents=True, exist_ok=True)
         self.compiler_manager.initialize_cache(self.local_magi_cache_path)
 
+    def _check_offload_config(self) -> None:
+        """Preconditions ``graph_weight_offload`` needs on its own.
+
+        Until now these came for free from ``enable_fsdp``, which pins
+        ``cudagraph_mode=NONE``.  Offload can run without FSDP, so it has to ask
+        for them itself -- a load manages its own CUDA stream and event, and
+        graph capture would not record either, which is a wrong answer rather
+        than an error.
+        """
+        offload_cfg = self.compile_config.offload_config
+        assert not offload_cfg.model_cpu_offload, (
+            "offload_config.graph_weight_offload and offload_config.model_cpu_offload both offload "
+            "the model's weights, through a compile-time graph rewrite and a runtime wrapper "
+            "respectively; enable exactly one"
+        )
+        assert self.compile_config.cudagraph_mode == CudaGraphMode.NONE, (
+            "offload_config.graph_weight_offload requires cudagraph_mode=NONE: magi::h2d_load runs "
+            "on a stream of its own and publishes a CUDA event, neither of which graph capture records"
+        )
+
+    def _reclaim_unloaded_weights(self) -> None:
+        """Put back any weight that was parked but that no graph ended up loading.
+
+        Timing is the whole trick: the offload rewrite is done, so every load the
+        graph will ever have is in it, and the graph has not run yet -- not even
+        the interpreter pass that compiles the submodules, which executes it on
+        the example inputs.  A shard the graph does not load has no bytes behind
+        it, and the failure is an illegal access inside a kernel with nothing
+        pointing back at the parking decision, so the miss is worth paying device
+        memory to close.
+
+        Normally empty.  It fills up when the two predicates that decide what to
+        park and what to load disagree: ``host_first`` parks a weight while the
+        model is being built, from its placements alone, and the source only
+        finds it later if the lowering actually produced an all-gather reading
+        it.
+        """
+        from magi_compiler.passes.weight_offload import host_pool
+
+        restored = host_pool.restore_unclaimed()
+        if not restored:
+            return
+        magi_logger.warning(
+            "host offload: %d parked weight(s) are not loaded by any compiled graph and have been put "
+            "back on the device (%.1f MiB); offload is simply not helping for these. Weights: %s",
+            len(restored),
+            host_pool.resident_bytes() / 2**20,
+            ", ".join(restored[:8]) + (f", +{len(restored) - 8} more" if len(restored) > 8 else ""),
+        )
+
+    def _h2d_load_reorder(self):
+        """The load placement pass, configured from the offload settings."""
+        from magi_compiler.passes.weight_offload import H2dLoadReorder, host_pool
+
+        offload_cfg = self.compile_config.offload_config
+        fsdp_cfg = self.compile_config.fsdp_config
+        return H2dLoadReorder(
+            bandwidth_bytes_per_ns=host_pool.h2d_bandwidth_bytes_per_ns(offload_cfg.offload_h2d_bandwidth_gbps),
+            window_margin_ns=fsdp_cfg.comm_overlap_window_margin_ns,
+            window_scale=fsdp_cfg.comm_overlap_window_scale,
+            max_resident_bytes=int(offload_cfg.offload_max_resident_mib) * 1024 * 1024,
+        )
+
+    def _apply_weight_offload(self, graph: fx.GraphModule, example_inputs) -> None:
+        """Host offload of a model that is NOT sharded.
+
+        Same machinery as the FSDP path, minus everything FSDP contributes: no
+        redistribute to lower, no all-gather to bucket, and no first-phase
+        reorder -- so the load placement pass is appended to Inductor's builtin
+        overlap passes rather than replacing them.  Replacing them is the FSDP
+        path's business, and doing it here would cost every other collective in
+        the model (CP / EP) its overlap for nothing.
+
+        ``disable_graph_split`` is not required, but it is worth having: the
+        loads are spliced in before the split, so with a split graph the
+        scheduler sees one submod at a time and a load can only be hoisted
+        within the submod that consumes it.  Correct either way, much weaker
+        without it.
+        """
+        from magi_compiler.passes.weight_offload import PlainParamSource, apply_weight_offload
+
+        # FSDP + host offload is handled exclusively by
+        # ``_apply_fsdp_fullgraph_overlap`` / ``lower_and_bucket_full_graph``
+        # (FsdpShardSource).  Running this path as well would bind the same
+        # bytes twice -- once as shards, once as whole parameters.
+        assert not self.compile_config.fsdp_config.enable_fsdp, (
+            "_apply_weight_offload is the unsharded path; with enable_fsdp the "
+            "backend must take _apply_fsdp_fullgraph_overlap so bind/insert "
+            "run once around bucketing, against FsdpShardSource"
+        )
+        self._check_offload_config()
+        offload_cfg = self.compile_config.offload_config
+        source = PlainParamSource(group_bytes=int(offload_cfg.offload_group_mib) * 1024 * 1024)
+
+        if not apply_weight_offload(
+            graph, example_inputs, source, min_bytes=int(offload_cfg.offload_min_shard_mib * 1024 * 1024)
+        ):
+            return
+
+        passes = list(self.inductor_compile_config.get("reorder_for_compute_comm_overlap_passes", []))
+        if not passes:
+            # Inductor's own defaults, which we are adding to rather than replacing.
+            passes = ["raise_comms", "sink_waits"]
+        passes.append(self._h2d_load_reorder())
+        self.inductor_compile_config["reorder_for_compute_comm_overlap"] = True
+        self.inductor_compile_config["reorder_for_compute_comm_overlap_passes"] = passes
+
     def _apply_fsdp_fullgraph_overlap(self, graph: fx.GraphModule, example_inputs) -> None:
         """Whole-graph FSDP all-gather / compute overlap (disable_graph_split path).
 
@@ -629,17 +740,13 @@ class MagiBackend:
 
         host_offload = offload_cfg.graph_weight_offload
         if host_offload:
-            assert not offload_cfg.model_cpu_offload, (
-                "offload_config.graph_weight_offload and offload_config.model_cpu_offload both offload "
-                "the model's weights, through a compile-time graph rewrite and a runtime wrapper "
-                "respectively; enable exactly one"
-            )
+            self._check_offload_config()
             assert fsdp_cfg.transport == "nccl", (
                 "offload_config.graph_weight_offload requires fsdp_config.transport='nccl': a "
                 "copy-engine gather reads its peers' device-resident shards, which offloading frees"
             )
 
-        from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder, H2dLoadReorder, lower_and_bucket_full_graph
+        from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder, lower_and_bucket_full_graph
         from magi_compiler.profiling import ProfilingRuntimeEstimator
 
         bucket_size_bytes = int(fsdp_cfg.bucket_size_mib) * 1024 * 1024
@@ -677,23 +784,16 @@ class MagiBackend:
         )
         passes = [reorder]
         if host_offload:
-            from magi_compiler.offload import host_pool
-
             # Phase 1 moves the load, its wait and the gather as one block, which
             # leaves the transfer fully exposed in front of the gather; phase 2 is
             # what opens a compute window in between.  Separate passes because the
             # two lanes are separate hardware: the same compute may hide a PCIe
             # load and an NVLink gather at once, so neither sweep may spend the
             # other's budget.
-            passes.append(
-                H2dLoadReorder(
-                    bandwidth_bytes_per_ns=host_pool.h2d_bandwidth_bytes_per_ns(offload_cfg.offload_h2d_bandwidth_gbps),
-                    window_margin_ns=fsdp_cfg.comm_overlap_window_margin_ns,
-                    window_scale=fsdp_cfg.comm_overlap_window_scale,
-                    max_resident_bytes=int(offload_cfg.offload_max_resident_mib) * 1024 * 1024,
-                    cost_fn=cost_fn,
-                )
-            )
+            reorder_loads = self._h2d_load_reorder()
+            if cost_fn is not None:
+                reorder_loads._cost_fn = cost_fn
+            passes.append(reorder_loads)
         self.inductor_compile_config["reorder_for_compute_comm_overlap"] = True
         self.inductor_compile_config["reorder_for_compute_comm_overlap_passes"] = passes
 
@@ -714,9 +814,13 @@ class MagiBackend:
         magi_logger.info(f"Setting up FX-level graph split with ops: {fx_split_ops=}")
         magi_logger.info(f"Resolved splitting ops for FX-level graph split: {resolved_ops=}")
 
-        # Step 1.4: whole-graph FSDP overlap.
+        # Step 1.4: exactly one host-offload rewrite, never both.
+        # FSDP on  -> lower/bucket + FsdpShardSource bind/insert (offload folds in).
+        # FSDP off -> PlainParamSource bind/insert.  elif, not a second if.
         if self.compile_config.fsdp_config.enable_fsdp:
             self._apply_fsdp_fullgraph_overlap(graph, example_inputs)
+        elif self.compile_config.offload_config.graph_weight_offload:
+            self._apply_weight_offload(graph, example_inputs)
 
         # Step 2: split graph by ops, we split graph based on resolved_ops, which becomes the partitioned single graph.
         subgraph_id = 0
@@ -778,6 +882,12 @@ class MagiBackend:
         self.full_graph_pass_manager(graph)
 
         split_gm, piecewise_graphs = self._split_graph(graph, example_inputs)
+
+        # Before the interpreter below, which runs the graph on the example
+        # inputs to drive per-submodule compilation -- a parked weight with no
+        # load would be read there, not at the first real forward.
+        if self.compile_config.offload_config.graph_weight_offload:
+            self._reclaim_unloaded_weights()
 
         submod_names_to_compile = [item.submod_name for item in piecewise_graphs if not item.is_splitting_graph]
         compilation_counter.num_piecewise_graphs_seen += len(piecewise_graphs)
