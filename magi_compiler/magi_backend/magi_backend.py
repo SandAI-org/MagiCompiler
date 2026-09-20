@@ -90,6 +90,13 @@ class CompilerManager:
         self.compile_config = compile_config
         self.compiler = make_compiler(compile_config)
         self.disable_cache = compile_config.disable_cache
+        # Offload cache: baked artifact slots vs this process's HostPool.
+        # ``_offload_cache_ready`` is True only after the host_slots sidecar
+        # matches the weights this graph bound; otherwise load() refuses replay.
+        self._offload_slot_table: dict[int, dict] = {}
+        self._offload_remap: dict[int, int] | None = None
+        self._offload_cache_ready: bool = False
+        self.host_slots_path: Path | None = None
 
     @property
     def hash(self) -> str:
@@ -112,6 +119,7 @@ class CompilerManager:
         cache_dir=/path/to/magi_cache/model_{idx}[_{tag}]_rank_{rank}/hash_str/[prefix/]
         inside cache_dir, there will be:
         - subgraph_indices.py
+        - host_slots.py (when graph_weight_offload is on)
         - computation_graph.py
 
         for multiple prefixes, they can share the same base cache dir of
@@ -121,6 +129,9 @@ class CompilerManager:
 
         self.cache_dir: Path = cache_dir
         self.cache_file_path: Path = cache_dir / "subgraph_indices.py"
+        self.host_slots_path = cache_dir / "host_slots.py"
+        self._offload_remap = None
+        self._offload_cache_ready = False
 
         if self.disable_cache:
             magi_logger.info("MagiCompiler's cache is disabled.")
@@ -158,9 +169,94 @@ class CompilerManager:
         data = printer.pformat(serializable)
         with self.cache_file_path.open("w") as f:
             f.write(data)
+        if self.compile_config.offload_config.graph_weight_offload:
+            self._save_host_slots_sidecar()
+
+    def bind_offload_cache(self, graph: fx.GraphModule) -> None:
+        """Match the host_slots sidecar to this process's bound weights.
+
+        On a match, install baked->current remap and replay the resident set
+        the placement pass chose at bake time.  On a miss, leave
+        ``_offload_cache_ready`` false so ``load()`` will not replay an
+        artifact whose slot integers belong to another pool.
+        """
+        from magi_compiler.passes.weight_offload.cache_slots import collect_host_slot_table, match_host_slot_tables
+
+        self._offload_slot_table = collect_host_slot_table(graph)
+        self._offload_remap = None
+        self._offload_cache_ready = False
+        if self.disable_cache:
+            return
+
+        sidecar = self._load_host_slots_sidecar()
+        if sidecar is None:
+            magi_logger.info("host offload: no host_slots sidecar; compile cache will miss and bake one")
+            return
+        remap = match_host_slot_tables(sidecar, self._offload_slot_table)
+        if remap is None:
+            magi_logger.info(
+                "host offload: host_slots sidecar does not match this process's bound weights; compile cache will miss"
+            )
+            return
+        self._replay_offload_residents(sidecar, remap)
+        self._offload_remap = remap
+        self._offload_cache_ready = True
+        magi_logger.info("host offload: compile cache reusable (%d slot(s) remapped)", len(remap))
+
+    def _load_host_slots_sidecar(self) -> dict[int, dict] | None:
+        if self.host_slots_path is None or not self.host_slots_path.exists():
+            return None
+        try:
+            raw = ast.literal_eval(self.host_slots_path.read_text())
+        except (OSError, SyntaxError, ValueError) as exc:
+            magi_logger.warning("host offload: failed to parse host_slots sidecar (%s); treating as cache miss", exc)
+            return None
+        if not isinstance(raw, dict):
+            magi_logger.warning("host offload: host_slots sidecar is not a dict; treating as cache miss")
+            return None
+        try:
+            return {int(k): dict(v) for k, v in raw.items()}
+        except (TypeError, ValueError) as exc:
+            magi_logger.warning("host offload: host_slots sidecar has invalid entries (%s); treating as cache miss", exc)
+            return None
+
+    def _save_host_slots_sidecar(self) -> None:
+        if self.host_slots_path is None:
+            return
+        if self._offload_remap is not None:
+            # Replay: artifacts on disk still use the baked slot space.  Rewriting
+            # the sidecar with this process's integers would desync the next load.
+            return
+        from magi_compiler.passes.weight_offload.cache_slots import refresh_resident_flags
+
+        table = refresh_resident_flags(self._offload_slot_table)
+        printer = pprint.PrettyPrinter(indent=4)
+        self.host_slots_path.write_text(printer.pformat(table))
+
+    def _replay_offload_residents(self, sidecar: dict[int, dict], remap: dict[int, int]) -> None:
+        from magi_compiler.passes.weight_offload import host_pool
+
+        current_slots = [remap[baked] for baked, info in sidecar.items() if info.get("resident")]
+        if current_slots:
+            host_pool.make_resident_many(current_slots)
+
+    def _wrap_loaded_offload(self, compiled: Callable) -> Callable:
+        remap = self._offload_remap
+        if remap is None:
+            return compiled
+
+        def wrapped(*args, __fn=compiled, __remap=remap):
+            from magi_compiler.passes.weight_offload.host_pool import using_slot_remap
+
+            with using_slot_remap(__remap):
+                return __fn(*args)
+
+        return wrapped
 
     @observe_lifecycle("compiler_manager_load")
     def load(self, graph: fx.GraphModule, example_inputs: list[Any], cache_entry: CacheEntry) -> Callable | None:
+        if self.compile_config.offload_config.graph_weight_offload and not self._offload_cache_ready:
+            return None
         if cache_entry not in self.cache:
             return None
 
@@ -188,7 +284,10 @@ class CompilerManager:
             cache_entry.runtime_shape,
             f"Directly load the {cache_entry.graph_index}-th graph from {cache_entry.backend_name} via handle {cache_handle}",
         )
-        return self.compiler.load(graph, example_inputs, cache_entry, cache_handle)
+        compiled = self.compiler.load(graph, example_inputs, cache_entry, cache_handle)
+        if compiled is None:
+            return None
+        return self._wrap_loaded_offload(compiled)
 
     @observe_lifecycle("compiler_manager_compile")
     def compile(
@@ -209,32 +308,37 @@ class CompilerManager:
             compilation_start_time = time.time()
 
         # Step1: Try loading from the cache.
-        # Host-offload slots are minted in this process at bind time and baked
-        # into the kernel.  Replaying an artifact would use another process's
-        # integers against this pool, so offload always compiles fresh.
+        # Offload artifacts bake process-local host-pool slots.  load() refuses
+        # them unless bind_offload_cache has matched the host_slots sidecar and
+        # installed a remap onto this process's pool.
         cache_entry = CacheEntry(runtime_shape, graph_index, self.compiler.name)
-        if not self.compile_config.offload_config.graph_weight_offload:
-            compiled_graph = self.load(graph, example_inputs, cache_entry)
-            if compiled_graph is not None:
-                return compiled_graph
+        compiled_graph = self.load(graph, example_inputs, cache_entry)
+        if compiled_graph is not None:
+            return compiled_graph
 
-            if self.compile_config.assert_cache_hit:
-                if cache_entry not in self.cache:
-                    raise RuntimeError(
-                        f"MAGI_COMPILE_ASSERT_CACHE_HIT: cache miss for runtime_shape={runtime_shape} "
-                        f"graph_index={graph_index}. The pre-baked compile cache does not cover this subgraph."
-                    )
-                cache_handle = self.cache[cache_entry]
-                if cache_handle.restart_analysis_count == 0:
-                    raise RuntimeError(
-                        f"MAGI_COMPILE_ASSERT_CACHE_HIT: cache load failed for runtime_shape={runtime_shape} "
-                        f"graph_index={graph_index}. Cache entry exists but artifact could not be loaded "
-                        f"(restart_analysis_count=0)."
-                    )
-                # restart_analysis_count > 0 — restart-analysis replay in progress.
-                # Fall through to normal compile path: standalone_compile will trigger
-                # TensorifyScalarRestartAnalysis (same as bake), dynamo re-traces, and
-                # on retry load() succeeds (graph shape matches cached artifact).
+        if self.compile_config.assert_cache_hit:
+            if cache_entry not in self.cache:
+                raise RuntimeError(
+                    f"MAGI_COMPILE_ASSERT_CACHE_HIT: cache miss for runtime_shape={runtime_shape} "
+                    f"graph_index={graph_index}. The pre-baked compile cache does not cover this subgraph."
+                )
+            if self.compile_config.offload_config.graph_weight_offload and not self._offload_cache_ready:
+                raise RuntimeError(
+                    f"MAGI_COMPILE_ASSERT_CACHE_HIT: offload host_slots sidecar missing or does not "
+                    f"match this process's bound weights for runtime_shape={runtime_shape} "
+                    f"graph_index={graph_index}. Re-bake the compile cache."
+                )
+            cache_handle = self.cache[cache_entry]
+            if cache_handle.restart_analysis_count == 0:
+                raise RuntimeError(
+                    f"MAGI_COMPILE_ASSERT_CACHE_HIT: cache load failed for runtime_shape={runtime_shape} "
+                    f"graph_index={graph_index}. Cache entry exists but artifact could not be loaded "
+                    f"(restart_analysis_count=0)."
+                )
+            # restart_analysis_count > 0 — restart-analysis replay in progress.
+            # Fall through to normal compile path: standalone_compile will trigger
+            # TensorifyScalarRestartAnalysis (same as bake), dynamo re-traces, and
+            # on retry load() succeeds (graph shape matches cached artifact).
 
         # Step2: Compile the graph
         key = f"artifact_shape_{runtime_shape}_subgraph_{graph_index}"
@@ -256,6 +360,11 @@ class CompilerManager:
         self, cache_entry: CacheEntry, cache_handle: CacheHandle | None, runtime_shape: int | None, key: str
     ) -> bool:
         if self.disable_cache:
+            return False
+        if self._offload_remap is not None:
+            # Replay session: artifacts on disk use baked slots.  A freshly
+            # compiled graph would bake this process's slots; mixing the two
+            # under one sidecar is unsafe.
             return False
         if cache_handle is None:
             self.cache.pop(cache_entry, None)
@@ -888,6 +997,7 @@ class MagiBackend:
         # load would be read there, not at the first real forward.
         if self.compile_config.offload_config.graph_weight_offload:
             self._reclaim_unloaded_weights()
+            self.compiler_manager.bind_offload_cache(split_gm)
 
         submod_names_to_compile = [item.submod_name for item in piecewise_graphs if not item.is_splitting_graph]
         compilation_counter.num_piecewise_graphs_seen += len(piecewise_graphs)

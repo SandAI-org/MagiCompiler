@@ -1180,3 +1180,39 @@ def test_inductor_lowers_the_load_to_a_snode_the_reorder_recognizes():
 
     assert seen["loads"] == 1, "the load must reach the scheduler as its own snode"
     assert seen["compute_misclassified"] == 0, "a load is a PCIe transfer, never compute that hides a gather"
+
+
+@requires_cuda
+def test_resolve_slot_is_identity_without_a_remap():
+    from magi_compiler.passes.weight_offload import host_pool
+
+    local = torch.randn(32, 16, device="cuda")
+    slot = _park(local, name="w")
+    assert host_pool.resolve_slot(slot) == slot
+    assert host_pool.find_slot("w", tuple(local.shape), str(local.dtype)) == slot
+
+
+@requires_cuda
+def test_h2d_load_follows_a_baked_to_current_remap():
+    """A cached kernel calls h2d_load with another process's slot integers."""
+    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
+
+    decoy = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
+    real = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
+    expected = real.clone()
+    decoy_slot = _park(decoy, name="decoy")
+    real_slot = _park(real, name="real")
+    assert decoy_slot != real_slot
+
+    out = H2D_LOAD(real, decoy_slot)
+    _WAIT(out)
+    torch.cuda.synchronize()
+    with host_pool.using_slot_remap({decoy_slot: real_slot}):
+        remapped = H2D_LOAD(real, decoy_slot)
+        _WAIT(remapped)
+    torch.cuda.synchronize()
+
+    assert not torch.equal(out, expected), "without a remap the baked slot reads the decoy"
+    torch.testing.assert_close(remapped, expected)
+    assert host_pool.resolve_slot(decoy_slot) == decoy_slot, "remap must not leak past the context"
