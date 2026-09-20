@@ -29,6 +29,7 @@ import os
 import shutil
 import socket
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -54,13 +55,20 @@ def _free_port() -> str:
 def _run(nproc: int, *extra: str) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env["MAGI_LOGGING_LEVEL"] = env.get("MAGI_LOGGING_LEVEL", "info")
-    return subprocess.run(
-        ["torchrun", f"--nproc_per_node={nproc}", f"--master_port={_free_port()}", str(_HELPER), *extra],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=900,
-    )
+    # A cache root of its own per run. Two runs of this helper produce the same
+    # FX graph by design -- host-first changes where the weights live, not what
+    # the graph says -- so a shared cache has the second one replay the first
+    # one's artifact and skip the scheduler, which is where the placement pass
+    # and every log line these tests assert on live.
+    with tempfile.TemporaryDirectory(prefix="magi_offload_e2e_") as cache_root:
+        env["MAGI_COMPILE_CACHE_ROOT_DIR"] = cache_root
+        return subprocess.run(
+            ["torchrun", f"--nproc_per_node={nproc}", f"--master_port={_free_port()}", str(_HELPER), *extra],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
 
 
 def _marker(stdout: str, marker: str, field: str) -> float:
@@ -179,3 +187,82 @@ def test_offload_multi_rank():
     p = _run(2)
     out = _check(p)
     assert "OFFLOAD_PASS" in p.stdout, out[-4000:]
+
+
+# ------------------------------------------------------- host-first loading
+
+
+@requires_cuda
+@requires_torchrun
+def test_host_first_never_puts_the_weights_on_the_device():
+    """The number offload exists to lower, measured rather than inferred.
+
+    Loading is where peak device memory used to be decided: every shard was
+    materialized on the GPU and filled there, and only the first compile moved
+    them off. Nothing about the steady state showed it, which is why the load
+    phase is measured separately here.
+    """
+    p = _run(1, "--host-first")
+    out = _check(p)
+    assert "OFFLOAD_PASS" in p.stdout, out[-4000:]
+
+    peak = _marker(p.stdout, "OFFLOAD_LOAD", "peak_mib")
+    weights = _marker(p.stdout, "OFFLOAD_LOAD", "weights_mib")
+    assert weights > 1, "the shape under test is supposed to have weights worth offloading"
+    assert peak < 0.5, f"materializing and filling the model should cost no device memory, cost {peak} MiB"
+
+
+@requires_cuda
+@requires_torchrun
+def test_host_first_reaches_the_same_steady_state():
+    """Only the path to the steady state changes, never the steady state itself.
+
+    Everything downstream of the handoff -- the graph, the loads, which weights
+    the placement pass keeps resident -- is supposed to be identical to the
+    bind-at-compile path. If it is not, the two are separate features with
+    separate bugs rather than one feature with a faster loader.
+
+    The bandwidth is pinned because the two runs are compared against each
+    other: the probe is a real measurement of a shared bus, and the placement
+    pass sizes every overlap window from it, so letting each run measure its own
+    compares two different schedules.
+    """
+    pinned = ("--h2d-gbps", "25")
+    host_first = _check(_run(1, "--host-first", *pinned))
+    legacy = _check(_run(1, *pinned))
+
+    for field in ("mib", "shards", "promoted_mib"):
+        assert _marker(host_first, "OFFLOAD_FREED", field) == _marker(legacy, "OFFLOAD_FREED", field), field
+    assert _marker(host_first, "OFFLOAD_LOAD", "peak_mib") < _marker(legacy, "OFFLOAD_LOAD", "peak_mib")
+
+
+@requires_cuda
+@requires_torchrun
+def test_host_first_weights_are_all_claimed_by_the_graph():
+    """Nothing may fall in the gap between "parked" and "loaded".
+
+    Parking happens while the model is built, from a weight's placements alone;
+    whether the graph actually loads it is only known once the lowering has run.
+    A weight in the gap has no bytes behind it, so the backend hands it back and
+    says so -- correct, but it means offload bought nothing for that weight, and
+    on this model it should never happen.
+    """
+    p = _run(1, "--host-first")
+    out = _check(p)
+    assert "are not loaded by any compiled graph" not in out, out[-4000:]
+
+
+@requires_cuda
+@requires_torchrun
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires >=2 GPUs")
+def test_host_first_multi_rank():
+    """world=2: ranks in a shard group vote per candidate, not WORLD-all-or-nothing.
+
+    A rank-dependent parking decision drops only the weights they do not share;
+    the rest stay offloaded.  An empty intersection would log ``nothing to offload``.
+    """
+    p = _run(2, "--host-first")
+    out = _check(p)
+    assert "OFFLOAD_PASS" in p.stdout, out[-4000:]
+    assert "nothing to offload" not in out, out[-4000:]
+    assert _marker(p.stdout, "OFFLOAD_LOAD", "peak_mib") < 0.5

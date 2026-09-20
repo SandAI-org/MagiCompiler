@@ -26,10 +26,16 @@ its shape and for the data edge from the parameter, but there are no bytes behin
 it until ``magi::h2d_load`` puts some there.  Nothing downstream of Dynamo has an
 opinion about that in theory; this is where we find out in practice.
 
+``--host-first`` runs the same chain against a model that was never on the device
+to begin with: built on meta, materialized through the patched ``to_empty`` into
+pinned host memory, and filled there.  What that is supposed to buy is the load
+peak, so the peak is measured and reported rather than inferred.
+
 Run: torchrun --nproc_per_node=N .../offload_e2e_helper.py [--bucket-mode ...]
 
 Markers printed on rank 0 (grepped by the test):
-  OFFLOAD_CONFIG world=<n> bucket_mode=<m>
+  OFFLOAD_CONFIG world=<n> bucket_mode=<m> host_first=<bool>
+  OFFLOAD_LOAD peak_mib=<f> weights_mib=<f>
   OFFLOAD_FREED mib=<f>  shards=<n>
   OFFLOAD_COMPILED
   OFFLOAD_NUMERIC rel=<f> ok=<bool>
@@ -71,6 +77,30 @@ class TinyModel(nn.Module):
         return x
 
 
+def log(msg: str, rank: int) -> None:
+    if rank == 0:
+        print(msg, flush=True)
+
+
+@torch.no_grad()
+def _fill_shards(model: nn.Module, ref: nn.Module, rank: int, world: int) -> float:
+    """Write this rank's slice of ``ref`` into each local shard.  Returns its MiB.
+
+    Stands in for the checkpoint loader: what matters is that it writes wherever
+    the shard already lives, host or device, and never moves it.  ``copy_``
+    handles both, which is the same reason ``dcp.load`` needs no offload-specific
+    path either.
+    """
+    nbytes = 0
+    for (_, dst), (_, src) in zip(model.named_parameters(), ref.named_parameters()):
+        local = dst._local_tensor
+        rows = local.shape[0]
+        piece = src[rank * rows : (rank + 1) * rows] if local.shape != src.shape else src
+        local.copy_(piece)
+        nbytes += local.numel() * local.element_size()
+    return nbytes / 2**20
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bucket-mode", default="none", choices=["none", "coalesced"])
@@ -88,6 +118,13 @@ def main() -> None:
     # 0 = take the fastest schedule and accept its residency; a cap pulls weights
     # back into the offload plan, into windows the schedule already left idle.
     ap.add_argument("--max-resident-mib", type=int, default=0)
+    # Build on meta and materialize the shards straight into host memory, rather
+    # than filling them on the device and copying them off at the first compile.
+    ap.add_argument("--host-first", action="store_true")
+    # 0 = probe the bus. A test comparing two runs has to pin it: the probe is a
+    # real measurement, it moves with whatever else is on the machine, and the
+    # placement pass sizes every overlap window from it.
+    ap.add_argument("--h2d-gbps", type=float, default=0.0)
     args = ap.parse_args()
 
     dist.init_process_group("cpu:gloo,cuda:nccl")
@@ -99,7 +136,7 @@ def main() -> None:
     os.environ.setdefault("MAGI_LOGGING_LEVEL", "INFO")
 
     if rank == 0:
-        print(f"OFFLOAD_CONFIG world={world} bucket_mode={args.bucket_mode}", flush=True)
+        print(f"OFFLOAD_CONFIG world={world} bucket_mode={args.bucket_mode} host_first={args.host_first}", flush=True)
 
     from torchtitan.experiments.simple_fsdp.simple_fsdp import data_parallel
 
@@ -111,12 +148,6 @@ def main() -> None:
     with torch.no_grad():
         eager_out = ref(x)
 
-    model = TinyModel(hidden, n_layers=args.n_layers).to(dev).to(torch.bfloat16)
-    with torch.no_grad():
-        for (_, dst), (_, src) in zip(model.named_parameters(), ref.named_parameters()):
-            dst.copy_(src)
-    model = data_parallel(model, mesh, mode="fully_shard", ac_mode=args.ac_mode)
-
     def _patch(cfg):
         cfg.compile_mode = CompileMode.MAGI_COMPILE
         cfg.cudagraph_mode = CudaGraphMode.NONE
@@ -126,17 +157,51 @@ def main() -> None:
         cfg.fsdp_config.bucket_size_mib = args.bucket_size_mib
         cfg.fsdp_config.cost_mode = args.cost_mode
         cfg.offload_config.graph_weight_offload = True
+        cfg.offload_config.host_first_materialize = args.host_first
         cfg.offload_config.offload_min_shard_mib = args.min_shard_mib
         cfg.offload_config.offload_max_resident_mib = args.max_resident_mib
+        cfg.offload_config.offload_h2d_bandwidth_gbps = args.h2d_gbps
         return cfg
 
-    compiled = magi_compile(model, config_patch=_patch, dynamic_arg_dims={"x": 0})
+    if args.host_first:
+        # The reference is what the checkpoint would be, so it has to be off the
+        # device before the peak is measured -- otherwise the thing under test is
+        # competing with a full copy of the model it is supposed to replace.
+        ref = ref.cpu()
+        torch.cuda.empty_cache()
+
+        with torch.device("meta"):
+            model = TinyModel(hidden, n_layers=args.n_layers).to(torch.bfloat16)
+        model = data_parallel(model, mesh, mode="fully_shard", ac_mode=args.ac_mode)
+        compiled = magi_compile(model, config_patch=_patch, dynamic_arg_dims={"x": 0})
+
+        torch.cuda.reset_peak_memory_stats()
+        # The delta, not the absolute peak: what is under test is what
+        # materializing and filling the model costs, and the process is holding
+        # unrelated tensors (the input, the eager reference output) either way.
+        base = torch.cuda.memory_allocated()
+        model.to_empty(device=torch.device("cuda", dev))
+        weights_mib = _fill_shards(model, ref, rank, world)
+        peak_mib = (torch.cuda.max_memory_allocated() - base) / 2**20
+    else:
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        model = TinyModel(hidden, n_layers=args.n_layers).to(dev).to(torch.bfloat16)
+        with torch.no_grad():
+            for (_, dst), (_, src) in zip(model.named_parameters(), ref.named_parameters()):
+                dst.copy_(src)
+        model = data_parallel(model, mesh, mode="fully_shard", ac_mode=args.ac_mode)
+        compiled = magi_compile(model, config_patch=_patch, dynamic_arg_dims={"x": 0})
+        weights_mib = sum(p.numel() * p.element_size() for p in ref.parameters()) / 2**20 / world
+        peak_mib = (torch.cuda.max_memory_allocated() - base) / 2**20
+
+    log(f"OFFLOAD_LOAD peak_mib={peak_mib:.2f} weights_mib={weights_mib:.2f}", rank)
 
     with torch.no_grad():
         out = compiled(x)
         torch.cuda.synchronize()
 
-    from magi_compiler.offload import host_pool
+    from magi_compiler.passes.weight_offload import host_pool
 
     if rank == 0:
         print(

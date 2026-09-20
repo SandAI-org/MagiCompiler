@@ -54,6 +54,8 @@ from torch._inductor.ir import MultiOutput
 from torch._inductor.scheduler import BaseSchedulerNode
 from torch._inductor.utils import contains_collective, contains_wait, is_collective
 
+from magi_compiler.passes.snode_utils import earliest_legal_index, validate_topological_order
+from magi_compiler.passes.weight_offload.ops import is_h2d_load as _is_h2d_load
 from magi_compiler.utils import magi_logger
 
 _AG = torch.ops._c10d_functional.all_gather_into_tensor.default
@@ -73,40 +75,6 @@ def _ce_ag_ops():
 
 _CE_AG_OPS = _ce_ag_ops()
 _WEIGHT_AG_OPS = tuple(op for op in (_AG, _AG_COALESCED, *_CE_AG_OPS) if op is not None)
-
-
-def _h2d_ops():
-    """Host-to-device weight load ops, imported lazily so this pass stays
-    importable without a CUDA build."""
-    try:
-        from magi_compiler.offload.h2d_op import H2D_LOAD, H2D_LOAD_COALESCED
-
-        return (H2D_LOAD, H2D_LOAD_COALESCED)
-    except Exception:  # noqa: BLE001
-        return ()
-
-
-_H2D_OPS = _h2d_ops()
-
-
-def _is_h2d_load(snode: BaseSchedulerNode) -> bool:
-    """``magi::h2d_load`` lowers to an ordinary FallbackKernel, so nothing in
-    Inductor marks it as a transfer.
-
-    It must be recognized here for one reason: it occupies the PCIe lane, not the
-    compute stream, so counting its runtime as compute that hides an all-gather
-    would double-spend the same microseconds on two different transfers.  It is
-    deliberately NOT part of the collective skeleton -- a load issues no NCCL
-    work, and putting it there would make two ranks that merely offload different
-    weights look like two structurally different graphs.
-    """
-    node = getattr(snode, "node", None)
-    if getattr(node, "op_overload", None) in _H2D_OPS:
-        return True
-    for child in getattr(snode, "snodes", []) or []:
-        if getattr(getattr(child, "node", None), "op_overload", None) in _H2D_OPS:
-            return True
-    return False
 
 
 # Default extra headroom (ns) added to each collective's runtime when sizing the
@@ -765,56 +733,3 @@ class FsdpOverlapReorder:
 
     def _validate_full(self, new_order, op_to_snode, buf_to_snode, users) -> bool:
         return validate_topological_order(new_order, buf_to_snode)
-
-
-def earliest_legal_index(group, index_of, buf_to_snode) -> int:
-    """1 + max index of any REAL (non-fake buffer) producer the group needs.
-
-    Deliberately NOT ``snode.ancestors``: that set is polluted by the fake
-    ``WeakDep`` edges Inductor inserts between collectives for comm-stream
-    serialization.  Weight gathers read independent param shards -- there is no
-    real gather->gather dependency -- so counting the WeakDep would pin the
-    launch right after the previous collective and forbid the very hoist this
-    pass exists for.  A gather's only real producer is its weight-shard
-    placeholder (+ to_local/pad/cast chain), so real ``lower`` is ~0."""
-    group_set = set(group)
-    lo = 0
-    for s in group:
-        for d in s.unmet_dependencies:  # buffer names
-            if _is_fake_dep(d):  # WeakDep / StarDep -- ordering hint, not data
-                continue
-            prod = buf_to_snode.get(d.name)
-            if prod is None or prod in group_set:
-                continue
-            lo = max(lo, index_of.get(prod, 0) + 1)
-    return lo
-
-
-def validate_topological_order(new_order, buf_to_snode) -> bool:
-    """Valid topological order w.r.t. REAL data deps: every node's non-fake
-    buffer producers precede it (the driver does not repair the order, so a
-    violation would silently miscompile).  Checking direct producers per node
-    is a complete validation of the real-dep DAG.  ``snode.ancestors`` is NOT
-    used -- it includes the fake WeakDep edges this pass intentionally crosses
-    (see ``earliest_legal_index``); an ancestors check would false-reject
-    every legal hoist.  WeakDep is advisory, not a correctness constraint."""
-    pos = {s: i for i, s in enumerate(new_order)}
-    for s in new_order:
-        sp = pos[s]
-        for d in s.unmet_dependencies:  # buffer names
-            if _is_fake_dep(d):  # WeakDep / StarDep -- advisory ordering, not data
-                continue
-            prod = buf_to_snode.get(d.name)
-            if prod is s:  # fused snode may name its own internal buffers
-                continue
-            if prod is not None and pos.get(prod, -1) >= sp:
-                magi_logger.debug(
-                    "validate fail: %s@%d needs buffer-dep %s@%d (buf %s)",
-                    s.get_name(),
-                    sp,
-                    prod.get_name(),
-                    pos.get(prod, -1),
-                    d.name,
-                )
-                return False
-    return True

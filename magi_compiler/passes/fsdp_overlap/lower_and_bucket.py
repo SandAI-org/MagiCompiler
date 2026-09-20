@@ -18,13 +18,17 @@ from typing import Any, Sequence
 
 import torch.fx as fx
 
+from magi_compiler.passes.weight_offload.sources import FsdpShardSource
 from magi_compiler.utils import magi_logger
 
+from ..weight_offload import bind_weights_to_host, insert_h2d_loads
+from ..weight_offload.node_meta import is_host_offloaded
 from .bucket_all_gather import bucket_weight_all_gather_coalesced
 from .copy_engine import bind_weights_for_copy_engine, rewrite_weight_ag_to_copy_engine
-from .node_meta import is_ce_bound, is_host_offloaded
+from .node_meta import is_ce_bound
 from .redistribute_lowering import lower_prim_redistribute_to_collectives
-from .weight_offload import bind_weights_to_host, insert_h2d_loads
+
+_SHARD_SOURCE = FsdpShardSource()
 
 
 def lower_and_bucket_full_graph(
@@ -65,6 +69,10 @@ def lower_and_bucket_full_graph(
     one of the two paths.  Offloaded and resident gathers are bucketed apart,
     since a bucket's members all have to have landed before its single launch.
 
+    This is the only ``bind_weights_to_host`` / ``insert_h2d_loads`` site when
+    FSDP is on.  The unsharded ``apply_weight_offload`` helper is the other
+    branch of the backend's if/elif -- they never share a graph.
+
     Returns the number of buckets created.
     """
     lowered = lower_prim_redistribute_to_collectives(graph)
@@ -73,7 +81,7 @@ def lower_and_bucket_full_graph(
     if transport == "copy_engine":
         bind_weights_for_copy_engine(graph, example_inputs, min_shard_bytes)
     if host_offload:
-        bind_weights_to_host(graph, example_inputs, min_shard_bytes=offload_min_shard_bytes)
+        bind_weights_to_host(graph, example_inputs, _SHARD_SOURCE, min_bytes=offload_min_shard_bytes)
 
     bucket_mode = (bucket_mode or "none").lower()
     n = 0
@@ -87,7 +95,7 @@ def lower_and_bucket_full_graph(
     # After bucketing, so a bucket's members are known and their loads can be
     # merged to match: one submission and one wait per bucket, not per weight.
     if host_offload:
-        insert_h2d_loads(graph)
+        insert_h2d_loads(graph, _SHARD_SOURCE)
 
     if transport == "copy_engine":
         rewrite_weight_ag_to_copy_engine(graph)

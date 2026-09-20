@@ -23,15 +23,8 @@ import torch.fx as fx
 
 from magi_compiler.utils import magi_logger
 
-from .node_meta import (
-    is_ce_bound,
-    is_host_offloaded,
-    is_uneven_shard,
-    is_weight_ag,
-    mark_ce_bound,
-    mark_host_offloaded,
-    mark_weight_ag,
-)
+from ..weight_offload.node_meta import is_host_offloaded, mark_host_offloaded
+from .node_meta import is_ce_bound, is_uneven_shard, is_weight_ag, mark_ce_bound, mark_weight_ag
 
 _ALL_GATHER = torch.ops._c10d_functional.all_gather_into_tensor.default
 _ALL_GATHER_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
