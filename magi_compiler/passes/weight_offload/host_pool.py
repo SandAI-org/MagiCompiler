@@ -24,10 +24,10 @@ A shard is addressed by an integer ``slot``, not by a pointer.  Adopt pairs a
 filled host buffer with a storage-free CUDA stand-in; the stand-in's address is
 not a usable key, so the slot rides along in the graph instead.
 
-Slots are minted in this process at adopt time (0, 1, 2, …).  They are
-not reused across compiles via the artifact cache: a cached kernel would bake
-someone else's integers.  The backend therefore always compiles the loads
-against the pool sitting in *this* process.
+Slots are minted in this process at adopt time (0, 1, 2, …).  A cached
+kernel bakes those integers, so a later process remaps them through
+``using_slot_remap`` (see the ``host_slots.py`` sidecar next to the
+piecewise cache) rather than compiling the loads again.
 
 The only way in is ``reserve`` + ``adopt``: the loader reads the checkpoint
 straight into a pinned reservation, and the shard never occupies a device byte.
@@ -40,12 +40,18 @@ runtime by the slot integers baked into the graph.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Iterator, Sequence
 
 import torch
 
 from magi_compiler.utils import magi_logger
+
+# Baked artifact slot -> this process's pool slot.  Installed only around a
+# loaded compiled graph, so two models in one process cannot clobber each other.
+_SLOT_REMAP: ContextVar[dict[int, int] | None] = ContextVar("magi_host_slot_remap", default=None)
 
 _SLAB_BYTES = 1 << 30
 """Cap on one pinned slab (1 GiB).
@@ -200,6 +206,17 @@ class HostPool:
     def slot_of(self, local: torch.Tensor) -> int | None:
         """The slot this stand-in was adopted under, or None."""
         return self._by_tensor.get(id(local))
+
+    def find_slot(self, name: str, shape: Sequence[int], dtype: str) -> int | None:
+        """The unique slot matching ``name`` + layout, or None if missing or ambiguous."""
+        matches = [
+            slot
+            for slot, shard in enumerate(self._slots)
+            if shard.name == name
+            and tuple(shard.host.shape) == tuple(int(d) for d in shape)
+            and str(shard.host.dtype) == dtype
+        ]
+        return matches[0] if len(matches) == 1 else None
 
     def name_of(self, slot: int) -> str:
         """The parameter behind a slot, for the placement logs."""
@@ -416,6 +433,38 @@ def adopt(host: torch.Tensor, device_tensor: torch.Tensor, name: str = "") -> in
 
 def slot_of(local: torch.Tensor) -> int | None:
     return _POOL.slot_of(local)
+
+
+def find_slot(name: str, shape: Sequence[int], dtype: str) -> int | None:
+    return _POOL.find_slot(name, shape, dtype)
+
+
+def resolve_slot(slot: int) -> int:
+    """Translate a baked artifact slot onto this process's pool.
+
+    Identity when no remap is installed -- compile-time loads and a cache miss
+    both mint and bake the same integers.
+    """
+    remap = _SLOT_REMAP.get()
+    if remap is None:
+        return slot
+    try:
+        return remap[slot]
+    except KeyError:
+        raise RuntimeError(
+            f"magi::h2d_load got baked slot {slot} which is not in this artifact's "
+            f"remap {sorted(remap)}. The compiled graph's slot ids do not match the sidecar."
+        ) from None
+
+
+@contextmanager
+def using_slot_remap(remap: dict[int, int] | None) -> Iterator[None]:
+    """Install ``baked -> current`` for the duration of a loaded compiled graph."""
+    token = _SLOT_REMAP.set(remap)
+    try:
+        yield
+    finally:
+        _SLOT_REMAP.reset(token)
 
 
 def name_of(slot: int) -> str:
