@@ -168,10 +168,12 @@ def main() -> None:
     ce = args.transport == "copy_engine"
 
     # -- count the rewrites, without asking the compiled model to confess ----
-    from magi_compiler.passes.fsdp_overlap import lower_and_bucket as _lb
+    # The backend resolves the retarget off the package at call time, so this is
+    # the seam to patch.
+    import magi_compiler.passes.fsdp_overlap as _fsdp_overlap
 
     n_rewritten = 0
-    orig_rewrite = _lb.rewrite_weight_ag_to_copy_engine
+    orig_rewrite = _fsdp_overlap.rewrite_weight_ag_to_copy_engine
 
     def spy_rewrite(graph):
         nonlocal n_rewritten
@@ -179,7 +181,7 @@ def main() -> None:
         n_rewritten += got
         return got
 
-    _lb.rewrite_weight_ag_to_copy_engine = spy_rewrite
+    _fsdp_overlap.rewrite_weight_ag_to_copy_engine = spy_rewrite
 
     # -- the reference: unsharded, eager, same checkpoint -------------------
     torch.manual_seed(1234)
@@ -212,7 +214,7 @@ def main() -> None:
         out2 = model(x)
         torch.cuda.synchronize()
 
-    _lb.rewrite_weight_ag_to_copy_engine = orig_rewrite
+    _fsdp_overlap.rewrite_weight_ag_to_copy_engine = orig_rewrite
 
     # (2) placement: the block's shards are in a window, the head's are not.
     # Checked after the first forward, not before it: the weights move during

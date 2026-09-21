@@ -13,8 +13,8 @@
 # limitations under the License.
 
 """Unit tests for the FSDP-overlap weight all-gather bucketing pass
-(``magi_compiler.passes.fsdp_overlap.bucket_all_gather`` +
-``lower_and_bucket_full_graph``).
+(``magi_compiler.passes.fsdp_overlap.bucket_all_gather``: the coalescing pass
+itself and the ``bucket_mode`` entry point in front of it).
 
 Pure-CPU: the bucketing pass operates on ``all_gather_into_tensor`` fx nodes tagged
 ``magi_fsdp_weight_ag`` (it never runs the ops), so we drive it with SYNTHETIC fx
@@ -30,7 +30,7 @@ import pytest
 import torch
 import torch.fx as fx
 
-from magi_compiler.passes.fsdp_overlap import bucket_weight_all_gather_coalesced, lower_and_bucket_full_graph
+from magi_compiler.passes.fsdp_overlap import bucket_weight_all_gather, bucket_weight_all_gather_coalesced
 
 _AG = torch.ops._c10d_functional.all_gather_into_tensor.default
 _AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
@@ -260,35 +260,35 @@ def test_compute_between_gathers_does_not_break_bucket():
 
 
 # ---------------------------------------------------------------------------
-# lower_and_bucket_full_graph (entry point)
+# bucket_weight_all_gather (bucket_mode entry point)
 # ---------------------------------------------------------------------------
-def test_lower_and_bucket_mode_none_returns_zero():
-    """mode 'none' -> lowering only, no bucketing -> 0 buckets, gathers untouched."""
+def test_bucket_mode_none_returns_zero():
+    """mode 'none' -> no bucketing -> 0 buckets, gathers untouched."""
     gm = _build_ag_graph([{"shape": (4, 8), "dtype": torch.bfloat16}] * 3)
-    n = lower_and_bucket_full_graph(gm, "none")
+    n = bucket_weight_all_gather(gm, "none")
     assert n == 0
     assert _n(gm, _AG) == 3
     assert _n(gm, _AG_COALESCED) == 0
 
 
-def test_lower_and_bucket_mode_coalesced():
+def test_bucket_mode_coalesced():
     """mode 'coalesced' -> all same-(group,dtype) gathers in one whole-graph bucket."""
     gm = _build_ag_graph([{"shape": (4, 8), "dtype": torch.bfloat16}] * 3)
-    n = lower_and_bucket_full_graph(gm, "coalesced")
+    n = bucket_weight_all_gather(gm, "coalesced")
     assert n == 1
     assert _n(gm, _AG_COALESCED) == 1
 
 
-def test_lower_and_bucket_size_cap():
+def test_bucket_mode_size_cap():
     """bucket_size_bytes flows through the entry point: cap 128 B on 4x64 B shards
     -> 2 buckets of 2."""
     gm = _build_ag_graph([{"shape": (4, 8), "dtype": torch.bfloat16}] * 4)
-    n = lower_and_bucket_full_graph(gm, "coalesced", bucket_size_bytes=128)
+    n = bucket_weight_all_gather(gm, "coalesced", bucket_size_bytes=128)
     assert n == 2
     assert _n(gm, _AG_COALESCED) == 2
 
 
-def test_lower_and_bucket_unknown_mode_raises():
+def test_bucket_mode_unknown_raises():
     gm = _build_ag_graph([{"shape": (4, 8), "dtype": torch.bfloat16}] * 2)
     with pytest.raises(ValueError, match="expected 'none' or 'coalesced'"):
-        lower_and_bucket_full_graph(gm, "concat")
+        bucket_weight_all_gather(gm, "concat")
