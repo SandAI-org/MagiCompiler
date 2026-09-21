@@ -198,10 +198,8 @@ def apply_weight_offload(
     """Bind then splice loads, for a graph that is NOT going through FSDP bucketing.
 
     FSDP cannot use this: it must bind *before* bucketing and insert *after*, so
-    a bucket's members share one load.  That sandwich lives in
-    ``fsdp_overlap.lower_and_bucket`` and is the only host-offload path when
-    ``enable_fsdp`` is on -- the backend dispatches with if/elif so this helper
-    and that sandwich never both run on the same graph.
+    a bucket's members share one load.  The backend's weight pipeline keeps the
+    two calls apart for that reason and does not go through here.
     """
     bound = bind_weights_to_host(graph, example_inputs, source, min_bytes=min_bytes)
     if not bound:

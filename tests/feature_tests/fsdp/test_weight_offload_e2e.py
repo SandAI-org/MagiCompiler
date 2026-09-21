@@ -136,7 +136,7 @@ def test_loads_are_coalesced_to_match_the_buckets():
     out = _check(p)
     assert "OFFLOAD_PASS" in p.stdout, out[-4000:]
 
-    buckets = int(next(l for l in out.splitlines() if "Whole-graph FSDP bucketing" in l).split("created ")[1].split()[0])
+    buckets = int(next(l for l in out.splitlines() if "FSDP fullgraph overlap" in l).split("created ")[1].split()[0])
     loads = int(next(l for l in out.splitlines() if "inserted" in l and "h2d_load" in l).split("inserted ")[1].split()[0])
     shards = _marker(p.stdout, "OFFLOAD_FREED", "shards")
     assert buckets > 1, "this shape is supposed to produce several buckets"

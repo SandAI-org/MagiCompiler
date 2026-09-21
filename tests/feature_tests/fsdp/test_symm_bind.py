@@ -135,6 +135,32 @@ def _bind(gm, examples, **kw):
     return bind_graph_weights(gm, copy_engine_weight_candidates(gm), dict(zip(names, examples)), **kw)
 
 
+def _pipeline(gm, examples, *, transport="copy_engine", bucket_size_bytes=0) -> int:
+    """``MagiBackend._apply_weight_pipeline`` with host offload off, inlined.
+
+    Lower, bind, bucket what bound, retarget -- the order matters and is the
+    thing several tests below are about.  Returns the bucket count.
+    """
+    from magi_compiler.passes.fsdp_overlap import (
+        bind_weights_for_copy_engine,
+        bucket_weight_all_gather,
+        is_ce_bound,
+        lower_prim_redistribute_to_collectives,
+        rewrite_weight_ag_to_copy_engine,
+    )
+
+    copy_engine = transport == "copy_engine"
+    lower_prim_redistribute_to_collectives(gm)
+    if copy_engine:
+        bind_weights_for_copy_engine(gm, examples, 0)
+    n = bucket_weight_all_gather(
+        gm, "coalesced", bucket_size_bytes=bucket_size_bytes, split_by=is_ce_bound if copy_engine else None
+    )
+    if copy_engine:
+        rewrite_weight_ag_to_copy_engine(gm)
+    return n
+
+
 # ---------------------------------------------------------------------------
 # The allocation itself
 # ---------------------------------------------------------------------------
@@ -485,11 +511,10 @@ def test_bind_parameters_skips_what_it_cannot_gather(mesh_1rank):
 def test_bound_weights_are_bucketed_and_retargeted(mesh_1rank):
     """The pipeline end to end: bind, then bucket only what bound, then retarget.
     Binding before bucketing is what keeps a bucket homogeneous."""
-    from magi_compiler.passes.fsdp_overlap import lower_and_bucket_full_graph
     from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER_COALESCED
 
     gm, examples = _graph([_param(mesh_1rank) for _ in range(4)])
-    n = lower_and_bucket_full_graph(gm, "coalesced", bucket_size_bytes=0, transport="copy_engine", example_inputs=examples)
+    n = _pipeline(gm, examples)
 
     assert n == 1
     coalesced = [x for x in gm.graph.nodes if x.target is CE_ALL_GATHER_COALESCED]
@@ -502,7 +527,6 @@ def test_an_unbound_weight_keeps_its_neighbours_on_the_copy_engine(mesh_1rank):
     """Only the weight that could not be bound loses the copy engine. Excluding it
     must not split the bucket around it, or one odd weight would cost throughput
     across the whole model."""
-    from magi_compiler.passes.fsdp_overlap import lower_and_bucket_full_graph
     from magi_compiler.passes.fsdp_overlap.node_meta import UNEVEN_SHARD
     from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER_COALESCED
 
@@ -510,7 +534,7 @@ def test_an_unbound_weight_keeps_its_neighbours_on_the_copy_engine(mesh_1rank):
     gathers = [n for n in gm.graph.nodes if n.target is _AG]
     gathers[1].meta[UNEVEN_SHARD] = True
 
-    lower_and_bucket_full_graph(gm, "coalesced", bucket_size_bytes=0, transport="copy_engine", example_inputs=examples)
+    _pipeline(gm, examples)
 
     coalesced = [n for n in gm.graph.nodes if n.target is CE_ALL_GATHER_COALESCED]
     assert len(coalesced) == 1
@@ -527,7 +551,6 @@ def test_unbound_weights_are_still_bucketed_as_nccl(mesh_1rank):
     wholesale would go from a handful of coalesced launches to one launch per
     weight, which costs far more memory than the copy engine ever saved.
     """
-    from magi_compiler.passes.fsdp_overlap import lower_and_bucket_full_graph
     from magi_compiler.passes.fsdp_overlap.node_meta import UNEVEN_SHARD
     from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER_COALESCED
 
@@ -537,10 +560,7 @@ def test_unbound_weights_are_still_bucketed_as_nccl(mesh_1rank):
     for node in [n for n in gm.graph.nodes if n.target is _AG][2:]:
         node.meta[UNEVEN_SHARD] = True  # two weights the copy engine cannot serve
 
-    assert (
-        lower_and_bucket_full_graph(gm, "coalesced", bucket_size_bytes=0, transport="copy_engine", example_inputs=examples)
-        == 2
-    )
+    assert _pipeline(gm, examples) == 2
 
     (ce,) = [n for n in gm.graph.nodes if n.target is CE_ALL_GATHER_COALESCED]
     (nccl,) = [n for n in gm.graph.nodes if n.target is _AG_COALESCED]
@@ -552,10 +572,9 @@ def test_unbound_weights_are_still_bucketed_as_nccl(mesh_1rank):
 @requires_cuda
 def test_nccl_transport_binds_nothing(mesh_1rank):
     """Symmetric memory is a copy-engine cost; the default transport must not pay it."""
-    from magi_compiler.passes.fsdp_overlap import lower_and_bucket_full_graph
     from magi_compiler.symm_mem import registered_buffers
 
     gm, examples = _graph([_param(mesh_1rank) for _ in range(2)])
-    lower_and_bucket_full_graph(gm, "coalesced", transport="nccl", example_inputs=examples)
+    _pipeline(gm, examples, transport="nccl")
 
     assert registered_buffers() == []
