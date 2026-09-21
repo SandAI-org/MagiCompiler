@@ -17,9 +17,11 @@
 ``to_empty`` is the single place a meta-built model turns into real storage, so a
 patched ``_apply`` hands back pinned host memory for the weights that offload is
 going to want.  The checkpoint reads straight into it.  Nothing about the loader
-changes: it still sees DTensors of the right global shape, dtype and sharding,
-and ``dcp.load`` still writes them in place.  Peak device memory stays at the
-resident set instead of the whole model.
+changes: it still sees DTensors of the right global shape, dtype, layout and
+sharding, and ``dcp.load`` still writes them in place.  Peak device memory stays
+at the resident set instead of the whole model.  A weight whose layout a flat
+reservation cannot reproduce is left on the device rather than quietly
+straightened out, which is what keeps that list honest.
 
 Two properties make this safe rather than clever:
 
@@ -279,10 +281,26 @@ def patch_materialize(instance: nn.Module, conf) -> None:
         # that are halfway through being replaced.
         chosen = {}
         shared = []
+        strided = []
         for name, param in self.named_parameters(recurse=recurse):
             if not _is_offloadable(param):
                 continue
             payload = _payload(param)
+            # Before the two refusals below, so neither reports a weight that was
+            # never a candidate in the first place.
+            if payload.numel() * payload.element_size() < min_bytes:
+                continue
+            if not payload.is_contiguous():
+                # A reservation is a flat span of a slab, so parking this one
+                # would hand both the loader and the graph a contiguous weight
+                # where ``to_empty`` keeps the stride -- silently, and to a kernel
+                # that reads the layout off the tensor that is a different weight.
+                # Preserving it is not a local change either: the load allocates
+                # its own output, and a copy whose two sides disagree about layout
+                # stages through a host bounce buffer, which is the pageable path
+                # this whole file exists to stay off.
+                strided.append(_pretty(name))
+                continue
             if not payload.is_meta:
                 # Host-first can only redirect a weight it materializes itself,
                 # and this one already has storage.  The reading worth guarding
@@ -295,9 +313,17 @@ def patch_materialize(instance: nn.Module, conf) -> None:
                 # is not offloaded, against an illegal access nothing traces here.
                 shared.append(_pretty(name))
                 continue
-            if payload.numel() * payload.element_size() < min_bytes:
-                continue
             chosen[id(param)] = _pretty(name)
+
+        if strided:
+            magi_logger.warning(
+                "host offload: %d weight(s) of %s have a non-contiguous layout and stay on the device (%s); a "
+                "host reservation is a flat pinned span, so offloading one would quietly make it contiguous "
+                "while to_empty preserves the stride",
+                len(strided),
+                type(self).__name__,
+                ", ".join(strided[:8]) + (" ..." if len(strided) > 8 else ""),
+            )
 
         if shared:
             magi_logger.warning(

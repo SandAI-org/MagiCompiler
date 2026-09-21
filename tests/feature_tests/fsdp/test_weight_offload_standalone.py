@@ -288,6 +288,98 @@ def test_a_plain_parameter_below_the_floor_stays_on_the_device():
     assert root.inner.small.weight.device.type == "cuda"
 
 
+class _Transposed(torch.nn.Module):
+    """A weight held transposed, so its dense layout is not the contiguous one."""
+
+    def __init__(self):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.empty(1024, 256, dtype=torch.bfloat16).t())
+
+    def forward(self, x):
+        return x @ self.w
+
+
+class _Conv(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(256, 256, 3, bias=False, dtype=torch.bfloat16)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+def _layout_to_empty_gives(cls, memory_format=None) -> tuple[int, ...]:
+    """The stride an unpatched ``to_empty`` produces, which host-first must match.
+
+    ``to_empty`` is ``empty_like`` with ``preserve_format``, so a dense
+    non-contiguous weight keeps its stride.  Asserting against a measurement
+    rather than a literal is what makes these tests about the two paths agreeing.
+    """
+    with torch.device("meta"):
+        root = torch.nn.Module()
+        root.inner = cls()
+        if memory_format is not None:
+            root.inner = root.inner.to(memory_format=memory_format)
+    root.to_empty(device=torch.device("cuda"))
+    (param,) = root.inner.parameters()
+    return param.stride()
+
+
+@requires_cuda
+def test_a_transposed_parameter_keeps_the_layout_to_empty_would_give_it():
+    """A flat reservation cannot express a stride, so this weight is not offloaded.
+
+    Parking it would hand the loader and the graph a contiguous weight where eager
+    gets a strided one -- silently, and to a kernel that reads the layout off the
+    tensor that is a different weight.  Preserving the layout instead is not a
+    local change: the load allocates its own output, and a copy whose two sides
+    disagree about layout stages through a host bounce buffer, which is the
+    pageable path pinning exists to avoid.
+    """
+    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload.host_first import handoff_if_pending
+
+    expected = _layout_to_empty_gives(_Transposed)
+    assert expected != torch.empty(256, 1024).stride(), "the fixture has to be non-contiguous to test anything"
+
+    with torch.device("meta"):
+        root = torch.nn.Module()
+        root.inner = _Transposed()
+    _patched(root.inner)
+    root.to_empty(device=torch.device("cuda"))
+
+    w = root.inner.w
+    assert w.device.type == "cuda", "a weight host-first declines keeps the storage to_empty gave it"
+    assert w.stride() == expected, "host-first must not change the layout to_empty would have produced"
+    assert handoff_if_pending(root.inner) == 0, "nothing was parked, so nothing is handed over"
+    assert host_pool.num_bound() == 0
+
+
+@requires_cuda
+def test_a_channels_last_weight_keeps_its_memory_format():
+    """The same refusal, in the shape it actually reaches us in.
+
+    ``model.to(memory_format=channels_last)`` is the realistic way a weight ends
+    up strided, and a conv that silently loses the format runs a different kernel.
+    """
+    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload.host_first import handoff_if_pending
+
+    expected = _layout_to_empty_gives(_Conv, memory_format=torch.channels_last)
+
+    with torch.device("meta"):
+        root = torch.nn.Module()
+        root.inner = _Conv().to(memory_format=torch.channels_last)
+    _patched(root.inner)
+    root.to_empty(device=torch.device("cuda"))
+
+    w = root.inner.conv.weight
+    assert w.stride() == expected, "host-first must not straighten out a channels-last weight"
+    assert w.is_contiguous(memory_format=torch.channels_last), "the conv must still get its format"
+    assert handoff_if_pending(root.inner) == 0
+    assert host_pool.num_bound() == 0
+
+
 @requires_cuda
 def test_plain_handoff_swaps_in_a_storage_free_device_stand_in():
     from magi_compiler.passes.weight_offload import host_pool
