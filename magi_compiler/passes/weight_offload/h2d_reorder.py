@@ -84,6 +84,15 @@ from .ops import H2D_OPS, is_h2d_load, slots_of
 _DEFAULT_WINDOW_MARGIN_NS = 5_000.0
 
 
+# A placed load occupies the closed interval [target, last_user] in the original
+# index space.  ``_rebuild`` inserts the load *before* the node at ``target``,
+# so that node already sees the new buffer.  ``last_user`` still reads the old
+# one, so two loads overlap iff earlier.last_user >= later.target.
+def _closed_live_overlap(last_user: int, next_start: int) -> bool:
+    """True when closed ranges ``[*, last_user]`` and ``[next_start, *]`` share a node."""
+    return last_user >= next_start
+
+
 def _snode_bytes(snode: BaseSchedulerNode) -> int:
     node = getattr(snode, "node", None)
     try:
@@ -115,6 +124,7 @@ class _Plan:
     group: list  # the load plus the alias snodes that must travel with it
     slots: list[int]  # host-pool slots this load pulls
     wait_idx: int  # earliest wait: the load's hard upper bound
+    # Inclusive right end of the closed live range [target, last_user].
     # Last snode that still reads this load's bytes (gather, matmul, ...).
     # The wait is only a floor: it means the copy has landed, not that the
     # buffer is free.  Sweep, peak and bubbles all use this.
@@ -384,9 +394,10 @@ class H2dLoadReorder:
 
         What is added here is the ``frontier``.  Having placed one load, the next
         one to move is not necessarily its immediate predecessor: if that load's
-        last user would still be reading it where the placed one now starts, it
-        is left alone and the sweep looks further back for one whose bytes are
-        already unused -- which may be several loads back, or none.
+        last user would still be reading it where the placed one now starts
+        (closed [target, last_user], so last_user == frontier already overlaps),
+        it is left alone and the sweep looks further back for one whose bytes
+        are already unused -- which may be several loads back, or none.
 
         A load left alone is not left exposed: its weight goes back on the device
         and stays there.  Loading a weight that nothing can hide is pure cost
@@ -405,8 +416,9 @@ class H2dLoadReorder:
         frontier = len(order)  # where the next-later load's bytes come alive
 
         for plan in reversed(plans):
-            if plan.last_user > frontier:
+            if _closed_live_overlap(plan.last_user, frontier):
                 # Something still reads this load where the next one would start.
+                # Equality overlaps: the later load is inserted *before* frontier.
                 plan.promoted = True
                 continue
 
@@ -445,7 +457,9 @@ class H2dLoadReorder:
             if at is not None:
                 events.append((at, p.nbytes))
                 events.append((p.last_user, -p.nbytes))
-        events.sort()
+        # Closed [at, last_user]: a start at i still overlaps an end at i, so
+        # apply allocations before releases or the peak under-counts the touch.
+        events.sort(key=lambda ev: (ev[0], ev[1] < 0))
         peak = live = 0
         for _idx, delta in events:
             live += delta
@@ -463,10 +477,13 @@ class H2dLoadReorder:
         """
         placed = sorted((t, by_load[load].last_user) for load, t in targets.items())
         out: list[tuple[int, int]] = []
-        prev_end = 0
+        # Sentinel "-1": no prior closed range, so the first free start is 0.
+        # After a load ending at ``end``, the next free start is end+1 -- a
+        # later load at ``end`` would be inserted before that last_user.
+        prev_end = -1
         for start, end in placed:
-            if start > prev_end:
-                out.append((prev_end, start))
+            if start > prev_end + 1:
+                out.append((prev_end + 1, start))
             prev_end = max(prev_end, end)
         return out
 
@@ -539,6 +556,10 @@ class H2dLoadReorder:
     def _rebuild(order, targets, index_of, groups) -> list[BaseSchedulerNode]:
         """Apply every move in one stable-sort rebuild: targets live in the
         original index space, so incremental moves would shift them.
+
+        The load sorts to ``target - 0.5``, i.e. immediately *before* the node
+        that currently sits at ``target``.  That node is the inclusive start of
+        the closed live range [target, last_user].
 
         Group members sort to the same key as their load and keep their relative
         order, so a load and its unpack stay adjacent.
