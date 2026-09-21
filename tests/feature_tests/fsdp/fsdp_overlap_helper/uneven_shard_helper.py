@@ -148,15 +148,39 @@ def _agree(value) -> bool:
     return all(v == seen[0] for v in seen)
 
 
+def _pipeline(gm, *, transport: str, bucket_size_bytes: int = 0) -> int:
+    """``MagiBackend._apply_weight_pipeline`` with host offload off, inlined.
+
+    Lower, bind, bucket what bound, retarget -- the order is what decides
+    transport per weight, which is the thing every rank has to agree on.
+    """
+    from magi_compiler.passes.fsdp_overlap import (
+        bind_weights_for_copy_engine,
+        bucket_weight_all_gather,
+        is_ce_bound,
+        lower_prim_redistribute_to_collectives,
+        rewrite_weight_ag_to_copy_engine,
+    )
+
+    copy_engine = transport == "copy_engine"
+    examples = _example_inputs(gm)
+    lower_prim_redistribute_to_collectives(gm)
+    if copy_engine:
+        bind_weights_for_copy_engine(gm, examples, 0)
+    n = bucket_weight_all_gather(
+        gm, "coalesced", bucket_size_bytes=bucket_size_bytes, split_by=is_ce_bound if copy_engine else None
+    )
+    if copy_engine:
+        rewrite_weight_ag_to_copy_engine(gm)
+    return n
+
+
 def _check_transport(mesh, rows: int, *, n: int, cols: int, say) -> bool:
-    from magi_compiler.passes.fsdp_overlap import lower_and_bucket_full_graph
     from magi_compiler.symm_mem import reset_registry
 
     reset_registry()  # each check accounts for its own windows
     gm = _build_graph(mesh, [rows] * n, cols)
-    lower_and_bucket_full_graph(
-        gm, "coalesced", bucket_size_bytes=0, transport="copy_engine", example_inputs=_example_inputs(gm)
-    )
+    _pipeline(gm, transport="copy_engine")
     targets, sizes = _gather_targets(gm)
     ok = _agree((targets, sizes))
     say(f"UNEVEN_TRANSPORT rows={rows} agree={ok} targets={targets} sizes={sizes}")
@@ -169,10 +193,8 @@ def _check_nccl_bucket_cap(mesh, rows: int, *, n: int, cols: int, cap: int, say)
     Runs on the DEFAULT transport, where the uneven weight is bucketed rather than
     excluded, so the cap is the only thing deciding membership.
     """
-    from magi_compiler.passes.fsdp_overlap import lower_and_bucket_full_graph
-
     gm = _build_graph(mesh, [rows] * n, cols)
-    lower_and_bucket_full_graph(gm, "coalesced", bucket_size_bytes=cap, transport="nccl")
+    _pipeline(gm, transport="nccl", bucket_size_bytes=cap)
     _targets, sizes = _gather_targets(gm)
     ok = _agree(sizes)
     say(f"UNEVEN_NCCL_BUCKETS rows={rows} agree={ok} sizes={sizes}")
@@ -214,14 +236,11 @@ def _check_mixed(mesh, *, even_rows: int, uneven_rows: int, cols: int, say) -> b
     the copy engine as one coalesced launch, the uneven pair stays on NCCL as
     another.  All ranks must report the same split.
     """
-    from magi_compiler.passes.fsdp_overlap import lower_and_bucket_full_graph
     from magi_compiler.symm_mem import reset_registry
 
     reset_registry()
     gm = _build_graph(mesh, [even_rows, uneven_rows, even_rows, uneven_rows], cols)
-    lower_and_bucket_full_graph(
-        gm, "coalesced", bucket_size_bytes=0, transport="copy_engine", example_inputs=_example_inputs(gm)
-    )
+    _pipeline(gm, transport="copy_engine")
     targets, sizes = _gather_targets(gm)
     targets = dict(sorted(targets.items()))
     sizes = sorted(sizes)

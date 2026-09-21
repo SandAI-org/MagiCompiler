@@ -225,7 +225,7 @@ def bucket_weight_all_gather_coalesced(graph: fx.GraphModule, bucket_size_bytes:
     mode to keep gathers of different kinds apart -- a bucket is one submission, so
     it cannot span two transports.
 
-    Runs after redistribute lowering (via ``lower_and_bucket_full_graph``).
+    Runs after redistribute lowering, and after binding when there is any.
     Returns the number of coalesced buckets created.
     """
     node_index = {n: i for i, n in enumerate(graph.graph.nodes)}
@@ -276,3 +276,24 @@ def bucket_weight_all_gather_coalesced(graph: fx.GraphModule, bucket_size_bytes:
         bucket_size_bytes,
     )
     return buckets
+
+
+def bucket_weight_all_gather(graph: fx.GraphModule, bucket_mode: str, bucket_size_bytes: int = 0, split_by=None) -> int:
+    """Bucket the lowered weight all-gathers as ``bucket_mode`` asks.
+
+      * ``"none"``      -- leave them alone (N individual all_gather + N waits).
+      * ``"coalesced"`` -- one all_gather_into_tensor_coalesced per bucket
+                           (ONE launch, N getitems, N waits).
+
+    ``bucket_size_bytes`` (coalesced mode only): when > 0, split the gathers into
+    buckets of at most this many local-shard bytes, breaking at dtype changes and
+    the byte cap in program order.  0 = no cap (one bucket per (group, dtype) run).
+
+    Returns the number of buckets created.
+    """
+    bucket_mode = (bucket_mode or "none").lower()
+    if bucket_mode in ("none", ""):
+        return 0
+    if bucket_mode != "coalesced":
+        raise ValueError(f"Unknown bucket_mode={bucket_mode!r}; expected 'none' or 'coalesced'")
+    return bucket_weight_all_gather_coalesced(graph, bucket_size_bytes=bucket_size_bytes, split_by=split_by)

@@ -14,10 +14,10 @@
 
 """torchrun entrypoint: compile-time weight offload, end to end, on a SimpleFSDP model.
 
-Chain under test (magi_backend._apply_fsdp_fullgraph_overlap with
+Chain under test (magi_backend._apply_weight_pipeline with
 ``offload_config.graph_weight_offload``)::
 
-    lowering -> tag parked slots -> h2d_load insertion -> bucketing
+    lowering -> tag parked slots -> bucketing -> h2d_load insertion
            -> FsdpOverlapReorder (phase 1) -> H2dLoadReorder (phase 2)
 
 Weights are built on meta, materialized through the patched ``to_empty`` into

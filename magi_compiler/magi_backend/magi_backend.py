@@ -756,6 +756,11 @@ class MagiBackend:
         """
         from magi_compiler.passes.weight_offload import host_pool
 
+        # Before and after, rather than the pool's resident total: the placement
+        # pass promotes shards back for a reason of its own, and counting those
+        # here would report a miss several times the size of the real one.
+        # ``make_resident_many`` only ever adds, so the difference is this call's.
+        before = host_pool.resident_bytes()
         restored = host_pool.restore_unclaimed()
         if not restored:
             return
@@ -763,7 +768,7 @@ class MagiBackend:
             "host offload: %d parked weight(s) are not loaded by any compiled graph and have been put "
             "back on the device (%.1f MiB); offload is simply not helping for these. Weights: %s",
             len(restored),
-            host_pool.resident_bytes() / 2**20,
+            (host_pool.resident_bytes() - before) / 2**20,
             ", ".join(restored[:8]) + (f", +{len(restored) - 8} more" if len(restored) > 8 else ""),
         )
 
@@ -772,137 +777,179 @@ class MagiBackend:
         from magi_compiler.passes.weight_offload import H2dLoadReorder, host_pool
 
         offload_cfg = self.compile_config.offload_config
-        fsdp_cfg = self.compile_config.fsdp_config
         return H2dLoadReorder(
             bandwidth_bytes_per_ns=host_pool.h2d_bandwidth_bytes_per_ns(offload_cfg.offload_h2d_bandwidth_gbps),
-            window_margin_ns=fsdp_cfg.comm_overlap_window_margin_ns,
-            window_scale=fsdp_cfg.comm_overlap_window_scale,
+            window_margin_ns=offload_cfg.h2d_overlap_window_margin_ns,
+            window_scale=offload_cfg.h2d_overlap_window_scale,
             max_resident_bytes=int(offload_cfg.offload_max_resident_mib) * 1024 * 1024,
         )
 
-    def _apply_weight_offload(self, graph: fx.GraphModule, example_inputs) -> None:
-        """Host offload of a model that is NOT sharded.
-
-        Same machinery as the FSDP path, minus everything FSDP contributes: no
-        redistribute to lower, no all-gather to bucket, and no first-phase
-        reorder -- so the load placement pass is appended to Inductor's builtin
-        overlap passes rather than replacing them.  Replacing them is the FSDP
-        path's business, and doing it here would cost every other collective in
-        the model (CP / EP) its overlap for nothing.
-
-        ``disable_graph_split`` is not required, but it is worth having: the
-        loads are spliced in before the split, so with a split graph the
-        scheduler sees one submod at a time and a load can only be hoisted
-        within the submod that consumes it.  Correct either way, much weaker
-        without it.
-        """
-        from magi_compiler.passes.weight_offload import PlainParamSource, apply_weight_offload
-
-        # FSDP + host offload is handled exclusively by
-        # ``_apply_fsdp_fullgraph_overlap`` / ``lower_and_bucket_full_graph``
-        # (FsdpShardSource).  Running this path as well would bind the same
-        # bytes twice -- once as shards, once as whole parameters.
-        assert not self.compile_config.fsdp_config.enable_fsdp, (
-            "_apply_weight_offload is the unsharded path; with enable_fsdp the "
-            "backend must take _apply_fsdp_fullgraph_overlap so bind/insert "
-            "run once around bucketing, against FsdpShardSource"
-        )
-        self._check_offload_config()
-        offload_cfg = self.compile_config.offload_config
-        source = PlainParamSource(group_bytes=int(offload_cfg.offload_group_mib) * 1024 * 1024)
-
-        if not apply_weight_offload(
-            graph, example_inputs, source, min_bytes=int(offload_cfg.offload_min_shard_mib * 1024 * 1024)
-        ):
-            return
-
-        passes = list(self.inductor_compile_config.get("reorder_for_compute_comm_overlap_passes", []))
-        if not passes:
-            # Inductor's own defaults, which we are adding to rather than replacing.
-            passes = ["raise_comms", "sink_waits"]
-        passes.append(self._h2d_load_reorder())
-        self.inductor_compile_config["reorder_for_compute_comm_overlap"] = True
-        self.inductor_compile_config["reorder_for_compute_comm_overlap_passes"] = passes
-
-    def _apply_fsdp_fullgraph_overlap(self, graph: fx.GraphModule, example_inputs) -> None:
-        """Whole-graph FSDP all-gather / compute overlap (disable_graph_split path).
-
-        1. Lower SimpleFSDP weight prim_redistribute -> explicit collectives, bind
-           the gathered weights into symmetric memory when the transport is the copy
-           engine, and optionally bucket them over the whole graph (no region
-           partitioning; buckets break only at dtype changes and the size cap).
-        2. Install the profiling runtime estimator at ``config.estimate_op_runtime``
-           (the analytical roofline is unusable for our sizing decisions).
-        3. Install the latest-safe-launch reorder pass, REPLACING PyTorch's builtin
-           raise_comms/sink_waits, and enable reorder_for_compute_comm_overlap.
-        4. With host offload on, append the second-phase pass that pulls each
-           weight load back out of the block phase 3 moved it in.
-        """
+    def _check_weight_pipeline_config(self) -> None:
+        """Preconditions of the FSDP / host-offload rewrite, per feature."""
         fsdp_cfg = self.compile_config.fsdp_config
-        offload_cfg = self.compile_config.offload_config
-        assert (
-            self.compile_config.disable_graph_split
-        ), "fsdp_config.enable_fullgraph_overlap requires disable_graph_split=True"
-        assert (
-            self.compile_config.cudagraph_mode == CudaGraphMode.NONE
-        ), "fsdp_config.enable_fullgraph_overlap requires cudagraph_mode=NONE"
-
-        host_offload = offload_cfg.graph_weight_offload
-        if host_offload:
+        if fsdp_cfg.enable_fsdp:
+            assert self.compile_config.disable_graph_split, "fsdp_config.enable_fsdp requires disable_graph_split=True"
+            assert (
+                self.compile_config.cudagraph_mode == CudaGraphMode.NONE
+            ), "fsdp_config.enable_fsdp requires cudagraph_mode=NONE"
+        if self.compile_config.offload_config.graph_weight_offload:
             self._check_offload_config()
-            assert fsdp_cfg.transport == "nccl", (
+            assert not (fsdp_cfg.enable_fsdp and fsdp_cfg.transport == "copy_engine"), (
                 "offload_config.graph_weight_offload requires fsdp_config.transport='nccl': a "
                 "copy-engine gather reads its peers' device-resident shards, which offloading frees"
             )
 
-        from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder, lower_and_bucket_full_graph
-        from magi_compiler.profiling import ProfilingRuntimeEstimator
+    @observe_lifecycle("weight_pipeline")
+    def _apply_weight_pipeline(self, graph: fx.GraphModule, example_inputs) -> None:
+        """FSDP lowering / bucketing and host offload, as one ordered rewrite.
 
-        bucket_size_bytes = int(fsdp_cfg.bucket_size_mib) * 1024 * 1024
-        n_buckets = lower_and_bucket_full_graph(
-            graph,
-            fsdp_cfg.bucket_mode,
-            bucket_size_bytes=bucket_size_bytes,
-            transport=fsdp_cfg.transport,
-            example_inputs=example_inputs,
-            min_shard_bytes=int(fsdp_cfg.symm_min_shard_mib) * 1024 * 1024,
-            host_offload=host_offload,
-            offload_min_shard_bytes=int(offload_cfg.offload_min_shard_mib * 1024 * 1024),
+        The two features rewrite the same weights, so they are one sequence
+        rather than two alternatives::
+
+            lower -> bind -> bucket -> insert loads -> retarget
+
+        and the order within it is forced.  ``bind`` has to see the
+        one-gather-per-weight form the lowering leaves behind, and bucketing
+        splits offloaded gathers from resident ones on the tag ``bind`` sets, so
+        binding sits between the two; the loads go in last so a bucket's members
+        share one submission and one wait rather than one apiece.
+
+        Which weights binding and splicing act on is the ``WeightSource``'s
+        business -- shards under FSDP, whole parameters without it -- which is
+        why there is one ``bind`` and one ``insert`` here and not one per
+        feature.  Steps a feature does not ask for simply drop out: no FSDP, no
+        redistribute to lower and no gather to bucket; no offload, nothing to
+        bind or load.
+
+        Runs on the whole graph, before the split.  ``disable_graph_split`` is
+        required under FSDP and merely worth having for offload alone: the
+        scheduler sees one submod at a time, so a load can only be hoisted
+        within the submod that consumes it.
+        """
+        fsdp_cfg = self.compile_config.fsdp_config
+        offload_cfg = self.compile_config.offload_config
+        enable_fsdp = fsdp_cfg.enable_fsdp
+        copy_engine = enable_fsdp and fsdp_cfg.transport == "copy_engine"
+        if not (enable_fsdp or offload_cfg.graph_weight_offload):
+            return
+        self._check_weight_pipeline_config()
+
+        from magi_compiler.passes.fsdp_overlap import (
+            bind_weights_for_copy_engine,
+            bucket_weight_all_gather,
+            is_ce_bound,
+            lower_prim_redistribute_to_collectives,
+            rewrite_weight_ag_to_copy_engine,
         )
-        magi_logger.info(
-            "FSDP fullgraph overlap: transport=%s bucket_mode=%s bucket_size=%d MiB created %d buckets",
-            fsdp_cfg.transport,
-            fsdp_cfg.bucket_mode,
-            fsdp_cfg.bucket_size_mib,
-            n_buckets,
+        from magi_compiler.passes.weight_offload import (
+            FsdpShardSource,
+            PlainParamSource,
+            bind_weights_to_host,
+            insert_h2d_loads,
+            is_host_offloaded,
         )
 
-        if fsdp_cfg.cost_mode == "analytical":
-            self._fsdp_overlap_estimator = None
-            cost_fn = None  # reorder pass defaults to Inductor's analytical estimate
-        else:  # "profile_sync" -- the default for BOTH single- and multi-rank
-            self._fsdp_overlap_estimator = ProfilingRuntimeEstimator()
-            self._fsdp_overlap_estimator._sync_across_ranks = True
-            cost_fn = self._fsdp_overlap_estimator
-
-        reorder = FsdpOverlapReorder(
-            comm_overlap_window_margin_ns=fsdp_cfg.comm_overlap_window_margin_ns,
-            cost_fn=cost_fn,
-            comm_overlap_window_scale=fsdp_cfg.comm_overlap_window_scale,
-            move_prep_chain=host_offload,
+        source = (
+            FsdpShardSource()
+            if enable_fsdp
+            else PlainParamSource(group_bytes=int(offload_cfg.offload_group_mib) * 1024 * 1024)
         )
-        passes = [reorder]
-        if host_offload:
-            # Phase 1 moves the load, its wait and the gather as one block, which
-            # leaves the transfer fully exposed in front of the gather; phase 2 is
-            # what opens a compute window in between.  Separate passes because the
-            # two lanes are separate hardware: the same compute may hide a PCIe
-            # load and an NVLink gather at once, so neither sweep may spend the
-            # other's budget.
+
+        if enable_fsdp:
+            lowered = lower_prim_redistribute_to_collectives(graph)
+            magi_logger.info("Whole-graph FSDP lowering: %d weight redistribute -> collectives", lowered)
+
+        # The bind slot, which the copy engine and host offload contend for and
+        # never share: a copy-engine gather reads its peers' device-resident
+        # shards, and offloading is the act of freeing those.
+        bound = 0
+        if copy_engine:
+            bind_weights_for_copy_engine(graph, example_inputs, int(fsdp_cfg.symm_min_shard_mib) * 1024 * 1024)
+        elif offload_cfg.graph_weight_offload:
+            bound = bind_weights_to_host(
+                graph, example_inputs, source, min_bytes=int(offload_cfg.offload_min_shard_mib * 1024 * 1024)
+            )
+
+        if enable_fsdp:
+            # Bound and unbound gathers bucket apart rather than the unbound ones
+            # dropping out of bucketing: losing the copy engine, or staying
+            # resident, must not also lose coalescing.
+            n_buckets = bucket_weight_all_gather(
+                graph,
+                fsdp_cfg.bucket_mode,
+                bucket_size_bytes=int(fsdp_cfg.bucket_size_mib) * 1024 * 1024,
+                split_by=is_ce_bound if copy_engine else (is_host_offloaded if bound else None),
+            )
+            magi_logger.info(
+                "FSDP fullgraph overlap: transport=%s bucket_mode=%s bucket_size=%d MiB created %d buckets",
+                fsdp_cfg.transport,
+                fsdp_cfg.bucket_mode,
+                fsdp_cfg.bucket_size_mib,
+                n_buckets,
+            )
+
+        if bound:
+            insert_h2d_loads(graph, source)
+
+        if copy_engine:
+            rewrite_weight_ag_to_copy_engine(graph)
+
+        self._configure_overlap_passes(loads_inserted=bool(bound))
+
+    def _configure_overlap_passes(self, *, loads_inserted: bool) -> None:
+        """Install the Inductor scheduler passes the rewrite above needs.
+
+        FSDP REPLACES PyTorch's builtin raise_comms/sink_waits with the
+        latest-safe-launch reorder, which hoists each all-gather launch just far
+        enough upstream for compute to hide it; offload on its own APPENDS to
+        them.  The asymmetry is deliberate: replacing them pays off when the
+        weight all-gathers are what the schedule is built around, and costs
+        every other collective in the model (CP / EP) its overlap when they are
+        not.
+        """
+        fsdp_cfg = self.compile_config.fsdp_config
+        if not (fsdp_cfg.enable_fsdp or loads_inserted):
+            # Offload was asked for but bound nothing: leave the schedule alone.
+            return
+
+        cost_fn = None
+        if fsdp_cfg.enable_fsdp:
+            from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder
+            from magi_compiler.profiling import ProfilingRuntimeEstimator
+
+            if fsdp_cfg.cost_mode == "analytical":
+                self._fsdp_overlap_estimator = None  # reorder pass defaults to Inductor's analytical estimate
+            else:  # "profile_sync" -- the default for BOTH single- and multi-rank
+                self._fsdp_overlap_estimator = ProfilingRuntimeEstimator()
+                self._fsdp_overlap_estimator._sync_across_ranks = True
+                cost_fn = self._fsdp_overlap_estimator
+
+            passes = [
+                FsdpOverlapReorder(
+                    comm_overlap_window_margin_ns=fsdp_cfg.comm_overlap_window_margin_ns,
+                    cost_fn=cost_fn,
+                    comm_overlap_window_scale=fsdp_cfg.comm_overlap_window_scale,
+                    move_prep_chain=loads_inserted,
+                )
+            ]
+        else:
+            passes = list(self.inductor_compile_config.get("reorder_for_compute_comm_overlap_passes", []))
+            if not passes:
+                # Inductor's own defaults, which we are adding to rather than replacing.
+                passes = ["raise_comms", "sink_waits"]
+
+        if loads_inserted:
+            # Under FSDP the pass above moves the load, its wait and the gather as
+            # one block, which leaves the transfer fully exposed in front of the
+            # gather; this second sweep is what opens a compute window in between.
+            # Separate passes because the two lanes are separate hardware: the same
+            # compute may hide a PCIe load and an NVLink gather at once, so neither
+            # sweep may spend the other's budget.
             reorder_loads = self._h2d_load_reorder()
             if cost_fn is not None:
                 reorder_loads._cost_fn = cost_fn
             passes.append(reorder_loads)
+
         self.inductor_compile_config["reorder_for_compute_comm_overlap"] = True
         self.inductor_compile_config["reorder_for_compute_comm_overlap_passes"] = passes
 
@@ -922,14 +969,6 @@ class MagiBackend:
         resolved_ops: list[torch._ops.OpOverload] = resolve_defined_ops(fx_split_ops)
         magi_logger.info(f"Setting up FX-level graph split with ops: {fx_split_ops=}")
         magi_logger.info(f"Resolved splitting ops for FX-level graph split: {resolved_ops=}")
-
-        # Step 1.4: exactly one host-offload rewrite, never both.
-        # FSDP on  -> lower/bucket + FsdpShardSource bind/insert (offload folds in).
-        # FSDP off -> PlainParamSource bind/insert.  elif, not a second if.
-        if self.compile_config.fsdp_config.enable_fsdp:
-            self._apply_fsdp_fullgraph_overlap(graph, example_inputs)
-        elif self.compile_config.offload_config.graph_weight_offload:
-            self._apply_weight_offload(graph, example_inputs)
 
         # Step 2: split graph by ops, we split graph based on resolved_ops, which becomes the partitioned single graph.
         subgraph_id = 0
@@ -989,6 +1028,10 @@ class MagiBackend:
         self._init_cache()
 
         self.full_graph_pass_manager(graph)
+
+        # Still whole-graph, but it needs the example inputs and it configures
+        # Inductor's scheduling, neither of which a FullGraphPassManager pass does.
+        self._apply_weight_pipeline(graph, example_inputs)
 
         split_gm, piecewise_graphs = self._split_graph(graph, example_inputs)
 

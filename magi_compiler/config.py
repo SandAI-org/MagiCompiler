@@ -279,6 +279,23 @@ class OffloadConfig(BaseModel):
             "safe direction: it hoists loads further than needed."
         ),
     )
+    h2d_overlap_window_margin_ns: float = Field(
+        5000.0,
+        ge=0.0,
+        description=(
+            "Extra headroom (ns) added to each H2D load's estimated transfer time when sizing its "
+            "compute window, absorbing estimator error + launch latency."
+        ),
+    )
+    h2d_overlap_window_scale: float = Field(
+        1.0,
+        ge=1.0,
+        description=(
+            "Multiplier on each H2D load's estimated transfer time when sizing its compute window "
+            "(need = transfer * scale + margin). Transfers are estimated from bytes / bandwidth "
+            "in isolation but run concurrent with the compute that hides them."
+        ),
+    )
 
 
 class FSDPConfig(BaseModel):
