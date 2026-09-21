@@ -129,6 +129,9 @@ def magi_compile(
 
     config_patch = config_patch or (lambda x: x)
     conf = config_patch(copy.deepcopy(get_compile_config()))
+    # After config_patch: pydantic only validates at construction, and host-first
+    # rewrite in the wrapper would otherwise empty weights under TORCH_COMPILE.
+    conf.check_graph_weight_offload_compile_mode()
     enable = enable_if is None or enable_if()
     if not enable or conf.compile_mode == CompileMode.NONE:
         return obj
