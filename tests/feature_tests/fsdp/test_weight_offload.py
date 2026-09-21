@@ -989,6 +989,76 @@ def _patched(instance, *, min_shard_mib=0.0):
     return instance
 
 
+class _Tied(torch.nn.Module):
+    """Two projections over one weight, the way a model ties its output head to an embedding."""
+
+    def __init__(self, rows: int, cols: int):
+        super().__init__()
+        self.a = torch.nn.Linear(cols, rows, bias=False)
+        self.b = torch.nn.Linear(cols, rows, bias=False)
+
+    def forward(self, x):
+        return self.a(x) + self.b(x)
+
+
+def _tied_on_meta(mesh, rows: int, cols: int) -> torch.nn.Module:
+    """A meta-built, sharded ``_Tied`` whose two names really are one Parameter.
+
+    Tied after the wrap because that is the only place it survives one:
+    ``data_parallel`` walks the parameters and gives each its own DTensor, so a
+    tie made in ``__init__`` comes out the other side as two shards.
+    """
+    from torchtitan.experiments.simple_fsdp.simple_fsdp import data_parallel
+
+    with torch.device("meta"):
+        inner = _Tied(rows, cols).to(torch.bfloat16)
+    root = torch.nn.Module()
+    root.inner = data_parallel(inner, mesh, mode="fully_shard", ac_mode="full")
+    root.inner.b._parameters["weight"] = _raw(root.inner.a)
+    return root
+
+
+def _tied_across_the_boundary(mesh, rows: int, cols: int, *, eager_first: bool) -> torch.nn.Module:
+    """A model whose eager sibling shares one Parameter with the compiled subtree.
+
+    ``_modules`` order decides which side's ``_apply`` reaches the shared object
+    first, and the two orders arrive at host-first differently -- the eager side
+    going first hands materialize a weight that already has storage, the compiled
+    side going first has its host buffer reclaimed afterwards -- so the caller
+    picks the order it means to test.
+    """
+    from torchtitan.experiments.simple_fsdp.simple_fsdp import data_parallel
+
+    with torch.device("meta"):
+        inner = _Compiled(rows, cols).to(torch.bfloat16)
+    wrapped = data_parallel(inner, mesh, mode="fully_shard", ac_mode="full")
+    eager = torch.nn.Linear(cols, rows, bias=False, device="meta", dtype=torch.bfloat16)
+
+    root = torch.nn.Module()
+    if eager_first:
+        root.eager, root.inner = eager, wrapped
+    else:
+        root.inner, root.eager = wrapped, eager
+    eager._parameters["weight"] = _raw(wrapped.big)  # one object, both sides of the boundary
+    return root
+
+
+def _assert_both_names_share_one_slot(root: torch.nn.Module) -> None:
+    """Every name of a tied weight must reach the same slot, on CUDA, with no bytes."""
+    from magi_compiler.passes.weight_offload import host_pool
+
+    slots = set()
+    for name in ("a", "b"):
+        local = _raw(getattr(root.inner, name))._local_tensor
+        assert local.device.type == "cuda", f"{name} must be lowered against a CUDA parameter"
+        assert local.untyped_storage().nbytes() == 0, f"{name} must carry no device bytes"
+        slot = host_pool.slot_of(local)
+        assert slot is not None, f"{name} must resolve to a slot, or its reader gathers the empty stand-in"
+        slots.add(slot)
+    assert len(slots) == 1, "one shard means one slot, whichever name the graph arrives by"
+    assert host_pool.num_bound() == 1, "a tied weight must not be adopted twice"
+
+
 @requires_cuda
 def test_to_empty_materializes_only_the_compiled_subtree_in_host_memory(dist_1rank):
     """Scope comes from the module tree, and it has to.
@@ -1107,6 +1177,109 @@ def test_a_pre_parked_shard_needs_no_binding(dist_1rank):
 
     (load,) = _nodes(gm, H2D_LOAD)
     assert load.args[1] == host_pool.slot_of(param._local_tensor)
+
+
+@requires_cuda
+def test_a_tied_shard_lands_on_one_slot(dist_1rank):
+    """One Parameter under two names is one shard, and both names have to find it.
+
+    The two halves of that come from opposite directions: ``named_parameters``
+    dedupes, so the handoff sees the weight once and mints one slot, and
+    ``swap_tensors`` rewrites the object rather than the registration, so that
+    single pass lands on both names at no extra cost.
+    """
+    from magi_compiler.passes.weight_offload.host_first import handoff_if_pending
+
+    root = _tied_on_meta(dist_1rank, rows=256, cols=64)
+    _patched(root.inner)
+    root.to_empty(device=torch.device("cuda"))
+    assert _raw(root.inner.a) is _raw(root.inner.b), "to_empty must leave the tie intact"
+
+    assert handoff_if_pending(root.inner) == 1, "a tied weight is one shard, not two"
+    _assert_both_names_share_one_slot(root)
+
+
+@requires_cuda
+def test_a_tied_shard_survives_a_swap_tensors_refusal(dist_1rank):
+    """The fallback has to be equivalent to the swap it stands in for.
+
+    ``swap_tensors`` refuses a tensor anything holds a weakref to, and then the
+    stand-in goes in by re-registration -- which writes one entry of one module's
+    ``_parameters``.  A tied weight has more than one, and a name left behind
+    keeps the host tensor and enters compilation as a CPU weight.  Nothing
+    downstream can report that: the pool knows the shard by the stand-in it
+    minted, so ``parked_slot`` would call the weight never-materialized while it
+    sits in a pinned slab.
+    """
+    import weakref
+
+    from magi_compiler.passes.weight_offload.host_first import handoff_if_pending
+
+    root = _tied_on_meta(dist_1rank, rows=256, cols=64)
+    _patched(root.inner)
+    root.to_empty(device=torch.device("cuda"))
+
+    # The mere existence of a weakref is what makes swap_tensors refuse, so this
+    # reference has to outlive the handoff.
+    witness = weakref.ref(_raw(root.inner.a))
+    assert witness() is not None
+
+    assert handoff_if_pending(root.inner) == 1
+    _assert_both_names_share_one_slot(root)
+
+
+@requires_cuda
+def test_a_weight_tied_outside_the_compiled_subtree_is_never_parked(dist_1rank):
+    """The compile boundary is drawn around modules, and a tie crosses it.
+
+    ``_apply`` swaps the object, so the eager sibling's pass over the shared
+    weight -- first, in this order -- materializes it for both sides.  Parking it
+    anyway would leave the handoff to empty a weight only the eager prologue
+    reads, and no graph would put the bytes back: an illegal access in a module
+    that was never compiled.
+    """
+    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload.host_first import handoff_if_pending
+
+    root = _tied_across_the_boundary(dist_1rank, rows=256, cols=64, eager_first=True)
+    _patched(root.inner)
+    root.to_empty(device=torch.device("cuda"))
+
+    shared = _raw(root.eager)._local_tensor
+    assert shared.device.type == "cuda", "materialize must leave the shared weight where the sibling put it"
+    assert shared.untyped_storage().nbytes() > 0, "a weight the eager prologue reads must keep its storage"
+
+    # ``small`` is not shared with anything, so declining ``big`` must not cost it its offload.
+    assert handoff_if_pending(root.inner) == 1, "declining one weight must not disable the rest"
+    shared = _raw(root.eager)._local_tensor
+    assert shared.untyped_storage().nbytes() > 0, "the handoff must not empty a weight it does not own"
+    assert host_pool.slot_of(shared) is None, "a weight the compiled graph does not own must never be adopted"
+
+
+@requires_cuda
+def test_a_weight_reclaimed_before_the_handoff_is_not_offloaded(dist_1rank):
+    """The other order, where materialize gets there first and the sibling undoes it.
+
+    ``to_empty`` on the eager side gives the shared object device storage again,
+    which orphans the host buffer.  What is left is correct and not free -- the
+    reservation is never loaded, the device memory is still spent -- so the
+    handoff has to find the weight gone rather than reason about a count of zero.
+    """
+    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload.host_first import handoff_if_pending
+
+    root = _tied_across_the_boundary(dist_1rank, rows=256, cols=64, eager_first=False)
+    _patched(root.inner)
+    root.to_empty(device=torch.device("cuda"))
+
+    shared = _raw(root.eager)._local_tensor
+    assert shared.device.type == "cuda", "the sibling's to_empty ran last and took the weight back"
+    assert shared.untyped_storage().nbytes() > 0, "whoever ran last gave it real storage; it must keep it"
+
+    assert handoff_if_pending(root.inner) == 1, "the weight that was not reclaimed is handed over as usual"
+    shared = _raw(root.eager)._local_tensor
+    assert shared.untyped_storage().nbytes() > 0, "the handoff must not empty a weight it no longer owns"
+    assert host_pool.slot_of(shared) is None, "the orphaned reservation must not become a slot"
 
 
 # ------------------------------------------------------------ real Inductor
