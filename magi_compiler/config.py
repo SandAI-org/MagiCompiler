@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import torch
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .utils import compute_hash
@@ -211,6 +211,9 @@ class OffloadConfig(BaseModel):
         False,
         description=(
             "Compile-time CPU offload of SimpleFSDP weight shards, scheduled at snode granularity. "
+            "Requires compile_mode=MAGI_COMPILE: host-first parks selected weights as empty CUDA "
+            "stand-ins and only the Magi backend inserts magi::h2d_load; TORCH_COMPILE and NONE "
+            "skip that rewrite and would leave the stand-in empty. "
             "Parks each selected local shard in pinned host memory and loads it back inside the graph "
             "with magi::h2d_load, placed far enough upstream for compute to hide the transfer before "
             "its all-gather launches -- but never so far that this load's bytes are still being read "
@@ -481,6 +484,25 @@ class CompileConfig(BaseSettings):
             "FULL captures the entire compiled graph as a single CUDA Graph."
         ),
     )
+
+    @model_validator(mode="after")
+    def _graph_weight_offload_requires_magi_compile(self) -> "CompileConfig":
+        self.check_graph_weight_offload_compile_mode()
+        return self
+
+    def check_graph_weight_offload_compile_mode(self) -> None:
+        """Reject ``graph_weight_offload`` unless the Magi rewrite backend is selected.
+
+        Construction-time pydantic validation does not re-run on later field
+        assignment (``cfg.compile_mode = ...`` / ``config_patch``). ``magi_compile``
+        calls this again so an illegal pair still fails before host-first rewrite.
+        """
+        if self.offload_config.graph_weight_offload and self.compile_mode != CompileMode.MAGI_COMPILE:
+            raise ValueError(
+                "offload_config.graph_weight_offload requires compile_mode=MAGI_COMPILE: "
+                "host-first parks weights as empty CUDA stand-ins and only the Magi backend "
+                "inserts magi::h2d_load; TORCH_COMPILE and NONE skip that rewrite"
+            )
 
     @property
     def has_cutlass(self) -> bool:
