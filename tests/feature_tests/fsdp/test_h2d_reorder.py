@@ -164,7 +164,9 @@ def test_two_loads_do_not_spend_the_same_compute():
         _compute("c1", 1e6),
         _load("ld0", 5),  # ~0.52ms
         _wait("w0", "ld0"),
-        _compute("mid", 1e6, deps=["w0"]),
+        # No dep on w0: last_user is w0, so the live ranges stay adjacent
+        # ([ld0, w0] / [ld1, ...]) and this test only checks compute claiming.
+        _compute("mid", 1e6),
         _load("ld1", 5),
         _wait("w1", "ld1"),
         _compute("user", 1e6, deps=["w1"]),
@@ -173,8 +175,8 @@ def test_two_loads_do_not_spend_the_same_compute():
     # ld1 claims mid, so ld0 has to fall back to c1 -- not share mid.
     assert out.index("ld1") < out.index("mid")
     assert out.index("ld0") < out.index("c1")
-    # ...and their live ranges do not overlap: ld0 is done by w0/mid before ld1 starts.
-    assert out.index("ld0") < out.index("w0") <= out.index("ld1")
+    # Closed [ld0, last_user]: last_user must be strictly before the next load.
+    assert out.index("ld0") < out.index("w0") < out.index("ld1")
 
 
 def test_load_never_crosses_its_own_producer():
@@ -398,7 +400,7 @@ def test_live_ranges_never_overlap_however_tight_the_chain():
         live = [(out.index(f"ld{i}"), out.index(f"w{i}")) for i, slot in enumerate(slots) if not host_pool.is_resident(slot)]
         live.sort()
         for (s0, e0), (s1, e1) in zip(live, live[1:]):
-            assert e0 <= s1, f"two shards live at once: [{s0},{e0}] and [{s1},{e1}]"
+            assert e0 < s1, f"two shards live at once: [{s0},{e0}] and [{s1},{e1}]"
         assert live, "the rule must not promote everything"
     finally:
         host_pool.reset()
@@ -452,6 +454,108 @@ def test_a_lone_load_is_never_promoted():
         assert shard.untyped_storage().nbytes() == 0, "it should still be offloaded"
     finally:
         host_pool.reset()
+
+
+def test_equal_last_user_and_frontier_promotes_earlier_load():
+    """Closed-interval equality: last_user == next target must not hoist both.
+
+    Rebuild inserts the later load *before* its target.  If that target is the
+    earlier load's last_user, both buffers are alive while that node runs.
+    The sweep must promote the earlier load instead of emitting ``ld0 ... ld1, user0``.
+    """
+    order = [
+        _compute("c0", 5e6),
+        _load("ld0", 4),
+        _wait("w0", "ld0"),
+        _compute("user0", 1e6, deps=["w0"]),
+        _load("ld1", 4),
+        _wait("w1", "ld1"),
+        _compute("user1", 1e6, deps=["w1"]),
+    ]
+    out = _reorder(order)
+    assert out.index("ld0") + 1 == out.index("w0"), "ld0 stays against its wait (promoted)"
+    assert out.index("ld1") < out.index("user0"), "ld1 is still hoisted to hide behind user0"
+    assert out == ["c0", "ld0", "w0", "ld1", "user0", "w1", "user1"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="promotion moves real bytes")
+def test_equal_last_user_and_frontier_hands_earlier_weight_back():
+    """Same topology as the order-only equality test, with real host-pool slots."""
+    from magi_compiler.passes.weight_offload import host_pool
+
+    host_pool.reset()
+    try:
+        shards = [torch.randn(4 * _MIB // 2, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+        s0, s1 = _park(shards[0]), _park(shards[1])
+        order = [
+            _compute("c0", 5e6),
+            _load("ld0", 4, slots=[s0]),
+            _wait("w0", "ld0"),
+            _compute("user0", 1e6, deps=["w0"]),
+            _load("ld1", 4, slots=[s1]),
+            _wait("w1", "ld1"),
+            _compute("user1", 1e6, deps=["w1"]),
+        ]
+        out = _reorder(order)
+        assert host_pool.is_resident(s0), "last_user == frontier must hand ld0 back"
+        assert not host_pool.is_resident(s1)
+        assert out.index("ld0") + 1 == out.index("w0")
+        assert out.index("ld1") < out.index("user0")
+    finally:
+        host_pool.reset()
+
+
+def test_adjacent_closed_ranges_both_stay_offloaded():
+    """[at, last_user] and [last_user+1, ...] touch but do not overlap."""
+    order = [
+        _compute("c0", 5e6),
+        _load("ld0", 4),
+        _wait("w0", "ld0"),
+        _compute("user0", 1e6, deps=["w0"]),
+        _compute("mid", 1e6),
+        _load("ld1", 4),
+        _wait("w1", "ld1"),
+        _compute("user1", 1e6, deps=["w1"]),
+    ]
+    out = _reorder(order)
+    assert out.index("ld0") < out.index("c0"), "ld0 is still hoisted"
+    assert out.index("ld1") < out.index("mid"), "ld1 is still hoisted"
+    assert out.index("user0") < out.index("ld1"), "closed ranges may touch, not overlap"
+
+
+def test_inflight_peak_counts_closed_interval_touch():
+    """Same-index start/end is overlap under a closed interval; peak is the sum."""
+
+    class _Fake:
+        def __init__(self, last_user, nbytes):
+            self.load = object()
+            self.last_user = last_user
+            self.nbytes = nbytes
+
+    earlier = _Fake(last_user=4, nbytes=100)
+    later = _Fake(last_user=7, nbytes=50)
+    peak = H2dLoadReorder._inflight_peak([earlier, later], {earlier.load: 0, later.load: 4})
+    assert peak == 150
+
+    later_after = _Fake(last_user=7, nbytes=50)
+    peak_adjacent = H2dLoadReorder._inflight_peak([earlier, later_after], {earlier.load: 0, later_after.load: 5})
+    assert peak_adjacent == 100
+
+
+def test_bubble_after_closed_range_starts_at_last_user_plus_one():
+    """A later load at last_user would overlap; the idle window starts after it."""
+
+    class _Fake:
+        def __init__(self, last_user):
+            self.load = object()
+            self.last_user = last_user
+
+    first = _Fake(last_user=4)
+    second = _Fake(last_user=8)
+    by_load = {first.load: first, second.load: second}
+    assert H2dLoadReorder._bubbles({first.load: 0, second.load: 5}, by_load) == []
+    assert H2dLoadReorder._bubbles({first.load: 0, second.load: 6}, by_load) == [(5, 6)]
+    assert H2dLoadReorder._bubbles({second.load: 3}, {second.load: second}) == [(0, 3)]
 
 
 def test_coalesced_load_window_covers_the_whole_bucket():
