@@ -28,6 +28,15 @@ Two properties make this safe rather than clever:
   intercepts exactly the subtree that will be compiled.  Weights outside it --
   an embedding, a final projection, anything the eager prologue touches -- never
   reach this code and keep their device storage.
+
+  The boundary is drawn around modules, and a weight tied across it belongs to
+  both sides: one Parameter object, registered inside the subtree and out.
+  ``_apply`` swaps the object rather than the registration, so whichever side
+  runs last decides what the object holds, and neither side can see the other.
+  Both orders are handled here instead of left to chance -- materialize declines
+  a weight that already has storage, and the handoff says so when one it parked
+  has been given storage again -- because the outcome of guessing is an illegal
+  access in a module that was never compiled.
 * **The graph never sees a host tensor.**  :func:`handoff` runs on the first
   call, before Dynamo traces: each parked weight becomes a CUDA tensor with
   zero-length storage, and the host buffer is adopted into the pool under its
@@ -60,6 +69,10 @@ weight into host memory.
 
 _PENDING_ATTR = "_magi_host_first_pending"
 """Set on an instance whose weights are waiting in host memory for their handoff."""
+
+_PARKED_ATTR = "_magi_host_first_parked"
+"""Names ``patch_materialize`` put in host memory, so the handoff can tell a
+weight it was never given from one that was taken back out from under it."""
 
 
 def _payload(param) -> torch.Tensor:
@@ -127,14 +140,23 @@ def _rebuild(param, local: torch.Tensor):
     return DTensor(local, spec, requires_grad=False)
 
 
-def _replace_param(module: nn.Module, name: str, param: nn.Parameter, new_data) -> nn.Parameter:
-    """Point ``name`` at ``new_data``.  Returns the parameter that ended up registered.
+def _replace_param(module: nn.Module, names: list[str], param: nn.Parameter, new_data) -> nn.Parameter:
+    """Point every path in ``names`` at ``new_data``.  Returns the parameter that ended up registered.
 
     ``swap_tensors`` first, because it keeps the very object SimpleFSDP's
     parametrization registered and every other reference already points at.  It
     refuses a tensor anything holds a weakref to, so re-registration by path is
     the fallback; both are only legal before the first trace, which is where
     this runs.
+
+    The two are not interchangeable, and a tied weight is where the difference
+    shows: ``swap_tensors`` rewrites the object, so one call reaches every name
+    that shares it, while re-registration writes one entry of one module's
+    ``_parameters``.  Walking ``names`` is what keeps the fallback equivalent --
+    a path left behind would still hold the host tensor and enter compilation as
+    a CPU weight, which nothing downstream can detect: the pool knows the shard
+    by the stand-in it minted, not by the bytes, so ``parked_slot`` would report
+    the weight as never materialized while it sits in a pinned slab.
 
     Which object comes back matters, and not only for tidiness: ``nn.Parameter``
     detaches what it is given, so the local tensor behind the registered
@@ -147,16 +169,22 @@ def _replace_param(module: nn.Module, name: str, param: nn.Parameter, new_data) 
         torch.utils.swap_tensors(param, replacement)
         return param
     except Exception as exc:  # noqa: BLE001
-        magi_logger.debug("host offload: swap_tensors on %s failed (%s); re-registering instead", name, exc)
+        # Warning, not debug: this is the branch where the in-place guarantee the
+        # rest of the handoff leans on is gone, and the re-registration below has
+        # to stand in for it.
+        magi_logger.warning(
+            "host offload: swap_tensors on %s failed (%s); re-registering %d path(s) instead", names[0], exc, len(names)
+        )
 
-    parent_path, _, attr = name.rpartition(".")
-    parent = module.get_submodule(parent_path) if parent_path else module
-    parent.register_parameter(attr, replacement)
+    for name in names:
+        parent_path, _, attr = name.rpartition(".")
+        parent = module.get_submodule(parent_path) if parent_path else module
+        parent.register_parameter(attr, replacement)
     return replacement
 
 
-def _parked_params(module: nn.Module) -> list[tuple[str, nn.Parameter]]:
-    """Every weight of ``module`` currently living in the host pool's slabs.
+def _parked_params(module: nn.Module) -> list[tuple[list[str], nn.Parameter]]:
+    """Every weight of ``module`` living in the host pool's slabs, with every path it answers to.
 
     Identified by where the bytes are rather than by a side table: only this
     file redirects a compiled module's weights onto the host, so after
@@ -164,16 +192,60 @@ def _parked_params(module: nn.Module) -> list[tuple[str, nn.Parameter]]:
     CUDA mesh, or an unsharded Parameter that is itself on CPU.  Reading it off
     the tensor cannot go stale the way a registry keyed on objects ``_apply``
     swaps would.
+
+    A tied weight is one Parameter object registered under several names, and
+    the handoff needs both halves of that fact: grouping on identity is what
+    keeps the shard on a single slot, and keeping the names is what lets
+    :func:`_replace_param` reach every registration site.  ``named_parameters``
+    would hand back only the first name -- it dedupes by default -- so the walk
+    asks for the duplicates and does the grouping itself.
     """
-    out = []
-    for name, param in module.named_parameters(recurse=True):
+    groups: dict[int, tuple[list[str], nn.Parameter]] = {}
+    for name, param in module.named_parameters(recurse=True, remove_duplicate=False):
         if _is_dtensor(param):
-            if param._local_tensor.device.type == "cpu" and param._spec.mesh.device_type != "cpu":
-                out.append((name, param))
-            continue
-        if param.device.type == "cpu":
-            out.append((name, param))
-    return out
+            parked = param._local_tensor.device.type == "cpu" and param._spec.mesh.device_type != "cpu"
+        else:
+            parked = param.device.type == "cpu"
+        if parked:
+            groups.setdefault(id(param), ([], param))[0].append(name)
+    return list(groups.values())
+
+
+def _warn_about_reclaimed(module: nn.Module, parked: list[tuple[list[str], nn.Parameter]]) -> None:
+    """Say so when a weight materialize parked is no longer on the host.
+
+    One thing takes a parked weight back: an ``_apply`` outside the compiled
+    subtree reaching the same Parameter object, which is what a weight tied
+    across the compile boundary looks like from in here.  ``_apply`` swaps the
+    object rather than the registration, so the sibling's ``to_empty`` gives the
+    shared object device storage again and the host buffer is orphaned.
+
+    Nothing is broken afterwards -- the weight has real storage and every reader
+    of it works -- but the pinned reservation behind it will never be loaded and
+    the device memory the offload was asked to save is still spent, while the
+    materialize log has already claimed the opposite.  Silence is the wrong
+    default for that: an offload that quietly does nothing reads exactly like one
+    that worked, and the only visible difference is a high-water mark that did
+    not move.
+    """
+    expected = getattr(module, _PARKED_ATTR, None)
+    if not expected:
+        return
+    # One reconciliation per materialize: the record describes a single
+    # to_empty, and a second handoff over an already handed-off module would
+    # otherwise find every name missing and say so.
+    setattr(module, _PARKED_ATTR, [])
+    found = {_pretty(name) for names, _ in parked for name in names}
+    missing = [name for name in expected if name not in found]
+    if missing:
+        magi_logger.warning(
+            "host offload: %d weight(s) materialized in host memory are back on the device before the "
+            "handoff and will not be offloaded (%s); the usual cause is a weight tied to a module outside "
+            "%s, whose own to_empty re-materialized the shared Parameter",
+            len(missing),
+            ", ".join(missing[:8]) + (" ..." if len(missing) > 8 else ""),
+            type(module).__name__,
+        )
 
 
 def patch_materialize(instance: nn.Module, conf) -> None:
@@ -206,13 +278,38 @@ def patch_materialize(instance: nn.Module, conf) -> None:
         # so a predicate evaluated inside the callback would be reading tensors
         # that are halfway through being replaced.
         chosen = {}
+        shared = []
         for name, param in self.named_parameters(recurse=recurse):
             if not _is_offloadable(param):
                 continue
             payload = _payload(param)
+            if not payload.is_meta:
+                # Host-first can only redirect a weight it materializes itself,
+                # and this one already has storage.  The reading worth guarding
+                # against is that another _apply got to the same Parameter object
+                # first, which is what a weight tied to a module outside the
+                # compiled subtree looks like from here: parking it would redirect
+                # a weight the eager prologue reads, and the handoff would then
+                # empty it with no load in that module's graph to put the bytes
+                # back.  Leave it alone either way -- the cost is one weight that
+                # is not offloaded, against an illegal access nothing traces here.
+                shared.append(_pretty(name))
+                continue
             if payload.numel() * payload.element_size() < min_bytes:
                 continue
             chosen[id(param)] = _pretty(name)
+
+        if shared:
+            magi_logger.warning(
+                "host offload: %d weight(s) of %s already have storage and stay on the device (%s); host-first "
+                "only redirects a weight it materializes itself, so one arriving with storage was either not "
+                "built on meta or is shared with a module outside the compiled subtree whose to_empty reached "
+                "it first -- and that one must keep its bytes, because the graph that would load them back is "
+                "not the graph that reads it",
+                len(shared),
+                type(self).__name__,
+                ", ".join(shared[:8]) + (" ..." if len(shared) > 8 else ""),
+            )
 
         if not chosen:
             return orig_apply(self, fn, recurse=recurse)
@@ -238,6 +335,7 @@ def patch_materialize(instance: nn.Module, conf) -> None:
 
         result = orig_apply(self, materialize, recurse=recurse)
         setattr(self, _PENDING_ATTR, True)
+        setattr(self, _PARKED_ATTR, list(chosen.values()))
         magi_logger.info(
             "host offload: %s materialized %d weight(s) (%.1f MiB) in pinned host memory instead of on %s; "
             "the checkpoint loads straight into them and no device byte is spent until the graph asks",
@@ -278,13 +376,14 @@ def handoff(module: nn.Module) -> int:
     and strides are the real ones, then immediately emptied.
     """
     parked = _parked_params(module)
+    _warn_about_reclaimed(module, parked)
     if not parked:
         setattr(module, _PENDING_ATTR, False)
         return 0
 
     device = torch.device("cuda", torch.cuda.current_device())
     nbytes = 0
-    for name, param in parked:
+    for names, param in parked:
         # Snapshot the host tensor before replace: for an unsharded Parameter
         # the payload IS param, and swap_tensors would otherwise turn that
         # reference into the CUDA stand-in.
@@ -294,11 +393,11 @@ def handoff(module: nn.Module) -> int:
         stand_in = torch.empty(host.shape, dtype=host.dtype, device=device)
         stand_in.untyped_storage().resize_(0)
         new_data = _rebuild(param, stand_in) if _is_dtensor(param) else stand_in
-        installed = _replace_param(module, name, param, new_data)
+        installed = _replace_param(module, names, param, new_data)
         # After, not before: registration is what decides which tensor object
         # the graph will be traced against, and the slot is keyed on it.
         device_tensor = installed._local_tensor if _is_dtensor(installed) else installed
-        host_pool.adopt(host, device_tensor, name=_pretty(name))
+        host_pool.adopt(host, device_tensor, name=_pretty(names[0]))
         nbytes += host.numel() * host.element_size()
 
     setattr(module, _PENDING_ATTR, False)
