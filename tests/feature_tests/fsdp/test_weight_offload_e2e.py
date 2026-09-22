@@ -37,6 +37,11 @@ import torch
 
 _HELPER = Path(__file__).parent / "fsdp_overlap_helper" / "offload_e2e_helper.py"
 
+# Several 4 MiB buckets back to back, close enough together that the sweep cannot
+# hide them all: the shape where placement has to choose between residency and
+# exposure, and therefore the one the budget tests are worth running on.
+_MULTI_BUCKET_SHAPE = ("--bucket-mode", "coalesced", "--bucket-size-mib", "4", "--n-layers", "6")
+
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 requires_torchrun = pytest.mark.skipif(shutil.which("torchrun") is None, reason="requires torchrun")
 
@@ -107,10 +112,9 @@ def test_both_reorder_phases_run():
     p = _run(1)
     out = _check(p)
     assert "FSDP overlap reorder: repositioned" in out, out[-4000:]
-    assert "h2d load reorder: hoisted" in out, out[-4000:]
-    hoisted = next(line for line in out.splitlines() if "h2d load reorder: hoisted" in line)
-    moved = int(hoisted.split("hoisted ")[1].split("/")[0])
-    assert moved > 0, hoisted
+    assert _REORDER_REPORT in out, out[-4000:]
+    moved = int(_reorder_report(out).split("Hoisted ")[1].split("/")[0])
+    assert moved > 0, _reorder_report(out)
 
 
 @requires_cuda
@@ -144,38 +148,99 @@ def test_loads_are_coalesced_to_match_the_buckets():
     assert loads < shards, "coalescing is supposed to be fewer loads than weights"
 
 
+_REORDER_REPORT = "h2d load reorder: "
+"""Prefix of phase 2's summary line, which the assertions below parse."""
+
+
+def _reorder_report(out: str) -> str:
+    """The INFO summary, not the WARNING lines that share the same prefix."""
+    return next(l for l in out.splitlines() if _REORDER_REPORT in l and "Hoisted " in l)
+
+
+def _inflight(out: str) -> tuple[float, float]:
+    """The in-flight peak and the budget it was held to, off the reorder's report."""
+    peak, rest = _reorder_report(out).split("in-flight peak ")[1].split(" MiB of the ", 1)
+    return float(peak), float(rest.split(" MiB")[0])
+
+
+def _exposed_ms(out: str) -> float:
+    """Transfer the reorder could not get under compute, off the same report."""
+    return float(_reorder_report(out).split("at peak; ")[1].split("ms still exposed")[0])
+
+
 @requires_cuda
 @requires_torchrun
-def test_only_one_shard_is_live_at_a_time():
-    """The rule that bounds the device cost, end to end.
+def test_the_inflight_budget_is_never_exceeded():
+    """The promise the whole pass rests on, end to end.
 
-    With several buckets back to back, the hoists would otherwise stack and put
-    most of the model back on the device.  The pass hands the overlapping ones
-    back instead, and reports the resulting in-flight peak -- which must be one
-    bucket, not the sum of them.
+    With several 4 MiB buckets back to back the hoists would otherwise stack and
+    put most of the model back on the device.  Unasked, the budget is what phase
+    1's own unhoisted order already needs plus one bucket, and the emitted
+    schedule has to fit inside it -- overshooting reads as a working run until the
+    day the model is big enough to OOM on the difference.
     """
-    p = _run(1, "--bucket-mode", "coalesced", "--bucket-size-mib", "4", "--n-layers", "6")
+    p = _run(1, *_MULTI_BUCKET_SHAPE)
     out = _check(p)
-    hoisted = next(line for line in out.splitlines() if "h2d load reorder: hoisted" in line)
-    peak = float(hoisted.split("in-flight peak ")[1].split(" MiB")[0])
-    assert 0 < peak <= 4.5, f"in-flight peak should be about one 4 MiB bucket: {hoisted}"
+    peak, budget = _inflight(out)
+    assert 0 < peak <= budget, f"in-flight peak {peak} MiB over the {budget} MiB budget"
+    assert budget <= 4.5 * 2, f"unhoisted floor plus one bucket, not more: {budget} MiB"
 
 
 @requires_cuda
 @requires_torchrun
-def test_residency_cap_is_respected():
-    """The second lever, end to end: whatever the schedule wants to keep, the cap
-    is what it actually gets.
+def test_inflight_budget_buys_concurrency():
+    """The knob that decides how much of the bus's work moves under compute.
 
-    This shape's loads happen to sit far enough apart that the sweep keeps
-    nothing resident, so the cap has nothing to claw back here -- that path is
-    unit-tested in ``test_h2d_reorder.py``.  What this covers is that a capped
-    run still compiles, still matches eager, and does not exceed the cap.
+    One 4 MiB bucket of budget means one transfer at a time, so a load whose
+    window overlaps its neighbour's live range has to wait its turn and ends up
+    exposed.  Room for several buckets is what lets those overlap, and both sides
+    of the trade have to be visible: exposure down, peak up.
     """
-    p = _run(1, "--bucket-mode", "coalesced", "--bucket-size-mib", "4", "--n-layers", "6", "--max-resident-mib", "1")
+    one_bucket = _run(1, *_MULTI_BUCKET_SHAPE, "--max-inflight-mib", "4")
+    out = _check(one_bucket)
+    tight_peak, tight_budget = _inflight(out)
+    tight_exposed = _exposed_ms(out)
+    assert tight_budget == 4 and tight_peak <= 4, f"one bucket asked for, one bucket used: {out[-2000:]}"
+
+    p = _run(1, *_MULTI_BUCKET_SHAPE, "--max-inflight-mib", "32")
+    out = _check(p)
+    wide_peak, wide_budget = _inflight(out)
+    assert "OFFLOAD_PASS" in p.stdout, out[-4000:]
+    assert wide_budget == 32, f"the budget asked for is the budget used, got {wide_budget} MiB"
+    assert wide_peak <= wide_budget, f"and it must stay inside it, got {wide_peak} MiB"
+    assert wide_peak > tight_peak, f"concurrency has to be what it spent the budget on: {wide_peak}"
+    assert _exposed_ms(out) < tight_exposed, f"and exposure is what it bought: {_exposed_ms(out)} vs {tight_exposed}"
+
+
+@requires_cuda
+@requires_torchrun
+def test_no_residency_budget_keeps_nothing_resident():
+    """The default, end to end.
+
+    Handing weights back costs device memory for the whole graph, so it happens
+    only when a budget asks for it -- doing it uninvited is how a run OOMs, and
+    the numerics have to come out right either way.
+    """
+    p = _run(1, *_MULTI_BUCKET_SHAPE)
     out = _check(p)
     assert "OFFLOAD_PASS" in p.stdout, out[-4000:]
-    assert _marker(p.stdout, "OFFLOAD_FREED", "promoted_mib") <= 1, "residency must stay inside the cap"
+    assert _marker(p.stdout, "OFFLOAD_FREED", "promoted_mib") == 0, "an empty budget must not promote"
+
+
+@requires_cuda
+@requires_torchrun
+def test_residency_budget_is_spent_and_not_exceeded():
+    """The knob that decides how much traffic the bus carries at all.
+
+    This shape has more exposed transfer than one bucket of residency can buy
+    out, so the budget is the binding constraint and both halves of the contract
+    are observable: something gets bought, and not more than was offered.
+    """
+    p = _run(1, *_MULTI_BUCKET_SHAPE, "--max-resident-mib", "8")
+    out = _check(p)
+    promoted = _marker(p.stdout, "OFFLOAD_FREED", "promoted_mib")
+    assert "OFFLOAD_PASS" in p.stdout, out[-4000:]
+    assert 0 < promoted <= 8, f"the budget has to be spent and not overspent, got {promoted} MiB"
 
 
 @requires_cuda
