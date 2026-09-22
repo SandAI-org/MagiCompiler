@@ -30,37 +30,81 @@ block, opening a window of compute between it and its wait::
     ... compute ...  h2d_load  ... compute ...  h2d_wait  all_gather  ...
                      ^ moved here             ^ left where phase 1 put it
 
-The window that hides a load is therefore strictly upstream of the window that
-hides its own gather, which is physics: a shard cannot be gathered before it has
-arrived.  What is NOT serialized is one weight against another -- the load of
-weight i+1 freely claims the same compute that hides the gather of weight i,
-because PCIe and NVLink are different hardware.  That is why this is a second
-sweep with its own compute pointer rather than more items in the first one.
+What a step can overlap at all
+------------------------------
 
-Hoisting is bounded by one rule: **at most one load is live on the device at a
-time** (one ``h2d_load``, which may be a whole FSDP bucket).  Those bytes occupy
-memory from where the load runs until the last snode that still reads them --
-the gather for a shard, the last matmul for an ungathered or unsharded weight --
-not until the wait that only means the copy has landed.  An unconstrained sweep
-would stack those intervals and rebuild, on the device, most of the residency
-that offloading just paid PCIe to remove.  A load that cannot be placed under
-the rule is handed back to the device rather than forced in, which removes its
-transfer instead of leaving a stall.  The cost is that some compute runs with
-the PCIe lane idle -- accepted deliberately: bounded memory is the point,
-overlap is the bonus.
+Before choosing where any load goes, there is a question of whether they can
+fit: with ``C`` ns of compute in the step and a bus running at ``B`` bytes/ns,
+no placement can hide more than ``C * B`` bytes of transfer.  Anything past that
+is exposed wherever it is put, and the only way to remove it is to stop
+transferring it -- residency.  So the pass computes
 
-Three consequences worth stating, because they are what make the split cheap:
+    schedule_size = bus_utilization * C * B
 
-* No cross-rank negotiation.  This pass moves no collective, so the NCCL launch
-  sequence is byte-identical before and after; ranks are free to place their
-  loads differently, and a rank on slower PCIe *should*.
-* No profiling.  A load's cost is ``bytes / bandwidth`` off one calibration
-  probe.  The first pass never benchmarks an ``h2d_load`` either -- a transfer on
-  a private stream neither hides an all-gather nor competes with one, so it has
-  no business in a compute window.
-* Failure is free.  Dropping this pass leaves phase 1's correct-but-slow order.
+and requires ``total_bytes - schedule_size`` of residency before it places
+anything.  Getting this backwards is not a small error: on a model with
+``total_bytes`` at 1.4x ``C * B``, a sweep that only prices per-load exposure
+reports every load hidden (each one individually is), buys no residency at all,
+and runs a third slower than the same graph with a third of the weight resident.
+
+Two budgets, and between them the whole policy
+----------------------------------------------
+
+* ``max_resident_bytes`` -- weight bytes handed back to the device permanently.
+* ``max_inflight_bytes`` -- weight bytes that may be live in load buffers at once.
+
+They add: the device holds at most ``max_resident_bytes + max_inflight_bytes`` of
+weight.  Splitting what used to be a single peak cap is what makes the trade
+expressible at all -- but the two are competing for one pool of device memory,
+so ``max_device_weight_bytes`` lets the caller name the pool instead and have
+the pass split it: the smallest in-flight budget that still hides everything,
+and the remainder to residency, which is worth strictly more per byte.
+
+Residency has to be spread, not stacked
+---------------------------------------
+
+Which weights become resident matters as much as how many.  Handing the budget
+to the largest ones takes them all from the front of the graph and leaves the
+back at its original bus-to-compute density, where the loads have nowhere to go;
+the step then follows the saturated half.  ``_select_resident`` instead walks the
+loads in wait order against a running allowance of ``utilization * B *
+prefix[wait]`` and promotes whatever overruns it, which keeps every prefix of the
+graph feasible and therefore spreads residency at the density the graph needs.
+Short hoists follow from that on their own, and short hoists are what keeps the
+in-flight peak small.
+
+Bus occupancy is not live range
+--------------------------------
+
+One PCIe stream serializes transfers in *time*, not in snode-index windows.  A
+load issued at index ``at`` occupies the bus for ``need`` ns starting when the
+compute stream reaches ``prefix[at]`` (or later, if the bus is still busy).  That
+interval is what must not overlap another transfer.  The buffer's live range
+``[at, last_user]`` is a separate quantity, bounded only by the in-flight byte
+budget.
+
+So the sweep books the two separately: a running bus end on the time axis, and
+``_Inflight`` on ``[at, last_user]`` in bytes.  Transfers are scheduled in
+DEADLINE order and as late as their deadlines allow (see ``_sweep``), which is
+what keeps the two from being confused for one another -- a load is hoisted
+because the bus needs it earlier, never because the model could not find a
+cheaper index.
+
+Residency is spent to the budget, not to zero exposure
+------------------------------------------------------
+
+A resident weight does not merely get hidden, it stops crossing PCIe at all:
+every step the bus carries ``total - resident`` bytes.  Modelled exposure can
+reach zero while the bus is still the real limit -- the model prices one stream
+at a nominal bandwidth, and eight ranks pulling from the same host in lockstep
+do not get it.  So the buy-out runs in two phases: first the priced one, which
+aims the budget at whatever the sweep still cannot hide, then a fill that hands
+out the remainder largest-first.  Per byte the bus saving is identical whichever
+weight is chosen, so the fill takes the big buckets: they dominate the in-flight
+peak and the allocator churn that goes with it.
 """
 
+from bisect import bisect_right, insort
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -83,14 +127,11 @@ from .ops import H2D_OPS, is_h2d_load, slots_of
 
 _DEFAULT_WINDOW_MARGIN_NS = 5_000.0
 
+_MAX_SPLIT_ROUNDS = 5
+"""Times ``_schedule`` may grow the in-flight budget out of the residency one."""
 
-# A placed load occupies the closed interval [target, last_user] in the original
-# index space.  ``_rebuild`` inserts the load *before* the node at ``target``,
-# so that node already sees the new buffer.  ``last_user`` still reads the old
-# one, so two loads overlap iff earlier.last_user >= later.target.
-def _closed_live_overlap(last_user: int, next_start: int) -> bool:
-    """True when closed ranges ``[*, last_user]`` and ``[next_start, *]`` share a node."""
-    return last_user >= next_start
+_DENSITY_SEARCH_ROUNDS = 8
+"""Bisection steps for the target bus density; 8 lands within 0.4% of it."""
 
 
 def _snode_bytes(snode: BaseSchedulerNode) -> int:
@@ -125,16 +166,51 @@ class _Plan:
     slots: list[int]  # host-pool slots this load pulls
     wait_idx: int  # earliest wait: the load's hard upper bound
     # Inclusive right end of the closed live range [target, last_user].
-    # Last snode that still reads this load's bytes (gather, matmul, ...).
-    # The wait is only a floor: it means the copy has landed, not that the
-    # buffer is free.  Sweep, peak and bubbles all use this.
     last_user: int
-    need: float  # ns of compute that would fully hide the transfer
+    need: float  # ns of compute / bus time that would fully hide the transfer
     lower: int  # earliest legal index (real-dep floor)
     nbytes: int
-    exposed: float  # ns of transfer the sweep could not cover; set by _sweep
-    promoted: bool = False  # shards put back on the device; transfer is now D2D
-    relieved: bool = False  # re-offloaded into an idle window to meet the cap
+    exposed: float  # ns of transfer the placement could not cover; set by _sweep
+    promoted: bool = False  # bought out of the offload plan; transfer is now D2D
+    budget_floor: int = 0  # earliest index the in-flight budget left open
+    budget_bound: bool = False  # the in-flight budget, not the bus, is what stopped it
+
+
+class _Inflight:
+    """Occupancy of the in-flight byte budget over the snode index space.
+
+    Ranges are closed, ``[start, last_user]``, because ``_rebuild`` inserts a load
+    *before* the node at its target: that node already sees the new buffer, while
+    the earlier load's ``last_user`` still reads the old one.  Two ranges
+    therefore overlap iff ``earlier.last_user >= later.start``.
+    """
+
+    def __init__(self, budget: int) -> None:
+        self.budget = budget
+        self._deltas: list[tuple[int, int]] = []
+
+    def add(self, start: int, last_user: int, nbytes: int) -> None:
+        insort(self._deltas, (start, nbytes))
+        insort(self._deltas, (last_user + 1, -nbytes))
+
+    def remove(self, start: int, last_user: int, nbytes: int) -> None:
+        self._deltas.remove((start, nbytes))
+        self._deltas.remove((last_user + 1, -nbytes))
+
+    def earliest_start(self, last_user: int, nbytes: int) -> int:
+        """Earliest index where ``[i, last_user]`` still fits ``nbytes`` in the budget."""
+        room = self.budget - nbytes
+        blocked = -1
+        occupied = 0
+        prev = 0
+        for idx, delta in self._deltas:
+            if prev > last_user:
+                break
+            if occupied > room and prev < idx:
+                blocked = max(blocked, min(idx - 1, last_user))
+            occupied += delta
+            prev = idx
+        return blocked + 1
 
 
 class H2dLoadReorder:
@@ -146,14 +222,18 @@ class H2dLoadReorder:
         window_margin_ns: float = _DEFAULT_WINDOW_MARGIN_NS,
         window_scale: float = 1.0,
         max_resident_bytes: int = 0,
+        max_inflight_bytes: int = 0,
+        max_device_weight_bytes: int = 0,
+        bus_utilization: float = 0.9,
         cost_fn=None,
     ) -> None:
         self.bandwidth_bytes_per_ns = max(1e-6, bandwidth_bytes_per_ns)
         self.window_margin_ns = window_margin_ns
         self.window_scale = window_scale
-        # Ceiling on the weight bytes the sweep may leave resident.  0 = none:
-        # take the fastest schedule and keep whatever it wants.  See _relieve.
         self.max_resident_bytes = max_resident_bytes
+        self.max_inflight_bytes = max_inflight_bytes
+        self.max_device_weight_bytes = max_device_weight_bytes
+        self.bus_utilization = min(1.0, max(1e-3, bus_utilization))
         if cost_fn is None:
             from torch._inductor.comms import estimate_op_runtime
 
@@ -162,14 +242,14 @@ class H2dLoadReorder:
         self._cost_cache: dict[BaseSchedulerNode, float] = {}
 
     def __deepcopy__(self, memo):
-        # Fresh, cache-free instance: Inductor deepcopies passes into the
-        # fx-graph cache key, and snode keys hold FakeTensors whose data_ptr
-        # access raises.
         new = H2dLoadReorder.__new__(H2dLoadReorder)
         new.bandwidth_bytes_per_ns = self.bandwidth_bytes_per_ns
         new.window_margin_ns = self.window_margin_ns
         new.window_scale = self.window_scale
         new.max_resident_bytes = self.max_resident_bytes
+        new.max_inflight_bytes = self.max_inflight_bytes
+        new.max_device_weight_bytes = self.max_device_weight_bytes
+        new.bus_utilization = self.bus_utilization
         new._cost_fn = self._cost_fn
         new._cost_cache = {}
         memo[id(self)] = new
@@ -212,48 +292,105 @@ class H2dLoadReorder:
         if not plans:
             return order
 
-        targets = self._sweep(plans, order, index_of)
-        if self.max_resident_bytes > 0:
-            self._relieve(plans, targets, index_of)
+        prefix = self._compute_prefix(order)
+        targets, budget = self._schedule(plans, order, index_of, prefix)
 
         new_order = self._rebuild(order, targets, index_of, {p.load: p.group for p in plans})
         if not validate_topological_order(new_order, buf_to_snode):
             magi_logger.warning("h2d load reorder: rebuilt order failed validation; leaving graph unchanged")
             return order
 
-        # Only once the order is committed: promotion moves real bytes, and a
-        # rejected order must not leave the pool half-rearranged.
         given_back = self._promote(plans)
-        # In-place: the Inductor driver's peak-memory report reads the list it
-        # handed us, not the one we return.
         order[:] = new_order
-        self._report(plans, targets, index_of, len(loads), given_back, len(order))
+        self._report(plans, targets, index_of, given_back, budget, len(order), prefix)
         return order
 
-    def _report(self, plans, targets, index_of, n_loads, given_back, n_snodes) -> None:
+    # -- reporting ---------------------------------------------------------
+    def _report(self, plans, targets, index_of, given_back, budget, n_snodes, prefix) -> None:
+        resident = [p for p in plans if p.promoted]
+        exposed = sum(p.exposed for p in plans)
+        by_budget = sum(p.exposed for p in plans if p.budget_bound)
+        inflight = self._inflight_peak(plans, self._live_starts(plans, targets, index_of))
         moved = sum(1 for load, target in targets.items() if target != index_of[load])
-        promoted = [p for p in plans if p.promoted]
-        relieved = [p for p in plans if p.relieved]
-        exposed = sum(p.exposed for p in plans if not p.promoted)
+        on_bus = sum(p.nbytes for p in plans if not p.promoted)
+        total = sum(p.nbytes for p in plans)
+        hideable = self._hideable_bytes(plans, prefix)
+        compute_ns = hideable / self.bus_utilization / self.bandwidth_bytes_per_ns
         magi_logger.info(
-            "h2d load reorder: hoisted %d/%d weight load(s) at %.1f GB/s; %d weight(s) kept resident "
-            "(%.1f MiB) because nothing could hide them%s; in-flight peak %.1f MiB; %.1fus still exposed",
-            moved,
-            n_loads,
+            "h2d load reorder: %.0fms of compute at %.1f GB/s can overlap %.1f MiB of the %.1f MiB "
+            "offloaded (%.0f%% bus utilization assumed), so %.1f MiB had to become resident; it did "
+            "over %d weight(s), leaving %.1f MiB on the bus, %.1fms of transfer. Hoisted %d/%d "
+            "load(s); in-flight peak %.1f MiB of the %.0f MiB budget; %.1f MiB of weight on the "
+            "device at peak; %.1fms still exposed%s",
+            compute_ns / 1e6,
             self.bandwidth_bytes_per_ns,
-            len(promoted),
+            hideable / 2**20,
+            total / 2**20,
+            self.bus_utilization * 100,
             given_back / 2**20,
-            f", {len(relieved)} re-offloaded into idle windows to meet the " f"{self.max_resident_bytes / 2**20:.0f} MiB cap"
-            if relieved
-            else "",
-            self._inflight_peak(plans, targets) / 2**20,
-            exposed / 1e3,
+            len(resident),
+            on_bus / 2**20,
+            on_bus / self.bandwidth_bytes_per_ns / 1e6,
+            moved,
+            len(plans),
+            inflight / 2**20,
+            budget / 2**20,
+            self._peak(plans, targets, index_of) / 2**20,
+            exposed / 1e6,
+            f", {by_budget / 1e6:.1f}ms of it because the in-flight budget and not the bus ran out" if by_budget > 0 else "",
         )
+        self._log_density(plans, prefix)
+        if inflight > budget:
+            magi_logger.warning(
+                "h2d load reorder: %.1f MiB of load buffers are live at once, over the %.0f MiB "
+                "budget the sweep was supposed to hold -- the in-flight accounting and the emitted "
+                "live ranges disagree, so treat the peak this pass reports as unreliable",
+                inflight / 2**20,
+                budget / 2**20,
+            )
         self._log_placement(plans, targets, index_of, n_snodes)
+
+    def _log_density(self, plans, prefix) -> None:
+        """How full the bus is over every prefix of the graph, after residency.
+
+        Measured on prefixes, not on the gap between neighbouring deadlines: a
+        load can be hoisted anywhere upstream, so what has to hold is that the
+        bytes due by each deadline fit the compute available by then.  Per-gap
+        densities read as noise for exactly that reason -- two loads four snodes
+        apart show one empty window and one impossible one, and nothing is wrong.
+
+        A max above 1.0 is a schedule that does not exist: that prefix has more
+        transfer than compute and the excess is exposed wherever it is placed.
+        """
+        if not magi_logger_enabled_for_debug():
+            return
+        by_wait: dict[int, int] = defaultdict(int)
+        for p in plans:
+            if not p.promoted:
+                by_wait[p.wait_idx] += p.nbytes
+        ratios = []
+        cumulative = 0
+        for wait in sorted(by_wait):
+            cumulative += by_wait[wait]
+            compute = prefix[min(wait, len(prefix) - 1)]
+            if compute > 0:
+                ratios.append(cumulative / self.bandwidth_bytes_per_ns / compute)
+        if not ratios:
+            return
+        magi_logger.debug(
+            "h2d load reorder: bus occupancy over %d prefix(es): first %.2f, median %.2f, worst "
+            "%.2f at prefix %d/%d (1.0 means the transfers due by then exactly fill the compute "
+            "available by then, and above 1.0 cannot be hidden at any placement)",
+            len(ratios),
+            ratios[0],
+            sorted(ratios)[len(ratios) // 2],
+            max(ratios),
+            ratios.index(max(ratios)) + 1,
+            len(ratios),
+        )
 
     @staticmethod
     def _weights_of(plan) -> str:
-        """The parameters behind one load, as the placement log wants them."""
         from . import host_pool
 
         names = [host_pool.name_of(s) for s in plan.slots]
@@ -261,39 +398,34 @@ class H2dLoadReorder:
         return ", ".join(names[:3]) + (f", +{len(names) - 3} more" if len(names) > 3 else "")
 
     def _log_placement(self, plans, targets, index_of, n_snodes) -> None:
-        """One line per load: which weights, how far it moved, and what it bought.
-
-        The interesting question a profile raises is always "why is that load
-        there", and the answer needs the weight names next to the indices -- a
-        bucket of forty-layer MoE experts and a bucket of attention projections
-        look identical as snode ids and behave nothing alike.
-        """
         if not magi_logger_enabled_for_debug():
             return
         magi_logger.debug(
             "h2d load placement (%d loads over %d snodes; 'at' is where the load ended up, "
-            "'last_user' the last snode that still reads its bytes):",
+            "'last_user' the last snode that still reads its bytes, 'floor' the dep floor and the "
+            "in-flight floor):",
             len(plans),
             n_snodes,
         )
         for p in sorted(plans, key=lambda p: index_of[p.load]):
             if p.promoted:
-                verdict = "RESIDENT: nothing upstream could hide it"
-            elif p.relieved:
-                verdict = "re-offloaded into an idle window (residency cap)"
+                verdict = f"RESIDENT: {p.need / 1e6:.1f}ms off the bus"
             elif p.exposed <= 0:
                 verdict = "hidden"
+            elif p.budget_bound:
+                verdict = f"EXPOSED {p.exposed / 1e6:.1f}ms (in-flight budget)"
             else:
-                verdict = f"EXPOSED {p.exposed / 1e3:.1f}us"
+                verdict = f"EXPOSED {p.exposed / 1e6:.1f}ms (bus/compute)"
             at = targets.get(p.load, index_of[p.load])
             magi_logger.debug(
-                "  %-10s %2d slot(s) %7.1f MiB  at %5d (from %5d, floor %5d)  last_user %5d  " "need %6.1fms  %-45s  %s",
+                "  %-10s %2d slot(s) %7.1f MiB  at %5d (from %5d, floor %5d/%5d)  last_user %5d  " "need %6.1fms  %-38s  %s",
                 p.load.get_name(),
                 len(p.slots),
                 p.nbytes / 2**20,
                 at,
                 index_of[p.load],
                 p.lower,
+                p.budget_floor,
                 p.last_user,
                 p.need / 1e6,
                 verdict,
@@ -303,19 +435,6 @@ class H2dLoadReorder:
     # -- planning ---------------------------------------------------------
     @staticmethod
     def _group_and_waits(load, users) -> tuple[list, list]:
-        """The snodes that travel with the load, and the waits that guard it.
-
-        A custom op's result reaches its consumers through a ``MultiOutput``
-        unpack rather than directly, so a wait is two hops away and the unpacks
-        have to move with the load -- they read the load's buffer and nothing
-        else.  Searching only the load's direct readers finds the unpacks,
-        decides they are not waits, and drops the load from the plan: no error,
-        no hoist, no overlap.  ``FsdpOverlapReorder._wait_snodes`` carries the
-        same scar.
-
-        A coalesced load has one unpack and one wait per bucket member, so both
-        are collected rather than stopping at the first.
-        """
         group = [load]
         waits: list = []
         stack = list(load.get_buffer_names())
@@ -334,14 +453,6 @@ class H2dLoadReorder:
 
     @staticmethod
     def _last_user_index(group, waits, users, index_of) -> int:
-        """Latest snode that still reads this load's bytes.
-
-        The wait only means the copy has landed.  Direct users of the load /
-        unpack / wait buffers are the ones that still hold those bytes -- a
-        gather for a shard, a matmul for an ungathered or plain weight.  Group
-        members (the load and its unpacks) travel with the load, so they do not
-        count: their final position is the placement, not a consumer.
-        """
         last = max(index_of[w] for w in waits)
         skip = set(group)
         for src in (*group, *waits):
@@ -352,12 +463,6 @@ class H2dLoadReorder:
         return last
 
     def _plan(self, loads, order, index_of, buf_to_snode, users) -> list[_Plan]:
-        """One entry per load, in program order, skipping the ones with no wait.
-
-        A load whose wait this pass cannot find is left alone rather than guessed
-        at: moving a transfer away from a synchronization we do not understand is
-        how you get a race that only shows up under load.
-        """
         plans: list[_Plan] = []
         for load in sorted(loads, key=lambda s: index_of[s]):
             group, waits = self._group_and_waits(load, users)
@@ -370,7 +475,6 @@ class H2dLoadReorder:
                     load=load,
                     group=group,
                     slots=slots_of(load),
-                    # The earliest wait: the load has to precede every one of them.
                     wait_idx=min(index_of[w] for w in waits),
                     last_user=self._last_user_index(group, waits, users, index_of),
                     need=need,
@@ -381,163 +485,359 @@ class H2dLoadReorder:
             )
         return plans
 
-    # -- placement --------------------------------------------------------
-    def _sweep(self, plans, order, index_of) -> dict:
-        """Latest-safe-launch, back to front, with one load live at a time.
+    # -- scheduling --------------------------------------------------------
+    @staticmethod
+    def _unhoisted(plan) -> int:
+        """Where a load sits when it is not hoisted at all: against its own wait."""
+        return max(plan.lower, plan.wait_idx - 1)
 
-        The two-pointer part is ``FsdpOverlapReorder``'s, for the same reason:
-        one PCIe stream means the loads are serialized against each other, so
-        each must claim a run of compute the next one cannot also spend.  The
-        pointer and the carry are this pass's own, which is how the PCIe lane
-        ends up free to reuse the compute the NVLink lane is already hiding
-        behind.
+    def _inflight_budget(self, plans) -> int:
+        """Bytes of load buffer this schedule may have live at once.
 
-        What is added here is the ``frontier``.  Having placed one load, the next
-        one to move is not necessarily its immediate predecessor: if that load's
-        last user would still be reading it where the placed one now starts
-        (closed [target, last_user], so last_user == frontier already overlaps),
-        it is left alone and the sweep looks further back for one whose bytes
-        are already unused -- which may be several loads back, or none.
-
-        A load left alone is not left exposed: its weight goes back on the device
-        and stays there.  Loading a weight that nothing can hide is pure cost
-        every single forward, so this is both the faster answer and the simpler
-        one, and it is why the sweep needs no separate notion of a buffer count.
-        Keeping at most one load in flight falls out of the same rule.
-
-        This produces the fastest schedule.  When the residency it asks for is
-        more than the caller can afford, ``_relieve`` puts some of it back --
-        that is the only other lever, and it runs after this.
+        Floored at what phase 1's own order already needs.  Unasked, that floor
+        plus one load -- the least memory any overlap at all can cost.
         """
+        floor = self._inflight_peak(plans, {p.load: self._unhoisted(p) for p in plans})
+        if self.max_inflight_bytes <= 0:
+            return floor + max((p.nbytes for p in plans), default=0)
+        if self.max_inflight_bytes < floor:
+            magi_logger.warning(
+                "h2d load reorder: the %.1f MiB in-flight budget is under the %.1f MiB that phase 1's "
+                "own unhoisted order already needs, so it is raised to that -- weights are still "
+                "being read past where the next load has to start, and no placement changes it",
+                self.max_inflight_bytes / 2**20,
+                floor / 2**20,
+            )
+            return floor
+        return self.max_inflight_bytes
+
+    def _hideable_bytes(self, plans, prefix) -> float:
+        """Weight bytes the step has compute to overlap, at the priced bandwidth.
+
+        Bounded by the compute upstream of the *last* wait, not by the whole
+        graph: compute after every load's deadline can hide nothing.
+        """
+        last_wait = max(p.wait_idx for p in plans)
+        return self.bus_utilization * prefix[min(last_wait, len(prefix) - 1)] * self.bandwidth_bytes_per_ns
+
+    def _budget_splits(self, plans):
+        """``(resident, inflight)`` budgets to try, most residency first.
+
+        With a single device-weight budget the two are one number split two ways,
+        and the split is not symmetric: residency takes bytes off the bus for
+        every step, while in-flight room only decides how far upstream a load may
+        start.  So the first attempt keeps in-flight at the minimum that can
+        pipeline at all -- the unhoisted floor, or two buckets, whichever is
+        larger -- and spends everything else on residency; later attempts buy
+        in-flight room back one bucket at a time, and only if the sweep says the
+        budget and not the bus is what left transfer exposed.
+        """
+        floor = self._inflight_peak(plans, {p.load: self._unhoisted(p) for p in plans})
+        biggest = max((p.nbytes for p in plans), default=0)
+        if self.max_device_weight_bytes <= 0:
+            yield self.max_resident_bytes, self._inflight_budget(plans)
+            return
+        device = self.max_device_weight_bytes
+        if floor >= device:
+            magi_logger.warning(
+                "h2d load reorder: the %.0f MiB device-weight budget is under the %.1f MiB of load "
+                "buffers phase 1's own unhoisted order already needs, so nothing is left for "
+                "residency and the bus carries every byte",
+                device / 2**20,
+                floor / 2**20,
+            )
+            yield 0, floor
+            return
+        inflight = min(device, max(floor, 2 * biggest))
+        for _ in range(_MAX_SPLIT_ROUNDS):
+            yield device - inflight, inflight
+            if inflight >= device or biggest <= 0:
+                return
+            inflight = min(device, inflight + biggest)
+
+    def _schedule(self, plans, order, index_of, prefix) -> tuple[dict, int]:
+        """Buy the residency the step cannot overlap, then place what is left."""
+        total = sum(p.nbytes for p in plans)
+        hideable = self._hideable_bytes(plans, prefix)
+        best: tuple[float, dict, int, set] | None = None
+        for resident_budget, inflight_budget in self._budget_splits(plans):
+            promoted, spent = self._select_resident(plans, prefix, resident_budget)
+            targets = self._sweep(plans, order, index_of, prefix, promoted, inflight_budget)
+            exposed = sum(p.exposed for p in plans)
+            if best is None or exposed < best[0] - 1e-9:
+                best = (exposed, targets, inflight_budget, promoted)
+            # Only an in-flight shortage is worth buying more in-flight room for;
+            # if the bus itself is full, taking bytes off residency makes it worse.
+            if exposed <= 0 or not any(p.budget_bound for p in plans):
+                break
+        assert best is not None  # _budget_splits always yields at least once
+        _, targets, inflight_budget, promoted = best
+        # Re-run the winner so the plans carry its placement, not the last try's.
+        targets = self._sweep(plans, order, index_of, prefix, promoted, inflight_budget)
+        self._log_shortfall(total, hideable, sum(p.nbytes for p in plans if p.promoted), sum(p.exposed for p in plans))
+        return targets, inflight_budget
+
+    def _log_shortfall(self, total, hideable, resident, exposed) -> None:
+        """Say so when the step simply has no compute for the bytes left on the bus."""
+        unavoidable = total - resident - hideable
+        if unavoidable <= 0 or exposed <= 0:
+            return
+        magi_logger.warning(
+            "h2d load reorder: %.1f MiB of weight is offloaded and %.1f MiB of it is resident, "
+            "leaving %.1f MiB on the bus, but %.0f ms of compute at %.1f GB/s can only overlap "
+            "%.1f MiB of it -- %.1f MiB (%.1fms) is exposed wherever the loads are placed, and only "
+            "more residency removes it",
+            total / 2**20,
+            resident / 2**20,
+            (total - resident) / 2**20,
+            hideable / self.bus_utilization / self.bandwidth_bytes_per_ns / 1e6,
+            self.bandwidth_bytes_per_ns,
+            hideable / 2**20,
+            unavoidable / 2**20,
+            unavoidable / self.bandwidth_bytes_per_ns / 1e6,
+        )
+
+    def _select_resident_at(self, plans, prefix, resident_budget, density) -> tuple[set, int, bool]:
+        """Promote weights until every prefix of the graph holds ``density``.
+
+        Walks the loads in deadline order against a running allowance of
+        ``density * B * prefix[wait]`` -- the bytes the bus can have delivered by
+        the time this load's gather needs them.  Overrunning it means the loads up
+        to here cannot all fit in the compute up to here, no matter where they go,
+        so one comes off the bus: the SMALLEST weight that closes the overrun.
+        Best fit, not largest, on two counts -- it does not spend budget on relief
+        the window did not ask for, and it leaves the window sitting at the target
+        density instead of alternating between slack and saturation.  Loads then
+        only have to travel as far as their own window, and short hoists are what
+        keeps the in-flight peak small.
+
+        Spreading falls out of walking prefixes rather than sizes.  Handing the
+        budget to the largest weights globally would take them all from the front
+        of the graph and leave the back saturated, which is where the step time
+        would then come from.
+
+        The third return value is whether the budget covered the target
+        everywhere; ``False`` means the walk wanted another weight off the bus and
+        could not pay for it.
+        """
+        rate = density * self.bandwidth_bytes_per_ns
+        promoted: set = set()
+        on_bus: list = []
+        kept = spent = 0
+        feasible = True
+        for plan in sorted(plans, key=lambda p: (p.wait_idx, -p.nbytes)):
+            kept += plan.nbytes
+            if plan.slots:  # only a load with host slots can be given back
+                on_bus.append(plan)
+            allowance = rate * prefix[min(plan.wait_idx, len(prefix) - 1)]
+            while kept > allowance:
+                pick = self._best_fit(on_bus, kept - allowance, resident_budget - spent)
+                if pick is None:
+                    # No candidate at all is the graph's own doing (a load with no
+                    # host slot cannot be given back); one that exists but does not
+                    # fit is the budget refusing, and only that is infeasibility.
+                    feasible = feasible and not on_bus
+                    break
+                on_bus.remove(pick)
+                promoted.add(pick.load)
+                kept -= pick.nbytes
+                spent += pick.nbytes
+        return promoted, spent, feasible
+
+    @staticmethod
+    def _best_fit(candidates, deficit: float, room: int):
+        """Smallest candidate that closes ``deficit``, else the largest that fits.
+
+        The fallback matters as much as the rule: when no single weight covers the
+        overrun, taking the largest is what makes progress -- the loop then comes
+        back for the remainder.
+        """
+        affordable = [p for p in candidates if p.nbytes <= room]
+        if not affordable:
+            return None
+        covering = [p for p in affordable if p.nbytes >= deficit]
+        return min(covering, key=lambda p: p.nbytes) if covering else max(affordable, key=lambda p: p.nbytes)
+
+    def _select_resident(self, plans, prefix, resident_budget) -> tuple[set, int]:
+        """The flattest bus-to-compute density the residency budget can hold.
+
+        Feasibility is monotone in the target: a budget that holds density ``d``
+        everywhere also holds anything looser, so the smallest holdable ``d`` is
+        the one to take.  Asking for less than the bus needs is the point -- it is
+        how a budget larger than feasibility requires gets spent without stacking
+        every purchase at the front of the graph, and it buys margin against the
+        cost table being optimistic.  When even the honest utilization does not
+        fit, the walk runs there anyway and spends what it has; ``_log_shortfall``
+        says how much transfer is then exposed no matter what.
+        """
+        lo, hi = 0.0, self.bus_utilization
+        best: tuple[set, int] | None = None
+        for _ in range(_DENSITY_SEARCH_ROUNDS):
+            mid = (lo + hi) / 2
+            promoted, spent, feasible = self._select_resident_at(plans, prefix, resident_budget, mid)
+            if feasible:
+                best = (promoted, spent)
+                hi = mid
+            else:
+                lo = mid
+        if best is not None:
+            return best
+        promoted, spent, _ = self._select_resident_at(plans, prefix, resident_budget, self.bus_utilization)
+        return promoted, spent
+
+    def _sweep(self, plans, order, index_of, prefix, promoted, budget) -> dict:
+        """Schedule the bus by deadline, then issue each load just in time.
+
+        Every offloaded load is booked at its unhoisted position in the in-flight
+        map before anything moves, and released only when placed -- so the budget
+        is a promise.  Promoted loads keep phase 1's position, take no bus slot
+        (device-to-device) and no in-flight room either: their bytes are charged
+        to the residency budget, and charging them twice would let a filled
+        residency squeeze the transfers that are still on the bus.
+
+        The active loads are then list-scheduled in DEADLINE order, in two
+        passes.  A backward pass over the waits gives each transfer the latest
+        instant it may finish without pushing the ones after it past their own
+        deadlines; a forward pass then runs the bus, giving each transfer the
+        latest slot that respects both that limit and the bus still being busy.
+        Where the bus is saturated the slots butt together and it never idles;
+        where there is slack a transfer simply starts late, which costs nothing
+        and keeps its buffer's live range short.  The snode a load is emitted at
+        is the latest one whose compute prefix still reaches its slot -- just in
+        time, because the DMA begins at that instant whatever index we choose and
+        anything earlier only holds memory for longer.
+
+        Scheduling by size instead is what the previous sweep did, and it cost
+        both ways.  The big transfers claimed the bus first; a 3ms bundle then
+        found every mid-graph instant taken, and the only placement the model
+        scored as fully hidden was the gap at the very top of the graph.  On
+        gaga4 400B that put 28 such bundles at snode ~400 against deadlines
+        1000+ nodes later: 4% of the bytes holding 37% of the in-flight budget
+        for the length of the graph, which under one device-weight budget comes
+        straight out of residency and back onto the bus.
+        """
+        live = _Inflight(budget)
+        for plan in plans:
+            plan.promoted = plan.load in promoted
+            if plan.promoted:
+                plan.exposed = 0.0
+                plan.budget_floor = index_of[plan.load]
+                plan.budget_bound = False
+            else:
+                live.add(self._unhoisted(plan), plan.last_user, plan.nbytes)
+
+        active = sorted((p for p in plans if not p.promoted), key=lambda p: (p.wait_idx, index_of[p.load]))
+        latest_finish = self._latest_finish(active, prefix)
+
         targets: dict = {}
-        compute_idx = len(order)
-        carry = 0.0
-        carry_idx = len(order)
-        frontier = len(order)  # where the next-later load's bytes come alive
+        bus_end = 0.0
+        emitted = -1
+        for plan in active:
+            live.remove(self._unhoisted(plan), plan.last_user, plan.nbytes)
+            floor = live.earliest_start(plan.last_user, plan.nbytes)
+            plan.budget_floor = floor
+            lo = max(plan.lower, floor)
 
-        for plan in reversed(plans):
-            if _closed_live_overlap(plan.last_user, frontier):
-                # Something still reads this load where the next one would start.
-                # Equality overlaps: the later load is inserted *before* frontier.
-                plan.promoted = True
-                continue
+            # As late as the deadlines allow, but never before the bus is free
+            # or before the load is legal to issue.
+            t_bus = max(prefix[lo], bus_end, latest_finish[plan.load] - plan.need)
+            bus_end = t_bus + plan.need
+            plan.exposed = max(0.0, bus_end - prefix[plan.wait_idx])
+            # The in-flight floor is the limit only when relaxing it would have
+            # started the DMA sooner; otherwise the bus was full regardless.
+            plan.budget_bound = plan.exposed > 0 and prefix[lo] > prefix[plan.lower] and prefix[lo] > t_bus - plan.need
 
-            cur = index_of[plan.load]
-            compute_idx = min(compute_idx, cur)
-            if cur < carry_idx:
-                carry = 0.0
-                carry_idx = compute_idx
-            acc = carry
-            t = compute_idx
-            while acc < plan.need and t > plan.lower:
-                s = order[t - 1]
-                if self._is_compute(s):
-                    acc += self._cost(s)
-                    carry_idx = t - 1
-                t -= 1
-            target = max(plan.lower, t)
-            targets[plan.load] = target
-            plan.exposed = max(0.0, plan.need - acc)
-            carry = max(0.0, acc - plan.need)
-            compute_idx = target
-            frontier = target
+            at = self._issue_index(prefix, t_bus, lo, plan.wait_idx, emitted)
+            targets[plan.load] = at
+            emitted = at
+            live.add(at, plan.last_user, plan.nbytes)
         return targets
 
     @staticmethod
-    def _inflight_peak(plans, targets) -> int:
-        """Most load bytes alive at once, over a sweep of the placed live ranges.
+    def _latest_finish(active, prefix) -> dict:
+        """Per load, the last instant its transfer may end and still keep order.
 
-        One bucket under the sweep's rule alone; more once a residency cap has
-        put loads back into idle windows, which is exactly the trade the cap
-        makes and the reason it is worth reporting rather than assuming.
+        Walked back from the last deadline: a transfer may not finish later than
+        its own wait, nor later than the start of the next one already pinned to
+        its deadline.  Without this a load with slack would be scheduled the
+        moment the bus is free, which is early, and then sit in memory until its
+        wait -- the bus gains nothing and the in-flight budget pays for it.
         """
+        limit = float("inf")
+        out: dict = {}
+        for plan in reversed(active):
+            limit = min(prefix[plan.wait_idx], limit)
+            out[plan.load] = limit
+            limit -= plan.need
+        return out
+
+    @staticmethod
+    def _issue_index(prefix, t_bus: float, lo: int, wait_idx: int, emitted: int) -> int:
+        """Latest snode whose compute prefix still reaches ``t_bus``.
+
+        Clamped into ``[lo, wait_idx)`` -- a load must follow its producers and
+        precede its own wait -- and never before the load placed ahead of it,
+        which holds an earlier bus slot, so the stream issues the transfers in
+        the order the bus was scheduled to run them.
+        """
+        hi = max(lo, wait_idx - 1)
+        at = bisect_right(prefix, t_bus, lo, max(lo + 1, wait_idx)) - 1
+        return min(hi, max(lo, emitted, at))
+
+    def _compute_prefix(self, order) -> list[float]:
+        prefix = [0.0] * (len(order) + 1)
+        for i, s in enumerate(order):
+            prefix[i + 1] = prefix[i] + (self._cost(s) if self._is_compute(s) else 0.0)
+        return prefix
+
+    # -- memory accounting -------------------------------------------------
+    @staticmethod
+    def _live_starts(plans, targets, index_of) -> dict:
+        """Where each load buffer still on the bus comes alive; resident ones never do."""
+        return {p.load: targets.get(p.load, index_of[p.load]) for p in plans if not p.promoted}
+
+    @staticmethod
+    def _peak_point(plans, starts) -> tuple[int, int]:
         events: list[tuple[int, int]] = []
         for p in plans:
-            at = targets.get(p.load)
+            at = starts.get(p.load)
             if at is not None:
                 events.append((at, p.nbytes))
                 events.append((p.last_user, -p.nbytes))
-        # Closed [at, last_user]: a start at i still overlaps an end at i, so
-        # apply allocations before releases or the peak under-counts the touch.
         events.sort(key=lambda ev: (ev[0], ev[1] < 0))
-        peak = live = 0
-        for _idx, delta in events:
+        peak = live = where = 0
+        for idx, delta in events:
             live += delta
-            peak = max(peak, live)
-        return peak
+            if live > peak:
+                peak, where = live, idx
+        return peak, where
 
-    # -- residency relief --------------------------------------------------
-    @staticmethod
-    def _bubbles(targets, by_load) -> list[tuple[int, int]]:
-        """Index ranges where the load stream has nothing to do.
+    @classmethod
+    def _inflight_peak(cls, plans, starts) -> int:
+        return cls._peak_point(plans, starts)[0]
 
-        The sweep leaves these behind on purpose -- it never hoists a load into a
-        window it does not need -- so they are the free space: a transfer put
-        here competes with no other transfer for the bus.
+    @classmethod
+    def _peak_with(cls, plans, starts, promoted) -> int:
+        permanent = sum(p.nbytes for p in plans if p.load in promoted)
+        return permanent + cls._inflight_peak(plans, starts)
+
+    @classmethod
+    def _peak(cls, plans, targets, index_of) -> int:
+        """Weight bytes on the device at the worst point in the graph.
+
+        Every load is counted where its buffer comes alive, promoted ones
+        included: residency removes the PCIe crossing, not the copy, so
+        ``h2d_load`` still allocates an output for a resident slot and its bytes
+        are on the device twice while that buffer lives.  The in-flight *budget*
+        deliberately does not charge for those (see ``_sweep``); this is the
+        memory report, where it would be a lie not to.
         """
-        placed = sorted((t, by_load[load].last_user) for load, t in targets.items())
-        out: list[tuple[int, int]] = []
-        # Sentinel "-1": no prior closed range, so the first free start is 0.
-        # After a load ending at ``end``, the next free start is end+1 -- a
-        # later load at ``end`` would be inserted before that last_user.
-        prev_end = -1
-        for start, end in placed:
-            if start > prev_end + 1:
-                out.append((prev_end + 1, start))
-            prev_end = max(prev_end, end)
-        return out
+        starts = {p.load: targets.get(p.load, index_of[p.load]) for p in plans}
+        return cls._peak_with(plans, starts, {p.load for p in plans if p.promoted})
 
-    def _relieve(self, plans, targets, index_of) -> None:
-        """Give up speed for residency, one weight at a time, until the cap holds.
-
-        The sweep hands back every weight it cannot schedule for free, which is
-        the fastest answer but says nothing about how much device memory that
-        costs.  When the bill is too high, weights come back into the offload
-        plan -- and the ones to pick are those whose loads fit in a bubble the
-        sweep already left idle, because a transfer there is the cheapest one
-        available: the bus is free and no other load is waiting on it.
-
-        Largest first, so the cap is met with the fewest weights re-offloaded and
-        therefore the fewest new transfers on the critical path.
-        """
-        by_load = {p.load: p for p in plans}
-        resident = sum(p.nbytes for p in plans if p.promoted)
-        if resident <= self.max_resident_bytes:
-            return
-
-        while resident > self.max_resident_bytes:
-            bubbles = self._bubbles(targets, by_load)
-            best = None
-            for plan in sorted((p for p in plans if p.promoted), key=lambda p: -p.nbytes):
-                for lo, hi in bubbles:
-                    at = max(plan.lower, lo)
-                    if at < min(hi, plan.wait_idx):
-                        best = (plan, at)
-                        break
-                if best is not None:
-                    break
-            if best is None:
-                magi_logger.warning(
-                    "h2d load reorder: %.1f MiB of weights stay resident, over the %.1f MiB cap -- "
-                    "no idle window is left to schedule another load into",
-                    resident / 2**20,
-                    self.max_resident_bytes / 2**20,
-                )
-                return
-            plan, at = best
-            plan.promoted = False
-            plan.relieved = True
-            targets[plan.load] = at
-            resident -= plan.nbytes
-
+    # -- committing --------------------------------------------------------
     @staticmethod
     def _promote(plans) -> int:
-        """Put the shards of every skipped load back on the device.
-
-        The graph is untouched: the load still runs, it just copies
-        device-to-device now.  That is what lets this decision be made during
-        scheduling without invalidating the artifact being scheduled.
-        """
         from . import host_pool
 
         slots: list[int] = []
@@ -545,8 +845,6 @@ class H2dLoadReorder:
             if not p.promoted:
                 continue
             if not p.slots:
-                # No slot to hand back -- leave the load where it is.  Correct,
-                # just a transfer this pass could not improve.
                 p.promoted = False
                 continue
             slots.extend(p.slots)
@@ -554,16 +852,6 @@ class H2dLoadReorder:
 
     @staticmethod
     def _rebuild(order, targets, index_of, groups) -> list[BaseSchedulerNode]:
-        """Apply every move in one stable-sort rebuild: targets live in the
-        original index space, so incremental moves would shift them.
-
-        The load sorts to ``target - 0.5``, i.e. immediately *before* the node
-        that currently sits at ``target``.  That node is the inclusive start of
-        the closed live range [target, last_user].
-
-        Group members sort to the same key as their load and keep their relative
-        order, so a load and its unpack stay adjacent.
-        """
         member_target = {m: targets[load] for load, group in groups.items() if load in targets for m in group}
 
         def _key(s):

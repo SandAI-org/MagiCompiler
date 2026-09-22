@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import torch
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .utils import compute_hash
@@ -216,11 +216,12 @@ class OffloadConfig(BaseModel):
             "skip that rewrite and would leave the stand-in empty. "
             "Parks each selected local shard in pinned host memory and loads it back inside the graph "
             "with magi::h2d_load, placed far enough upstream for compute to hide the transfer before "
-            "its all-gather launches -- but never so far that this load's bytes are still being read "
-            "where the next load begins, so at most one load (one bucket) is ever in flight. A weight that cannot be scheduled "
-            "under that rule stays resident instead, since loading something nothing can hide costs "
-            "PCIe every forward and buys nothing; offload_max_resident_mib caps how much of that the "
-            "pass may keep. Works with SimpleFSDP (transport='nccl') and with unsharded "
+            "its all-gather launches. Two budgets bound the result and between them are the whole "
+            "policy: offload_max_inflight_mib is how many bytes may be live in load buffers at once, "
+            "i.e. how much of the bus's work can be moved under compute, and "
+            "offload_max_resident_mib is how many bytes may go back on the device permanently, i.e. "
+            "how much traffic the bus has to carry at all. They add up to the weight bytes on the "
+            "device. Works with SimpleFSDP (transport='nccl') and with unsharded "
             "nn.Parameter models. Mutually exclusive with model_cpu_offload (the runtime-wrapper "
             "path) because the two offload the same bytes through different mechanisms. "
             "host_first_materialize (the default) is how the weights enter the host pool: a "
@@ -262,12 +263,59 @@ class OffloadConfig(BaseModel):
         0,
         ge=0,
         description=(
-            "Cap on the weight MiB the placement pass may leave resident per GPU. The pass first "
-            "picks the fastest schedule, which keeps any weight it cannot hide behind compute -- "
-            "loading such a weight is pure cost every forward. Where that asks for more device "
-            "memory than you have, this cap pulls weights back into the offload plan, choosing the "
-            "ones whose loads fit in a window the schedule already left idle so the bus is free. "
-            "0 = no cap: take the fastest schedule and accept its residency."
+            "Residency budget per GPU: weight MiB the placement pass may hand back to the device "
+            "permanently, to buy out transfer no compute window can hide. A resident weight pays no "
+            "PCIe at all, so this is what decides how much traffic the bus carries: with T MiB of "
+            "offloadable weight, a bandwidth of B MiB/ms and C ms of compute per step, no schedule "
+            "can be compute-bound unless (T - resident) / B <= C, which makes T - C*B a hard lower "
+            "bound on this setting. The pass spends the budget on the loads whose exposure costs the "
+            "most per resident byte, re-planning after each purchase because a weight taken off the "
+            "bus hands its compute window to its neighbours. 0 = buy nothing: everything parked on "
+            "the host stays offloaded, however exposed that leaves it. Adds to "
+            "offload_max_inflight_mib -- together they bound the weight bytes on the device."
+        ),
+    )
+    offload_max_inflight_mib: int = Field(
+        0,
+        ge=0,
+        description=(
+            "In-flight budget per GPU: weight MiB that may be live in H2D load buffers at once. A "
+            "load's bytes are live from where the load runs until the last op that still reads them, "
+            "so this is what decides how far upstream a load may be hoisted, and therefore how much "
+            "of the bus's work can be moved under the compute that hides it. One bucket's worth "
+            "serializes the bus against itself: it idles through every compute window shorter than a "
+            "transfer, even on a graph with compute to spare. Size it at several buckets to keep the "
+            "bus near full duty cycle. 0 = one load on top of whatever the unhoisted order already "
+            "needs, which is the least memory any overlap at all can cost; a value below what the "
+            "unhoisted order needs is raised to it with a warning, since no placement goes lower. "
+            "Adds to offload_max_resident_mib."
+        ),
+    )
+    offload_max_device_weight_mib: int = Field(
+        0,
+        ge=0,
+        description=(
+            "Single budget for the weight MiB on the device, which the placement pass then splits "
+            "between residency and in-flight load buffers itself: the smallest in-flight budget that "
+            "still hides every transfer, and all the rest to residency. Prefer this over setting "
+            "offload_max_resident_mib and offload_max_inflight_mib by hand -- the two compete for the "
+            "same memory, so a guess at one is a guess at the other, and residency is worth strictly "
+            "more per byte (it removes the transfer from every step, while in-flight room only buys "
+            "the schedule somewhere to put it). 0 = use the two separate budgets instead."
+        ),
+    )
+    offload_bus_utilization: float = Field(
+        0.9,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Fraction of the compute time the H2D bus can be expected to actually occupy, used to "
+            "size how much weight a step can overlap at all: schedule_size = utilization * compute * "
+            "bandwidth, and anything beyond it has to become resident or it is exposed no matter "
+            "where the loads are placed. Below 1.0 because a transfer can only start at a snode "
+            "boundary and must fit before its own all-gather, so the bus is never packed perfectly. "
+            "This is NOT a fudge factor for a wrong compute estimate: if the cost table is wrong, the "
+            "product is wrong at any utilization."
         ),
     )
     offload_h2d_bandwidth_gbps: float = Field(
@@ -501,25 +549,6 @@ class CompileConfig(BaseSettings):
             "FULL captures the entire compiled graph as a single CUDA Graph."
         ),
     )
-
-    @model_validator(mode="after")
-    def _graph_weight_offload_requires_magi_compile(self) -> "CompileConfig":
-        self.check_graph_weight_offload_compile_mode()
-        return self
-
-    def check_graph_weight_offload_compile_mode(self) -> None:
-        """Reject ``graph_weight_offload`` unless the Magi rewrite backend is selected.
-
-        Construction-time pydantic validation does not re-run on later field
-        assignment (``cfg.compile_mode = ...`` / ``config_patch``). ``magi_compile``
-        calls this again so an illegal pair still fails before host-first rewrite.
-        """
-        if self.offload_config.graph_weight_offload and self.compile_mode != CompileMode.MAGI_COMPILE:
-            raise ValueError(
-                "offload_config.graph_weight_offload requires compile_mode=MAGI_COMPILE: "
-                "host-first parks weights as empty CUDA stand-ins and only the Magi backend "
-                "inserts magi::h2d_load; TORCH_COMPILE and NONE skip that rewrite"
-            )
 
     @property
     def has_cutlass(self) -> bool:
