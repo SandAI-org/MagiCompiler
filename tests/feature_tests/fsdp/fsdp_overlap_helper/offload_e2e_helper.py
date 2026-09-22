@@ -110,9 +110,12 @@ def main() -> None:
     # where the lowering pass cannot see it.  Anything else leaves the
     # redistribute in the top-level graph, which is what this chain needs.
     ap.add_argument("--ac-mode", default="full")
-    # 0 = take the fastest schedule and accept its residency; a cap pulls weights
-    # back into the offload plan, into windows the schedule already left idle.
+    # The two budgets the placement pass spends: how much weight may go back on
+    # the device permanently, and how much may be live in load buffers at once.
+    # 0 / 0 is the smallest footprint a schedule can have -- nothing resident,
+    # one load in flight -- and therefore the slowest.
     ap.add_argument("--max-resident-mib", type=int, default=0)
+    ap.add_argument("--max-inflight-mib", type=int, default=0)
     # Accepted for older invocations; host-first is the only materialization path.
     ap.add_argument("--host-first", action="store_true")
     # 0 = probe the bus. A test comparing two runs has to pin it: the probe is a
@@ -154,6 +157,7 @@ def main() -> None:
         cfg.offload_config.host_first_materialize = True
         cfg.offload_config.offload_min_shard_mib = args.min_shard_mib
         cfg.offload_config.offload_max_resident_mib = args.max_resident_mib
+        cfg.offload_config.offload_max_inflight_mib = args.max_inflight_mib
         cfg.offload_config.offload_h2d_bandwidth_gbps = args.h2d_gbps
         return cfg
 

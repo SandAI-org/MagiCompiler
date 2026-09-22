@@ -305,6 +305,62 @@ def _extern_replay_fn(snode: ExternKernelSchedulerNode):
     return fn
 
 
+def _argument_bytes(snode: BaseSchedulerNode) -> int:
+    """Bytes in this kernel's tensor arguments, from the fx node's metas."""
+    origin = _fx_node_of(getattr(snode, "node", None))
+    if origin is None:
+        return 0
+    nbytes = 0
+    for ev in _iter_tensor_metas((*origin.args, *getattr(origin, "kwargs", {}).values())):
+        numel = 1
+        for s in _static(ev.shape):
+            numel *= s[1] if isinstance(s, tuple) else s
+        nbytes += numel * ev.dtype.itemsize
+    return nbytes
+
+
+_DRAM_FLOOR_SLACK = 0.5
+"""How far under the DRAM floor a measurement may land before we distrust it.
+
+Not 1.0: a kernel can legitimately beat the floor by reading an argument it only
+partially touches, or out of L2.  Half the floor is well outside that, and the
+replay failures this catches come in two orders of magnitude low.
+"""
+
+
+def _warn_if_implausible(snode: BaseSchedulerNode, ns: float) -> None:
+    """Flag a measurement too fast to have read the kernel's own arguments.
+
+    Not a cost model -- a plausibility check.  A replay landing far under the
+    time it takes to merely stream its operands did not do the kernel's work:
+    the usual cause is an argument whose VALUES drive the work (expert offsets,
+    tile counts, sequence bounds) arriving zero-filled from the generic realize,
+    which makes the kernel exit without touching its operands.  Worth the check
+    because the failure mode is otherwise invisible -- a kernel that does nothing
+    measures as free, and every pass reading the cost table then treats a real
+    kernel as a gap it can hoist transfers across.
+    """
+    from torch._inductor.utils import get_gpu_dram_gbps
+
+    nbytes = _argument_bytes(snode)
+    gbps = max(1.0, float(get_gpu_dram_gbps()))
+    floor_ns = nbytes / gbps  # bytes / (GB/s) == ns
+    if floor_ns <= 0.0 or ns >= floor_ns * _DRAM_FLOOR_SLACK:
+        return
+    magi_logger.warning(
+        "profiling: %s measured %.1fus, but its arguments are %.0f MiB and take %.1fus to even read "
+        "at %.0f GB/s -- the replay is not doing the kernel's work, so this op is priced at near "
+        "zero and every pass reading the cost table will treat it as a gap. When an argument's "
+        "VALUES are what drive the work, give the op a materialize_inputs hook, or draw the custom-"
+        "op boundary around whatever produces those values so the replay produces them too",
+        _snode_label(snode),
+        ns / 1e3,
+        nbytes / 2**20,
+        floor_ns / 1e3,
+        gbps,
+    )
+
+
 def _measure_extern(snode: ExternKernelSchedulerNode, fixed_iters: bool = False) -> float:
     """Time an extern (matmul / custom-op) snode by replaying its aten op.
 
@@ -676,6 +732,7 @@ class ProfilingRuntimeEstimator:
                 fixed = _extern_has_internal_collective(snode)
                 with _shapeenv_sandbox(), _suppress_guards():
                     ns = _measure_extern(snode, fixed_iters=fixed)
+                _warn_if_implausible(snode, ns)
                 self.n_measured += 1
                 return ns, True
             return self._measure(snode), True
@@ -686,8 +743,20 @@ class ProfilingRuntimeEstimator:
     def summary(self) -> str:
         """One line per distinct op + a machine-parseable ``ESTLINE`` tag
         (kind|label|per_call_us|calls|total_us|measured) for diffing against an
-        nsys trace."""
+        nsys trace.
+
+        The per-kind totals are what an nsys trace is actually comparable to, so
+        they are spelled out rather than left to be re-summed by hand.  They
+        cover every cost query this process made: one estimator serves every
+        graph it compiles, so a model compiled twice reports twice the work of
+        one forward.
+        """
         lines = []
+        totals: dict[str, float] = {}
+        calls_by_kind: dict[str, int] = {}
+        for e in self._table.values():
+            totals[e.kind] = totals.get(e.kind, 0.0) + e.ns * (e.reuse_count + 1)
+            calls_by_kind[e.kind] = calls_by_kind.get(e.kind, 0) + e.reuse_count + 1
         for e in sorted(self._table.values(), key=lambda e: -e.ns * (e.reuse_count + 1)):
             calls = e.reuse_count + 1  # first encounter + reuses
             per_us = e.ns / 1e3
@@ -696,9 +765,13 @@ class ProfilingRuntimeEstimator:
             lines.append(f"  [{e.kind:10}] {e.label:<48} {per_us:9.2f}us/call x{calls:<4} " f"= {total_us:11.2f}us  ({meas})")
             # grep-friendly: ESTLINE|kind|label|per_call_us|calls|total_us|measured
             lines.append(f"  ESTLINE|{e.kind}|{e.label}|{per_us:.3f}|{calls}|{total_us:.3f}|{meas}")
+        totals_str = ", ".join(
+            f"{kind}={ns / 1e6:.1f}ms over {calls_by_kind[kind]} call(s)" for kind, ns in sorted(totals.items())
+        )
         return (
             f"profile table: {len(self._table)} distinct ops, "
-            f"{self.n_measured} measured, {self.n_cache_hits} reuses\n" + "\n".join(lines)
+            f"{self.n_measured} measured, {self.n_cache_hits} reuses; "
+            f"cumulative estimate {totals_str}\n" + "\n".join(lines)
         )
 
     def __call__(self, snode: BaseSchedulerNode) -> float:
@@ -790,6 +863,8 @@ class ProfilingRuntimeEstimator:
         measured = True
         try:
             ns = self._measure_extern_safe(snode) if is_extern else self._measure(snode)
+            if is_extern:
+                _warn_if_implausible(snode, ns)
         except BaseException as exc:  # noqa: BLE001
             magi_logger.debug("Profiling estimator fell back to analytical for %s: %s", snode.get_name(), exc)
             ns = _safe_analytical(snode)

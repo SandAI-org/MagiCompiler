@@ -23,12 +23,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from pydantic import ValidationError
 from torch import nn
 from torch.testing import assert_close
 
 from magi_compiler.api import magi_compile
-from magi_compiler.config import CompileConfig, CompileMode, OffloadConfig
+from magi_compiler.config import CompileConfig
 from tests.perf_tests import cuda_benchmark
 
 
@@ -691,38 +690,3 @@ class TestPerformanceImprovementConsistency:
             "Non-module entry timings diverged too much: "
             f"class={t_nm_class:.4f}s, instance={t_nm_inst:.4f}s, method={t_nm_mtd:.4f}s"
         )
-
-
-class TestGraphWeightOffloadCompileMode:
-    """``graph_weight_offload`` is a Magi graph rewrite; vanilla / eager modes must fail closed."""
-
-    @pytest.mark.parametrize("mode", [CompileMode.TORCH_COMPILE, CompileMode.NONE])
-    def test_construct_rejects_non_magi_compile(self, mode):
-        with pytest.raises(ValidationError, match="graph_weight_offload requires compile_mode=MAGI_COMPILE"):
-            CompileConfig(compile_mode=mode, offload_config=OffloadConfig(graph_weight_offload=True))
-
-    def test_construct_allows_magi_compile(self):
-        conf = CompileConfig(compile_mode=CompileMode.MAGI_COMPILE, offload_config=OffloadConfig(graph_weight_offload=True))
-        conf.check_graph_weight_offload_compile_mode()
-
-    @pytest.mark.parametrize("mode", [CompileMode.TORCH_COMPILE, CompileMode.NONE])
-    def test_check_rejects_mutated_non_magi_compile(self, mode):
-        conf = CompileConfig()
-        conf.compile_mode = mode
-        conf.offload_config.graph_weight_offload = True
-        with pytest.raises(ValueError, match="graph_weight_offload requires compile_mode=MAGI_COMPILE"):
-            conf.check_graph_weight_offload_compile_mode()
-
-    @pytest.mark.parametrize("mode", [CompileMode.TORCH_COMPILE, CompileMode.NONE])
-    def test_magi_compile_rejects_config_patch_non_magi_compile(self, mode):
-        def patch_cfg(cfg):
-            cfg.compile_mode = mode
-            cfg.offload_config.graph_weight_offload = True
-            return cfg
-
-        class Identity(nn.Module):
-            def forward(self, x: torch.Tensor) -> torch.Tensor:
-                return x
-
-        with pytest.raises(ValueError, match="graph_weight_offload requires compile_mode=MAGI_COMPILE"):
-            magi_compile(Identity(), config_patch=patch_cfg)

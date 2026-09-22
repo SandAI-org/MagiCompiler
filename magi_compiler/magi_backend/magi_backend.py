@@ -308,9 +308,6 @@ class CompilerManager:
             compilation_start_time = time.time()
 
         # Step1: Try loading from the cache.
-        # Offload artifacts bake process-local host-pool slots.  load() refuses
-        # them unless bind_offload_cache has matched the host_slots sidecar and
-        # installed a remap onto this process's pool.
         cache_entry = CacheEntry(runtime_shape, graph_index, self.compiler.name)
         compiled_graph = self.load(graph, example_inputs, cache_entry)
         if compiled_graph is not None:
@@ -717,26 +714,6 @@ class MagiBackend:
         self.local_magi_cache_path.mkdir(parents=True, exist_ok=True)
         self.compiler_manager.initialize_cache(self.local_magi_cache_path)
 
-    def _check_offload_config(self) -> None:
-        """Preconditions ``graph_weight_offload`` needs on its own.
-
-        Until now these came for free from ``enable_fsdp``, which pins
-        ``cudagraph_mode=NONE``.  Offload can run without FSDP, so it has to ask
-        for them itself -- a load manages its own CUDA stream and event, and
-        graph capture would not record either, which is a wrong answer rather
-        than an error.
-        """
-        offload_cfg = self.compile_config.offload_config
-        assert not offload_cfg.model_cpu_offload, (
-            "offload_config.graph_weight_offload and offload_config.model_cpu_offload both offload "
-            "the model's weights, through a compile-time graph rewrite and a runtime wrapper "
-            "respectively; enable exactly one"
-        )
-        assert self.compile_config.cudagraph_mode == CudaGraphMode.NONE, (
-            "offload_config.graph_weight_offload requires cudagraph_mode=NONE: magi::h2d_load runs "
-            "on a stream of its own and publishes a CUDA event, neither of which graph capture records"
-        )
-
     def _reclaim_unloaded_weights(self) -> None:
         """Put back any weight that was parked but that no graph ended up loading.
 
@@ -782,6 +759,9 @@ class MagiBackend:
             window_margin_ns=offload_cfg.h2d_overlap_window_margin_ns,
             window_scale=offload_cfg.h2d_overlap_window_scale,
             max_resident_bytes=int(offload_cfg.offload_max_resident_mib) * 1024 * 1024,
+            max_inflight_bytes=int(offload_cfg.offload_max_inflight_mib) * 1024 * 1024,
+            max_device_weight_bytes=int(offload_cfg.offload_max_device_weight_mib) * 1024 * 1024,
+            bus_utilization=float(offload_cfg.offload_bus_utilization),
         )
 
     def _check_weight_pipeline_config(self) -> None:
@@ -793,7 +773,16 @@ class MagiBackend:
                 self.compile_config.cudagraph_mode == CudaGraphMode.NONE
             ), "fsdp_config.enable_fsdp requires cudagraph_mode=NONE"
         if self.compile_config.offload_config.graph_weight_offload:
-            self._check_offload_config()
+            offload_cfg = self.compile_config.offload_config
+            assert not offload_cfg.model_cpu_offload, (
+                "offload_config.graph_weight_offload and offload_config.model_cpu_offload both offload "
+                "the model's weights, through a compile-time graph rewrite and a runtime wrapper "
+                "respectively; enable exactly one"
+            )
+            assert self.compile_config.cudagraph_mode == CudaGraphMode.NONE, (
+                "offload_config.graph_weight_offload requires cudagraph_mode=NONE: magi::h2d_load runs "
+                "on a stream of its own and publishes a CUDA event, neither of which graph capture records"
+            )
             assert not (fsdp_cfg.enable_fsdp and fsdp_cfg.transport == "copy_engine"), (
                 "offload_config.graph_weight_offload requires fsdp_config.transport='nccl': a "
                 "copy-engine gather reads its peers' device-resident shards, which offloading frees"
