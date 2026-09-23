@@ -14,6 +14,8 @@
 
 import contextlib
 import re
+import shutil
+import uuid
 from abc import abstractmethod
 from collections.abc import Callable
 from pathlib import Path
@@ -21,11 +23,54 @@ from typing import Any
 
 import torch
 import torch.fx as fx
+from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
 from magi_compiler.magi_depyf.timeline import observe_lifecycle
 from magi_compiler.utils import compilation_counter, compute_hash, magi_logger
 
 from ._cache_data_cls import CacheEntry, CacheHandle
+
+
+@contextlib.contextmanager
+def _nonce_autograd_cache_key_on_keying_failure():
+    """Fall back to a nonce AOTAutograd cache key when a graph cannot be keyed.
+
+    Backport of ``torch._functorch.config.bypass_autograd_cache_key`` (what
+    ``torch._dynamo.aot_compile`` relies on). Our PyTorch version
+    (2.9.0a0+nv25.10) does not include it.
+
+    Root cause: AOTAutograd refuses to key graphs whose call_function targets
+    are outside its allowlist, e.g. the ``prim_redistribute`` / ``prim_to_local``
+    closures Dynamo emits for SimpleFSDP DTensor params (upstream Issue #167349).
+    Without a key nothing is recorded, so ``CompiledArtifact.save()`` fails with
+    ``aot_autograd: []`` and every subgraph is recompiled on the next run.
+
+    A nonce is safe because MagiCompiler finds artifacts by its own cache path,
+    never by this key. uuid4 instead of upstream's ``random.random()``: ranks and
+    runs seeded alike share one cache dir and must not generate the same key.
+    """
+    from torch._functorch._aot_autograd import autograd_cache
+
+    orig_autograd_cache_key = autograd_cache.autograd_cache_key
+    nonce_keys: list[str] = []
+
+    def _key_or_nonce(*args, **kwargs):
+        try:
+            return orig_autograd_cache_key(*args, **kwargs)
+        except Exception as e:
+            nonce_key = "a" + uuid.uuid4().hex
+            nonce_keys.append(nonce_key)
+            magi_logger.info("AOTAutograd cannot key this graph, using nonce key %s: %s", nonce_key, e)
+            return nonce_key, []
+
+    autograd_cache.autograd_cache_key = _key_or_nonce
+    try:
+        yield
+    finally:
+        autograd_cache.autograd_cache_key = orig_autograd_cache_key
+        # Entries under a nonce key can never be looked up again; don't let them pile up in the shared cache dir.
+        for nonce_key in nonce_keys:
+            shutil.rmtree(autograd_cache.AOTAutogradCache._get_tmp_dir_for_key(nonce_key), ignore_errors=True)
 
 
 def _placeholder_names(graph: fx.GraphModule) -> list[str]:
@@ -321,7 +366,12 @@ class InductorStandaloneAdaptor(CompilerInterface):
         stride_ctx, captured_strides = _intercept_inductor_output_strides()
 
         try:
-            with scope_asserts, functorch_config.patch(autograd_cache_allow_custom_autograd_functions=True), stride_ctx:
+            with (
+                scope_asserts,
+                _nonce_autograd_cache_key_on_keying_failure(),
+                functorch_config.patch(autograd_cache_allow_custom_autograd_functions=True),
+                stride_ctx,
+            ):
                 compiled_graph = standalone_compile(
                     graph, example_inputs, dynamic_shapes=dynamic_shapes, options={"config_patches": current_config}
                 )
@@ -346,6 +396,8 @@ class InductorStandaloneAdaptor(CompilerInterface):
         # autograd_cache_allow_custom_autograd_functions=True is required above so that
         # autograd_function_apply (a HigherOrderOperator) does not bypass AOTAutograd cache
         # key computation, which would leave aot_autograd_artifacts empty and cause save() to fail.
+        # _nonce_autograd_cache_key_on_keying_failure() does the same for graphs that still cannot
+        # be keyed, e.g. those with SimpleFSDP DTensor params.
         assert key is not None
         restart_analysis_count = self._restart_analysis_counts.get(key, 0)
         if hasattr(self, "cache_dir") and self.cache_dir is not None:
@@ -365,7 +417,12 @@ class InductorStandaloneAdaptor(CompilerInterface):
         assert isinstance(cache_handle.key, str) and cache_handle.key is not None
         assert isinstance(cache_handle.path, str) and cache_handle.path is not None
 
-        expected_arity = _read_generated_code_expected_arity(cache_handle.path)
+        # AOTAutograd flattens tensor-subclass inputs such as DTensor (PyTorch 2.12 passes two values per DTensor),
+        # so the generated code's arity only matches the graph's when there are none.
+        if any(is_traceable_wrapper_subclass(x) for x in example_inputs):
+            expected_arity = None
+        else:
+            expected_arity = _read_generated_code_expected_arity(cache_handle.path)
         actual_arity = len(example_inputs)
         summarized_inputs = [_summarize_compile_input(x) for x in example_inputs[:8]]
         magi_logger.info(
