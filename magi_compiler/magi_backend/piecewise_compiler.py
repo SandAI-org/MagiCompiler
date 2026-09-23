@@ -23,6 +23,7 @@ from typing import Any
 
 import torch
 import torch.fx as fx
+from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
 from magi_compiler.magi_depyf.timeline import observe_lifecycle
 from magi_compiler.utils import compilation_counter, compute_hash, magi_logger
@@ -416,7 +417,12 @@ class InductorStandaloneAdaptor(CompilerInterface):
         assert isinstance(cache_handle.key, str) and cache_handle.key is not None
         assert isinstance(cache_handle.path, str) and cache_handle.path is not None
 
-        expected_arity = _read_generated_code_expected_arity(cache_handle.path)
+        # AOTAutograd flattens tensor-subclass inputs such as DTensor (PyTorch 2.12 passes two values per DTensor),
+        # so the generated code's arity only matches the graph's when there are none.
+        if any(is_traceable_wrapper_subclass(x) for x in example_inputs):
+            expected_arity = None
+        else:
+            expected_arity = _read_generated_code_expected_arity(cache_handle.path)
         actual_arity = len(example_inputs)
         summarized_inputs = [_summarize_compile_input(x) for x in example_inputs[:8]]
         magi_logger.info(
