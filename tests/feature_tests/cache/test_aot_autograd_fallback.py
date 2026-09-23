@@ -12,105 +12,85 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the eager backward lowering fix in PiecewiseCompiler.
+"""Tests for the eager backward lowering fix (backport of PyTorch PR #185635).
 
-Root cause (PyTorch Issue #152022, fixed in PR #185635 but not in our version):
+Root cause (PyTorch Issue #152022):
 standalone_compile() calls save_cache_artifacts() immediately after compile_fx(),
 but for training graphs AOTAutograd lazily defers backward lowering to the first
-.backward() call.  This means aot_autograd_artifacts is empty when save() runs.
+.backward() call.  This means aot_autograd_artifacts is empty when save() runs,
+causing: ``AssertionError: CacheInfo(..., aot_autograd_artifacts=[], ...)``.
 
-Our fix: _force_eager_backward_lowering() monkey-patches AOTConfig.__post_init__
-to set force_non_lazy_backward_lowering=True, which makes AOTAutograd compile
-the backward eagerly before save_cache_artifacts() runs.
+Our fix: ``_force_eager_backward_lowering()`` context manager in
+``piecewise_compiler.py`` monkey-patches ``AOTConfig.__post_init__`` to set
+``force_non_lazy_backward_lowering=True``.
 
-Test 1: ``test_lazy_backward_causes_empty_aot_artifacts``
-    Reproduces the bug: AOTConfig with force_non_lazy_backward_lowering=False
-    → backward compiled lazily → aot_autograd_artifacts stays empty → save() asserts.
+Tests
+-----
+test_context_manager_patches_and_restores
+    Unit test: verifies the context manager patches __post_init__ correctly
+    and restores it on exit.
 
-Test 2: ``test_eager_backward_populates_aot_artifacts``
-    With _force_eager_backward_lowering(), AOTConfig gets
-    force_non_lazy_backward_lowering=True → backward compiled eagerly →
-    aot_autograd_artifacts is populated.
-
-Test 3: ``test_context_manager_restores_post_init``
-    Verifies _force_eager_backward_lowering() properly restores __post_init__
-    after exiting the context.
+test_eager_backward_artifact_saved_and_reused
+    Integration test (subprocess, requires CUDA): a real training model is
+    compiled through magi_compile with a spy on standalone_compile that
+    records force_non_lazy_backward_lowering at each call.  Verifies:
+    - the flag is True during every standalone_compile call
+    - artifacts are saved without "Failed to save" errors
+    - a second run hits cache (0 recompilations)
 """
 from __future__ import annotations
 
-import dataclasses
-from collections import defaultdict
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
+import torch
+
+from magi_compiler.magi_backend.piecewise_compiler import _force_eager_backward_lowering
 
 
-@dataclasses.dataclass
-class FakeCacheInfo:
-    """Minimal mock of torch.compiler._cache.CacheInfo."""
+class TestContextManagerUnit:
+    """_force_eager_backward_lowering patches AOTConfig.__post_init__ correctly."""
 
-    artifacts: defaultdict = dataclasses.field(default_factory=lambda: defaultdict(list))
+    def test_patches_and_restores(self):
+        from torch._functorch._aot_autograd.schemas import AOTConfig
 
-    @property
-    def aot_autograd_artifacts(self):
-        return self.artifacts["aot_autograd"]
+        orig = AOTConfig.__post_init__
 
+        # Inside: patched
+        with _force_eager_backward_lowering():
+            assert AOTConfig.__post_init__ is not orig
+            config = AOTConfig(
+                fw_compiler=lambda *a, **k: None,
+                bw_compiler=lambda *a, **k: None,
+                partition_fn=lambda *a, **k: None,
+                decompositions={},
+                num_params_buffers=0,
+                aot_id=0,
+                keep_inference_input_mutations=False,
+            )
+            assert config.force_non_lazy_backward_lowering is True
 
-class FakeCompiledGraph:
-    """Minimal mock of standalone_compile result."""
+        # Outside: restored
+        assert AOTConfig.__post_init__ is orig
+        config2 = AOTConfig(
+            fw_compiler=lambda *a, **k: None,
+            bw_compiler=lambda *a, **k: None,
+            partition_fn=lambda *a, **k: None,
+            decompositions={},
+            num_params_buffers=0,
+            aot_id=0,
+            keep_inference_input_mutations=False,
+        )
+        assert config2.force_non_lazy_backward_lowering is False
 
-    def __init__(self, *, aot_autograd_key: str | None = None):
-        ci = FakeCacheInfo()
-        ci.artifacts["inductor"] = ["fake_inductor_key"]
-        if aot_autograd_key:
-            ci.artifacts["aot_autograd"] = [aot_autograd_key]
-        self._artifacts = (b"fake_bytes", ci)
+    def test_default_aotconfig_is_lazy(self):
+        """Without the fix, AOTConfig defaults to lazy backward (the bug condition)."""
+        from torch._functorch._aot_autograd.schemas import AOTConfig
 
-    def save(self, *, path: str, format: str):
-        """Mimic the real save() assert from standalone_compile.py:74."""
-        _, cache_info = self._artifacts
-        assert (
-            len(cache_info.aot_autograd_artifacts) == 1
-        ), f"Expected 1 aot_autograd artifact, got {len(cache_info.aot_autograd_artifacts)}: {cache_info}"
-
-
-def test_lazy_backward_causes_empty_aot_artifacts():
-    """Reproduce: without the fix, AOTConfig.force_non_lazy_backward_lowering=False
-    causes backward to be lazy, leaving aot_autograd_artifacts empty → save() fails.
-
-    This simulates the exact assertion error seen in the H200 monolithic bake:
-    'AssertionError: CacheInfo(..., aot_autograd_artifacts=[], ...)'
-    """
-    from torch._functorch._aot_autograd.schemas import AOTConfig
-
-    # Simulate creating AOTConfig without the fix
-    config = AOTConfig(
-        fw_compiler=lambda *a, **k: None,
-        bw_compiler=lambda *a, **k: None,
-        partition_fn=lambda *a, **k: None,
-        decompositions={},
-        num_params_buffers=0,
-        aot_id=0,
-        keep_inference_input_mutations=False,
-    )
-
-    # Without fix: force_non_lazy_backward_lowering is False
-    assert config.force_non_lazy_backward_lowering is False, "Default should be False (lazy backward)"
-
-    # This causes aot_autograd_artifacts to be empty → save() fails
-    graph = FakeCompiledGraph(aot_autograd_key=None)  # no backward artifact
-    with pytest.raises(AssertionError, match="aot_autograd"):
-        graph.save(path="/tmp/fake", format="unpacked")
-
-
-def test_eager_backward_populates_aot_artifacts():
-    """With _force_eager_backward_lowering(), AOTConfig gets
-    force_non_lazy_backward_lowering=True, enabling eager backward compilation.
-    This means aot_autograd_artifacts will be populated before save() runs."""
-    from torch._functorch._aot_autograd.schemas import AOTConfig
-
-    from magi_compiler.magi_backend.piecewise_compiler import _force_eager_backward_lowering
-
-    with _force_eager_backward_lowering():
         config = AOTConfig(
             fw_compiler=lambda *a, **k: None,
             bw_compiler=lambda *a, **k: None,
@@ -120,39 +100,56 @@ def test_eager_backward_populates_aot_artifacts():
             aot_id=0,
             keep_inference_input_mutations=False,
         )
-
-        # With fix: force_non_lazy_backward_lowering is True
-        assert config.force_non_lazy_backward_lowering is True, "Fix should set force_non_lazy_backward_lowering=True"
-
-    # Simulate what happens when backward IS compiled eagerly:
-    # aot_autograd_artifacts is populated → save() succeeds
-    graph = FakeCompiledGraph(aot_autograd_key="real_backward_key")
-    graph.save(path="/tmp/fake", format="unpacked")  # should NOT raise
+        assert config.force_non_lazy_backward_lowering is False
 
 
-def test_context_manager_restores_post_init():
-    """_force_eager_backward_lowering() must restore __post_init__ on exit."""
-    from torch._functorch._aot_autograd.schemas import AOTConfig
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_eager_backward_artifact_saved_and_reused(tmp_path: Path):
+    """Real training model: backward flag is True → artifact saved → cache reused.
 
-    from magi_compiler.magi_backend.piecewise_compiler import _force_eager_backward_lowering
+    Two-process integration test (same pattern as test_autograd_function_cache_flag):
+      run 1 (warm)  — compile + save, verify flag and artifact count
+      run 2 (cache) — load from cache, verify no recompilation
+    """
+    helper_path = Path(__file__).parent / "cache_reuse_helper" / "eager_backward_helper.py"
+    cache_root = tmp_path / "cache"
+    out1 = tmp_path / "run1.json"
+    out2 = tmp_path / "run2.json"
 
-    orig_post_init = AOTConfig.__post_init__
+    env = os.environ.copy()
+    env["MAGI_LOGGING_LEVEL"] = "info"
+    env["MAGI_COMPILE_CACHE_ROOT_DIR"] = str(cache_root)
 
-    with _force_eager_backward_lowering():
-        # Inside: post_init is patched
-        assert AOTConfig.__post_init__ is not orig_post_init
+    def _run(output: Path) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(helper_path), "--output", str(output)], env=env, capture_output=True, text=True
+        )
 
-    # Outside: post_init is restored
-    assert AOTConfig.__post_init__ is orig_post_init
+    # ── Run 1: warm cache ────────────────────────────────────────────────
+    p1 = _run(out1)
+    assert p1.returncode == 0, f"run 1 failed\nstdout:\n{p1.stdout}\nstderr:\n{p1.stderr}"
 
-    # Verify default behavior is back to lazy
-    config = AOTConfig(
-        fw_compiler=lambda *a, **k: None,
-        bw_compiler=lambda *a, **k: None,
-        partition_fn=lambda *a, **k: None,
-        decompositions={},
-        num_params_buffers=0,
-        aot_id=0,
-        keep_inference_input_mutations=False,
+    assert "Failed to save compiled artifact" not in p1.stderr, (
+        "Artifact save still failing — eager backward lowering not effective.\n" f"stderr:\n{p1.stderr}"
     )
-    assert config.force_non_lazy_backward_lowering is False
+
+    r1 = json.loads(out1.read_text())
+
+    assert r1["num_standalone_compile_calls"] > 0, "Spy never called — standalone_compile not intercepted"
+    assert r1["all_flags_true"], (
+        f"force_non_lazy_backward_lowering was NOT True during standalone_compile; "
+        f"per-call values: {r1['backward_flag_during_compile']}"
+    )
+    assert r1["num_compiled_artifacts_saved"] > 0, f"No artifacts saved on warm run (got {r1['num_compiled_artifacts_saved']})"
+
+    # ── Run 2: cache hit ─────────────────────────────────────────────────
+    p2 = _run(out2)
+    assert p2.returncode == 0, f"run 2 failed\nstdout:\n{p2.stdout}\nstderr:\n{p2.stderr}"
+
+    r2 = json.loads(out2.read_text())
+
+    assert r2["num_inductor_compiles"] == 0, (
+        f"Expected 0 recompiles on cache-hit run, got {r2['num_inductor_compiles']}\n" f"stderr:\n{p2.stderr}"
+    )
+
+    assert abs(r1["loss"] - r2["loss"]) < 1e-2, f"Loss mismatch: run1={r1['loss']}, run2={r2['loss']}"
