@@ -14,12 +14,18 @@
 
 """Helper script for test_aot_autograd_fallback.py.
 
-Runs a real training step (forward + backward) through magi_compile, with a
-spy on standalone_compile that records AOTConfig.force_non_lazy_backward_lowering
-at the moment each subgraph is compiled.
+Supports two modes and an optional --disable-fix flag for bug reproduction.
 
-This proves the _force_eager_backward_lowering() context manager is active
-during the real compile path — not just in isolation.
+Modes
+-----
+infer  — inference (forward only under torch.no_grad), the real deployment scenario.
+train  — training (forward + backward + optimizer), needed to trigger the
+         lazy backward lowering bug (PyTorch Issue #152022).
+
+--disable-fix
+    Replaces ``_force_eager_backward_lowering()`` with a no-op context manager,
+    reproducing the bug condition where ``AOTConfig.force_non_lazy_backward_lowering``
+    remains ``False`` during ``standalone_compile``.
 
 Output JSON payload
 -------------------
@@ -28,11 +34,12 @@ Output JSON payload
 - num_standalone_compile_calls: len(backward_flag_during_compile)
 - num_compiled_artifacts_saved: from compilation_counter
 - num_inductor_compiles: from compilation_counter
-- loss: scalar training loss value
+- output_value: scalar output value (loss for train, sum for infer)
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 from unittest.mock import patch
 
@@ -46,6 +53,18 @@ from magi_compiler.utils import compilation_counter
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
 HIDDEN = 16
+
+
+@magi_compile(dynamic_arg_dims={"x": 0})
+class InferenceModel(nn.Module):
+    """Minimal inference model (forward only)."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(HIDDEN, HIDDEN, dtype=DTYPE, device=DEVICE)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x)
 
 
 @magi_compile(dynamic_arg_dims={"x": 0})
@@ -63,11 +82,20 @@ class TrainingModel(nn.Module):
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True)
+    parser.add_argument("--mode", choices=["train", "infer"], default="infer")
+    parser.add_argument(
+        "--disable-fix", action="store_true", help="Replace _force_eager_backward_lowering with no-op to reproduce bug"
+    )
     args = parser.parse_args()
 
     torch._dynamo.reset()
     torch.manual_seed(2026)
     torch.cuda.manual_seed_all(2026)
+
+    if args.disable_fix:
+        import magi_compiler.magi_backend.piecewise_compiler as _pc_mod
+
+        _pc_mod._force_eager_backward_lowering = contextlib.nullcontext
 
     _real_standalone_compile = _inductor_mod.standalone_compile
     backward_flag_during_compile: list[bool] = []
@@ -75,8 +103,6 @@ def main() -> None:
     def _spy_standalone_compile(graph, example_inputs, **kwargs):
         from torch._functorch._aot_autograd.schemas import AOTConfig
 
-        # Walk the frame stack is fragile; instead, we create a throwaway
-        # AOTConfig to observe whether __post_init__ has been patched.
         probe = AOTConfig(
             fw_compiler=lambda *a, **k: None,
             bw_compiler=lambda *a, **k: None,
@@ -90,14 +116,21 @@ def main() -> None:
         return _real_standalone_compile(graph, example_inputs, **kwargs)
 
     with patch("torch._inductor.standalone_compile", side_effect=_spy_standalone_compile):
-        model = TrainingModel()
-        optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
-        x = torch.randn(4, HIDDEN, device=DEVICE, dtype=DTYPE)
-
-        optimizer.zero_grad()
-        loss = model(x)
-        loss.backward()
-        optimizer.step()
+        if args.mode == "infer":
+            model = InferenceModel()
+            x = torch.randn(4, HIDDEN, device=DEVICE, dtype=DTYPE)
+            with torch.no_grad():
+                output = model(x)
+            output_value = float(output.float().sum().item())
+        else:
+            model = TrainingModel()
+            optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+            x = torch.randn(4, HIDDEN, device=DEVICE, dtype=DTYPE)
+            optimizer.zero_grad()
+            loss = model(x)
+            loss.backward()
+            optimizer.step()
+            output_value = float(loss.float().item())
 
     payload = {
         "backward_flag_during_compile": backward_flag_during_compile,
@@ -105,7 +138,7 @@ def main() -> None:
         "num_standalone_compile_calls": len(backward_flag_during_compile),
         "num_compiled_artifacts_saved": compilation_counter.num_compiled_artifacts_saved,
         "num_inductor_compiles": compilation_counter.num_inductor_compiles,
-        "loss": float(loss.float().item()),
+        "output_value": output_value,
     }
     with open(args.output, "w") as f:
         json.dump(payload, f)
