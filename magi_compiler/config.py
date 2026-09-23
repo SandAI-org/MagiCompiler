@@ -224,20 +224,9 @@ class OffloadConfig(BaseModel):
             "device. Works with SimpleFSDP (transport='nccl') and with unsharded "
             "nn.Parameter models. Mutually exclusive with model_cpu_offload (the runtime-wrapper "
             "path) because the two offload the same bytes through different mechanisms. "
-            "host_first_materialize (the default) is how the weights enter the host pool: a "
-            "meta-built model's to_empty hands back pinned host memory and the checkpoint "
-            "loads into it directly, so they never occupy a device byte."
-        ),
-    )
-    host_first_materialize: bool = Field(
-        True,
-        description=(
-            "Build the offloadable weights of a @magi_compile'd module in pinned host memory rather "
-            "than on the device, by intercepting the to_empty that materializes a meta-built model. "
-            "Applies to SimpleFSDP DTensor shards and to unsharded nn.Parameter weights. This is "
-            "the only way a weight enters the host pool; without it those weights stay on the "
-            "device and graph_weight_offload will not load them. Ignored unless "
-            "graph_weight_offload is on."
+            "When this is on, a meta-built model's to_empty hands back pinned host memory and the "
+            "checkpoint loads into it directly, so the weights enter the host pool without occupying "
+            "a device byte."
         ),
     )
     offload_min_shard_mib: float = Field(
@@ -305,7 +294,7 @@ class OffloadConfig(BaseModel):
         ),
     )
     offload_bus_utilization: float = Field(
-        0.9,
+        1.0,
         gt=0.0,
         le=1.0,
         description=(

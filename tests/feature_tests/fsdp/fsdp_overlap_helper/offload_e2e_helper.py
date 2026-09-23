@@ -154,7 +154,6 @@ def main() -> None:
         cfg.fsdp_config.bucket_size_mib = args.bucket_size_mib
         cfg.fsdp_config.cost_mode = args.cost_mode
         cfg.offload_config.graph_weight_offload = True
-        cfg.offload_config.host_first_materialize = True
         cfg.offload_config.offload_min_shard_mib = args.min_shard_mib
         cfg.offload_config.offload_max_resident_mib = args.max_resident_mib
         cfg.offload_config.offload_max_inflight_mib = args.max_inflight_mib
