@@ -16,8 +16,9 @@ from __future__ import annotations
 
 """Latest-safe-launch FSDP all-gather / compute overlap reorder pass.
 
-Installed as the only ``reorder_for_compute_comm_overlap_passes`` entry (replaces
-``raise_comms``/``sink_waits``); runs on the whole Inductor graph
+Installed in ``reorder_for_compute_comm_overlap_passes`` in place of
+``raise_comms``/``sink_waits``, right after ``SnodeCostProfile``, whose
+``SnodeCostTable`` is this pass's ``cost_fn``; runs on the whole Inductor graph
 (``disable_graph_split=True``).  For each FSDP weight all-gather launch, place it
 at the LATEST position whose downstream compute still hides the collective::
 
@@ -44,6 +45,7 @@ Handles both lowering forms: plain all_gather (1 launch / 1 wait) and coalesced
 """
 
 import bisect
+import copy
 import hashlib
 from collections import defaultdict
 
@@ -54,11 +56,12 @@ from torch._inductor.ir import MultiOutput
 from torch._inductor.scheduler import BaseSchedulerNode
 from torch._inductor.utils import contains_collective, contains_wait, is_collective
 
-from magi_compiler.passes.snode_utils import earliest_legal_index, validate_topological_order
+from magi_compiler.passes.snode_utils import earliest_legal_index, is_compute
+from magi_compiler.passes.snode_utils import is_weight_gather as _is_weight_gather
+from magi_compiler.passes.snode_utils import validate_topological_order
 from magi_compiler.passes.weight_offload.ops import is_h2d_load as _is_h2d_load
 from magi_compiler.utils import magi_logger
 
-_AG = torch.ops._c10d_functional.all_gather_into_tensor.default
 _AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
 
 
@@ -74,7 +77,6 @@ def _ce_ag_ops():
 
 
 _CE_AG_OPS = _ce_ag_ops()
-_WEIGHT_AG_OPS = tuple(op for op in (_AG, _AG_COALESCED, *_CE_AG_OPS) if op is not None)
 
 
 # Default extra headroom (ns) added to each collective's runtime when sizing the
@@ -118,11 +120,6 @@ def _leaf_collective_node(snode: BaseSchedulerNode):
 
 def _issues_transfer(snode: BaseSchedulerNode) -> bool:
     return contains_collective(snode) or _leaf_collective_node(snode) is not None
-
-
-def _is_weight_gather(snode: BaseSchedulerNode) -> bool:
-    node = _leaf_collective_node(snode)
-    return node is not None and getattr(node, "op_overload", None) in _WEIGHT_AG_OPS
 
 
 def _is_multi_output(snode: BaseSchedulerNode) -> bool:
@@ -234,47 +231,38 @@ class FsdpOverlapReorder:
         # run concurrent with the compute that hides them (~1.4-1.5x slower on
         # 8xH100).  See CompileConfig.fsdp_config.comm_overlap_window_scale.
         self.comm_overlap_window_scale = comm_overlap_window_scale
-        # cost_fn: snode -> ns (default: Inductor's estimate_op_runtime hook).
+        # cost_fn: snode -> ns.  Normally the SnodeCostTable filled by the
+        # SnodeCostProfile pass ahead of this one; Inductor's estimate_op_runtime
+        # hook when the pass runs on its own.
         if cost_fn is None:
             from torch._inductor.comms import estimate_op_runtime
 
             cost_fn = estimate_op_runtime
         self._cost_fn = cost_fn
-        # Per-compile cost cache.  Must never survive into a deepcopy: Inductor
-        # deepcopies this pass into the fx-graph cache key, and snode keys hold
-        # FakeTensors whose data_ptr access raises.
-        self._cost_cache: dict[BaseSchedulerNode, float] = {}
 
     def __deepcopy__(self, memo):
-        # Fresh, cache-free instance (see _cost_cache note); cost_fn shared by
-        # reference -- it is itself deepcopy-safe.
+        # Through memo, so this copy and the profile pass's copy share one table.
         new = FsdpOverlapReorder.__new__(FsdpOverlapReorder)
+        memo[id(self)] = new
         new.comm_overlap_window_margin_ns = self.comm_overlap_window_margin_ns
         new.comm_overlap_window_scale = self.comm_overlap_window_scale
         new.move_prep_chain = self.move_prep_chain
-        new._cost_fn = self._cost_fn
-        new._cost_cache = {}
-        memo[id(self)] = new
+        new._cost_fn = copy.deepcopy(self._cost_fn, memo)
         return new
 
     # -- cost -------------------------------------------------------------
     def _cost(self, snode: BaseSchedulerNode) -> float:
-        c = self._cost_cache.get(snode)
-        if c is None:
-            try:
-                c = max(0.0, float(self._cost_fn(snode)))
-            except Exception:  # noqa: BLE001
-                c = 0.0
-            self._cost_cache[snode] = c
-        return c
+        try:
+            return max(0.0, float(self._cost_fn(snode)))
+        except Exception:  # noqa: BLE001
+            return 0.0
 
     @staticmethod
     def _is_compute(snode: BaseSchedulerNode) -> bool:
-        return not _issues_transfer(snode) and not _is_h2d_load(snode) and not contains_wait(snode)
+        return is_compute(snode)
 
     # -- main -------------------------------------------------------------
     def __call__(self, snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
-        self._cost_cache = {}  # fresh per compile; snodes are unique
         order = list(snodes)
         launches = [s for s in order if _is_weight_gather(s)]
         if not launches:
@@ -295,26 +283,10 @@ class FsdpOverlapReorder:
         index_of = {s: i for i, s in enumerate(order)}
 
         skel_idx, skel_kinds = _collective_skeleton(order)
-        mode, sync_group, world = self._negotiate_mode(order, launches, skel_kinds)
+        costs_ok = bool(getattr(self._cost_fn, "ok", True))
+        mode, sync_group, world = self._negotiate_mode(order, launches, skel_kinds, costs_ok)
         if mode == "abort":
             return order
-
-        # profile_sync: warm the estimator table on every node, then re-measure in
-        # rank-lockstep (warm_and_sync) so shared keys get real, max-reduced costs.
-        # On failure, leave the graph unchanged (overlap off, no hang).
-        if hasattr(self._cost_fn, "warm_and_sync") and getattr(self._cost_fn, "_sync_across_ranks", False):
-            try:
-                for s in order:
-                    if self._is_compute(s) or _issues_transfer(s):
-                        self._cost(s)
-                n_changed = self._cost_fn.warm_and_sync()
-                self._cost_cache = {}  # re-read synced costs
-                magi_logger.info(
-                    "FSDP overlap reorder: rank-synchronized profiling done (%d cost entries reconciled)", n_changed
-                )
-            except Exception as exc:  # noqa: BLE001
-                magi_logger.warning("FSDP overlap reorder: synchronized profiling failed (%s); leaving graph unchanged", exc)
-                return order
 
         # ---- two-pointer back-to-front sweep (see module docstring) ----
         launches_in_order = sorted(launches, key=lambda s: index_of[s])  # original program order
@@ -444,40 +416,36 @@ class FsdpOverlapReorder:
                 )
             moved = 0
 
-        measured = getattr(self._cost_fn, "n_measured", None)
-        cache_hits = getattr(self._cost_fn, "n_cache_hits", None)
-        n_distinct = len(getattr(self._cost_fn, "_table", {}) or {})
-        magi_logger.info(
-            "FSDP overlap reorder: repositioned %d/%d weight all-gather launch(es) "
-            "(cost table: %d distinct ops, measured=%s reused=%s)",
-            moved,
-            len(launches),
-            n_distinct,
-            measured,
-            cache_hits,
-        )
-        # Full op->time table at DEBUG.  The guard is load-bearing here: summary()
-        # builds the whole table string eagerly, unlike lazy %-format args.
-        if hasattr(self._cost_fn, "summary"):
-            magi_logger.debug("FSDP overlap %s", self._cost_fn.summary())
+        magi_logger.info("FSDP overlap reorder: repositioned %d/%d weight all-gather launch(es)", moved, len(launches))
         return order
 
     # -- multi-rank agreement ---------------------------------------------
     @staticmethod
-    def _negotiate_mode(order, launches, skel_kinds) -> tuple[str, object, int]:
+    def _negotiate_mode(order, launches, skel_kinds, costs_ok: bool = True) -> tuple[str, object, int]:
         """Rank-identical placement mode: (mode, group, world).
 
         ``identical`` / ``slot``: skeletons match → consensus slots (in-slot index is per-rank).
         ``pinned``: skeletons differ → keep each AG between its neighboring NCCL snodes.
-        ``abort``: weight-AG counts differ → leave the graph unchanged.
+        ``abort``: weight-AG counts differ, or some rank failed to price its graph
+        → leave the graph unchanged.  The pricing verdict travels in the same
+        exchange: a rank that bailed on its own would skip this collective and
+        leave its peers blocked in it.
         """
         from magi_compiler.profiling.runtime_estimator import _get_cost_sync_group
 
         group = _get_cost_sync_group()
         world = dist.get_world_size()
-        mine = ((_graph_fingerprint(order), len(order), len(launches)), tuple(skel_kinds))
+        mine = ((_graph_fingerprint(order), len(order), len(launches)), tuple(skel_kinds), bool(costs_ok))
         peers: list = [None] * world
         dist.all_gather_object(peers, mine, group=group)
+        failed = [rank for rank, p in enumerate(peers) if not p[2]]
+        if failed:
+            magi_logger.warning(
+                "FSDP overlap reorder: snode cost profiling failed on rank(s) %s; leaving the graph "
+                "unchanged on every rank (overlap OFF).",
+                failed,
+            )
+            return "abort", group, world
         if all(p == peers[0] for p in peers[1:]):
             return "identical", group, world
 
