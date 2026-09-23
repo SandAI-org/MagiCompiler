@@ -983,7 +983,6 @@ def _patched(instance, *, min_shard_mib=0.0):
 
     conf = get_compile_config().model_copy(deep=True)
     conf.offload_config.graph_weight_offload = True
-    conf.offload_config.host_first_materialize = True
     conf.offload_config.offload_min_shard_mib = min_shard_mib
     patch_materialize(instance, conf)
     return instance

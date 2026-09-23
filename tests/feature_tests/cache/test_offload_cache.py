@@ -33,6 +33,7 @@ from magi_compiler.passes.weight_offload.cache_slots import (
     slot_identity,
 )
 from magi_compiler.passes.weight_offload.node_meta import mark_host_slot
+from magi_compiler.passes.weight_offload.offload_cache import CacheValidity, OffloadCache
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -100,10 +101,33 @@ def test_collect_and_refresh_read_the_live_pool():
     assert refreshed[slot]["resident"] is True
 
 
+def test_disabled_offload_cache_is_a_noop(tmp_path: Path):
+    cache = OffloadCache(enabled=False)
+    cache.initialize(tmp_path)
+    g = fx.Graph()
+    node = g.placeholder("w")
+    g.output((node,))
+    gm = fx.GraphModule(nn.Module(), g)
+
+    assert cache.bind(gm) is CacheValidity.KEEP
+    assert cache.allows_load()
+    assert cache.allows_store()
+    assert cache.remap is None
+    assert cache.miss_reason() is None
+    cache.save()
+    assert cache.host_slots_path is not None
+    assert not cache.host_slots_path.exists()
+
+
+def _offload_cache(tmp_path: Path) -> OffloadCache:
+    cache = OffloadCache(enabled=True)
+    cache.initialize(tmp_path)
+    return cache
+
+
 def _offload_manager(tmp_path: Path) -> CompilerManager:
     conf = CompileConfig()
     conf.offload_config.graph_weight_offload = True
-    conf.offload_config.host_first_materialize = True
     mgr = CompilerManager(conf)
     mgr.initialize_cache(tmp_path)
     return mgr
@@ -117,63 +141,107 @@ def _tagged_graph(slot: int) -> fx.GraphModule:
     return fx.GraphModule(nn.Module(), g)
 
 
-@requires_cuda
-def test_bind_offload_cache_matches_sidecar_and_replays_resident(tmp_path: Path):
+def _adopt_weight(name: str = "w", shape=(8, 8)):
     from magi_compiler.passes.weight_offload import host_pool
 
-    local = torch.randn(8, 8, device="cuda", dtype=torch.bfloat16)
-    host = host_pool.reserve(tuple(local.shape), local.dtype, name="w")
+    local = torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
+    host = host_pool.reserve(tuple(local.shape), local.dtype, name=name)
     host.copy_(local.detach())
     local.untyped_storage().resize_(0)
-    slot = host_pool.adopt(host, local, name="w")
+    slot = host_pool.adopt(host, local, name=name)
+    return slot, local
 
+
+@requires_cuda
+def test_bind_matches_sidecar_and_replays_resident(tmp_path: Path):
+    from magi_compiler.passes.weight_offload import host_pool
+
+    slot, local = _adopt_weight()
     sidecar = {
         99: {"name": "w", "shape": (8, 8), "dtype": str(local.dtype), "nbytes": host_pool.slot_bytes(slot), "resident": True}
     }
-    mgr = _offload_manager(tmp_path)
-    mgr.host_slots_path.write_text(repr(sidecar))
-    mgr.bind_offload_cache(_tagged_graph(slot))
+    cache = _offload_cache(tmp_path)
+    cache.host_slots_path.write_text(repr(sidecar))
 
-    assert mgr._offload_cache_ready
-    assert mgr._offload_remap == {99: slot}
+    assert cache.bind(_tagged_graph(slot)) is CacheValidity.KEEP
+    assert cache.allows_load()
+    assert not cache.allows_store()
+    assert cache.remap == {99: slot}
+    assert cache.miss_reason() is None
     assert host_pool.is_resident(slot)
 
 
 @requires_cuda
-def test_bind_offload_cache_misses_without_sidecar(tmp_path: Path):
-    from magi_compiler.passes.weight_offload import host_pool
+def test_bind_misses_without_sidecar(tmp_path: Path):
+    slot, _ = _adopt_weight()
+    cache = _offload_cache(tmp_path)
 
-    local = torch.randn(8, 8, device="cuda", dtype=torch.bfloat16)
-    host = host_pool.reserve(tuple(local.shape), local.dtype, name="w")
-    host.copy_(local.detach())
-    local.untyped_storage().resize_(0)
-    slot = host_pool.adopt(host, local, name="w")
-
-    mgr = _offload_manager(tmp_path)
-    mgr.bind_offload_cache(_tagged_graph(slot))
-    assert not mgr._offload_cache_ready
-    assert mgr._offload_remap is None
+    assert cache.bind(_tagged_graph(slot)) is CacheValidity.DROP
+    assert not cache.allows_load()
+    assert cache.allows_store()
+    assert cache.remap is None
+    assert cache.miss_reason() is not None
 
 
 @requires_cuda
-def test_save_to_file_writes_host_slots_sidecar(tmp_path: Path):
-    from magi_compiler.passes.weight_offload import host_pool
+def test_save_writes_host_slots_sidecar(tmp_path: Path):
+    slot, _ = _adopt_weight()
+    cache = _offload_cache(tmp_path)
+    assert cache.bind(_tagged_graph(slot)) is CacheValidity.DROP
+    cache.save()
 
-    local = torch.randn(8, 8, device="cuda", dtype=torch.bfloat16)
-    host = host_pool.reserve(tuple(local.shape), local.dtype, name="w")
-    host.copy_(local.detach())
-    local.untyped_storage().resize_(0)
-    slot = host_pool.adopt(host, local, name="w")
-
-    mgr = _offload_manager(tmp_path)
-    mgr.bind_offload_cache(_tagged_graph(slot))
-    assert not mgr._offload_cache_ready
-    mgr.save_to_file()
-
-    raw = ast.literal_eval(mgr.host_slots_path.read_text())
+    raw = ast.literal_eval(cache.host_slots_path.read_text())
     assert raw[slot]["name"] == "w"
     assert tuple(raw[slot]["shape"]) == (8, 8)
     assert raw[slot]["resident"] is False
+
+
+@requires_cuda
+def test_replay_does_not_rewrite_sidecar(tmp_path: Path):
+    from magi_compiler.passes.weight_offload import host_pool
+
+    slot, local = _adopt_weight()
+    sidecar = {
+        3: {"name": "w", "shape": (8, 8), "dtype": str(local.dtype), "nbytes": host_pool.slot_bytes(slot), "resident": False}
+    }
+    cache = _offload_cache(tmp_path)
+    cache.host_slots_path.write_text(repr(sidecar))
+    assert cache.bind(_tagged_graph(slot)) is CacheValidity.KEEP
+    cache.save()
+    assert ast.literal_eval(cache.host_slots_path.read_text()) == sidecar
+
+
+@requires_cuda
+def test_bind_miss_drops_compile_indices(tmp_path: Path):
+    from magi_compiler.magi_backend._cache_data_cls import CacheEntry, CacheHandle
+
+    slot, _ = _adopt_weight()
+    mgr = _offload_manager(tmp_path)
+    mgr.cache[CacheEntry(None, 0, "inductor_standalone")] = CacheHandle("k", str(tmp_path), 0)
+    mgr.bind_offload_cache(_tagged_graph(slot))
+
+    assert mgr.cache == {}
+    assert not mgr.offload_cache.allows_load()
+    assert mgr.offload_cache.remap is None
+
+
+@requires_cuda
+def test_bind_hit_keeps_compile_indices(tmp_path: Path):
+    from magi_compiler.magi_backend._cache_data_cls import CacheEntry, CacheHandle
+    from magi_compiler.passes.weight_offload import host_pool
+
+    slot, local = _adopt_weight()
+    sidecar = {
+        3: {"name": "w", "shape": (8, 8), "dtype": str(local.dtype), "nbytes": host_pool.slot_bytes(slot), "resident": False}
+    }
+    mgr = _offload_manager(tmp_path)
+    entry = CacheEntry(None, 0, "inductor_standalone")
+    mgr.cache[entry] = CacheHandle("k", str(tmp_path), 0)
+    mgr.offload_cache.host_slots_path.write_text(repr(sidecar))
+    mgr.bind_offload_cache(_tagged_graph(slot))
+
+    assert entry in mgr.cache
+    assert mgr.offload_cache.allows_load()
 
 
 @requires_cuda
@@ -181,25 +249,68 @@ def test_replay_does_not_store_a_mixed_slot_artifact(tmp_path: Path):
     from magi_compiler.magi_backend._cache_data_cls import CacheEntry, CacheHandle
     from magi_compiler.passes.weight_offload import host_pool
 
-    local = torch.randn(8, 8, device="cuda", dtype=torch.bfloat16)
-    host = host_pool.reserve(tuple(local.shape), local.dtype, name="w")
-    host.copy_(local.detach())
-    local.untyped_storage().resize_(0)
-    slot = host_pool.adopt(host, local, name="w")
-
+    slot, local = _adopt_weight()
     sidecar = {
         3: {"name": "w", "shape": (8, 8), "dtype": str(local.dtype), "nbytes": host_pool.slot_bytes(slot), "resident": False}
     }
     mgr = _offload_manager(tmp_path)
-    mgr.host_slots_path.write_text(repr(sidecar))
+    mgr.offload_cache.host_slots_path.write_text(repr(sidecar))
     mgr.bind_offload_cache(_tagged_graph(slot))
-    assert mgr._offload_remap == {3: slot}
+    assert mgr.offload_cache.remap == {3: slot}
+    assert not mgr.offload_cache.allows_store()
 
     stored = mgr._maybe_store_cache_entry(
         CacheEntry(None, 0, "inductor_standalone"), CacheHandle("k", str(tmp_path), 0), None, "k"
     )
     assert stored is False
     assert mgr.cache == {}
+
+
+@requires_cuda
+def test_wrap_loaded_applies_slot_remap(tmp_path: Path):
+    from magi_compiler.passes.weight_offload import host_pool
+
+    slot, local = _adopt_weight()
+    sidecar = {
+        99: {"name": "w", "shape": (8, 8), "dtype": str(local.dtype), "nbytes": host_pool.slot_bytes(slot), "resident": False}
+    }
+    cache = _offload_cache(tmp_path)
+    cache.host_slots_path.write_text(repr(sidecar))
+    cache.bind(_tagged_graph(slot))
+
+    seen: list[int] = []
+
+    def compiled():
+        seen.append(host_pool.resolve_slot(99))
+        return "ok"
+
+    assert cache.wrap_loaded(compiled)() == "ok"
+    assert seen == [slot]
+
+
+@requires_cuda
+def test_save_to_file_writes_host_slots_sidecar(tmp_path: Path):
+    slot, _ = _adopt_weight()
+    mgr = _offload_manager(tmp_path)
+    mgr.bind_offload_cache(_tagged_graph(slot))
+    mgr.save_to_file()
+
+    raw = ast.literal_eval(mgr.offload_cache.host_slots_path.read_text())
+    assert raw[slot]["name"] == "w"
+    assert tuple(raw[slot]["shape"]) == (8, 8)
+    assert raw[slot]["resident"] is False
+
+
+@requires_cuda
+def test_bind_miss_raises_when_assert_cache_hit(tmp_path: Path):
+    slot, _ = _adopt_weight()
+    conf = CompileConfig()
+    conf.offload_config.graph_weight_offload = True
+    conf.assert_cache_hit = True
+    mgr = CompilerManager(conf)
+    mgr.initialize_cache(tmp_path)
+    with pytest.raises(RuntimeError, match="host_slots sidecar"):
+        mgr.bind_offload_cache(_tagged_graph(slot))
 
 
 @requires_cuda

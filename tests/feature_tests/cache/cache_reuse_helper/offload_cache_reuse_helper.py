@@ -33,7 +33,6 @@ class TinyOffloadNet(nn.Module):
 
 def _patch_offload(cfg):
     cfg.offload_config.graph_weight_offload = True
-    cfg.offload_config.host_first_materialize = True
     cfg.offload_config.offload_min_shard_mib = 0.0
     cfg.cudagraph_mode = CudaGraphMode.NONE
     return cfg
