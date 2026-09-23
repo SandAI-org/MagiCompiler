@@ -50,6 +50,7 @@ import pytest
 import torch
 
 from magi_compiler.magi_backend.piecewise_compiler import _force_eager_backward_lowering
+from magi_compiler.utils.envs import IS_PT_212
 
 
 class TestContextManagerUnit:
@@ -104,6 +105,7 @@ class TestContextManagerUnit:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(IS_PT_212, reason="PT 2.12 includes upstream fix; cache ABI differs")
 def test_eager_backward_artifact_saved_and_reused(tmp_path: Path):
     """Real training model: backward flag is True → artifact saved → cache reused.
 
