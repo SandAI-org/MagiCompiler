@@ -34,7 +34,25 @@ from magi_compiler.config import CompileConfig, CompileMode, CudaGraphMode, indu
 from magi_compiler.magi_depyf.timeline import observe_lifecycle, observe_lifecycle_context
 from magi_compiler.offload.offload_warpper import OffloadWrapper
 from magi_compiler.passes import CustomJointGraphPartitionFn, FullGraphPassManager, PostGradPassManager, pass_context
+from magi_compiler.passes.fsdp_overlap import (
+    FsdpOverlapReorder,
+    bind_weights_for_copy_engine,
+    bucket_weight_all_gather,
+    is_ce_bound,
+    lower_prim_redistribute_to_collectives,
+    rewrite_weight_ag_to_copy_engine,
+)
+from magi_compiler.passes.weight_offload import (
+    FsdpShardSource,
+    H2dLoadReorder,
+    PlainParamSource,
+    bind_weights_to_host,
+    host_pool,
+    insert_h2d_loads,
+    is_host_offloaded,
+)
 from magi_compiler.passes.weight_offload.offload_cache import CacheValidity, OffloadCache
+from magi_compiler.profiling import ProfilingRuntimeEstimator
 from magi_compiler.utils import compilation_counter, compute_code_hash, compute_hash, magi_logger
 from magi_compiler.utils.visualize import save_fx_graph_visualization
 
@@ -679,31 +697,18 @@ class MagiBackend:
             ", ".join(restored[:8]) + (f", +{len(restored) - 8} more" if len(restored) > 8 else ""),
         )
 
-    def _h2d_load_reorder(self):
-        """The load placement pass, configured from the offload settings."""
-        from magi_compiler.passes.weight_offload import H2dLoadReorder, host_pool
-
-        offload_cfg = self.compile_config.offload_config
-        return H2dLoadReorder(
-            bandwidth_bytes_per_ns=host_pool.h2d_bandwidth_bytes_per_ns(offload_cfg.offload_h2d_bandwidth_gbps),
-            window_margin_ns=offload_cfg.h2d_overlap_window_margin_ns,
-            window_scale=offload_cfg.h2d_overlap_window_scale,
-            max_resident_bytes=int(offload_cfg.offload_max_resident_mib) * 1024 * 1024,
-            max_inflight_bytes=int(offload_cfg.offload_max_inflight_mib) * 1024 * 1024,
-            max_device_weight_bytes=int(offload_cfg.offload_max_device_weight_mib) * 1024 * 1024,
-            bus_utilization=float(offload_cfg.offload_bus_utilization),
-        )
-
-    def _check_weight_pipeline_config(self) -> None:
-        """Preconditions of the FSDP / host-offload rewrite, per feature."""
+    @observe_lifecycle("weight_pipeline")
+    def _apply_weight_pipeline(self, graph: fx.GraphModule, example_inputs) -> None:
         fsdp_cfg = self.compile_config.fsdp_config
-        if fsdp_cfg.enable_fsdp:
+        offload_cfg = self.compile_config.offload_config
+        enable_fsdp = fsdp_cfg.enable_fsdp
+        copy_engine = enable_fsdp and fsdp_cfg.transport == "copy_engine"
+        if enable_fsdp:
             assert self.compile_config.disable_graph_split, "fsdp_config.enable_fsdp requires disable_graph_split=True"
             assert (
                 self.compile_config.cudagraph_mode == CudaGraphMode.NONE
             ), "fsdp_config.enable_fsdp requires cudagraph_mode=NONE"
-        if self.compile_config.offload_config.graph_weight_offload:
-            offload_cfg = self.compile_config.offload_config
+        if offload_cfg.graph_weight_offload:
             assert not offload_cfg.model_cpu_offload, (
                 "offload_config.graph_weight_offload and offload_config.model_cpu_offload both offload "
                 "the model's weights, through a compile-time graph rewrite and a runtime wrapper "
@@ -713,60 +718,10 @@ class MagiBackend:
                 "offload_config.graph_weight_offload requires cudagraph_mode=NONE: magi::h2d_load runs "
                 "on a stream of its own and publishes a CUDA event, neither of which graph capture records"
             )
-            assert not (fsdp_cfg.enable_fsdp and fsdp_cfg.transport == "copy_engine"), (
+            assert not (enable_fsdp and fsdp_cfg.transport == "copy_engine"), (
                 "offload_config.graph_weight_offload requires fsdp_config.transport='nccl': a "
                 "copy-engine gather reads its peers' device-resident shards, which offloading frees"
             )
-
-    @observe_lifecycle("weight_pipeline")
-    def _apply_weight_pipeline(self, graph: fx.GraphModule, example_inputs) -> None:
-        """FSDP lowering / bucketing and host offload, as one ordered rewrite.
-
-        The two features rewrite the same weights, so they are one sequence
-        rather than two alternatives::
-
-            lower -> bind -> bucket -> insert loads -> retarget
-
-        and the order within it is forced.  ``bind`` has to see the
-        one-gather-per-weight form the lowering leaves behind, and bucketing
-        splits offloaded gathers from resident ones on the tag ``bind`` sets, so
-        binding sits between the two; the loads go in last so a bucket's members
-        share one submission and one wait rather than one apiece.
-
-        Which weights binding and splicing act on is the ``WeightSource``'s
-        business -- shards under FSDP, whole parameters without it -- which is
-        why there is one ``bind`` and one ``insert`` here and not one per
-        feature.  Steps a feature does not ask for simply drop out: no FSDP, no
-        redistribute to lower and no gather to bucket; no offload, nothing to
-        bind or load.
-
-        Runs on the whole graph, before the split.  ``disable_graph_split`` is
-        required under FSDP and merely worth having for offload alone: the
-        scheduler sees one submod at a time, so a load can only be hoisted
-        within the submod that consumes it.
-        """
-        fsdp_cfg = self.compile_config.fsdp_config
-        offload_cfg = self.compile_config.offload_config
-        enable_fsdp = fsdp_cfg.enable_fsdp
-        copy_engine = enable_fsdp and fsdp_cfg.transport == "copy_engine"
-        if not (enable_fsdp or offload_cfg.graph_weight_offload):
-            return
-        self._check_weight_pipeline_config()
-
-        from magi_compiler.passes.fsdp_overlap import (
-            bind_weights_for_copy_engine,
-            bucket_weight_all_gather,
-            is_ce_bound,
-            lower_prim_redistribute_to_collectives,
-            rewrite_weight_ag_to_copy_engine,
-        )
-        from magi_compiler.passes.weight_offload import (
-            FsdpShardSource,
-            PlainParamSource,
-            bind_weights_to_host,
-            insert_h2d_loads,
-            is_host_offloaded,
-        )
 
         source = (
             FsdpShardSource()
@@ -790,9 +745,6 @@ class MagiBackend:
             )
 
         if enable_fsdp:
-            # Bound and unbound gathers bucket apart rather than the unbound ones
-            # dropping out of bucketing: losing the copy engine, or staying
-            # resident, must not also lose coalescing.
             n_buckets = bucket_weight_all_gather(
                 graph,
                 fsdp_cfg.bucket_mode,
@@ -815,6 +767,13 @@ class MagiBackend:
 
         self._configure_overlap_passes(loads_inserted=bool(bound))
 
+        if offload_cfg.graph_weight_offload:
+            # Before the interpreter, which runs the graph on the example inputs
+            # to drive per-submodule compilation -- a parked weight with no load
+            # would be read there, not at the first real forward.
+            self._reclaim_unloaded_weights()
+            self.compiler_manager.bind_offload_cache(graph)
+
     def _configure_overlap_passes(self, *, loads_inserted: bool) -> None:
         """Install the Inductor scheduler passes the rewrite above needs.
 
@@ -833,9 +792,6 @@ class MagiBackend:
 
         cost_fn = None
         if fsdp_cfg.enable_fsdp:
-            from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder
-            from magi_compiler.profiling import ProfilingRuntimeEstimator
-
             if fsdp_cfg.cost_mode == "analytical":
                 self._fsdp_overlap_estimator = None  # reorder pass defaults to Inductor's analytical estimate
             else:  # "profile_sync" -- the default for BOTH single- and multi-rank
@@ -858,15 +814,17 @@ class MagiBackend:
                 passes = ["raise_comms", "sink_waits"]
 
         if loads_inserted:
-            # Under FSDP the pass above moves the load, its wait and the gather as
-            # one block, which leaves the transfer fully exposed in front of the
-            # gather; this second sweep is what opens a compute window in between.
-            # Separate passes because the two lanes are separate hardware: the same
-            # compute may hide a PCIe load and an NVLink gather at once, so neither
-            # sweep may spend the other's budget.
-            reorder_loads = self._h2d_load_reorder()
-            if cost_fn is not None:
-                reorder_loads._cost_fn = cost_fn
+            offload_cfg = self.compile_config.offload_config
+            reorder_loads = H2dLoadReorder(
+                bandwidth_bytes_per_ns=host_pool.h2d_bandwidth_bytes_per_ns(offload_cfg.offload_h2d_bandwidth_gbps),
+                window_margin_ns=offload_cfg.h2d_overlap_window_margin_ns,
+                window_scale=offload_cfg.h2d_overlap_window_scale,
+                max_resident_bytes=int(offload_cfg.offload_max_resident_mib) * 1024 * 1024,
+                max_inflight_bytes=int(offload_cfg.offload_max_inflight_mib) * 1024 * 1024,
+                max_device_weight_bytes=int(offload_cfg.offload_max_device_weight_mib) * 1024 * 1024,
+                bus_utilization=float(offload_cfg.offload_bus_utilization),
+                cost_fn=cost_fn,
+            )
             passes.append(reorder_loads)
 
         self.inductor_compile_config["reorder_for_compute_comm_overlap"] = True
@@ -953,13 +911,6 @@ class MagiBackend:
         self._apply_weight_pipeline(graph, example_inputs)
 
         split_gm, piecewise_graphs = self._split_graph(graph, example_inputs)
-
-        # Before the interpreter below, which runs the graph on the example
-        # inputs to drive per-submodule compilation -- a parked weight with no
-        # load would be read there, not at the first real forward.
-        if self.compile_config.offload_config.graph_weight_offload:
-            self._reclaim_unloaded_weights()
-            self.compiler_manager.bind_offload_cache(split_gm)
 
         submod_names_to_compile = [item.submod_name for item in piecewise_graphs if not item.is_splitting_graph]
         compilation_counter.num_piecewise_graphs_seen += len(piecewise_graphs)
