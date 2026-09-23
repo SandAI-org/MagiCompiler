@@ -99,7 +99,11 @@ class _Snode:
 def stub_wait_predicate(monkeypatch):
     """Inductor decides ``contains_wait`` by isinstance against ``ir._WaitKernel``,
     which a synthetic node cannot be."""
-    monkeypatch.setattr(h2d_reorder, "contains_wait", lambda s: getattr(s, "kind", None) == "wait")
+    from magi_compiler.passes import snode_utils
+
+    is_wait = lambda s: getattr(s, "kind", None) == "wait"  # noqa: E731
+    monkeypatch.setattr(h2d_reorder, "contains_wait", is_wait)
+    monkeypatch.setattr(snode_utils, "contains_wait", is_wait)
 
 
 def _compute(name, cost_ns, deps=()):

@@ -104,16 +104,18 @@ def _mode_ladder_selfcheck(rank: int) -> bool:
     negotiate = FsdpOverlapReorder._negotiate_mode
     odd = rank == 1
     ag, other = (True, "ag", (8, 8)), (False, "cp", (4,))
-    cases = {
-        # (n_snodes, weight-AG count, skeleton kinds) -> expected mode
-        "identical": (4, 2, [ag, other, ag]),
-        "slot": (5 if odd else 4, 2, [ag, other, ag]),  # graphs differ, skeleton does not
-        "pinned": (5 if odd else 4, 2, [ag, other, ag] if odd else [ag, ag, other]),
-        "abort": (5 if odd else 4, 3 if odd else 2, [ag, other, ag]),
-    }
+    cases = [
+        # (expected mode, n_snodes, weight-AG count, skeleton kinds, costs_ok)
+        ("identical", 4, 2, [ag, other, ag], True),
+        ("slot", 5 if odd else 4, 2, [ag, other, ag], True),  # graphs differ, skeleton does not
+        ("pinned", 5 if odd else 4, 2, [ag, other, ag] if odd else [ag, ag, other], True),
+        ("abort", 5 if odd else 4, 3 if odd else 2, [ag, other, ag], True),
+        # identical graphs, but rank 1 failed to price its graph: every rank aborts
+        ("abort", 4, 2, [ag, other, ag], not odd),
+    ]
     ok = True
-    for expected, (n_snodes, n_ag, kinds) in cases.items():
-        got = negotiate([_FakeSnode() for _ in range(n_snodes)], [None] * n_ag, kinds)[0]
+    for expected, n_snodes, n_ag, kinds, costs_ok in cases:
+        got = negotiate([_FakeSnode() for _ in range(n_snodes)], [None] * n_ag, kinds, costs_ok)[0]
         ok = ok and got == expected
         print(f"REORDER_MODE_CASE rank={rank} expected={expected} got={got}", flush=True)
     return ok
