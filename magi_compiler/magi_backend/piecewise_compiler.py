@@ -14,6 +14,8 @@
 
 import contextlib
 import re
+import shutil
+import uuid
 from abc import abstractmethod
 from collections.abc import Callable
 from pathlib import Path
@@ -29,34 +31,45 @@ from ._cache_data_cls import CacheEntry, CacheHandle
 
 
 @contextlib.contextmanager
-def _force_eager_backward_lowering():
-    """Force AOTAutograd to eagerly compile backward during standalone_compile.
+def _nonce_autograd_cache_key_on_keying_failure():
+    """Fall back to a nonce AOTAutograd cache key when a graph cannot be keyed.
 
-    Backport of PyTorch PR #185635 fix for upstream Issue #152022.
-    Our PyTorch version (2.9.0a0+nv25.10) does not include this fix.
+    Backport of ``torch._functorch.config.bypass_autograd_cache_key`` (what
+    ``torch._dynamo.aot_compile`` relies on). Our PyTorch version
+    (2.9.0a0+nv25.10) does not include it.
 
-    Root cause: standalone_compile calls save_cache_artifacts() immediately after
-    compile_fx returns. For training graphs, AOTAutograd normally lowers the
-    backward lazily on first backward() call. This means aot_autograd_artifacts
-    is empty when save() runs, causing an assertion failure.
+    Root cause: AOTAutograd refuses to key graphs whose call_function targets
+    are outside its allowlist, e.g. the ``prim_redistribute`` / ``prim_to_local``
+    closures Dynamo emits for SimpleFSDP DTensor params (upstream Issue #167349).
+    Without a key nothing is recorded, so ``CompiledArtifact.save()`` fails with
+    ``aot_autograd: []`` and every subgraph is recompiled on the next run.
 
-    Fix: Temporarily patch AOTConfig.__post_init__ to force
-    force_non_lazy_backward_lowering=True, which makes AOTAutograd compile and
-    record the backward before save_cache_artifacts() runs.
+    A nonce is safe because MagiCompiler finds artifacts by its own cache path,
+    never by this key. uuid4 instead of upstream's ``random.random()``: ranks and
+    runs seeded alike share one cache dir and must not generate the same key.
     """
-    from torch._functorch._aot_autograd.schemas import AOTConfig
+    from torch._functorch._aot_autograd import autograd_cache
 
-    orig_post_init = AOTConfig.__post_init__
+    orig_autograd_cache_key = autograd_cache.autograd_cache_key
+    nonce_keys: list[str] = []
 
-    def _forced_post_init(self):
-        orig_post_init(self)
-        self.force_non_lazy_backward_lowering = True
+    def _key_or_nonce(*args, **kwargs):
+        try:
+            return orig_autograd_cache_key(*args, **kwargs)
+        except Exception as e:
+            nonce_key = "a" + uuid.uuid4().hex
+            nonce_keys.append(nonce_key)
+            magi_logger.info("AOTAutograd cannot key this graph, using nonce key %s: %s", nonce_key, e)
+            return nonce_key, []
 
-    AOTConfig.__post_init__ = _forced_post_init
+    autograd_cache.autograd_cache_key = _key_or_nonce
     try:
         yield
     finally:
-        AOTConfig.__post_init__ = orig_post_init
+        autograd_cache.autograd_cache_key = orig_autograd_cache_key
+        # Entries under a nonce key can never be looked up again; don't let them pile up in the shared cache dir.
+        for nonce_key in nonce_keys:
+            shutil.rmtree(autograd_cache.AOTAutogradCache._get_tmp_dir_for_key(nonce_key), ignore_errors=True)
 
 
 def _placeholder_names(graph: fx.GraphModule) -> list[str]:
@@ -352,9 +365,12 @@ class InductorStandaloneAdaptor(CompilerInterface):
         stride_ctx, captured_strides = _intercept_inductor_output_strides()
 
         try:
-            with scope_asserts, _force_eager_backward_lowering(), functorch_config.patch(
-                autograd_cache_allow_custom_autograd_functions=True
-            ), stride_ctx:
+            with (
+                scope_asserts,
+                _nonce_autograd_cache_key_on_keying_failure(),
+                functorch_config.patch(autograd_cache_allow_custom_autograd_functions=True),
+                stride_ctx,
+            ):
                 compiled_graph = standalone_compile(
                     graph, example_inputs, dynamic_shapes=dynamic_shapes, options={"config_patches": current_config}
                 )
@@ -376,12 +392,11 @@ class InductorStandaloneAdaptor(CompilerInterface):
         self._last_output_strides = captured_strides if captured_strides else None
 
         # Step3: Save the compiled artifact
-        # Two context managers are required above for correct cache saving:
-        # 1. _force_eager_backward_lowering(): backport of PyTorch PR #185635 — forces
-        #    AOTAutograd to eagerly compile backward, so aot_autograd_artifacts is populated
-        #    before save_cache_artifacts() runs inside standalone_compile.
-        # 2. autograd_cache_allow_custom_autograd_functions=True: prevents autograd_function_apply
-        #    (a HigherOrderOperator) from bypassing AOTAutograd cache key computation.
+        # autograd_cache_allow_custom_autograd_functions=True is required above so that
+        # autograd_function_apply (a HigherOrderOperator) does not bypass AOTAutograd cache
+        # key computation, which would leave aot_autograd_artifacts empty and cause save() to fail.
+        # _nonce_autograd_cache_key_on_keying_failure() does the same for graphs that still cannot
+        # be keyed, e.g. those with SimpleFSDP DTensor params.
         assert key is not None
         restart_analysis_count = self._restart_analysis_counts.get(key, 0)
         if hasattr(self, "cache_dir") and self.cache_dir is not None:
