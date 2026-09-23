@@ -22,10 +22,11 @@ happen.
 
 from __future__ import annotations
 
+import torch
 from torch._inductor.comms import _is_fake_dep
 from torch._inductor.ir import MultiOutput
 from torch._inductor.scheduler import BaseSchedulerNode
-from torch._inductor.utils import contains_collective, is_collective
+from torch._inductor.utils import contains_collective, contains_wait, is_collective
 
 from magi_compiler.utils import magi_logger
 
@@ -67,6 +68,31 @@ def leaf_collective_node(snode: BaseSchedulerNode):
 def issues_transfer(snode: BaseSchedulerNode) -> bool:
     """True if this snode moves bytes between devices rather than computing."""
     return contains_collective(snode) or leaf_collective_node(snode) is not None
+
+
+_NCCL_WEIGHT_AG_OPS = (
+    torch.ops._c10d_functional.all_gather_into_tensor.default,
+    torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default,
+)
+
+
+def is_weight_gather(snode: BaseSchedulerNode) -> bool:
+    """An FSDP weight all-gather launch, over NCCL or the copy engine."""
+    node = leaf_collective_node(snode)
+    op = getattr(node, "op_overload", None) if node is not None else None
+    return op is not None and (op in _NCCL_WEIGHT_AG_OPS or op in ce_ag_ops())
+
+
+def is_compute(snode: BaseSchedulerNode) -> bool:
+    """True if this snode's runtime is compute a transfer can hide behind.
+
+    A weight load is excluded along with the collectives: counting a PCIe
+    transfer as compute would spend the same microseconds hiding two transfers.
+    """
+    # Imported per call: weight_offload's package init imports this module.
+    from .weight_offload.ops import is_h2d_load
+
+    return not issues_transfer(snode) and not is_h2d_load(snode) and not contains_wait(snode)
 
 
 def is_multi_output(snode: BaseSchedulerNode) -> bool:

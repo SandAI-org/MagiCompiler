@@ -42,6 +42,7 @@ from magi_compiler.passes.fsdp_overlap import (
     lower_prim_redistribute_to_collectives,
     rewrite_weight_ag_to_copy_engine,
 )
+from magi_compiler.passes.snode_cost import SnodeCostProfile, SnodeCostTable
 from magi_compiler.passes.weight_offload import (
     FsdpShardSource,
     H2dLoadReorder,
@@ -777,6 +778,10 @@ class MagiBackend:
     def _configure_overlap_passes(self, *, loads_inserted: bool) -> None:
         """Install the Inductor scheduler passes the rewrite above needs.
 
+        The chain opens with ``SnodeCostProfile``, which prices the graph once
+        (rank-synchronized, unless ``fsdp_config.cost_mode`` is 'analytical')
+        into the ``SnodeCostTable`` every pass after it reads.
+
         FSDP REPLACES PyTorch's builtin raise_comms/sink_waits with the
         latest-safe-launch reorder, which hoists each all-gather launch just far
         enough upstream for compute to hide it; offload on its own APPENDS to
@@ -790,28 +795,24 @@ class MagiBackend:
             # Offload was asked for but bound nothing: leave the schedule alone.
             return
 
-        cost_fn = None
-        if fsdp_cfg.enable_fsdp:
-            if fsdp_cfg.cost_mode == "analytical":
-                self._fsdp_overlap_estimator = None  # reorder pass defaults to Inductor's analytical estimate
-            else:  # "profile_sync" -- the default for BOTH single- and multi-rank
-                self._fsdp_overlap_estimator = ProfilingRuntimeEstimator()
-                self._fsdp_overlap_estimator._sync_across_ranks = True
-                cost_fn = self._fsdp_overlap_estimator
+        costs = SnodeCostTable()
+        estimator = None if fsdp_cfg.cost_mode == "analytical" else ProfilingRuntimeEstimator(sync_across_ranks=True)
+        passes: list = [SnodeCostProfile(costs, estimator)]
 
-            passes = [
+        if fsdp_cfg.enable_fsdp:
+            passes.append(
                 FsdpOverlapReorder(
                     comm_overlap_window_margin_ns=fsdp_cfg.comm_overlap_window_margin_ns,
-                    cost_fn=cost_fn,
+                    cost_fn=costs,
                     comm_overlap_window_scale=fsdp_cfg.comm_overlap_window_scale,
                     move_prep_chain=loads_inserted,
                 )
-            ]
+            )
         else:
-            passes = list(self.inductor_compile_config.get("reorder_for_compute_comm_overlap_passes", []))
-            if not passes:
-                # Inductor's own defaults, which we are adding to rather than replacing.
-                passes = ["raise_comms", "sink_waits"]
+            # Inductor's own defaults, which we are adding to rather than replacing.
+            passes.extend(
+                self.inductor_compile_config.get("reorder_for_compute_comm_overlap_passes") or ["raise_comms", "sink_waits"]
+            )
 
         if loads_inserted:
             offload_cfg = self.compile_config.offload_config
@@ -823,7 +824,7 @@ class MagiBackend:
                 max_inflight_bytes=int(offload_cfg.offload_max_inflight_mib) * 1024 * 1024,
                 max_device_weight_bytes=int(offload_cfg.offload_max_device_weight_mib) * 1024 * 1024,
                 bus_utilization=float(offload_cfg.offload_bus_utilization),
-                cost_fn=cost_fn,
+                cost_fn=costs,
             )
             passes.append(reorder_loads)
 

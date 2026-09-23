@@ -19,7 +19,9 @@ from __future__ import annotations
 Installed AFTER ``FsdpOverlapReorder`` in
 ``reorder_for_compute_comm_overlap_passes``; Inductor chains the passes
 (``order = p(order)``), so this one sees the all-gather placement the first pass
-settled on.
+settled on.  Compute is priced by the ``SnodeCostTable`` that ``SnodeCostProfile``
+filled at the head of the chain; a load's own transfer is priced here, from its
+bytes and the configured bandwidth.
 
 Phase 1 moves ``h2d_load``, its wait and the all-gather as one block, which is
 correct but leaves the load fully exposed: the wait sits directly in front of the
@@ -104,6 +106,7 @@ weight is chosen, so the fill takes the big buckets: they dominate the in-flight
 peak and the allocator churn that goes with it.
 """
 
+import copy
 from bisect import bisect_right, insort
 from collections import defaultdict
 from dataclasses import dataclass
@@ -122,7 +125,7 @@ def magi_logger_enabled_for_debug() -> bool:
     return logging.getLogger("magi_compiler").isEnabledFor(logging.DEBUG)
 
 
-from ..snode_utils import earliest_legal_index, is_multi_output, issues_transfer, validate_topological_order
+from ..snode_utils import earliest_legal_index, is_compute, is_multi_output, validate_topological_order
 from .ops import H2D_OPS, is_h2d_load, slots_of
 
 _DEFAULT_WINDOW_MARGIN_NS = 5_000.0
@@ -239,10 +242,11 @@ class H2dLoadReorder:
 
             cost_fn = estimate_op_runtime
         self._cost_fn = cost_fn
-        self._cost_cache: dict[BaseSchedulerNode, float] = {}
 
     def __deepcopy__(self, memo):
+        # Through memo, so this copy and the profile pass's copy share one table.
         new = H2dLoadReorder.__new__(H2dLoadReorder)
+        memo[id(self)] = new
         new.bandwidth_bytes_per_ns = self.bandwidth_bytes_per_ns
         new.window_margin_ns = self.window_margin_ns
         new.window_scale = self.window_scale
@@ -250,30 +254,19 @@ class H2dLoadReorder:
         new.max_inflight_bytes = self.max_inflight_bytes
         new.max_device_weight_bytes = self.max_device_weight_bytes
         new.bus_utilization = self.bus_utilization
-        new._cost_fn = self._cost_fn
-        new._cost_cache = {}
-        memo[id(self)] = new
+        new._cost_fn = copy.deepcopy(self._cost_fn, memo)
         return new
 
     def _cost(self, snode: BaseSchedulerNode) -> float:
-        c = self._cost_cache.get(snode)
-        if c is None:
-            try:
-                c = max(0.0, float(self._cost_fn(snode)))
-            except Exception:  # noqa: BLE001
-                c = 0.0
-            self._cost_cache[snode] = c
-        return c
+        try:
+            return max(0.0, float(self._cost_fn(snode)))
+        except Exception:  # noqa: BLE001
+            return 0.0
 
     def _transfer_ns(self, group: list[BaseSchedulerNode]) -> float:
         return _load_bytes(group) / self.bandwidth_bytes_per_ns
 
-    @staticmethod
-    def _is_compute(snode: BaseSchedulerNode) -> bool:
-        return not issues_transfer(snode) and not is_h2d_load(snode) and not contains_wait(snode)
-
     def __call__(self, snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
-        self._cost_cache = {}
         order = list(snodes)
         loads = [s for s in order if is_h2d_load(s)]
         if not loads:
@@ -787,7 +780,7 @@ class H2dLoadReorder:
     def _compute_prefix(self, order) -> list[float]:
         prefix = [0.0] * (len(order) + 1)
         for i, s in enumerate(order):
-            prefix[i + 1] = prefix[i] + (self._cost(s) if self._is_compute(s) else 0.0)
+            prefix[i + 1] = prefix[i] + (self._cost(s) if is_compute(s) else 0.0)
         return prefix
 
     # -- memory accounting -------------------------------------------------
