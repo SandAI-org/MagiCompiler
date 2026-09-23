@@ -241,11 +241,7 @@ def _magi_compile_bound_method(
     if getattr(instance, installed_attr, False):
         return instance
 
-    if (
-        isinstance(instance, nn.Module)
-        and conf.offload_config.graph_weight_offload
-        and conf.offload_config.host_first_materialize
-    ):
+    if isinstance(instance, nn.Module) and conf.offload_config.graph_weight_offload:
         from magi_compiler.passes.weight_offload import patch_materialize
 
         # Here rather than at first call: the weights this module will be

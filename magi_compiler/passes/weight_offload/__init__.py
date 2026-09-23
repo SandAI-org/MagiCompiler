@@ -24,6 +24,7 @@ from .binder import apply_weight_offload, bind_weights_to_host, insert_h2d_loads
 from .h2d_reorder import H2dLoadReorder
 from .host_first import handoff_if_pending, patch_materialize
 from .node_meta import HOST_OFFLOADED, HOST_SLOT, host_slot, is_host_offloaded, mark_host_offloaded, mark_host_slot
+from .offload_cache import CacheValidity, OffloadCache
 from .ops import H2D_OPS, is_h2d_load, slots_of
 from .sources import FsdpShardSource, OffloadCandidate, PlainParamSource, WeightSource, shard_holder
 
@@ -31,6 +32,8 @@ __all__ = [
     "apply_weight_offload",
     "bind_weights_to_host",
     "insert_h2d_loads",
+    "CacheValidity",
+    "OffloadCache",
     "H2dLoadReorder",
     "FsdpShardSource",
     "OffloadCandidate",
