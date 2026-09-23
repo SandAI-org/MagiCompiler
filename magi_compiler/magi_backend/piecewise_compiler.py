@@ -28,6 +28,37 @@ from magi_compiler.utils import compilation_counter, compute_hash, magi_logger
 from ._cache_data_cls import CacheEntry, CacheHandle
 
 
+@contextlib.contextmanager
+def _force_eager_backward_lowering():
+    """Force AOTAutograd to eagerly compile backward during standalone_compile.
+
+    Backport of PyTorch PR #185635 fix for upstream Issue #152022.
+    Our PyTorch version (2.9.0a0+nv25.10) does not include this fix.
+
+    Root cause: standalone_compile calls save_cache_artifacts() immediately after
+    compile_fx returns. For training graphs, AOTAutograd normally lowers the
+    backward lazily on first backward() call. This means aot_autograd_artifacts
+    is empty when save() runs, causing an assertion failure.
+
+    Fix: Temporarily patch AOTConfig.__post_init__ to force
+    force_non_lazy_backward_lowering=True, which makes AOTAutograd compile and
+    record the backward before save_cache_artifacts() runs.
+    """
+    from torch._functorch._aot_autograd.schemas import AOTConfig
+
+    orig_post_init = AOTConfig.__post_init__
+
+    def _forced_post_init(self):
+        orig_post_init(self)
+        self.force_non_lazy_backward_lowering = True
+
+    AOTConfig.__post_init__ = _forced_post_init
+    try:
+        yield
+    finally:
+        AOTConfig.__post_init__ = orig_post_init
+
+
 def _placeholder_names(graph: fx.GraphModule) -> list[str]:
     return [str(node.target) for node in graph.graph.nodes if node.op == "placeholder"]
 
@@ -321,7 +352,9 @@ class InductorStandaloneAdaptor(CompilerInterface):
         stride_ctx, captured_strides = _intercept_inductor_output_strides()
 
         try:
-            with scope_asserts, functorch_config.patch(autograd_cache_allow_custom_autograd_functions=True), stride_ctx:
+            with scope_asserts, _force_eager_backward_lowering(), functorch_config.patch(
+                autograd_cache_allow_custom_autograd_functions=True
+            ), stride_ctx:
                 compiled_graph = standalone_compile(
                     graph, example_inputs, dynamic_shapes=dynamic_shapes, options={"config_patches": current_config}
                 )
@@ -343,9 +376,12 @@ class InductorStandaloneAdaptor(CompilerInterface):
         self._last_output_strides = captured_strides if captured_strides else None
 
         # Step3: Save the compiled artifact
-        # autograd_cache_allow_custom_autograd_functions=True is required above so that
-        # autograd_function_apply (a HigherOrderOperator) does not bypass AOTAutograd cache
-        # key computation, which would leave aot_autograd_artifacts empty and cause save() to fail.
+        # Two context managers are required above for correct cache saving:
+        # 1. _force_eager_backward_lowering(): backport of PyTorch PR #185635 — forces
+        #    AOTAutograd to eagerly compile backward, so aot_autograd_artifacts is populated
+        #    before save_cache_artifacts() runs inside standalone_compile.
+        # 2. autograd_cache_allow_custom_autograd_functions=True: prevents autograd_function_apply
+        #    (a HigherOrderOperator) from bypassing AOTAutograd cache key computation.
         assert key is not None
         restart_analysis_count = self._restart_analysis_counts.get(key, 0)
         if hasattr(self, "cache_dir") and self.cache_dir is not None:
