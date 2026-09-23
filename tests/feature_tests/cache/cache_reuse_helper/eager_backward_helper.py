@@ -14,18 +14,12 @@
 
 """Helper script for test_aot_autograd_fallback.py.
 
-Supports two modes and an optional --disable-fix flag for bug reproduction.
+Runs a real inference step (forward only under torch.no_grad) through
+magi_compile, with a spy on standalone_compile that records
+AOTConfig.force_non_lazy_backward_lowering at each call.
 
-Modes
------
-infer  — inference (forward only under torch.no_grad), the real deployment scenario.
-train  — training (forward + backward + optimizer), needed to trigger the
-         lazy backward lowering bug (PyTorch Issue #152022).
-
---disable-fix
-    Replaces ``_force_eager_backward_lowering()`` with a no-op context manager,
-    reproducing the bug condition where ``AOTConfig.force_non_lazy_backward_lowering``
-    remains ``False`` during ``standalone_compile``.
+Supports --disable-fix to reproduce the bug by replacing
+_force_eager_backward_lowering with a no-op context manager.
 
 Output JSON payload
 -------------------
@@ -34,7 +28,7 @@ Output JSON payload
 - num_standalone_compile_calls: len(backward_flag_during_compile)
 - num_compiled_artifacts_saved: from compilation_counter
 - num_inductor_compiles: from compilation_counter
-- output_value: scalar output value (loss for train, sum for infer)
+- output_value: scalar output value
 """
 from __future__ import annotations
 
@@ -67,22 +61,9 @@ class InferenceModel(nn.Module):
         return self.linear(x)
 
 
-@magi_compile(dynamic_arg_dims={"x": 0})
-class TrainingModel(nn.Module):
-    """Minimal training model whose backward triggers AOTAutograd lowering."""
-
-    def __init__(self):
-        super().__init__()
-        self.linear = nn.Linear(HIDDEN, HIDDEN, dtype=DTYPE, device=DEVICE)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(x).sum()
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True)
-    parser.add_argument("--mode", choices=["train", "infer"], default="infer")
     parser.add_argument(
         "--disable-fix", action="store_true", help="Replace _force_eager_backward_lowering with no-op to reproduce bug"
     )
@@ -116,21 +97,11 @@ def main() -> None:
         return _real_standalone_compile(graph, example_inputs, **kwargs)
 
     with patch("torch._inductor.standalone_compile", side_effect=_spy_standalone_compile):
-        if args.mode == "infer":
-            model = InferenceModel()
-            x = torch.randn(4, HIDDEN, device=DEVICE, dtype=DTYPE)
-            with torch.no_grad():
-                output = model(x)
-            output_value = float(output.float().sum().item())
-        else:
-            model = TrainingModel()
-            optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
-            x = torch.randn(4, HIDDEN, device=DEVICE, dtype=DTYPE)
-            optimizer.zero_grad()
-            loss = model(x)
-            loss.backward()
-            optimizer.step()
-            output_value = float(loss.float().item())
+        model = InferenceModel()
+        x = torch.randn(4, HIDDEN, device=DEVICE, dtype=DTYPE)
+        with torch.no_grad():
+            output = model(x)
+        output_value = float(output.float().sum().item())
 
     payload = {
         "backward_flag_during_compile": backward_flag_during_compile,

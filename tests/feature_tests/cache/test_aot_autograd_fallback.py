@@ -16,9 +16,9 @@
 
 Root cause (PyTorch Issue #152022):
 standalone_compile() calls save_cache_artifacts() immediately after compile_fx(),
-but for training graphs AOTAutograd lazily defers backward lowering to the first
-.backward() call.  This means aot_autograd_artifacts is empty when save() runs,
-causing: ``AssertionError: CacheInfo(..., aot_autograd_artifacts=[], ...)``.
+but AOTAutograd lazily defers backward lowering, so aot_autograd_artifacts is empty
+when save() runs.  Real-world evidence: every subgraph in a 400B inference bake
+fails with ``CacheInfo(artifacts=..., {'inductor': [...], 'aot_autograd': []})``.
 
 Our fix: ``_force_eager_backward_lowering()`` context manager in
 ``piecewise_compiler.py`` monkey-patches ``AOTConfig.__post_init__`` to set
@@ -27,14 +27,14 @@ Our fix: ``_force_eager_backward_lowering()`` context manager in
 Test structure (bug-reproduce-test-first)
 -----------------------------------------
 Unit (no GPU, fast):
-    test_bug_reproduced   — without CM, AOTConfig defaults to lazy backward (the bug)
+    test_bug_reproduced   — without CM, AOTConfig defaults to lazy (the bug)
     test_bug_fixed        — with CM, AOTConfig is forced to eager (the fix)
 
-Integration (GPU, subprocess):
-    test_bug_training_cache_save_fails_without_fix
-        — training model + fix disabled → flag is False, cache save fails
+Integration (GPU, subprocess, inference model):
+    test_bug_cache_save_fails_without_fix
+        — inference model + fix disabled → flag is False (bug condition)
     test_fix_inference_cache_saved_and_reused
-        — inference model (real scenario) + fix enabled → cache saved and reused
+        — inference model + fix enabled → cache saved and reused
 """
 from __future__ import annotations
 
@@ -60,7 +60,8 @@ class TestContextManagerUnit:
         """Without fix: AOTConfig defaults to lazy backward lowering (the bug condition).
 
         This is the root cause of PyTorch Issue #152022: save_cache_artifacts()
-        finds empty aot_autograd_artifacts because backward hasn't been lowered yet.
+        finds empty aot_autograd_artifacts because backward hasn't been lowered.
+        Real-world impact: every subgraph in a 400B inference bake fails to save.
         """
         from torch._functorch._aot_autograd.schemas import AOTConfig
 
@@ -114,8 +115,8 @@ def _make_env(cache_root: Path) -> dict:
     return env
 
 
-def _run_helper(output: Path, env: dict, *, mode: str = "infer", disable_fix: bool = False) -> subprocess.CompletedProcess:
-    cmd = [sys.executable, str(HELPER), "--output", str(output), "--mode", mode]
+def _run_helper(output: Path, env: dict, *, disable_fix: bool = False) -> subprocess.CompletedProcess:
+    cmd = [sys.executable, str(HELPER), "--output", str(output)]
     if disable_fix:
         cmd.append("--disable-fix")
     return subprocess.run(cmd, env=env, capture_output=True, text=True)
@@ -123,22 +124,21 @@ def _run_helper(output: Path, env: dict, *, mode: str = "infer", disable_fix: bo
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.skipif(IS_PT_212, reason="PT 2.12 includes upstream fix; bug cannot be reproduced")
-def test_bug_training_cache_save_fails_without_fix(tmp_path: Path):
-    """Bug reproduction (integration): training model WITHOUT fix.
+def test_bug_cache_save_fails_without_fix(tmp_path: Path):
+    """Bug reproduction (integration): inference model WITHOUT fix.
 
     Disables _force_eager_backward_lowering via --disable-fix, then compiles
-    a training model through magi_compile. This reproduces the exact condition
-    from PyTorch Issue #152022:
-    - AOTConfig.force_non_lazy_backward_lowering remains False
-    - save_cache_artifacts() fails because backward hasn't been lowered
+    an inference model through magi_compile. This reproduces the condition
+    from PyTorch Issue #152022: AOTConfig.force_non_lazy_backward_lowering
+    remains False during standalone_compile.
 
-    The subprocess may crash (AssertionError inside standalone_compile) or
-    succeed with 0 artifacts saved — both confirm the bug.
+    In real bake jobs, this causes every subgraph to fail with:
+      CacheInfo(artifacts=..., {'inductor': [...], 'aot_autograd': []})
     """
     env = _make_env(tmp_path / "cache")
     out = tmp_path / "result.json"
 
-    p = _run_helper(out, env, mode="train", disable_fix=True)
+    p = _run_helper(out, env, disable_fix=True)
 
     if p.returncode != 0:
         assert (
@@ -169,7 +169,7 @@ def test_fix_inference_cache_saved_and_reused(tmp_path: Path):
     out2 = tmp_path / "run2.json"
 
     # ── Run 1: warm cache ────────────────────────────────────────────────
-    p1 = _run_helper(out1, env, mode="infer")
+    p1 = _run_helper(out1, env)
     assert p1.returncode == 0, f"run 1 failed\nstdout:\n{p1.stdout}\nstderr:\n{p1.stderr}"
     assert "Failed to save compiled artifact" not in p1.stderr, f"Artifact save still failing.\nstderr:\n{p1.stderr}"
 
@@ -181,7 +181,7 @@ def test_fix_inference_cache_saved_and_reused(tmp_path: Path):
     assert r1["num_compiled_artifacts_saved"] > 0, f"No artifacts saved (got {r1['num_compiled_artifacts_saved']})"
 
     # ── Run 2: cache hit ─────────────────────────────────────────────────
-    p2 = _run_helper(out2, env, mode="infer")
+    p2 = _run_helper(out2, env)
     assert p2.returncode == 0, f"run 2 failed\nstdout:\n{p2.stdout}\nstderr:\n{p2.stderr}"
 
     r2 = json.loads(out2.read_text())
