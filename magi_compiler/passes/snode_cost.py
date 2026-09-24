@@ -41,7 +41,7 @@ from torch._inductor.scheduler import BaseSchedulerNode
 from magi_compiler.utils import magi_logger
 
 from .snode_utils import is_compute, is_weight_gather, issues_transfer
-from .weight_offload.ops import is_h2d_load
+from .weight_offload.schedule.h2d_snode import is_h2d_load
 
 
 def _analytical(snode: BaseSchedulerNode) -> float:

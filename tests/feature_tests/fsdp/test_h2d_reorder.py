@@ -29,8 +29,8 @@ this suite exists to catch.
 import pytest
 import torch
 
-from magi_compiler.passes.weight_offload import h2d_reorder
-from magi_compiler.passes.weight_offload.h2d_reorder import H2dLoadReorder
+from magi_compiler.passes.weight_offload.schedule import h2d_reorder, load_plan
+from magi_compiler.passes.weight_offload.schedule.h2d_reorder import H2dLoadReorder
 
 _MIB = 1 << 20
 
@@ -76,7 +76,7 @@ class _Snode:
     snodes = None
 
     def __init__(self, name, kind, *, deps=(), cost=0.0, numel=0, slots=()):
-        from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
+        from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
         self.name = name
         self.kind = kind
@@ -746,7 +746,7 @@ def test_adjacent_closed_ranges_both_stay_offloaded():
 
 def _plan_stub(name, *, wait_idx, last_user, nbytes, need=0.0, lower=0, promoted=False):
     """A ``_Plan`` carrying only the fields the memory and pricing helpers read."""
-    return h2d_reorder._Plan(
+    return load_plan.LoadPlan(
         load=_Snode(name, "load"),
         group=[],
         slots=[],
@@ -800,11 +800,11 @@ def test_peak_counts_a_promoted_weight_twice_where_its_copy_runs():
     plans = [kept, resident]
     index_of = {kept.load: 0, resident.load: 10}
 
-    assert H2dLoadReorder._peak(plans, {kept.load: 0}, index_of) == 8 * _MIB + 8 * _MIB
+    assert load_plan.device_peak(plans, {kept.load: 0}, index_of) == 8 * _MIB + 8 * _MIB
 
     resident.last_user = 3  # its buffer now overlaps the kept load's
     index_of[resident.load] = 1
-    assert H2dLoadReorder._peak(plans, {kept.load: 0}, index_of) == 8 * _MIB + 12 * _MIB
+    assert load_plan.device_peak(plans, {kept.load: 0}, index_of) == 8 * _MIB + 12 * _MIB
 
 
 def test_inflight_occupancy_finds_the_earliest_fitting_start():
@@ -814,7 +814,7 @@ def test_inflight_occupancy_finds_the_earliest_fitting_start():
     graph; one that does not has to start past whatever is in its way, which is
     what turns a byte budget into a placement floor.
     """
-    live = h2d_reorder._Inflight(budget=10)
+    live = load_plan.InflightMap(budget=10)
     live.add(4, 8, 6)  # 6 bytes live over the closed range [4, 8]
 
     assert live.earliest_start(12, 4) == 0, "4 fits alongside 6 in a 10-byte budget"
@@ -840,11 +840,11 @@ def test_inflight_peak_counts_closed_interval_touch():
 
     earlier = _Fake(last_user=4, nbytes=100)
     later = _Fake(last_user=7, nbytes=50)
-    peak = H2dLoadReorder._inflight_peak([earlier, later], {earlier.load: 0, later.load: 4})
+    peak = load_plan.inflight_peak([earlier, later], {earlier.load: 0, later.load: 4})
     assert peak == 150
 
     later_after = _Fake(last_user=7, nbytes=50)
-    peak_adjacent = H2dLoadReorder._inflight_peak([earlier, later_after], {earlier.load: 0, later_after.load: 5})
+    peak_adjacent = load_plan.inflight_peak([earlier, later_after], {earlier.load: 0, later_after.load: 5})
     assert peak_adjacent == 100
 
 

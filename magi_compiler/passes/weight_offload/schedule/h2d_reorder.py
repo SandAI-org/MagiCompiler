@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import annotations
-
 """Second-phase reorder: hoist each weight load off the gather it feeds.
 
 Installed AFTER ``FsdpOverlapReorder`` in
@@ -86,7 +84,7 @@ interval is what must not overlap another transfer.  The buffer's live range
 budget.
 
 So the sweep books the two separately: a running bus end on the time axis, and
-``_Inflight`` on ``[at, last_user]`` in bytes.  Transfers are scheduled in
+``InflightMap`` on ``[at, last_user]`` in bytes.  Transfers are scheduled in
 DEADLINE order and as late as their deadlines allow (see ``_sweep``), which is
 what keeps the two from being confused for one another -- a load is hoisted
 because the bus needs it earlier, never because the model could not find a
@@ -106,10 +104,11 @@ weight is chosen, so the fill takes the big buckets: they dominate the in-flight
 peak and the allocator churn that goes with it.
 """
 
+from __future__ import annotations
+
 import copy
-from bisect import bisect_right, insort
+from bisect import bisect_right
 from collections import defaultdict
-from dataclasses import dataclass
 
 from torch._inductor.comms import _is_fake_dep
 from torch._inductor.scheduler import BaseSchedulerNode
@@ -117,16 +116,10 @@ from torch._inductor.utils import contains_wait
 
 from magi_compiler.utils import magi_logger
 
-
-def magi_logger_enabled_for_debug() -> bool:
-    """The per-load report builds a string per line; skip it when nobody reads it."""
-    import logging
-
-    return logging.getLogger("magi_compiler").isEnabledFor(logging.DEBUG)
-
-
-from ..snode_utils import earliest_legal_index, is_compute, is_multi_output, validate_topological_order
-from .ops import H2D_OPS, is_h2d_load, slots_of
+from ...snode_utils import earliest_legal_index, is_compute, is_multi_output, validate_topological_order
+from .h2d_reorder_report import H2dReorderReport
+from .h2d_snode import H2D_OPS, is_h2d_load, slots_of
+from .load_plan import InflightMap, LoadPlan, inflight_peak, load_bytes
 
 _DEFAULT_WINDOW_MARGIN_NS = 5_000.0
 
@@ -137,86 +130,7 @@ _DENSITY_SEARCH_ROUNDS = 8
 """Bisection steps for the target bus density; 8 lands within 0.4% of it."""
 
 
-def _snode_bytes(snode: BaseSchedulerNode) -> int:
-    node = getattr(snode, "node", None)
-    try:
-        numel = 1
-        for d in node.get_size():
-            numel *= int(d)
-        return numel * node.get_dtype().itemsize
-    except Exception:  # noqa: BLE001 - an unsized node simply contributes nothing
-        return 0
-
-
-def _load_bytes(group: list[BaseSchedulerNode]) -> int:
-    """Bytes this load pulls across PCIe.
-
-    Measured on the unpacks rather than on the load itself: a coalesced load is a
-    multi-output kernel whose own ``get_size`` describes no single tensor, and
-    sizing a whole bucket's window from one member would under-count it by the
-    bucket factor.
-    """
-    unpacks = [s for s in group if is_multi_output(s)]
-    return sum(_snode_bytes(s) for s in (unpacks or group[:1]))
-
-
-@dataclass
-class _Plan:
-    """One load's placement problem: how much transfer to hide, and where it may go."""
-
-    load: BaseSchedulerNode
-    group: list  # the load plus the alias snodes that must travel with it
-    slots: list[int]  # host-pool slots this load pulls
-    wait_idx: int  # earliest wait: the load's hard upper bound
-    # Inclusive right end of the closed live range [target, last_user].
-    last_user: int
-    need: float  # ns of compute / bus time that would fully hide the transfer
-    lower: int  # earliest legal index (real-dep floor)
-    nbytes: int
-    exposed: float  # ns of transfer the placement could not cover; set by _sweep
-    promoted: bool = False  # bought out of the offload plan; transfer is now D2D
-    budget_floor: int = 0  # earliest index the in-flight budget left open
-    budget_bound: bool = False  # the in-flight budget, not the bus, is what stopped it
-
-
-class _Inflight:
-    """Occupancy of the in-flight byte budget over the snode index space.
-
-    Ranges are closed, ``[start, last_user]``, because ``_rebuild`` inserts a load
-    *before* the node at its target: that node already sees the new buffer, while
-    the earlier load's ``last_user`` still reads the old one.  Two ranges
-    therefore overlap iff ``earlier.last_user >= later.start``.
-    """
-
-    def __init__(self, budget: int) -> None:
-        self.budget = budget
-        self._deltas: list[tuple[int, int]] = []
-
-    def add(self, start: int, last_user: int, nbytes: int) -> None:
-        insort(self._deltas, (start, nbytes))
-        insort(self._deltas, (last_user + 1, -nbytes))
-
-    def remove(self, start: int, last_user: int, nbytes: int) -> None:
-        self._deltas.remove((start, nbytes))
-        self._deltas.remove((last_user + 1, -nbytes))
-
-    def earliest_start(self, last_user: int, nbytes: int) -> int:
-        """Earliest index where ``[i, last_user]`` still fits ``nbytes`` in the budget."""
-        room = self.budget - nbytes
-        blocked = -1
-        occupied = 0
-        prev = 0
-        for idx, delta in self._deltas:
-            if prev > last_user:
-                break
-            if occupied > room and prev < idx:
-                blocked = max(blocked, min(idx - 1, last_user))
-            occupied += delta
-            prev = idx
-        return blocked + 1
-
-
-class H2dLoadReorder:
+class H2dLoadReorder(H2dReorderReport):
     """Callable reorder pass.  Run me after ``FsdpOverlapReorder``."""
 
     def __init__(
@@ -264,7 +178,7 @@ class H2dLoadReorder:
             return 0.0
 
     def _transfer_ns(self, group: list[BaseSchedulerNode]) -> float:
-        return _load_bytes(group) / self.bandwidth_bytes_per_ns
+        return load_bytes(group) / self.bandwidth_bytes_per_ns
 
     def __call__(self, snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         order = list(snodes)
@@ -298,133 +212,6 @@ class H2dLoadReorder:
         self._report(plans, targets, index_of, given_back, budget, len(order), prefix)
         return order
 
-    # -- reporting ---------------------------------------------------------
-    def _report(self, plans, targets, index_of, given_back, budget, n_snodes, prefix) -> None:
-        resident = [p for p in plans if p.promoted]
-        exposed = sum(p.exposed for p in plans)
-        by_budget = sum(p.exposed for p in plans if p.budget_bound)
-        inflight = self._inflight_peak(plans, self._live_starts(plans, targets, index_of))
-        moved = sum(1 for load, target in targets.items() if target != index_of[load])
-        on_bus = sum(p.nbytes for p in plans if not p.promoted)
-        total = sum(p.nbytes for p in plans)
-        hideable = self._hideable_bytes(plans, prefix)
-        compute_ns = hideable / self.bus_utilization / self.bandwidth_bytes_per_ns
-        magi_logger.info(
-            "h2d load reorder: %.0fms of compute at %.1f GB/s can overlap %.1f MiB of the %.1f MiB "
-            "offloaded (%.0f%% bus utilization assumed), so %.1f MiB had to become resident; it did "
-            "over %d weight(s), leaving %.1f MiB on the bus, %.1fms of transfer. Hoisted %d/%d "
-            "load(s); in-flight peak %.1f MiB of the %.0f MiB budget; %.1f MiB of weight on the "
-            "device at peak; %.1fms still exposed%s",
-            compute_ns / 1e6,
-            self.bandwidth_bytes_per_ns,
-            hideable / 2**20,
-            total / 2**20,
-            self.bus_utilization * 100,
-            given_back / 2**20,
-            len(resident),
-            on_bus / 2**20,
-            on_bus / self.bandwidth_bytes_per_ns / 1e6,
-            moved,
-            len(plans),
-            inflight / 2**20,
-            budget / 2**20,
-            self._peak(plans, targets, index_of) / 2**20,
-            exposed / 1e6,
-            f", {by_budget / 1e6:.1f}ms of it because the in-flight budget and not the bus ran out" if by_budget > 0 else "",
-        )
-        self._log_density(plans, prefix)
-        if inflight > budget:
-            magi_logger.warning(
-                "h2d load reorder: %.1f MiB of load buffers are live at once, over the %.0f MiB "
-                "budget the sweep was supposed to hold -- the in-flight accounting and the emitted "
-                "live ranges disagree, so treat the peak this pass reports as unreliable",
-                inflight / 2**20,
-                budget / 2**20,
-            )
-        self._log_placement(plans, targets, index_of, n_snodes)
-
-    def _log_density(self, plans, prefix) -> None:
-        """How full the bus is over every prefix of the graph, after residency.
-
-        Measured on prefixes, not on the gap between neighbouring deadlines: a
-        load can be hoisted anywhere upstream, so what has to hold is that the
-        bytes due by each deadline fit the compute available by then.  Per-gap
-        densities read as noise for exactly that reason -- two loads four snodes
-        apart show one empty window and one impossible one, and nothing is wrong.
-
-        A max above 1.0 is a schedule that does not exist: that prefix has more
-        transfer than compute and the excess is exposed wherever it is placed.
-        """
-        if not magi_logger_enabled_for_debug():
-            return
-        by_wait: dict[int, int] = defaultdict(int)
-        for p in plans:
-            if not p.promoted:
-                by_wait[p.wait_idx] += p.nbytes
-        ratios = []
-        cumulative = 0
-        for wait in sorted(by_wait):
-            cumulative += by_wait[wait]
-            compute = prefix[min(wait, len(prefix) - 1)]
-            if compute > 0:
-                ratios.append(cumulative / self.bandwidth_bytes_per_ns / compute)
-        if not ratios:
-            return
-        magi_logger.debug(
-            "h2d load reorder: bus occupancy over %d prefix(es): first %.2f, median %.2f, worst "
-            "%.2f at prefix %d/%d (1.0 means the transfers due by then exactly fill the compute "
-            "available by then, and above 1.0 cannot be hidden at any placement)",
-            len(ratios),
-            ratios[0],
-            sorted(ratios)[len(ratios) // 2],
-            max(ratios),
-            ratios.index(max(ratios)) + 1,
-            len(ratios),
-        )
-
-    @staticmethod
-    def _weights_of(plan) -> str:
-        from . import host_pool
-
-        names = [host_pool.name_of(s) for s in plan.slots]
-        names = [n for n in names if n] or ["?"]
-        return ", ".join(names[:3]) + (f", +{len(names) - 3} more" if len(names) > 3 else "")
-
-    def _log_placement(self, plans, targets, index_of, n_snodes) -> None:
-        if not magi_logger_enabled_for_debug():
-            return
-        magi_logger.debug(
-            "h2d load placement (%d loads over %d snodes; 'at' is where the load ended up, "
-            "'last_user' the last snode that still reads its bytes, 'floor' the dep floor and the "
-            "in-flight floor):",
-            len(plans),
-            n_snodes,
-        )
-        for p in sorted(plans, key=lambda p: index_of[p.load]):
-            if p.promoted:
-                verdict = f"RESIDENT: {p.need / 1e6:.1f}ms off the bus"
-            elif p.exposed <= 0:
-                verdict = "hidden"
-            elif p.budget_bound:
-                verdict = f"EXPOSED {p.exposed / 1e6:.1f}ms (in-flight budget)"
-            else:
-                verdict = f"EXPOSED {p.exposed / 1e6:.1f}ms (bus/compute)"
-            at = targets.get(p.load, index_of[p.load])
-            magi_logger.debug(
-                "  %-10s %2d slot(s) %7.1f MiB  at %5d (from %5d, floor %5d/%5d)  last_user %5d  " "need %6.1fms  %-38s  %s",
-                p.load.get_name(),
-                len(p.slots),
-                p.nbytes / 2**20,
-                at,
-                index_of[p.load],
-                p.lower,
-                p.budget_floor,
-                p.last_user,
-                p.need / 1e6,
-                verdict,
-                self._weights_of(p),
-            )
-
     # -- planning ---------------------------------------------------------
     @staticmethod
     def _group_and_waits(load, users) -> tuple[list, list]:
@@ -455,8 +242,8 @@ class H2dLoadReorder:
                         last = max(last, index_of[u])
         return last
 
-    def _plan(self, loads, order, index_of, buf_to_snode, users) -> list[_Plan]:
-        plans: list[_Plan] = []
+    def _plan(self, loads, order, index_of, buf_to_snode, users) -> list[LoadPlan]:
+        plans: list[LoadPlan] = []
         for load in sorted(loads, key=lambda s: index_of[s]):
             group, waits = self._group_and_waits(load, users)
             if not waits:
@@ -464,7 +251,7 @@ class H2dLoadReorder:
                 continue
             need = self._transfer_ns(group) * self.window_scale + self.window_margin_ns
             plans.append(
-                _Plan(
+                LoadPlan(
                     load=load,
                     group=group,
                     slots=slots_of(load),
@@ -472,7 +259,7 @@ class H2dLoadReorder:
                     last_user=self._last_user_index(group, waits, users, index_of),
                     need=need,
                     lower=earliest_legal_index(group, index_of, buf_to_snode),
-                    nbytes=_load_bytes(group),
+                    nbytes=load_bytes(group),
                     exposed=need,
                 )
             )
@@ -490,7 +277,7 @@ class H2dLoadReorder:
         Floored at what phase 1's own order already needs.  Unasked, that floor
         plus one load -- the least memory any overlap at all can cost.
         """
-        floor = self._inflight_peak(plans, {p.load: self._unhoisted(p) for p in plans})
+        floor = inflight_peak(plans, {p.load: self._unhoisted(p) for p in plans})
         if self.max_inflight_bytes <= 0:
             return floor + max((p.nbytes for p in plans), default=0)
         if self.max_inflight_bytes < floor:
@@ -525,7 +312,7 @@ class H2dLoadReorder:
         in-flight room back one bucket at a time, and only if the sweep says the
         budget and not the bus is what left transfer exposed.
         """
-        floor = self._inflight_peak(plans, {p.load: self._unhoisted(p) for p in plans})
+        floor = inflight_peak(plans, {p.load: self._unhoisted(p) for p in plans})
         biggest = max((p.nbytes for p in plans), default=0)
         if self.max_device_weight_bytes <= 0:
             yield self.max_resident_bytes, self._inflight_budget(plans)
@@ -569,26 +356,6 @@ class H2dLoadReorder:
         targets = self._sweep(plans, order, index_of, prefix, promoted, inflight_budget)
         self._log_shortfall(total, hideable, sum(p.nbytes for p in plans if p.promoted), sum(p.exposed for p in plans))
         return targets, inflight_budget
-
-    def _log_shortfall(self, total, hideable, resident, exposed) -> None:
-        """Say so when the step simply has no compute for the bytes left on the bus."""
-        unavoidable = total - resident - hideable
-        if unavoidable <= 0 or exposed <= 0:
-            return
-        magi_logger.warning(
-            "h2d load reorder: %.1f MiB of weight is offloaded and %.1f MiB of it is resident, "
-            "leaving %.1f MiB on the bus, but %.0f ms of compute at %.1f GB/s can only overlap "
-            "%.1f MiB of it -- %.1f MiB (%.1fms) is exposed wherever the loads are placed, and only "
-            "more residency removes it",
-            total / 2**20,
-            resident / 2**20,
-            (total - resident) / 2**20,
-            hideable / self.bus_utilization / self.bandwidth_bytes_per_ns / 1e6,
-            self.bandwidth_bytes_per_ns,
-            hideable / 2**20,
-            unavoidable / 2**20,
-            unavoidable / self.bandwidth_bytes_per_ns / 1e6,
-        )
 
     def _select_resident_at(self, plans, prefix, resident_budget, density) -> tuple[set, int, bool]:
         """Promote weights until every prefix of the graph holds ``density``.
@@ -709,7 +476,7 @@ class H2dLoadReorder:
         for the length of the graph, which under one device-weight budget comes
         straight out of residency and back onto the bus.
         """
-        live = _Inflight(budget)
+        live = InflightMap(budget)
         for plan in plans:
             plan.promoted = plan.load in promoted
             if plan.promoted:
@@ -783,55 +550,10 @@ class H2dLoadReorder:
             prefix[i + 1] = prefix[i] + (self._cost(s) if is_compute(s) else 0.0)
         return prefix
 
-    # -- memory accounting -------------------------------------------------
-    @staticmethod
-    def _live_starts(plans, targets, index_of) -> dict:
-        """Where each load buffer still on the bus comes alive; resident ones never do."""
-        return {p.load: targets.get(p.load, index_of[p.load]) for p in plans if not p.promoted}
-
-    @staticmethod
-    def _peak_point(plans, starts) -> tuple[int, int]:
-        events: list[tuple[int, int]] = []
-        for p in plans:
-            at = starts.get(p.load)
-            if at is not None:
-                events.append((at, p.nbytes))
-                events.append((p.last_user, -p.nbytes))
-        events.sort(key=lambda ev: (ev[0], ev[1] < 0))
-        peak = live = where = 0
-        for idx, delta in events:
-            live += delta
-            if live > peak:
-                peak, where = live, idx
-        return peak, where
-
-    @classmethod
-    def _inflight_peak(cls, plans, starts) -> int:
-        return cls._peak_point(plans, starts)[0]
-
-    @classmethod
-    def _peak_with(cls, plans, starts, promoted) -> int:
-        permanent = sum(p.nbytes for p in plans if p.load in promoted)
-        return permanent + cls._inflight_peak(plans, starts)
-
-    @classmethod
-    def _peak(cls, plans, targets, index_of) -> int:
-        """Weight bytes on the device at the worst point in the graph.
-
-        Every load is counted where its buffer comes alive, promoted ones
-        included: residency removes the PCIe crossing, not the copy, so
-        ``h2d_load`` still allocates an output for a resident slot and its bytes
-        are on the device twice while that buffer lives.  The in-flight *budget*
-        deliberately does not charge for those (see ``_sweep``); this is the
-        memory report, where it would be a lie not to.
-        """
-        starts = {p.load: targets.get(p.load, index_of[p.load]) for p in plans}
-        return cls._peak_with(plans, starts, {p.load for p in plans if p.promoted})
-
     # -- committing --------------------------------------------------------
     @staticmethod
     def _promote(plans) -> int:
-        from . import host_pool
+        from ..runtime import host_pool
 
         slots: list[int] = []
         for p in plans:

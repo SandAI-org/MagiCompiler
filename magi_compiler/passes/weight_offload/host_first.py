@@ -58,7 +58,7 @@ import torch.nn as nn
 
 from magi_compiler.utils import magi_logger
 
-from . import host_pool
+from .runtime import host_pool
 
 _TO_EMPTY = "Module.to_empty.<locals>.<lambda>"
 """Qualname of the callable ``nn.Module.to_empty`` hands to ``_apply``.

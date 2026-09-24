@@ -59,7 +59,7 @@ from torch._inductor.utils import contains_collective, contains_wait, is_collect
 from magi_compiler.passes.snode_utils import earliest_legal_index, is_compute
 from magi_compiler.passes.snode_utils import is_weight_gather as _is_weight_gather
 from magi_compiler.passes.snode_utils import validate_topological_order
-from magi_compiler.passes.weight_offload.ops import is_h2d_load as _is_h2d_load
+from magi_compiler.passes.weight_offload.schedule.h2d_snode import is_h2d_load as _is_h2d_load
 from magi_compiler.utils import magi_logger
 
 _AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default

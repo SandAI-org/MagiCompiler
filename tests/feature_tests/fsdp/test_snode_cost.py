@@ -43,7 +43,7 @@ class _Snode:
     snodes = None
 
     def __init__(self, name, kind):
-        from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
+        from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
         self.name = name
         self.kind = kind

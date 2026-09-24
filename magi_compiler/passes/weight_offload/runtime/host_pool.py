@@ -26,8 +26,8 @@ not a usable key, so the slot rides along in the graph instead.
 
 Slots are minted in this process at adopt time (0, 1, 2, …).  A cached
 kernel bakes those integers, so a later process remaps them through
-``using_slot_remap`` (see the ``host_slots.py`` sidecar next to the
-piecewise cache) rather than compiling the loads again.
+``slot_remap.using_slot_remap`` (see the ``host_slots.py`` sidecar next to
+the piecewise cache) rather than compiling the loads again.
 
 The only way in is ``reserve`` + ``adopt``: the loader reads the checkpoint
 straight into a pinned reservation, and the shard never occupies a device byte.
@@ -40,18 +40,14 @@ runtime by the slot integers baked into the graph.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Iterator, Sequence
+from typing import Sequence
 
 import torch
 
 from magi_compiler.utils import magi_logger
 
-# Baked artifact slot -> this process's pool slot.  Installed only around a
-# loaded compiled graph, so two models in one process cannot clobber each other.
-_SLOT_REMAP: ContextVar[dict[int, int] | None] = ContextVar("magi_host_slot_remap", default=None)
+from .bandwidth import PROBE_BYTES, measure_h2d_bandwidth, probe_world
 
 _SLAB_BYTES = 1 << 30
 """Cap on one pinned slab (1 GiB).
@@ -64,12 +60,6 @@ larger than this gets a slab of its own.
 _ALIGN_BYTES = 512
 """Every shard starts on a multiple of this many bytes: the alignment the DMA
 engine wants for peak host-to-device throughput."""
-
-_PROBE_BYTES = 64 << 20
-_FALLBACK_BYTES_PER_NS = 20.0
-"""~20 GB/s: a conservative PCIe Gen4 x16 pinned transfer, used when the probe
-cannot run.  Under-estimating bandwidth over-estimates the load, which makes the
-reorder pass hoist further than needed -- slower but never incorrect."""
 
 
 @dataclass(frozen=True)
@@ -352,66 +342,14 @@ class HostPool:
         if self._bandwidth_bytes_per_ns is not None:
             return self._bandwidth_bytes_per_ns
 
-        self._bandwidth_bytes_per_ns = _measure_h2d_bandwidth()
+        self._bandwidth_bytes_per_ns = measure_h2d_bandwidth()
         magi_logger.info(
             "host offload: measured H2D bandwidth %.1f GB/s (pinned, %d MiB probe, %d rank(s) probing together)",
             self._bandwidth_bytes_per_ns,
-            _PROBE_BYTES // 2**20,
-            _probe_world(),
+            PROBE_BYTES // 2**20,
+            probe_world(),
         )
         return self._bandwidth_bytes_per_ns
-
-
-def _probe_world() -> int:
-    import torch.distributed as dist
-
-    return dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
-
-
-def _probe_barrier() -> None:
-    """Line every rank up on the probe, so it measures the contended bandwidth.
-
-    Best-effort: a failure here costs accuracy, not correctness, and must never
-    be the thing that hangs a compile.
-    """
-    import torch.distributed as dist
-
-    if dist.is_available() and dist.is_initialized():
-        try:
-            dist.barrier()
-        except Exception as exc:  # noqa: BLE001
-            magi_logger.warning("host offload: bandwidth probe barrier failed (%s); measuring unsynchronized", exc)
-
-
-def _measure_h2d_bandwidth() -> float:
-    if not torch.cuda.is_available():
-        return _FALLBACK_BYTES_PER_NS
-    try:
-        src = torch.empty(_PROBE_BYTES, dtype=torch.uint8, device="cpu", pin_memory=True)
-        dst = torch.empty(_PROBE_BYTES, dtype=torch.uint8, device="cuda")
-        stream = torch.cuda.current_stream()
-        for _ in range(2):  # warm the driver's mapping before timing
-            dst.copy_(src, non_blocking=True)
-        stream.synchronize()
-
-        # Enough iterations that the ranks stay overlapped for the whole window
-        # rather than straggling apart after the barrier.
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        iters = 20
-        _probe_barrier()
-        start.record(stream)
-        for _ in range(iters):
-            dst.copy_(src, non_blocking=True)
-        end.record(stream)
-        stream.synchronize()
-        _probe_barrier()
-        elapsed_ns = start.elapsed_time(end) * 1e6
-        if elapsed_ns <= 0:
-            return _FALLBACK_BYTES_PER_NS
-        return _PROBE_BYTES * iters / elapsed_ns
-    except RuntimeError as exc:  # noqa: BLE001
-        magi_logger.warning("host offload: H2D bandwidth probe failed (%s); assuming %.1f GB/s", exc, _FALLBACK_BYTES_PER_NS)
-        return _FALLBACK_BYTES_PER_NS
 
 
 # Process-wide pool.  ``magi::h2d_load`` looks slots up here at runtime; a
@@ -437,34 +375,6 @@ def slot_of(local: torch.Tensor) -> int | None:
 
 def find_slot(name: str, shape: Sequence[int], dtype: str) -> int | None:
     return _POOL.find_slot(name, shape, dtype)
-
-
-def resolve_slot(slot: int) -> int:
-    """Translate a baked artifact slot onto this process's pool.
-
-    Identity when no remap is installed -- compile-time loads and a cache miss
-    both mint and bake the same integers.
-    """
-    remap = _SLOT_REMAP.get()
-    if remap is None:
-        return slot
-    try:
-        return remap[slot]
-    except KeyError:
-        raise RuntimeError(
-            f"magi::h2d_load got baked slot {slot} which is not in this artifact's "
-            f"remap {sorted(remap)}. The compiled graph's slot ids do not match the sidecar."
-        ) from None
-
-
-@contextmanager
-def using_slot_remap(remap: dict[int, int] | None) -> Iterator[None]:
-    """Install ``baked -> current`` for the duration of a loaded compiled graph."""
-    token = _SLOT_REMAP.set(remap)
-    try:
-        yield
-    finally:
-        _SLOT_REMAP.reset(token)
 
 
 def name_of(slot: int) -> str:

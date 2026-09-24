@@ -84,7 +84,7 @@ def _park(tensor: torch.Tensor, name: str = "") -> int:
 
 
 def _cand(name, holder_name, group, shape=(4, 4)):
-    from magi_compiler.passes.weight_offload.sources import OffloadCandidate
+    from magi_compiler.passes.weight_offload.graph.weight_source import OffloadCandidate
 
     holder = type("Node", (), {"name": holder_name})()
     local = torch.empty(shape, dtype=torch.float32)
@@ -93,11 +93,11 @@ def _cand(name, holder_name, group, shape=(4, 4)):
 
 def _patch_dist(monkeypatch, *, world, replies):
     """``replies[group]`` is the list-of-ranks payload ``all_gather_object`` should write."""
-    from magi_compiler.passes.weight_offload import binder
+    from magi_compiler.passes.weight_offload.graph import bind
 
-    monkeypatch.setattr(binder.dist, "is_available", lambda: True)
-    monkeypatch.setattr(binder.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(binder.dist, "get_world_size", lambda group=None: world)
+    monkeypatch.setattr(bind.dist, "is_available", lambda: True)
+    monkeypatch.setattr(bind.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(bind.dist, "get_world_size", lambda group=None: world)
 
     seen = []
 
@@ -108,7 +108,7 @@ def _patch_dist(monkeypatch, *, world, replies):
         for i, item in enumerate(payload):
             out[i] = item
 
-    monkeypatch.setattr(binder.dist, "all_gather_object", fake_all_gather_object)
+    monkeypatch.setattr(bind.dist, "all_gather_object", fake_all_gather_object)
     return seen
 
 
@@ -116,18 +116,18 @@ def test_align_keeps_only_candidates_every_rank_in_the_group_planned(monkeypatch
     """A weight only some ranks want is dropped; the rest of the plan stays."""
     from collections import Counter
 
-    from magi_compiler.passes.weight_offload import binder
+    from magi_compiler.passes.weight_offload.graph import bind
 
     group = object()
     shared = _cand("w_shared", "tl_shared", group)
     mine_only = _cand("w_mine", "tl_mine", group)
     plan = [shared, mine_only]
-    mine_keys = [binder._candidate_key(c) for c in plan]
+    mine_keys = [bind._candidate_key(c) for c in plan]
     peer_keys = [mine_keys[0]]
     _patch_dist(monkeypatch, world=2, replies={group: [mine_keys, peer_keys]})
 
     skipped = Counter()
-    kept = binder._align_across_ranks(plan, {}, skipped)
+    kept = bind._align_across_ranks(plan, {}, skipped)
     assert [c.name for c in kept] == ["w_shared"]
     assert skipped["not planned by every rank in the shard group"] == 1
 
@@ -136,18 +136,18 @@ def test_align_votes_per_group_not_on_world(monkeypatch):
     """Expert-mesh disagreement must not take a dense-mesh weight with it."""
     from collections import Counter
 
-    from magi_compiler.passes.weight_offload import binder
+    from magi_compiler.passes.weight_offload.graph import bind
 
     dense, expert = object(), object()
     dense_w = _cand("dense.w", "tl_dense", dense)
     expert_w = _cand("expert.w", "tl_expert", expert)
     plan = [dense_w, expert_w]
-    dense_key = binder._candidate_key(dense_w)
-    expert_key = binder._candidate_key(expert_w)
+    dense_key = bind._candidate_key(dense_w)
+    expert_key = bind._candidate_key(expert_w)
     seen = _patch_dist(monkeypatch, world=2, replies={dense: [[dense_key], [dense_key]], expert: [[expert_key], []]})
 
     skipped = Counter()
-    kept = binder._align_across_ranks(plan, {}, skipped)
+    kept = bind._align_across_ranks(plan, {}, skipped)
     assert [c.name for c in kept] == ["dense.w"]
     assert skipped["not planned by every rank in the shard group"] == 1
     assert set(seen) == {dense, expert}, "each mesh must vote on its own group, never WORLD"
@@ -157,11 +157,11 @@ def test_align_keeps_ungrouped_candidates_without_a_collective(monkeypatch):
     """An unsharded Parameter has no mesh and does not enter a vote."""
     from collections import Counter
 
-    from magi_compiler.passes.weight_offload import binder
+    from magi_compiler.passes.weight_offload.graph import bind
 
     plain = _cand("linear.weight", "l_self_weight", group=None)
     seen = _patch_dist(monkeypatch, world=2, replies={})
-    kept = binder._align_across_ranks([plain], {}, Counter())
+    kept = bind._align_across_ranks([plain], {}, Counter())
     assert kept == [plain]
     assert seen == []
 
@@ -170,15 +170,15 @@ def test_align_still_enters_a_group_found_only_on_graph_inputs(monkeypatch):
     """A rank that collected nothing on a mesh must still join that mesh's vote."""
     from collections import Counter
 
-    from magi_compiler.passes.weight_offload import binder
+    from magi_compiler.passes.weight_offload.graph import bind
 
     group = object()
     fake_param = type("P", (), {"_spec": type("S", (), {"mesh": object()})()})()
-    monkeypatch.setattr(binder, "mesh_group", lambda obj: group if obj is fake_param else None)
+    monkeypatch.setattr(bind, "mesh_group", lambda obj: group if obj is fake_param else None)
 
     seen = _patch_dist(monkeypatch, world=2, replies={group: [[], [("peer", "h", (4, 4), "torch.float32")]]})
     skipped = Counter()
-    kept = binder._align_across_ranks([], {"w": fake_param}, skipped)
+    kept = bind._align_across_ranks([], {"w": fake_param}, skipped)
     assert kept == []
     assert seen == [group]
 
@@ -187,17 +187,17 @@ def test_align_failed_group_does_not_abort_the_others(monkeypatch):
     """A collective failing on one mesh drops that mesh, not the whole plan."""
     from collections import Counter
 
-    from magi_compiler.passes.weight_offload import binder
+    from magi_compiler.passes.weight_offload.graph import bind
 
     dense, expert = object(), object()
     dense_w = _cand("dense.w", "tl_dense", dense)
     expert_w = _cand("expert.w", "tl_expert", expert)
     plan = [dense_w, expert_w]
-    dense_key = binder._candidate_key(dense_w)
+    dense_key = bind._candidate_key(dense_w)
 
-    monkeypatch.setattr(binder.dist, "is_available", lambda: True)
-    monkeypatch.setattr(binder.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(binder.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(bind.dist, "is_available", lambda: True)
+    monkeypatch.setattr(bind.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(bind.dist, "get_world_size", lambda group=None: 2)
 
     def fake_all_gather_object(out, obj, group=None):
         if group is expert:
@@ -205,10 +205,10 @@ def test_align_failed_group_does_not_abort_the_others(monkeypatch):
         out[0] = [dense_key]
         out[1] = [dense_key]
 
-    monkeypatch.setattr(binder.dist, "all_gather_object", fake_all_gather_object)
+    monkeypatch.setattr(bind.dist, "all_gather_object", fake_all_gather_object)
 
     skipped = Counter()
-    kept = binder._align_across_ranks(plan, {}, skipped)
+    kept = bind._align_across_ranks(plan, {}, skipped)
     assert [c.name for c in kept] == ["dense.w"]
     assert skipped["process-group agreement failed"] == 1
 
@@ -370,7 +370,7 @@ def test_reset_clears_the_cached_bandwidth():
 
 @requires_cuda
 def test_h2d_load_returns_the_offloaded_bytes():
-    from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     local = torch.randn(512, 128, device="cuda", dtype=torch.bfloat16)
     expected = local.clone()
@@ -392,7 +392,7 @@ def test_h2d_load_runs_off_the_compute_stream():
     current stream would be correct, would pass the check above, and would
     overlap exactly nothing no matter where the reorder pass put it.
     """
-    from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD, h2d_stream
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD, h2d_stream
 
     local = torch.randn(4096, 1024, device="cuda", dtype=torch.bfloat16)
     slot = _park(local)
@@ -419,7 +419,7 @@ def test_wait_tensor_is_what_synchronizes_the_load():
     """
     import torch._C._distributed_c10d as _c10d
 
-    from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     local = torch.randn(1024, 256, device="cuda", dtype=torch.bfloat16)
     expected = local.clone()
@@ -437,7 +437,7 @@ def test_wait_tensor_is_what_synchronizes_the_load():
 def test_h2d_load_meta_kernel_preserves_layout():
     """Inductor traces the op with fake tensors; a wrong meta shape shows up as a
     lowering error far away from here."""
-    from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     with torch._subclasses.FakeTensorMode():
         shard = torch.empty(64, 16, device="cuda", dtype=torch.bfloat16)
@@ -482,7 +482,7 @@ def _nodes(gm, target):
 def test_bind_and_insert_puts_the_load_between_the_shard_and_the_gather(dist_1rank):
     from magi_compiler.passes.fsdp_overlap import FsdpShardSource
     from magi_compiler.passes.weight_offload import bind_weights_to_host, insert_h2d_loads, is_host_offloaded
-    from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     gm, param = _lowered_weight_graph(dist_1rank)
     _park(param._local_tensor)
@@ -513,7 +513,7 @@ def test_load_sits_above_the_dtype_cast(dist_1rank):
     """
     from magi_compiler.passes.fsdp_overlap import FsdpShardSource
     from magi_compiler.passes.weight_offload import bind_weights_to_host, insert_h2d_loads
-    from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     gm, param = _lowered_weight_graph(dist_1rank, forward_dtype=torch.float32)
     _park(param._local_tensor)
@@ -540,7 +540,7 @@ def test_second_graph_over_the_same_parameters_still_gets_its_loads(dist_1rank):
     """
     from magi_compiler.passes.fsdp_overlap import FsdpShardSource
     from magi_compiler.passes.weight_offload import bind_weights_to_host, insert_h2d_loads
-    from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     gm1, param = _lowered_weight_graph(dist_1rank)
     _park(param._local_tensor)
@@ -596,7 +596,7 @@ def test_a_weight_two_gathers_read_gets_a_load_for_each(dist_1rank):
     """
     from magi_compiler.passes.fsdp_overlap import FsdpShardSource
     from magi_compiler.passes.weight_offload import bind_weights_to_host, host_pool, insert_h2d_loads
-    from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     gm, param = _twice_gathered_weight_graph(dist_1rank)
     expected = param._local_tensor.clone()
@@ -705,7 +705,7 @@ def test_a_replicated_weight_is_offloaded_even_though_nothing_gathers_it(dist_1r
     """
     from magi_compiler.passes.fsdp_overlap import FsdpShardSource
     from magi_compiler.passes.weight_offload import bind_weights_to_host, host_pool, insert_h2d_loads
-    from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     gm, param = _replicated_weight_graph(dist_1rank)
     expected = param._local_tensor.clone()
@@ -736,8 +736,8 @@ def test_an_ungathered_weight_gets_a_load_to_itself(dist_1rank):
     """
     from magi_compiler.passes.fsdp_overlap import FsdpShardSource
     from magi_compiler.passes.weight_offload import bind_weights_to_host, insert_h2d_loads
-    from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD, H2D_LOAD_COALESCED
     from magi_compiler.passes.weight_offload.node_meta import host_slot
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD, H2D_LOAD_COALESCED
 
     gm, shard, repl = _mixed_weight_graph(dist_1rank)
     _park(shard._local_tensor)
@@ -769,7 +769,7 @@ def test_binding_after_bucketing_is_reported_rather_than_silently_empty(dist_1ra
     """
     from magi_compiler.passes.fsdp_overlap import bucket_weight_all_gather_coalesced
     from magi_compiler.passes.weight_offload import bind_weights_to_host
-    from magi_compiler.passes.weight_offload.sources import FsdpShardSource
+    from magi_compiler.passes.weight_offload.graph.weight_source import FsdpShardSource
 
     # Two gathers, because a bucket of one is left as its own all_gather.
     gm, param = _twice_gathered_weight_graph(dist_1rank)
@@ -832,7 +832,7 @@ def test_promoting_a_slot_switches_the_load_to_a_device_source():
     during scheduling without invalidating the artifact it is scheduling.
     """
     from magi_compiler.passes.weight_offload import host_pool
-    from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     w = torch.randn(256, 128, device="cuda", dtype=torch.bfloat16)
     expected = w.clone()
@@ -862,7 +862,7 @@ def test_a_promoted_load_costs_no_stream_machinery():
     import torch._C._distributed_c10d as _c10d
 
     from magi_compiler.passes.weight_offload import host_pool
-    from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     w = torch.randn(256, 128, device="cuda", dtype=torch.bfloat16)
     expected = w.clone()
@@ -891,7 +891,7 @@ def test_a_promoted_load_still_returns_its_own_buffer():
     test on the op's contract rather than on any one graph that trips it.
     """
     from magi_compiler.passes.weight_offload import host_pool
-    from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD, H2D_LOAD_COALESCED
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD, H2D_LOAD_COALESCED
 
     shards = [torch.randn(128, 64, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
     expected = [s.clone() for s in shards]
@@ -1159,8 +1159,8 @@ def test_a_pre_parked_shard_needs_no_binding(dist_1rank):
     """
     from magi_compiler.passes.fsdp_overlap import FsdpShardSource
     from magi_compiler.passes.weight_offload import bind_weights_to_host, host_pool, insert_h2d_loads
-    from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
     from magi_compiler.passes.weight_offload.host_first import handoff_if_pending
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     root = _shard_on_meta(dist_1rank, rows=256, cols=64)
     _patched(root.inner)
@@ -1294,7 +1294,7 @@ def test_storage_freed_shard_survives_a_real_inductor_compile():
     about that; Inductor's input handling (guards, ``assert_size_stride``, memory
     planning) is where it would go wrong if anything did.
     """
-    from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     w = torch.randn(512, 256, device="cuda", dtype=torch.bfloat16)
     x = torch.randn(64, 512, device="cuda", dtype=torch.bfloat16)
@@ -1325,7 +1325,7 @@ def test_inductor_lowers_the_load_to_a_snode_the_reorder_recognizes():
     never materializes -- so it is asserted here, inside a real compile.
     """
     from magi_compiler.passes.fsdp_overlap.reorder import _is_h2d_load
-    from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     seen = {"loads": 0, "compute_misclassified": 0}
 
@@ -1357,18 +1357,19 @@ def test_inductor_lowers_the_load_to_a_snode_the_reorder_recognizes():
 @requires_cuda
 def test_resolve_slot_is_identity_without_a_remap():
     from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload.runtime import slot_remap
 
     local = torch.randn(32, 16, device="cuda")
     slot = _park(local, name="w")
-    assert host_pool.resolve_slot(slot) == slot
+    assert slot_remap.resolve_slot(slot) == slot
     assert host_pool.find_slot("w", tuple(local.shape), str(local.dtype)) == slot
 
 
 @requires_cuda
 def test_h2d_load_follows_a_baked_to_current_remap():
     """A cached kernel calls h2d_load with another process's slot integers."""
-    from magi_compiler.passes.weight_offload import host_pool
-    from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
+    from magi_compiler.passes.weight_offload.runtime import slot_remap
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     decoy = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
     real = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
@@ -1380,11 +1381,11 @@ def test_h2d_load_follows_a_baked_to_current_remap():
     out = H2D_LOAD(real, decoy_slot)
     _WAIT(out)
     torch.cuda.synchronize()
-    with host_pool.using_slot_remap({decoy_slot: real_slot}):
+    with slot_remap.using_slot_remap({decoy_slot: real_slot}):
         remapped = H2D_LOAD(real, decoy_slot)
         _WAIT(remapped)
     torch.cuda.synchronize()
 
     assert not torch.equal(out, expected), "without a remap the baked slot reads the decoy"
     torch.testing.assert_close(remapped, expected)
-    assert host_pool.resolve_slot(decoy_slot) == decoy_slot, "remap must not leak past the context"
+    assert slot_remap.resolve_slot(decoy_slot) == decoy_slot, "remap must not leak past the context"

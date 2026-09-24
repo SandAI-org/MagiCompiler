@@ -85,7 +85,7 @@ def _nodes(gm, target):
 @requires_cuda
 def test_a_plain_parameter_is_offloaded_without_any_fsdp():
     from magi_compiler.passes.weight_offload import host_pool
-    from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     w = torch.nn.Parameter(torch.randn(256, 256, device="cuda", dtype=torch.bfloat16))
     _park(w, name="layers.0.weight")
@@ -124,7 +124,7 @@ def test_weights_group_by_first_use_not_by_declaration():
     order says nothing about when they run.  Grouping by it would put the first
     layer and the last in one submission -- a load that has to land before layer
     0 and is not needed until layer N."""
-    from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD, H2D_LOAD_COALESCED
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD, H2D_LOAD_COALESCED
 
     params = [torch.nn.Parameter(torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)) for _ in range(4)]
     for p in params:
@@ -147,7 +147,7 @@ def test_weights_group_by_first_use_not_by_declaration():
 
 @requires_cuda
 def test_one_load_per_weight_when_no_group_cap_is_set():
-    from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     params = [torch.nn.Parameter(torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)) for _ in range(3)]
     for p in params:
@@ -190,7 +190,7 @@ def test_offload_survives_a_real_inductor_compile_without_fsdp():
 
     assert not dist.is_initialized(), "this test exists to prove offload needs no process group"
 
-    from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     w = torch.nn.Parameter(torch.randn(512, 256, device="cuda", dtype=torch.bfloat16), requires_grad=False)
     x = torch.randn(64, 512, device="cuda", dtype=torch.bfloat16)
@@ -416,8 +416,8 @@ def test_a_pre_parked_plain_parameter_needs_no_binding():
     the empty stand-in.
     """
     from magi_compiler.passes.weight_offload import host_pool
-    from magi_compiler.passes.weight_offload.h2d_op import H2D_LOAD
     from magi_compiler.passes.weight_offload.host_first import handoff_if_pending
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     root = _meta_root()
     _patched(root.inner)

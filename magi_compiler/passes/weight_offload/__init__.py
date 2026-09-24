@@ -18,15 +18,24 @@ What a weight looks like in the graph is a ``WeightSource`` --
 ``PlainParamSource`` for an unsharded model, ``FsdpShardSource`` for a
 SimpleFSDP one.  Everything else -- the host pool, the ``magi::h2d_load``
 splice, the placement pass -- is written once against that.
+
+Layout, in the order a compile meets it:
+
+* ``host_first``  -- model build: weights materialize in pinned host memory.
+* ``graph/``      -- FX weight pipeline: bind parked weights, splice loads in.
+* ``schedule/``   -- Inductor scheduler pass: place each load, buy residency.
+* ``cache/``      -- host-slot sidecar next to the piecewise compile cache.
+* ``runtime/``    -- what the compiled graph calls: host pool, ``magi::h2d_load``.
 """
 
-from .binder import apply_weight_offload, bind_weights_to_host, insert_h2d_loads
-from .h2d_reorder import H2dLoadReorder
+from .cache.offload_cache import CacheValidity, OffloadCache
+from .graph.bind import apply_weight_offload, bind_weights_to_host, insert_h2d_loads
+from .graph.weight_source import FsdpShardSource, OffloadCandidate, PlainParamSource, WeightSource, shard_holder
 from .host_first import handoff_if_pending, patch_materialize
 from .node_meta import HOST_OFFLOADED, HOST_SLOT, host_slot, is_host_offloaded, mark_host_offloaded, mark_host_slot
-from .offload_cache import CacheValidity, OffloadCache
-from .ops import H2D_OPS, is_h2d_load, slots_of
-from .sources import FsdpShardSource, OffloadCandidate, PlainParamSource, WeightSource, shard_holder
+from .runtime import host_pool
+from .schedule.h2d_reorder import H2dLoadReorder
+from .schedule.h2d_snode import H2D_OPS, is_h2d_load, slots_of
 
 __all__ = [
     "apply_weight_offload",
@@ -44,6 +53,7 @@ __all__ = [
     "HOST_SLOT",
     "H2D_OPS",
     "handoff_if_pending",
+    "host_pool",
     "host_slot",
     "patch_materialize",
     "is_h2d_load",
