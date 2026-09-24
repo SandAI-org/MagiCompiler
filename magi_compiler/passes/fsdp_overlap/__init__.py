@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from magi_compiler.passes.weight_offload.sources import FsdpShardSource, shard_holder
+from magi_compiler.passes.weight_offload.graph.weight_source import FsdpShardSource, shard_holder
 
 from .bucket_all_gather import bucket_weight_all_gather, bucket_weight_all_gather_coalesced
 from .copy_engine import bind_weights_for_copy_engine, copy_engine_weight_candidates, rewrite_weight_ag_to_copy_engine

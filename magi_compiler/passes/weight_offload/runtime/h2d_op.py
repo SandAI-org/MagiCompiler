@@ -37,6 +37,7 @@ import torch._C._distributed_c10d as _c10d
 from magi_compiler.cuda.event_work import EventWork
 
 from . import host_pool
+from .slot_remap import resolve_slot
 
 _LIB = torch.library.Library("magi", "FRAGMENT")
 _SCHEMA = "h2d_load(Tensor shard, int slot) -> Tensor"
@@ -66,7 +67,7 @@ def _issue_loads(shards: list[torch.Tensor], slots: list[int]) -> list[torch.Ten
     # ``source``, not ``get``: a slot the placement pass promoted back onto the
     # device copies from there instead, which turns this into a D2D copy without
     # any other part of the op, the graph or the schedule having to know.
-    slots = [host_pool.resolve_slot(slot) for slot in slots]
+    slots = [resolve_slot(slot) for slot in slots]
     hosts = [host_pool.source(slot) for slot in slots]
     for shard, host, slot in zip(shards, hosts, slots):
         if tuple(shard.shape) != tuple(host.shape) or shard.dtype != host.dtype:

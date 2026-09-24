@@ -26,14 +26,14 @@ import torch.nn as nn
 
 from magi_compiler.config import CompileConfig
 from magi_compiler.magi_backend.magi_backend import CompilerManager
-from magi_compiler.passes.weight_offload.cache_slots import (
+from magi_compiler.passes.weight_offload.cache.offload_cache import CacheValidity, OffloadCache
+from magi_compiler.passes.weight_offload.cache.slot_table import (
     collect_host_slot_table,
     match_host_slot_tables,
     refresh_resident_flags,
     slot_identity,
 )
 from magi_compiler.passes.weight_offload.node_meta import mark_host_slot
-from magi_compiler.passes.weight_offload.offload_cache import CacheValidity, OffloadCache
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -269,6 +269,7 @@ def test_replay_does_not_store_a_mixed_slot_artifact(tmp_path: Path):
 @requires_cuda
 def test_wrap_loaded_applies_slot_remap(tmp_path: Path):
     from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload.runtime import slot_remap
 
     slot, local = _adopt_weight()
     sidecar = {
@@ -281,7 +282,7 @@ def test_wrap_loaded_applies_slot_remap(tmp_path: Path):
     seen: list[int] = []
 
     def compiled():
-        seen.append(host_pool.resolve_slot(99))
+        seen.append(slot_remap.resolve_slot(99))
         return "ok"
 
     assert cache.wrap_loaded(compiled)() == "ok"

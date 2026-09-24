@@ -37,8 +37,8 @@ def collect_host_slot_table(module: nn.Module) -> dict[int, dict[str, Any]]:
     Walks child GraphModules as well: after a split the tags live on the
     submods, not on the root.
     """
-    from . import host_pool
-    from .node_meta import host_slot
+    from ..node_meta import host_slot
+    from ..runtime import host_pool
 
     table: dict[int, dict[str, Any]] = {}
     for _, child in module.named_modules():
@@ -95,6 +95,6 @@ def refresh_resident_flags(table: Mapping[int, Mapping[str, Any]]) -> dict[int, 
     collected.  The sidecar must record that final set so a cache hit can
     replay it.
     """
-    from . import host_pool
+    from ..runtime import host_pool
 
     return {int(slot): {**dict(info), "resident": bool(host_pool.is_resident(int(slot)))} for slot, info in table.items()}

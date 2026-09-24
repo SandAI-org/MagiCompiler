@@ -30,8 +30,8 @@ Weights reach the host pool only through host-first materialization
     casting on the host would both burn CPU and, for a fp32-master/bf16-forward
     weight, double the bytes crossing PCIe.
 
-What a weight *is* belongs to the source (see ``sources.py``); everything here
-is written once and works for a sharded model and a plain one alike.
+What a weight *is* belongs to the source (see ``weight_source.py``); everything
+here is written once and works for a sharded model and a plain one alike.
 """
 
 from __future__ import annotations
@@ -46,8 +46,8 @@ import torch.fx as fx
 
 from magi_compiler.utils import magi_logger
 
-from .node_meta import host_slot, mark_host_offloaded, mark_host_slot
-from .sources import OffloadCandidate, WeightSource, mesh_group
+from ..node_meta import host_slot, mark_host_offloaded, mark_host_slot
+from .weight_source import OffloadCandidate, WeightSource, mesh_group
 
 _WAIT = torch.ops._c10d_functional.wait_tensor.default
 
@@ -239,7 +239,7 @@ def _claim(slots) -> None:
     Claiming here -- at the splice, not at the bind -- is what lets
     ``restore_unclaimed`` tell them apart once the graph is final.
     """
-    from . import host_pool
+    from ..runtime import host_pool
 
     for slot in slots:
         host_pool.mark_claimed(slot)
@@ -253,7 +253,7 @@ def _splice_loads(graph: fx.GraphModule, pairs, order) -> int:
     themselves are hoisted to meet it; they read nothing but a placeholder, so
     moving them up is always legal.
     """
-    from .h2d_op import H2D_LOAD, H2D_LOAD_COALESCED
+    from ..runtime.h2d_op import H2D_LOAD, H2D_LOAD_COALESCED
 
     holders = [h for h, _ in pairs]
     slots = [s for _, s in pairs]

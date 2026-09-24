@@ -90,7 +90,7 @@ def is_compute(snode: BaseSchedulerNode) -> bool:
     transfer as compute would spend the same microseconds hiding two transfers.
     """
     # Imported per call: weight_offload's package init imports this module.
-    from .weight_offload.ops import is_h2d_load
+    from .weight_offload.schedule.h2d_snode import is_h2d_load
 
     return not issues_transfer(snode) and not is_h2d_load(snode) and not contains_wait(snode)
 

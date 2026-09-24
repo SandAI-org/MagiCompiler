@@ -80,7 +80,7 @@ def snode_issues_collective(snode: BaseSchedulerNode) -> bool:
 def _is_h2d_load(snode: BaseSchedulerNode) -> bool:
     # Imported per call: ``magi_compiler.passes`` imports this module lazily, and
     # a module-level import here would close that cycle.
-    from magi_compiler.passes.weight_offload.ops import is_h2d_load
+    from magi_compiler.passes.weight_offload.schedule.h2d_snode import is_h2d_load
 
     return is_h2d_load(snode)
 
