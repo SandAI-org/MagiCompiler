@@ -33,7 +33,7 @@ import torch.fx as fx
 
 from magi_compiler.utils import magi_logger
 
-from .cache_slots import collect_host_slot_table, match_host_slot_tables, refresh_resident_flags
+from .slot_table import collect_host_slot_table, match_host_slot_tables, refresh_resident_flags
 
 
 class CacheValidity(enum.Enum):
@@ -77,7 +77,7 @@ class OffloadCache:
         off, or sidecar identities match).  Returns ``DROP`` on a miss so the
         caller can discard indices whose artifacts bake another pool's slots.
         """
-        from . import host_pool
+        from ..runtime import host_pool
 
         self._slot_table = collect_host_slot_table(graph)
         self._remap = None
@@ -118,7 +118,7 @@ class OffloadCache:
             return compiled
 
         def wrapped(*args, __fn=compiled, __remap=remap):
-            from .host_pool import using_slot_remap
+            from ..runtime.slot_remap import using_slot_remap
 
             with using_slot_remap(__remap):
                 return __fn(*args)

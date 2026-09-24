@@ -44,15 +44,16 @@ from magi_compiler.passes.fsdp_overlap import (
 )
 from magi_compiler.passes.snode_cost import SnodeCostProfile, SnodeCostTable
 from magi_compiler.passes.weight_offload import (
+    CacheValidity,
     FsdpShardSource,
     H2dLoadReorder,
+    OffloadCache,
     PlainParamSource,
     bind_weights_to_host,
     host_pool,
     insert_h2d_loads,
     is_host_offloaded,
 )
-from magi_compiler.passes.weight_offload.offload_cache import CacheValidity, OffloadCache
 from magi_compiler.profiling import ProfilingRuntimeEstimator
 from magi_compiler.utils import compilation_counter, compute_code_hash, compute_hash, magi_logger
 from magi_compiler.utils.visualize import save_fx_graph_visualization

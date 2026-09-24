@@ -29,7 +29,7 @@ def h2d_ops() -> tuple:
     """The host-to-device load ops, imported lazily so this module stays
     importable without a CUDA build."""
     try:
-        from .h2d_op import H2D_LOAD, H2D_LOAD_COALESCED
+        from ..runtime.h2d_op import H2D_LOAD, H2D_LOAD_COALESCED
 
         return (H2D_LOAD, H2D_LOAD_COALESCED)
     except Exception:  # noqa: BLE001

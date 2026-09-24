@@ -35,14 +35,12 @@ from __future__ import annotations
 
 from collections import Counter, deque
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Mapping, Protocol
 
 import torch
 import torch.fx as fx
 
-# Producers we walk through when tracing a value back to the parameter behind it.
-_PREP_METHODS = {"to_local", "contiguous", "to", "view", "reshape"}
-_PREP_FUNCTIONS = ("constant_pad_nd", "_to_copy", "convert_element_type", "view", "reshape", "clone")
+from .fx_walk import is_prep, param_name, resolve, walk_back_to_holder
 
 
 def mesh_group(param: Any):
@@ -99,50 +97,13 @@ class WeightSource(Protocol):
         """
 
 
-def is_prep(node: fx.Node) -> bool:
-    """A cheap reshaping producer that a weight's value may pass through."""
-    if node.op == "call_method":
-        return str(node.target) in _PREP_METHODS
-    if node.op == "call_function":
-        name = getattr(node.target, "__name__", "") or str(node.target)
-        return any(t in name for t in _PREP_FUNCTIONS)
-    return False
-
-
-def param_name(node: fx.Node) -> str:
-    """A parameter's module path, as something a human can place.
-
-    Dynamo names a lifted parameter after that path, so
-    ``L_self_modules_layers_3_modules_mlp_parameters_w1_`` becomes
-    ``layers.3.mlp.w1`` -- which is what the placement logs need to be readable
-    at forty layers.
-    """
-    raw = str(getattr(node, "target", "") or getattr(node, "name", "") or "?")
-    parts = [p for p in raw.strip("_").split("_") if p and p not in ("L", "self", "modules", "parameters", "parameter")]
-    return ".".join(parts) or raw
-
-
-def resolve(graph: fx.GraphModule, node: fx.Node, placeholder_examples: Mapping[str, Any]) -> Any:
-    """The live object a placeholder or get_attr stands for, or None."""
-    if node.op == "placeholder":
-        return placeholder_examples.get(node.name)
-    if node.op == "get_attr":
-        obj: Any = graph
-        for part in str(node.target).split("."):
-            obj = getattr(obj, part, None)
-            if obj is None:
-                return None
-        return obj
-    return None
-
-
 def parked_slot(local: Any, min_bytes: int) -> tuple[int | None, str | None]:
     """The host-pool slot for ``local``, or ``(None, why)`` if it cannot be loaded.
 
     A weight reaches the pool only through host-first materialization.  Collect
     never copies a resident shard off the device.
     """
-    from . import host_pool
+    from ..runtime import host_pool
 
     if not isinstance(local, torch.Tensor):
         return None, "graph input is not a tensor"
@@ -155,7 +116,7 @@ def parked_slot(local: Any, min_bytes: int) -> tuple[int | None, str | None]:
 
 
 @dataclass
-class PlainParamSource:
+class PlainParamSource(WeightSource):
     """Weights of a model that is NOT sharded: lifted parameter placeholders.
 
     Without FSDP there is no redistribute to lower and no all-gather to key off,
@@ -174,7 +135,7 @@ class PlainParamSource:
     def collect(
         self, graph: fx.GraphModule, placeholder_examples: Mapping[str, Any], min_bytes: int
     ) -> tuple[list[OffloadCandidate], Counter]:
-        from . import host_pool
+        from ..runtime import host_pool
 
         candidates: list[OffloadCandidate] = []
         skipped: Counter = Counter()
@@ -209,8 +170,8 @@ class PlainParamSource:
         return candidates, skipped
 
     def group(self, graph: fx.GraphModule, holders: set[fx.Node]) -> list[list[fx.Node]]:
-        from . import host_pool
-        from .node_meta import host_slot
+        from ..node_meta import host_slot
+        from ..runtime import host_pool
 
         order = {n: i for i, n in enumerate(graph.graph.nodes)}
 
@@ -232,22 +193,6 @@ class PlainParamSource:
                 groups.append([node])
                 run_bytes = nbytes
         return groups
-
-
-def walk_back_to_holder(node: fx.Node, stop: Callable[[fx.Node], bool]) -> fx.Node | None:
-    """Walk a prep chain backwards until ``stop`` accepts a node."""
-    q: deque[fx.Node] = deque([node])
-    seen: set[fx.Node] = set()
-    while q:
-        n = q.popleft()
-        if n in seen:
-            continue
-        seen.add(n)
-        if stop(n):
-            return n
-        if is_prep(n):
-            q.extend(n.all_input_nodes)
-    return None
 
 
 _ALL_GATHER = torch.ops._c10d_functional.all_gather_into_tensor.default
@@ -331,7 +276,7 @@ def _weight_behind(to_local: fx.Node) -> fx.Node | None:
 
 
 @dataclass
-class FsdpShardSource:
+class FsdpShardSource(WeightSource):
     """Weights of a SimpleFSDP model: the shards its weight all-gathers read.
 
     A shard's loaded bytes die at the all-gather that consumes them, which is why
@@ -353,7 +298,7 @@ class FsdpShardSource:
     ) -> tuple[list[OffloadCandidate], Counter]:
         from magi_compiler.passes.fsdp_overlap.node_meta import is_weight_ag
 
-        from . import host_pool
+        from ..runtime import host_pool
 
         candidates: list[OffloadCandidate] = []
         skipped: Counter = Counter()
@@ -435,7 +380,7 @@ class FsdpShardSource:
         gather and freed, while these ARE the weight the matmul reads and live to
         its last consumer.  ``group`` gives each its own load for that reason.
         """
-        from . import host_pool
+        from ..runtime import host_pool
 
         for node in graph.graph.nodes:
             if node in seen or not _is_local_extraction(node) or not node.users:
@@ -526,7 +471,7 @@ class FsdpShardSource:
     @staticmethod
     def _holder_of(node, holders: set[fx.Node]) -> fx.Node | None:
         """Walk back from a gather's shard argument to the tagged ``to_local``."""
-        from .node_meta import host_slot
+        from ..node_meta import host_slot
 
         if not isinstance(node, fx.Node):
             return None
