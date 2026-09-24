@@ -16,8 +16,9 @@ from __future__ import annotations
 
 """Latest-safe-launch FSDP all-gather / compute overlap reorder pass.
 
-Installed as the only ``reorder_for_compute_comm_overlap_passes`` entry (replaces
-``raise_comms``/``sink_waits``); runs on the whole Inductor graph
+Installed in ``reorder_for_compute_comm_overlap_passes`` in place of
+``raise_comms``/``sink_waits``, right after ``SnodeCostProfile``, whose
+``SnodeCostTable`` is this pass's ``cost_fn``; runs on the whole Inductor graph
 (``disable_graph_split=True``).  For each FSDP weight all-gather launch, place it
 at the LATEST position whose downstream compute still hides the collective::
 
@@ -44,6 +45,7 @@ Handles both lowering forms: plain all_gather (1 launch / 1 wait) and coalesced
 """
 
 import bisect
+import copy
 import hashlib
 from collections import defaultdict
 
@@ -54,9 +56,12 @@ from torch._inductor.ir import MultiOutput
 from torch._inductor.scheduler import BaseSchedulerNode
 from torch._inductor.utils import contains_collective, contains_wait, is_collective
 
+from magi_compiler.passes.snode_utils import earliest_legal_index, is_compute
+from magi_compiler.passes.snode_utils import is_weight_gather as _is_weight_gather
+from magi_compiler.passes.snode_utils import validate_topological_order
+from magi_compiler.passes.weight_offload.schedule.h2d_snode import is_h2d_load as _is_h2d_load
 from magi_compiler.utils import magi_logger
 
-_AG = torch.ops._c10d_functional.all_gather_into_tensor.default
 _AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
 
 
@@ -72,7 +77,7 @@ def _ce_ag_ops():
 
 
 _CE_AG_OPS = _ce_ag_ops()
-_WEIGHT_AG_OPS = tuple(op for op in (_AG, _AG_COALESCED, *_CE_AG_OPS) if op is not None)
+
 
 # Default extra headroom (ns) added to each collective's runtime when sizing the
 # compute window, absorbing estimator error + kernel-launch latency so the wait
@@ -115,11 +120,6 @@ def _leaf_collective_node(snode: BaseSchedulerNode):
 
 def _issues_transfer(snode: BaseSchedulerNode) -> bool:
     return contains_collective(snode) or _leaf_collective_node(snode) is not None
-
-
-def _is_weight_gather(snode: BaseSchedulerNode) -> bool:
-    node = _leaf_collective_node(snode)
-    return node is not None and getattr(node, "op_overload", None) in _WEIGHT_AG_OPS
 
 
 def _is_multi_output(snode: BaseSchedulerNode) -> bool:
@@ -217,52 +217,52 @@ class FsdpOverlapReorder:
         comm_overlap_window_margin_ns: float = _DEFAULT_WINDOW_MARGIN_NS,
         cost_fn=None,
         comm_overlap_window_scale: float = 1.0,
+        move_prep_chain: bool = False,
     ) -> None:
+        # Host offload puts an h2d_load + its wait between the weight placeholder
+        # and the gather.  Those are real data producers, so ``lower`` lands one
+        # slot below the launch and the gather can no longer move at all unless
+        # the whole prep chain travels with it.  Off by default: for a graph
+        # without offload this would also start hoisting dtype casts and pads
+        # that today stay put, and that is a separate change from this one.
+        self.move_prep_chain = move_prep_chain
         self.comm_overlap_window_margin_ns = comm_overlap_window_margin_ns
         # need = comm * scale + margin: collectives are measured in isolation but
         # run concurrent with the compute that hides them (~1.4-1.5x slower on
         # 8xH100).  See CompileConfig.fsdp_config.comm_overlap_window_scale.
         self.comm_overlap_window_scale = comm_overlap_window_scale
-        # cost_fn: snode -> ns (default: Inductor's estimate_op_runtime hook).
+        # cost_fn: snode -> ns.  Normally the SnodeCostTable filled by the
+        # SnodeCostProfile pass ahead of this one; Inductor's estimate_op_runtime
+        # hook when the pass runs on its own.
         if cost_fn is None:
             from torch._inductor.comms import estimate_op_runtime
 
             cost_fn = estimate_op_runtime
         self._cost_fn = cost_fn
-        # Per-compile cost cache.  Must never survive into a deepcopy: Inductor
-        # deepcopies this pass into the fx-graph cache key, and snode keys hold
-        # FakeTensors whose data_ptr access raises.
-        self._cost_cache: dict[BaseSchedulerNode, float] = {}
 
     def __deepcopy__(self, memo):
-        # Fresh, cache-free instance (see _cost_cache note); cost_fn shared by
-        # reference -- it is itself deepcopy-safe.
+        # Through memo, so this copy and the profile pass's copy share one table.
         new = FsdpOverlapReorder.__new__(FsdpOverlapReorder)
+        memo[id(self)] = new
         new.comm_overlap_window_margin_ns = self.comm_overlap_window_margin_ns
         new.comm_overlap_window_scale = self.comm_overlap_window_scale
-        new._cost_fn = self._cost_fn
-        new._cost_cache = {}
-        memo[id(self)] = new
+        new.move_prep_chain = self.move_prep_chain
+        new._cost_fn = copy.deepcopy(self._cost_fn, memo)
         return new
 
     # -- cost -------------------------------------------------------------
     def _cost(self, snode: BaseSchedulerNode) -> float:
-        c = self._cost_cache.get(snode)
-        if c is None:
-            try:
-                c = max(0.0, float(self._cost_fn(snode)))
-            except Exception:  # noqa: BLE001
-                c = 0.0
-            self._cost_cache[snode] = c
-        return c
+        try:
+            return max(0.0, float(self._cost_fn(snode)))
+        except Exception:  # noqa: BLE001
+            return 0.0
 
     @staticmethod
     def _is_compute(snode: BaseSchedulerNode) -> bool:
-        return not _issues_transfer(snode) and not contains_wait(snode)
+        return is_compute(snode)
 
     # -- main -------------------------------------------------------------
     def __call__(self, snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
-        self._cost_cache = {}  # fresh per compile; snodes are unique
         order = list(snodes)
         launches = [s for s in order if _is_weight_gather(s)]
         if not launches:
@@ -283,26 +283,10 @@ class FsdpOverlapReorder:
         index_of = {s: i for i, s in enumerate(order)}
 
         skel_idx, skel_kinds = _collective_skeleton(order)
-        mode, sync_group, world = self._negotiate_mode(order, launches, skel_kinds)
+        costs_ok = bool(getattr(self._cost_fn, "ok", True))
+        mode, sync_group, world = self._negotiate_mode(order, launches, skel_kinds, costs_ok)
         if mode == "abort":
             return order
-
-        # profile_sync: warm the estimator table on every node, then re-measure in
-        # rank-lockstep (warm_and_sync) so shared keys get real, max-reduced costs.
-        # On failure, leave the graph unchanged (overlap off, no hang).
-        if hasattr(self._cost_fn, "warm_and_sync") and getattr(self._cost_fn, "_sync_across_ranks", False):
-            try:
-                for s in order:
-                    if self._is_compute(s) or _issues_transfer(s):
-                        self._cost(s)
-                n_changed = self._cost_fn.warm_and_sync()
-                self._cost_cache = {}  # re-read synced costs
-                magi_logger.info(
-                    "FSDP overlap reorder: rank-synchronized profiling done (%d cost entries reconciled)", n_changed
-                )
-            except Exception as exc:  # noqa: BLE001
-                magi_logger.warning("FSDP overlap reorder: synchronized profiling failed (%s); leaving graph unchanged", exc)
-                return order
 
         # ---- two-pointer back-to-front sweep (see module docstring) ----
         launches_in_order = sorted(launches, key=lambda s: index_of[s])  # original program order
@@ -310,7 +294,7 @@ class FsdpOverlapReorder:
         plans = []  # (launch, group, fc_idx, comm_runtime, lower)
         lowers: dict = {}  # launch -> earliest legal index (real-dep floor)
         for launch in launches_in_order:
-            group = self._launch_group(launch, order, buf_to_snode, users)
+            group = self._launch_group(launch, order, buf_to_snode, users, index_of)
             fc_idx = self._first_consumer_index(launch, group, order, users)
             if fc_idx is None:
                 continue
@@ -432,40 +416,36 @@ class FsdpOverlapReorder:
                 )
             moved = 0
 
-        measured = getattr(self._cost_fn, "n_measured", None)
-        cache_hits = getattr(self._cost_fn, "n_cache_hits", None)
-        n_distinct = len(getattr(self._cost_fn, "_table", {}) or {})
-        magi_logger.info(
-            "FSDP overlap reorder: repositioned %d/%d weight all-gather launch(es) "
-            "(cost table: %d distinct ops, measured=%s reused=%s)",
-            moved,
-            len(launches),
-            n_distinct,
-            measured,
-            cache_hits,
-        )
-        # Full op->time table at DEBUG.  The guard is load-bearing here: summary()
-        # builds the whole table string eagerly, unlike lazy %-format args.
-        if hasattr(self._cost_fn, "summary"):
-            magi_logger.debug("FSDP overlap %s", self._cost_fn.summary())
+        magi_logger.info("FSDP overlap reorder: repositioned %d/%d weight all-gather launch(es)", moved, len(launches))
         return order
 
     # -- multi-rank agreement ---------------------------------------------
     @staticmethod
-    def _negotiate_mode(order, launches, skel_kinds) -> tuple[str, object, int]:
+    def _negotiate_mode(order, launches, skel_kinds, costs_ok: bool = True) -> tuple[str, object, int]:
         """Rank-identical placement mode: (mode, group, world).
 
         ``identical`` / ``slot``: skeletons match → consensus slots (in-slot index is per-rank).
         ``pinned``: skeletons differ → keep each AG between its neighboring NCCL snodes.
-        ``abort``: weight-AG counts differ → leave the graph unchanged.
+        ``abort``: weight-AG counts differ, or some rank failed to price its graph
+        → leave the graph unchanged.  The pricing verdict travels in the same
+        exchange: a rank that bailed on its own would skip this collective and
+        leave its peers blocked in it.
         """
         from magi_compiler.profiling.runtime_estimator import _get_cost_sync_group
 
         group = _get_cost_sync_group()
         world = dist.get_world_size()
-        mine = ((_graph_fingerprint(order), len(order), len(launches)), tuple(skel_kinds))
+        mine = ((_graph_fingerprint(order), len(order), len(launches)), tuple(skel_kinds), bool(costs_ok))
         peers: list = [None] * world
         dist.all_gather_object(peers, mine, group=group)
+        failed = [rank for rank, p in enumerate(peers) if not p[2]]
+        if failed:
+            magi_logger.warning(
+                "FSDP overlap reorder: snode cost profiling failed on rank(s) %s; leaving the graph "
+                "unchanged on every rank (overlap OFF).",
+                failed,
+            )
+            return "abort", group, world
         if all(p == peers[0] for p in peers[1:]):
             return "identical", group, world
 
@@ -553,12 +533,13 @@ class FsdpOverlapReorder:
             )
 
     # -- group detection --------------------------------------------------
-    def _launch_group(self, launch, order, buf_to_snode, users) -> list[BaseSchedulerNode]:
+    def _launch_group(self, launch, order, buf_to_snode, users, index_of) -> list[BaseSchedulerNode]:
         """The snodes that must move together with the launch.
 
         Coalesced: packed collective + its MultiOutput members (they depend on the
         packed buffer and must stay immediately after it, before any wait).
         no-bucket: just the launch (the wait stays put).
+        With ``move_prep_chain``: plus the upstream shard prep (see _prep_chain).
         """
         group = [launch]
         node = _leaf_collective_node(launch)
@@ -581,7 +562,55 @@ class FsdpOverlapReorder:
                 deps = [d for d in s.unmet_dependencies if not _is_fake_dep(d)]
                 if deps and all(d.name in produced for d in deps):
                     group.append(s)
+        if self.move_prep_chain:
+            group.extend(self._prep_chain(group, buf_to_snode, index_of))
         return group
+
+    @staticmethod
+    def _prep_chain(group, buf_to_snode, index_of) -> list[BaseSchedulerNode]:
+        """The UPSTREAM shard-prep snodes that have to travel with the launch.
+
+        A weight's path from placeholder to gather can hold an ``h2d_load``, its
+        wait, a dtype cast and an uneven-shard pad.  Every one of them is a real
+        buffer producer, so ``_earliest_legal_index`` pins the launch just below
+        them: leaving them behind does not make the hoist illegal, it makes it
+        impossible.
+
+        Moving a producer earlier is always legal for its readers, so there is no
+        "all users inside the group" condition here -- the cost of a longer live
+        range is the in-flight budget's business, not correctness'.  The condition
+        that does matter is that a traveller reads nothing but graph inputs and
+        other travellers: a node that touches an activation would be compute we
+        are simultaneously counting as compute that hides this gather.  Anything
+        failing that is dropped, and ``_earliest_legal_index`` then simply reports
+        a higher floor -- a shorter hoist, never a wrong one.
+        """
+        members = set(group)
+        stack = list(group)
+        reached: set[BaseSchedulerNode] = set()
+        while stack:
+            for d in stack.pop().unmet_dependencies:
+                if _is_fake_dep(d):
+                    continue
+                prod = buf_to_snode.get(d.name)
+                if prod is None or prod in members or prod in reached:
+                    continue
+                if _issues_transfer(prod) and not _is_h2d_load(prod):
+                    continue  # a real collective is not prep; it has a plan of its own
+                reached.add(prod)
+                stack.append(prod)
+
+        # Program order, so every producer is classified before its consumers and
+        # one pass settles the cascade of a dropped node's dependents.
+        keep: set[BaseSchedulerNode] = set()
+        for s in sorted(reached, key=lambda n: index_of[n]):
+            if all(
+                buf_to_snode.get(d.name) in (None, s) or buf_to_snode.get(d.name) in keep
+                for d in s.unmet_dependencies
+                if not _is_fake_dep(d)
+            ):
+                keep.add(s)
+        return sorted(keep, key=lambda n: index_of[n])
 
     # -- consumer discovery ----------------------------------------------
     def _wait_snodes(self, group, order, users) -> list[BaseSchedulerNode]:
@@ -591,7 +620,14 @@ class FsdpOverlapReorder:
         was an Inductor collective; a custom-op gather puts an alias snode between
         the launch and its wait, and missing the wait silently drops the gather
         from the placement plan altogether.
+
+        A wait that is itself a group member is stepped over rather than
+        reported: with host offload the group contains the ``h2d_load`` and the
+        wait that guards it, and that wait sits UPSTREAM of the gather.  Stopping
+        there would report the gather's own launch as its first consumer, which
+        reads as a zero-width overlap window in every log this pass emits.
         """
+        members = set(group)
         stack = [b for s in group for b in s.get_buffer_names()]
         waits: list[BaseSchedulerNode] = []
         seen: set = set()
@@ -600,9 +636,9 @@ class FsdpOverlapReorder:
                 if u in seen:
                     continue
                 seen.add(u)
-                if contains_wait(u):
+                if contains_wait(u) and u not in members:
                     waits.append(u)
-                elif self._is_transparent(u):
+                elif u in members or self._is_transparent(u):
                     stack.extend(u.get_buffer_names())
         return waits
 
@@ -661,52 +697,7 @@ class FsdpOverlapReorder:
         return barrier
 
     def _earliest_legal_index(self, group, order, index_of, buf_to_snode, op_to_snode) -> int:
-        """1 + max index of any REAL (non-fake buffer) producer the group needs.
-
-        Deliberately NOT ``snode.ancestors``: that set is polluted by the fake
-        ``WeakDep`` edges Inductor inserts between collectives for comm-stream
-        serialization.  Weight gathers read independent param shards -- there is no
-        real gather->gather dependency -- so counting the WeakDep would pin the
-        launch right after the previous collective and forbid the very hoist this
-        pass exists for.  A gather's only real producer is its weight-shard
-        placeholder (+ to_local/pad/cast chain), so real ``lower`` is ~0."""
-        group_set = set(group)
-        lo = 0
-        for s in group:
-            for d in s.unmet_dependencies:  # buffer names
-                if _is_fake_dep(d):  # WeakDep / StarDep -- ordering hint, not data
-                    continue
-                prod = buf_to_snode.get(d.name)
-                if prod is None or prod in group_set:
-                    continue
-                lo = max(lo, index_of.get(prod, 0) + 1)
-        return lo
+        return earliest_legal_index(group, index_of, buf_to_snode)
 
     def _validate_full(self, new_order, op_to_snode, buf_to_snode, users) -> bool:
-        """Valid topological order w.r.t. REAL data deps: every node's non-fake
-        buffer producers precede it (the driver does not repair the order, so a
-        violation would silently miscompile).  Checking direct producers per node
-        is a complete validation of the real-dep DAG.  ``snode.ancestors`` is NOT
-        used -- it includes the fake WeakDep edges this pass intentionally crosses
-        (see ``_earliest_legal_index``); an ancestors check would false-reject
-        every legal hoist.  WeakDep is advisory, not a correctness constraint."""
-        pos = {s: i for i, s in enumerate(new_order)}
-        for s in new_order:
-            sp = pos[s]
-            for d in s.unmet_dependencies:  # buffer names
-                if _is_fake_dep(d):  # WeakDep / StarDep -- advisory ordering, not data
-                    continue
-                prod = buf_to_snode.get(d.name)
-                if prod is s:  # fused snode may name its own internal buffers
-                    continue
-                if prod is not None and pos.get(prod, -1) >= sp:
-                    magi_logger.debug(
-                        "validate fail: %s@%d needs buffer-dep %s@%d (buf %s)",
-                        s.get_name(),
-                        sp,
-                        prod.get_name(),
-                        pos.get(prod, -1),
-                        d.name,
-                    )
-                    return False
-        return True
+        return validate_topological_order(new_order, buf_to_snode)

@@ -16,7 +16,7 @@
 SimpleFSDP-style model, and print machine-checkable markers to stdout for the pytest
 driver (tests/feature_tests/test_fsdp_overlap_e2e.py).
 
-Chain under test (magi_backend._apply_fsdp_fullgraph_overlap):
+Chain under test (magi_backend._apply_weight_pipeline):
   redistribute lowering  ->  whole-graph bucketing (coalesced)  ->  FsdpOverlapReorder
 
 Model: two Linear layers whose params are Shard(0) DTensors (via torchtitan

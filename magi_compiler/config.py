@@ -207,6 +207,132 @@ class OffloadConfig(BaseModel):
             "Env var: MAGI_COMPILE_OFFLOAD_CONFIG__FORCE_PER_RANK_WEIGHTS (1/0/true/false)."
         ),
     )
+    graph_weight_offload: bool = Field(
+        False,
+        description=(
+            "Compile-time CPU offload of SimpleFSDP weight shards, scheduled at snode granularity. "
+            "Requires compile_mode=MAGI_COMPILE: host-first parks selected weights as empty CUDA "
+            "stand-ins and only the Magi backend inserts magi::h2d_load; TORCH_COMPILE and NONE "
+            "skip that rewrite and would leave the stand-in empty. "
+            "Parks each selected local shard in pinned host memory and loads it back inside the graph "
+            "with magi::h2d_load, placed far enough upstream for compute to hide the transfer before "
+            "its all-gather launches. Two budgets bound the result and between them are the whole "
+            "policy: offload_max_inflight_mib is how many bytes may be live in load buffers at once, "
+            "i.e. how much of the bus's work can be moved under compute, and "
+            "offload_max_resident_mib is how many bytes may go back on the device permanently, i.e. "
+            "how much traffic the bus has to carry at all. They add up to the weight bytes on the "
+            "device. Works with SimpleFSDP (transport='nccl') and with unsharded "
+            "nn.Parameter models. Mutually exclusive with model_cpu_offload (the runtime-wrapper "
+            "path) because the two offload the same bytes through different mechanisms. "
+            "When this is on, a meta-built model's to_empty hands back pinned host memory and the "
+            "checkpoint loads into it directly, so the weights enter the host pool without occupying "
+            "a device byte."
+        ),
+    )
+    offload_min_shard_mib: float = Field(
+        1.0,
+        ge=0.0,
+        description=(
+            "Minimum local-shard MiB to offload. Below this the transfer is dominated by fixed DMA "
+            "overhead rather than bandwidth, so it costs schedule slack and frees almost nothing."
+        ),
+    )
+    offload_group_mib: int = Field(
+        0,
+        ge=0,
+        description=(
+            "Cap on the MiB of weights merged into one load, for models WITHOUT FSDP (with FSDP the "
+            "loads mirror the all-gather buckets instead). Merging amortizes the ~10us of CPU each "
+            "load pays for its stream sync, event and Work registration, which on a model with "
+            "hundreds of weights is milliseconds sitting in front of the first one. 0 = one load "
+            "per weight."
+        ),
+    )
+    offload_max_resident_mib: int = Field(
+        0,
+        ge=0,
+        description=(
+            "Residency budget per GPU: weight MiB the placement pass may hand back to the device "
+            "permanently, to buy out transfer no compute window can hide. A resident weight pays no "
+            "PCIe at all, so this is what decides how much traffic the bus carries: with T MiB of "
+            "offloadable weight, a bandwidth of B MiB/ms and C ms of compute per step, no schedule "
+            "can be compute-bound unless (T - resident) / B <= C, which makes T - C*B a hard lower "
+            "bound on this setting. The pass spends the budget on the loads whose exposure costs the "
+            "most per resident byte, re-planning after each purchase because a weight taken off the "
+            "bus hands its compute window to its neighbours. 0 = buy nothing: everything parked on "
+            "the host stays offloaded, however exposed that leaves it. Adds to "
+            "offload_max_inflight_mib -- together they bound the weight bytes on the device."
+        ),
+    )
+    offload_max_inflight_mib: int = Field(
+        0,
+        ge=0,
+        description=(
+            "In-flight budget per GPU: weight MiB that may be live in H2D load buffers at once. A "
+            "load's bytes are live from where the load runs until the last op that still reads them, "
+            "so this is what decides how far upstream a load may be hoisted, and therefore how much "
+            "of the bus's work can be moved under the compute that hides it. One bucket's worth "
+            "serializes the bus against itself: it idles through every compute window shorter than a "
+            "transfer, even on a graph with compute to spare. Size it at several buckets to keep the "
+            "bus near full duty cycle. 0 = one load on top of whatever the unhoisted order already "
+            "needs, which is the least memory any overlap at all can cost; a value below what the "
+            "unhoisted order needs is raised to it with a warning, since no placement goes lower. "
+            "Adds to offload_max_resident_mib."
+        ),
+    )
+    offload_max_device_weight_mib: int = Field(
+        0,
+        ge=0,
+        description=(
+            "Single budget for the weight MiB on the device, which the placement pass then splits "
+            "between residency and in-flight load buffers itself: the smallest in-flight budget that "
+            "still hides every transfer, and all the rest to residency. Prefer this over setting "
+            "offload_max_resident_mib and offload_max_inflight_mib by hand -- the two compete for the "
+            "same memory, so a guess at one is a guess at the other, and residency is worth strictly "
+            "more per byte (it removes the transfer from every step, while in-flight room only buys "
+            "the schedule somewhere to put it). 0 = use the two separate budgets instead."
+        ),
+    )
+    offload_bus_utilization: float = Field(
+        1.0,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Fraction of the compute time the H2D bus can be expected to actually occupy, used to "
+            "size how much weight a step can overlap at all: schedule_size = utilization * compute * "
+            "bandwidth, and anything beyond it has to become resident or it is exposed no matter "
+            "where the loads are placed. Below 1.0 because a transfer can only start at a snode "
+            "boundary and must fit before its own all-gather, so the bus is never packed perfectly. "
+            "This is NOT a fudge factor for a wrong compute estimate: if the cost table is wrong, the "
+            "product is wrong at any utilization."
+        ),
+    )
+    offload_h2d_bandwidth_gbps: float = Field(
+        0.0,
+        ge=0.0,
+        description=(
+            "Override the measured host-to-device bandwidth (GB/s) used to size each load's overlap "
+            "window. 0 = calibrate once per process with a pinned probe. Under-estimating is the "
+            "safe direction: it hoists loads further than needed."
+        ),
+    )
+    h2d_overlap_window_margin_ns: float = Field(
+        5000.0,
+        ge=0.0,
+        description=(
+            "Extra headroom (ns) added to each H2D load's estimated transfer time when sizing its "
+            "compute window, absorbing estimator error + launch latency."
+        ),
+    )
+    h2d_overlap_window_scale: float = Field(
+        1.0,
+        ge=1.0,
+        description=(
+            "Multiplier on each H2D load's estimated transfer time when sizing its compute window "
+            "(need = transfer * scale + margin). Transfers are estimated from bytes / bandwidth "
+            "in isolation but run concurrent with the compute that hides them."
+        ),
+    )
 
 
 class FSDPConfig(BaseModel):
