@@ -41,22 +41,15 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requir
 requires_torchrun = pytest.mark.skipif(shutil.which("torchrun") is None, reason="requires torchrun")
 
 
-# profile_sync JIT-compiles every node in rank-lockstep, which on first
-# run (no cache) can exceed the default 900s on slower arch (B300 SM103).
-_DEFAULT_TIMEOUT = 900
-_PROFILE_SYNC_TIMEOUT = 1800
-
-
 def _run(nproc: int, cost_mode: str, port: str) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env["MAGI_LOGGING_LEVEL"] = "info"  # so the backend's chain INFO logs are captured
-    t = _PROFILE_SYNC_TIMEOUT if cost_mode == "profile_sync" else _DEFAULT_TIMEOUT
     return subprocess.run(
         ["torchrun", f"--nproc_per_node={nproc}", f"--master_port={port}", str(_HELPER), "--cost-mode", cost_mode],
         env=env,
         capture_output=True,
         text=True,
-        timeout=t,
+        timeout=900,
     )
 
 
