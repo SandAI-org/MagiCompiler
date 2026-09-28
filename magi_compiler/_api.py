@@ -457,6 +457,14 @@ def _compilation_context(state: MagiCompileState):
             {
                 "TORCHINDUCTOR_CACHE_DIR": (_inductor_cache_dump_path).as_posix(),
                 "TRITON_CACHE_DIR": (_triton_cache_dump_path).as_posix(),
+                # Enable Triton autotune result disk cache.  With
+                # autotune_at_compile_time=False, autotuning runs on the first
+                # forward pass.  This flag persists the selected configs as
+                # .autotune.json in TRITON_CACHE_DIR (which points to
+                # persistent AFS).  Subsequent cold starts (verify pods) read
+                # the cached results and skip benchmarking entirely,
+                # eliminating ~3-5 min first-forward overhead.
+                "TRITON_CACHE_AUTOTUNING": "1",
             },
         ),
         explain_compilation(_debug_dump_path.as_posix()),
