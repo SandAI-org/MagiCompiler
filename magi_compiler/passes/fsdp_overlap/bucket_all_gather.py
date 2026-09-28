@@ -199,50 +199,25 @@ def _coalesce_one_bucket(graph: fx.GraphModule, node_index: dict[fx.Node, int], 
 
 
 def bucket_weight_all_gather_coalesced(graph: fx.GraphModule, bucket_size_bytes: int = 0, split_by=None) -> int:
-    """Coalesce the SimpleFSDP weight all-gathers that are NEIGHBOURS in the graph.
+    """Coalesce neighboring SimpleFSDP weight all-gathers on one mesh.
 
-    A bucket is drawn from a run of launches that are consecutive in program
-    order on ONE mesh, capped at ``bucket_size_bytes`` of accumulated local-shard
-    bytes (0 = no cap) and cut at every dtype change.  Another mesh's gather ends
-    the run; a run of one is left as its own plain all_gather.
+    A bucket is a run of consecutive launches, cut at a mesh or dtype change and
+    capped at ``bucket_size_bytes`` of local-shard bytes (0 = no cap).  A run of
+    one stays a plain all_gather.  Fusing across a gap keeps the earlier shard
+    live until the later consumer, so only graph neighbors are fused.
 
-    Adjacency is the load-bearing word.  Fusing two gathers makes the earlier
-    one's shard, and the unsharded output it becomes, live until the later one's
-    consumer; do that across a mesh boundary and a bucket can span most of the
-    model.  Each bucket of >= 2 gathers becomes::
-
-        coalesced = all_gather_into_tensor_coalesced([local_0..local_{N-1}], W, group)
-        out_i     = getitem(coalesced, i)   # same shape as the member's old output
-        wait_i    = wait_tensor(out_i)      # one wait per member, left at its consumer
-
-    ``all_gather_into_tensor_coalesced`` fuses N launches into one NCCL group but
-    returns one buffer per input, so members are recovered by zero-copy getitem --
-    no cat/split on the compute stream, no transient memory spike.  Downstream users
-    are re-pointed from each old wait to ``wait_i``; the launch + getitems stay
-    together so ``FsdpOverlapReorder`` later moves them as one unit.
-
-    ``split_by(node)`` adds a second bucket key, used in copy-engine and host-offload
-    mode to keep gathers of different kinds apart -- a bucket is one submission, so
-    it cannot span two transports.
-
-    Runs after redistribute lowering, and after binding when there is any.
+    Each bucket of >= 2 becomes one coalesced launch, a getitem per member, and
+    a wait left at that member's consumer.  ``split_by(node)`` keeps different
+    transports (copy engine, host offload) apart: one submission cannot span two.
     Returns the number of coalesced buckets created.
     """
     node_index = {n: i for i, n in enumerate(graph.graph.nodes)}
 
-    # Runs of launches that are adjacent in the GRAPH, cut wherever the mesh
-    # changes.  Keying by group alone made two gathers on one mesh "neighbours"
-    # with hundreds of another mesh's gathers between them, and fusing those
-    # drags the earlier shard -- and the unsharded output it becomes -- across
-    # everything in between: on a 40-layer MoE, layer 0's attention weight shared
-    # a bucket with layer 30's, holding gigabytes of gathered weight for most of
-    # a forward.
-    #
-    # ``split_by`` deliberately does NOT cut a run.  It marks a gather that has
-    # to travel differently (unbound from the copy engine, resident rather than
-    # offloaded), and those are isolated single gathers sitting between their
-    # neighbours, not a stretch of the model.  Letting one of them end the run
-    # would split the bucket around it and cost throughput for nothing.
+    # Consecutive launches on one mesh.  Grouping by mesh alone fused gathers
+    # hundreds of nodes apart, pinning the earlier gathered weight until the later
+    # consumer.
+    # ``split_by`` does not cut a run: one differently-bound gather between
+    # neighbors would split the bucket and lose throughput.
     runs: list[list[fx.Node]] = []
     last_group = object()
     for node in graph.graph.nodes:
@@ -279,16 +254,11 @@ def bucket_weight_all_gather_coalesced(graph: fx.GraphModule, bucket_size_bytes:
 
 
 def bucket_weight_all_gather(graph: fx.GraphModule, bucket_mode: str, bucket_size_bytes: int = 0, split_by=None) -> int:
-    """Bucket the lowered weight all-gathers as ``bucket_mode`` asks.
+    """Bucket lowered weight all-gathers.
 
-      * ``"none"``      -- leave them alone (N individual all_gather + N waits).
-      * ``"coalesced"`` -- one all_gather_into_tensor_coalesced per bucket
-                           (ONE launch, N getitems, N waits).
-
-    ``bucket_size_bytes`` (coalesced mode only): when > 0, split the gathers into
-    buckets of at most this many local-shard bytes, breaking at dtype changes and
-    the byte cap in program order.  0 = no cap (one bucket per (group, dtype) run).
-
+    ``"none"`` leaves N individual all_gathers.  ``"coalesced"`` fuses each bucket
+    into one all_gather_into_tensor_coalesced.  ``bucket_size_bytes > 0`` caps a
+    bucket's local-shard bytes (0 = no cap); dtype changes always split.
     Returns the number of buckets created.
     """
     bucket_mode = (bucket_mode or "none").lower()
