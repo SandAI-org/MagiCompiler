@@ -232,13 +232,7 @@ def insert_h2d_loads(graph: fx.GraphModule, source: WeightSource) -> int:
 
 
 def _claim(slots) -> None:
-    """Record that these shards now have a load that will put their bytes back.
-
-    The pool cannot tell a shard that is waiting for its load from one that will
-    never get one, and the second kind is a kernel reading freed storage.
-    Claiming here -- at the splice, not at the bind -- is what lets
-    ``restore_unclaimed`` tell them apart once the graph is final.
-    """
+    """Record that these shards now have a load that will put their bytes back."""
     from ..runtime import host_pool
 
     for slot in slots:
