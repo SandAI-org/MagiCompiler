@@ -219,17 +219,13 @@ class FsdpOverlapReorder:
         comm_overlap_window_scale: float = 1.0,
         move_prep_chain: bool = False,
     ) -> None:
-        # Host offload puts an h2d_load + its wait between the weight placeholder
-        # and the gather.  Those are real data producers, so ``lower`` lands one
-        # slot below the launch and the gather can no longer move at all unless
-        # the whole prep chain travels with it.  Off by default: for a graph
-        # without offload this would also start hoisting dtype casts and pads
-        # that today stay put, and that is a separate change from this one.
+        # Offload's h2d_load + wait sit between the placeholder and the gather,
+        # so the gather cannot move unless that prep chain travels with it.
+        # Off by default: without offload this also hoists casts and pads.
         self.move_prep_chain = move_prep_chain
         self.comm_overlap_window_margin_ns = comm_overlap_window_margin_ns
         # need = comm * scale + margin: collectives are measured in isolation but
-        # run concurrent with the compute that hides them (~1.4-1.5x slower on
-        # 8xH100).  See CompileConfig.fsdp_config.comm_overlap_window_scale.
+        # run concurrent with the compute that hides them.
         self.comm_overlap_window_scale = comm_overlap_window_scale
         # cost_fn: snode -> ns.  Normally the SnodeCostTable filled by the
         # SnodeCostProfile pass ahead of this one; Inductor's estimate_op_runtime

@@ -665,28 +665,19 @@ class MagiBackend:
         self.compiler_manager.initialize_cache(self.local_magi_cache_path)
 
     def _reclaim_unloaded_weights(self) -> None:
-        """Put back any weight that was parked but that no graph ended up loading.
+        """Restore parked weights that no compiled graph loads.
 
-        Timing is the whole trick: the offload rewrite is done, so every load the
-        graph will ever have is in it, and the graph has not run yet -- not even
-        the interpreter pass that compiles the submodules, which executes it on
-        the example inputs.  A shard the graph does not load has no bytes behind
-        it, and the failure is an illegal access inside a kernel with nothing
-        pointing back at the parking decision, so the miss is worth paying device
-        memory to close.
+        After the offload rewrite, before any execution — including the interpreter
+        that compiles submodules on the example inputs. A parked shard with no load
+        has no device bytes, and the fault is an illegal access inside a kernel.
 
-        Normally empty.  It fills up when the two predicates that decide what to
-        park and what to load disagree: ``host_first`` parks a weight while the
-        model is being built, from its placements alone, and the source only
-        finds it later if the lowering actually produced an all-gather reading
-        it.
+        Usually empty. Non-empty when ``host_first`` parked a weight from its
+        placement but lowering never emitted an all-gather that reads it.
         """
         from magi_compiler.passes.weight_offload import host_pool
 
-        # Before and after, rather than the pool's resident total: the placement
-        # pass promotes shards back for a reason of its own, and counting those
-        # here would report a miss several times the size of the real one.
-        # ``make_resident_many`` only ever adds, so the difference is this call's.
+        # Delta, not the pool total: the placement pass also promotes shards, and
+        # ``make_resident_many`` only adds, so the difference is this call.
         before = host_pool.resident_bytes()
         restored = host_pool.restore_unclaimed()
         if not restored:
@@ -777,23 +768,18 @@ class MagiBackend:
             self.compiler_manager.bind_offload_cache(graph)
 
     def _configure_overlap_passes(self, *, loads_inserted: bool) -> None:
-        """Install the Inductor scheduler passes the rewrite above needs.
+        """Install the Inductor scheduler passes the weight rewrite needs.
 
-        The chain opens with ``SnodeCostProfile``, which prices the graph once
-        (rank-synchronized, unless ``fsdp_config.cost_mode`` is 'analytical')
-        into the ``SnodeCostTable`` every pass after it reads.
-
-        FSDP REPLACES PyTorch's builtin raise_comms/sink_waits with the
-        latest-safe-launch reorder, which hoists each all-gather launch just far
-        enough upstream for compute to hide it; offload on its own APPENDS to
-        them.  The asymmetry is deliberate: replacing them pays off when the
-        weight all-gathers are what the schedule is built around, and costs
-        every other collective in the model (CP / EP) its overlap when they are
-        not.
+        ``SnodeCostProfile`` prices the graph once into ``SnodeCostTable``
+        (rank-synchronized unless ``fsdp_config.cost_mode`` is ``analytical``).
+        FSDP replaces Inductor's ``raise_comms`` / ``sink_waits`` with
+        latest-safe-launch reorder; offload alone appends to those defaults.
+        Replacing them only pays off when weight all-gathers dominate the
+        schedule, and otherwise drops overlap for other collectives (CP / EP).
         """
         fsdp_cfg = self.compile_config.fsdp_config
         if not (fsdp_cfg.enable_fsdp or loads_inserted):
-            # Offload was asked for but bound nothing: leave the schedule alone.
+            # Offload requested but nothing bound.
             return
 
         costs = SnodeCostTable()
@@ -810,7 +796,7 @@ class MagiBackend:
                 )
             )
         else:
-            # Inductor's own defaults, which we are adding to rather than replacing.
+            # Append to Inductor's defaults.
             passes.extend(
                 self.inductor_compile_config.get("reorder_for_compute_comm_overlap_passes") or ["raise_comms", "sink_waits"]
             )
