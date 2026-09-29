@@ -106,28 +106,34 @@ peak and the allocator churn that goes with it.
 
 from __future__ import annotations
 
-import copy
 import logging
-from bisect import bisect_right
 from collections import defaultdict
 
-from torch._inductor.comms import _is_fake_dep
 from torch._inductor.scheduler import BaseSchedulerNode
 from torch._inductor.utils import contains_wait
 
 from magi_compiler.utils import magi_logger
 
-from ...snode_utils import earliest_legal_index, is_compute, is_multi_output, validate_topological_order
+from ...overlap import (
+    DEFAULT_WINDOW_MARGIN_NS,
+    CostView,
+    OverlapPass,
+    SnodeGraph,
+    alap_schedule,
+    device_peak,
+    inflight_peak,
+    live_starts,
+    unhoisted_index,
+)
+from ...snode_utils import is_multi_output
 from .h2d_snode import H2D_OPS, is_h2d_load, slots_of
-from .load_plan import InflightMap, LoadPlan, device_peak, inflight_peak, live_starts, load_bytes
+from .load_plan import LoadPlan, load_bytes
 
 
 def _magi_logger_enabled_for_debug() -> bool:
     """The per-load report builds a string per line; skip it when nobody reads it."""
     return logging.getLogger("magi_compiler").isEnabledFor(logging.DEBUG)
 
-
-_DEFAULT_WINDOW_MARGIN_NS = 5_000.0
 
 _MAX_SPLIT_ROUNDS = 5
 """Times ``_schedule`` may grow the in-flight budget out of the residency one."""
@@ -136,13 +142,15 @@ _DENSITY_SEARCH_ROUNDS = 8
 """Bisection steps for the target bus density; 8 lands within 0.4% of it."""
 
 
-class H2dLoadReorder:
+class H2dLoadReorder(OverlapPass):
     """Callable reorder pass.  Run me after ``FsdpOverlapReorder``."""
+
+    name = "h2d load reorder"
 
     def __init__(
         self,
         bandwidth_bytes_per_ns: float,
-        window_margin_ns: float = _DEFAULT_WINDOW_MARGIN_NS,
+        window_margin_ns: float = DEFAULT_WINDOW_MARGIN_NS,
         window_scale: float = 1.0,
         max_resident_bytes: int = 0,
         max_inflight_bytes: int = 0,
@@ -150,6 +158,7 @@ class H2dLoadReorder:
         bus_utilization: float = 0.9,
         cost_fn=None,
     ) -> None:
+        super().__init__(cost_fn)
         self.bandwidth_bytes_per_ns = max(1e-6, bandwidth_bytes_per_ns)
         self.window_margin_ns = window_margin_ns
         self.window_scale = window_scale
@@ -157,114 +166,67 @@ class H2dLoadReorder:
         self.max_inflight_bytes = max_inflight_bytes
         self.max_device_weight_bytes = max_device_weight_bytes
         self.bus_utilization = min(1.0, max(1e-3, bus_utilization))
-        if cost_fn is None:
-            from torch._inductor.comms import estimate_op_runtime
-
-            cost_fn = estimate_op_runtime
-        self._cost_fn = cost_fn
-
-    def __deepcopy__(self, memo):
-        # Through memo, so this copy and the profile pass's copy share one table.
-        new = H2dLoadReorder.__new__(H2dLoadReorder)
-        memo[id(self)] = new
-        new.bandwidth_bytes_per_ns = self.bandwidth_bytes_per_ns
-        new.window_margin_ns = self.window_margin_ns
-        new.window_scale = self.window_scale
-        new.max_resident_bytes = self.max_resident_bytes
-        new.max_inflight_bytes = self.max_inflight_bytes
-        new.max_device_weight_bytes = self.max_device_weight_bytes
-        new.bus_utilization = self.bus_utilization
-        new._cost_fn = copy.deepcopy(self._cost_fn, memo)
-        return new
-
-    def _cost(self, snode: BaseSchedulerNode) -> float:
-        try:
-            return max(0.0, float(self._cost_fn(snode)))
-        except Exception:  # noqa: BLE001
-            return 0.0
 
     def _transfer_ns(self, group: list[BaseSchedulerNode]) -> float:
         return load_bytes(group) / self.bandwidth_bytes_per_ns
 
-    def __call__(self, snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
-        order = list(snodes)
-        loads = [s for s in order if is_h2d_load(s)]
-        if not loads:
-            magi_logger.debug("h2d load reorder: no weight load among %d snodes (known ops: %s)", len(order), H2D_OPS)
-            return order
+    # -- OverlapPass hooks ------------------------------------------------
+    def wants(self, order: list[BaseSchedulerNode]) -> bool:
+        if any(is_h2d_load(s) for s in order):
+            return True
+        magi_logger.debug("h2d load reorder: no weight load among %d snodes (known ops: %s)", len(order), H2D_OPS)
+        return False
 
-        buf_to_snode = {b: s for s in order for b in s.get_buffer_names()}
-        users: dict[str, set] = defaultdict(set)
-        for s in order:
-            for d in s.unmet_dependencies:
-                if not _is_fake_dep(d):
-                    users[d.name].add(s)
-        index_of = {s: i for i, s in enumerate(order)}
+    def plan(self, graph: SnodeGraph, cost: CostView, ctx: dict) -> list[LoadPlan] | None:
+        return self._plan(graph) or None
 
-        plans = self._plan(loads, order, index_of, buf_to_snode, users)
-        if not plans:
-            return order
+    def place(self, graph: SnodeGraph, cost: CostView, plans: list[LoadPlan], ctx: dict) -> None:
+        prefix = cost.prefix(graph.order)
+        targets, budget = self._schedule(plans, graph.order, graph.index_of, prefix)
+        ctx.update(prefix=prefix, targets=targets, budget=budget)
 
-        prefix = self._compute_prefix(order)
-        targets, budget = self._schedule(plans, order, index_of, prefix)
+    def on_commit(self, graph: SnodeGraph, plans: list[LoadPlan], ctx: dict) -> None:
+        ctx["given_back"] = self._promote(plans)
 
-        new_order = self._rebuild(order, targets, index_of, {p.load: p.group for p in plans})
-        if not validate_topological_order(new_order, buf_to_snode):
-            magi_logger.warning("h2d load reorder: rebuilt order failed validation; leaving graph unchanged")
-            return order
-
-        given_back = self._promote(plans)
-        order[:] = new_order
-        self._report(plans, targets, index_of, given_back, budget, len(order), prefix)
-        return order
+    def report(self, graph: SnodeGraph, cost: CostView, plans: list[LoadPlan], committed: bool, ctx: dict) -> None:
+        if committed:
+            self._report(plans, ctx["targets"], graph.index_of, ctx["given_back"], ctx["budget"], len(graph), ctx["prefix"])
 
     # -- planning ---------------------------------------------------------
     @staticmethod
-    def _group_and_waits(load, users) -> tuple[list, list]:
-        group = [load]
-        waits: list = []
-        stack = list(load.get_buffer_names())
-        seen: set = set()
-        while stack:
-            for u in users.get(stack.pop(), ()):
-                if u in seen:
-                    continue
-                seen.add(u)
-                if contains_wait(u):
-                    waits.append(u)
-                elif is_multi_output(u):
-                    group.append(u)
-                    stack.extend(u.get_buffer_names())
+    def _group_and_waits(load, graph: SnodeGraph) -> tuple[list, list]:
+        """The load plus the unpacks that travel with it, and the waits guarding it."""
+
+        def classify(u):
+            if contains_wait(u):
+                return "wait", False
+            if is_multi_output(u):
+                return "member", True
+            return None, False
+
+        found = graph.walk_users([load], classify)
+        group = [load] + [u for label, u in found if label == "member"]
+        waits = [u for label, u in found if label == "wait"]
         return group, waits
 
-    @staticmethod
-    def _last_user_index(group, waits, users, index_of) -> int:
-        last = max(index_of[w] for w in waits)
-        skip = set(group)
-        for src in (*group, *waits):
-            for name in src.get_buffer_names():
-                for u in users.get(name, ()):
-                    if u not in skip:
-                        last = max(last, index_of[u])
-        return last
-
-    def _plan(self, loads, order, index_of, buf_to_snode, users) -> list[LoadPlan]:
+    def _plan(self, graph: SnodeGraph) -> list[LoadPlan]:
+        index_of = graph.index_of
         plans: list[LoadPlan] = []
-        for load in sorted(loads, key=lambda s: index_of[s]):
-            group, waits = self._group_and_waits(load, users)
+        for load in (s for s in graph.order if is_h2d_load(s)):
+            group, waits = self._group_and_waits(load, graph)
             if not waits:
                 magi_logger.debug("h2d load reorder: %s has no wait; leaving it in place", load.get_name())
                 continue
             need = self._transfer_ns(group) * self.window_scale + self.window_margin_ns
             plans.append(
                 LoadPlan(
-                    load=load,
+                    anchor=load,
                     group=group,
                     slots=slots_of(load),
-                    wait_idx=min(index_of[w] for w in waits),
-                    last_user=self._last_user_index(group, waits, users, index_of),
+                    deadline=min(index_of[w] for w in waits),
+                    last_user=graph.last_user_index(group, waits),
                     need=need,
-                    lower=earliest_legal_index(group, index_of, buf_to_snode),
+                    lower=graph.earliest_legal_index(group),
                     nbytes=load_bytes(group),
                     exposed=need,
                 )
@@ -272,18 +234,13 @@ class H2dLoadReorder:
         return plans
 
     # -- scheduling --------------------------------------------------------
-    @staticmethod
-    def _unhoisted(plan) -> int:
-        """Where a load sits when it is not hoisted at all: against its own wait."""
-        return max(plan.lower, plan.wait_idx - 1)
-
     def _inflight_budget(self, plans) -> int:
         """Bytes of load buffer this schedule may have live at once.
 
         Floored at what phase 1's own order already needs.  Unasked, that floor
         plus one load -- the least memory any overlap at all can cost.
         """
-        floor = inflight_peak(plans, {p.load: self._unhoisted(p) for p in plans})
+        floor = inflight_peak(plans, {p.load: unhoisted_index(p) for p in plans})
         if self.max_inflight_bytes <= 0:
             return floor + max((p.nbytes for p in plans), default=0)
         if self.max_inflight_bytes < floor:
@@ -318,7 +275,7 @@ class H2dLoadReorder:
         in-flight room back one bucket at a time, and only if the sweep says the
         budget and not the bus is what left transfer exposed.
         """
-        floor = inflight_peak(plans, {p.load: self._unhoisted(p) for p in plans})
+        floor = inflight_peak(plans, {p.load: unhoisted_index(p) for p in plans})
         biggest = max((p.nbytes for p in plans), default=0)
         if self.max_device_weight_bytes <= 0:
             yield self.max_resident_bytes, self._inflight_budget(plans)
@@ -454,107 +411,24 @@ class H2dLoadReorder:
     def _sweep(self, plans, order, index_of, prefix, promoted, budget) -> dict:
         """Schedule the bus by deadline, then issue each load just in time.
 
-        Every offloaded load is booked at its unhoisted position in the in-flight
-        map before anything moves, and released only when placed -- so the budget
-        is a promise.  Promoted loads keep phase 1's position, take no bus slot
-        (device-to-device) and no in-flight room either: their bytes are charged
-        to the residency budget, and charging them twice would let a filled
+        ``overlap.alap_schedule`` does the placing.  Promoted loads are its
+        inactive tasks: they keep phase 1's position and take no bus slot
+        (device-to-device) and no in-flight room -- their bytes are charged to
+        the residency budget, and charging them twice would let a filled
         residency squeeze the transfers that are still on the bus.
 
-        The active loads are then list-scheduled in DEADLINE order, in two
-        passes.  A backward pass over the waits gives each transfer the latest
-        instant it may finish without pushing the ones after it past their own
-        deadlines; a forward pass then runs the bus, giving each transfer the
-        latest slot that respects both that limit and the bus still being busy.
-        Where the bus is saturated the slots butt together and it never idles;
-        where there is slack a transfer simply starts late, which costs nothing
-        and keeps its buffer's live range short.  The snode a load is emitted at
-        is the latest one whose compute prefix still reaches its slot -- just in
-        time, because the DMA begins at that instant whatever index we choose and
-        anything earlier only holds memory for longer.
-
-        Scheduling by size instead is what the previous sweep did, and it cost
-        both ways.  The big transfers claimed the bus first; a 3ms bundle then
-        found every mid-graph instant taken, and the only placement the model
-        scored as fully hidden was the gap at the very top of the graph.  On
-        gaga4 400B that put 28 such bundles at snode ~400 against deadlines
-        1000+ nodes later: 4% of the bytes holding 37% of the in-flight budget
-        for the length of the graph, which under one device-weight budget comes
-        straight out of residency and back onto the bus.
+        Scheduling by size instead of by deadline is what the previous sweep
+        did, and it cost both ways.  The big transfers claimed the bus first; a
+        3ms bundle then found every mid-graph instant taken, and the only
+        placement the model scored as fully hidden was the gap at the very top of
+        the graph.  On gaga4 400B that put 28 such bundles at snode ~400 against
+        deadlines 1000+ nodes later: 4% of the bytes holding 37% of the in-flight
+        budget for the length of the graph, which under one device-weight budget
+        comes straight out of residency and back onto the bus.
         """
-        live = InflightMap(budget)
         for plan in plans:
             plan.promoted = plan.load in promoted
-            if plan.promoted:
-                plan.exposed = 0.0
-                plan.budget_floor = index_of[plan.load]
-                plan.budget_bound = False
-            else:
-                live.add(self._unhoisted(plan), plan.last_user, plan.nbytes)
-
-        active = sorted((p for p in plans if not p.promoted), key=lambda p: (p.wait_idx, index_of[p.load]))
-        latest_finish = self._latest_finish(active, prefix)
-
-        targets: dict = {}
-        bus_end = 0.0
-        emitted = -1
-        for plan in active:
-            live.remove(self._unhoisted(plan), plan.last_user, plan.nbytes)
-            floor = live.earliest_start(plan.last_user, plan.nbytes)
-            plan.budget_floor = floor
-            lo = max(plan.lower, floor)
-
-            # As late as the deadlines allow, but never before the bus is free
-            # or before the load is legal to issue.
-            t_bus = max(prefix[lo], bus_end, latest_finish[plan.load] - plan.need)
-            bus_end = t_bus + plan.need
-            plan.exposed = max(0.0, bus_end - prefix[plan.wait_idx])
-            # The in-flight floor is the limit only when relaxing it would have
-            # started the DMA sooner; otherwise the bus was full regardless.
-            plan.budget_bound = plan.exposed > 0 and prefix[lo] > prefix[plan.lower] and prefix[lo] > t_bus - plan.need
-
-            at = self._issue_index(prefix, t_bus, lo, plan.wait_idx, emitted)
-            targets[plan.load] = at
-            emitted = at
-            live.add(at, plan.last_user, plan.nbytes)
-        return targets
-
-    @staticmethod
-    def _latest_finish(active, prefix) -> dict:
-        """Per load, the last instant its transfer may end and still keep order.
-
-        Walked back from the last deadline: a transfer may not finish later than
-        its own wait, nor later than the start of the next one already pinned to
-        its deadline.  Without this a load with slack would be scheduled the
-        moment the bus is free, which is early, and then sit in memory until its
-        wait -- the bus gains nothing and the in-flight budget pays for it.
-        """
-        limit = float("inf")
-        out: dict = {}
-        for plan in reversed(active):
-            limit = min(prefix[plan.wait_idx], limit)
-            out[plan.load] = limit
-            limit -= plan.need
-        return out
-
-    @staticmethod
-    def _issue_index(prefix, t_bus: float, lo: int, wait_idx: int, emitted: int) -> int:
-        """Latest snode whose compute prefix still reaches ``t_bus``.
-
-        Clamped into ``[lo, wait_idx)`` -- a load must follow its producers and
-        precede its own wait -- and never before the load placed ahead of it,
-        which holds an earlier bus slot, so the stream issues the transfers in
-        the order the bus was scheduled to run them.
-        """
-        hi = max(lo, wait_idx - 1)
-        at = bisect_right(prefix, t_bus, lo, max(lo + 1, wait_idx)) - 1
-        return min(hi, max(lo, emitted, at))
-
-    def _compute_prefix(self, order) -> list[float]:
-        prefix = [0.0] * (len(order) + 1)
-        for i, s in enumerate(order):
-            prefix[i + 1] = prefix[i] + (self._cost(s) if is_compute(s) else 0.0)
-        return prefix
+        return alap_schedule(plans, prefix, index_of, budget)
 
     # -- committing --------------------------------------------------------
     @staticmethod
@@ -570,16 +444,6 @@ class H2dLoadReorder:
                 continue
             slots.extend(p.slots)
         return host_pool.make_resident_many(slots)
-
-    @staticmethod
-    def _rebuild(order, targets, index_of, groups) -> list[BaseSchedulerNode]:
-        member_target = {m: targets[load] for load, group in groups.items() if load in targets for m in group}
-
-        def _key(s):
-            target = member_target.get(s)
-            return (target - 0.5, index_of[s]) if target is not None else (index_of[s], 0.0)
-
-        return sorted(order, key=_key)
 
     # -- reporting --------------------------------------------------------
     def _report(self, plans, targets, index_of, given_back, budget, n_snodes, prefix) -> None:

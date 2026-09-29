@@ -29,6 +29,7 @@ this suite exists to catch.
 import pytest
 import torch
 
+from magi_compiler.passes.overlap import memory, scheduler
 from magi_compiler.passes.weight_offload.schedule import h2d_reorder, load_plan
 from magi_compiler.passes.weight_offload.schedule.h2d_reorder import H2dLoadReorder
 
@@ -526,24 +527,14 @@ def test_loads_far_enough_apart_both_survive():
 
 def test_last_user_is_the_consumer_not_the_wait():
     """The wait is only the floor; last_user is whoever still reads the bytes."""
-    from collections import defaultdict
-
-    from torch._inductor.comms import _is_fake_dep
+    from magi_compiler.passes.overlap import SnodeGraph
 
     order = [_compute("c0", 5e6), _load("ld", 4), _wait("w", "ld"), _compute("matmul", 1e6, deps=["w"])]
-    users = defaultdict(set)
-    for s in order:
-        for d in s.unmet_dependencies:
-            if not _is_fake_dep(d):
-                users[d.name].add(s)
-    index_of = {s: i for i, s in enumerate(order)}
-    load = next(s for s in order if s.name == "ld")
-    plans = H2dLoadReorder(bandwidth_bytes_per_ns=10.0, window_margin_ns=0.0, cost_fn=lambda s: s.cost)._plan(
-        [load], order, index_of, {}, users
-    )
+    graph = SnodeGraph(order)
+    plans = H2dLoadReorder(bandwidth_bytes_per_ns=10.0, window_margin_ns=0.0, cost_fn=lambda s: s.cost)._plan(graph)
     assert len(plans) == 1
-    assert plans[0].wait_idx == index_of[order[2]]
-    assert plans[0].last_user == index_of[order[3]]
+    assert plans[0].wait_idx == graph.index_of[order[2]]
+    assert plans[0].last_user == graph.index_of[order[3]]
 
 
 def test_load_without_a_wait_is_left_alone():
@@ -747,16 +738,16 @@ def test_adjacent_closed_ranges_both_stay_offloaded():
 def _plan_stub(name, *, wait_idx, last_user, nbytes, need=0.0, lower=0, promoted=False):
     """A ``_Plan`` carrying only the fields the memory and pricing helpers read."""
     return load_plan.LoadPlan(
-        load=_Snode(name, "load"),
+        anchor=_Snode(name, "load"),
         group=[],
         slots=[],
-        wait_idx=wait_idx,
+        deadline=wait_idx,
         last_user=last_user,
         need=need,
         lower=lower,
         nbytes=nbytes,
         exposed=need,
-        promoted=promoted,
+        inactive=promoted,
     )
 
 
@@ -766,13 +757,13 @@ def test_latest_finish_chains_the_deadlines_backwards():
     early = _plan_stub("early", wait_idx=2, last_user=4, nbytes=_MIB, need=100.0)
     late = _plan_stub("late", wait_idx=4, last_user=5, nbytes=_MIB, need=250.0)
 
-    limits = H2dLoadReorder._latest_finish([early, late], prefix)
+    limits = scheduler.latest_finish([early, late], prefix)
     assert limits[late.load] == 1000.0, "the last one is held only by its own wait"
     assert limits[early.load] == 300.0, "its own wait is tighter than 1000 - 250"
 
     # Grow the later transfer until it is what binds the earlier one.
     late.need = 800.0
-    limits = H2dLoadReorder._latest_finish([early, late], prefix)
+    limits = scheduler.latest_finish([early, late], prefix)
     assert limits[early.load] == 200.0, "it now has to be done before `late` starts"
 
 
@@ -780,13 +771,13 @@ def test_issue_index_is_just_in_time():
     """The DMA starts at ``t_bus`` whatever index we pick, so pick the latest."""
     prefix = [0.0, 100.0, 300.0, 600.0, 1000.0]
 
-    assert H2dLoadReorder._issue_index(prefix, 300.0, 0, 4, -1) == 2
-    assert H2dLoadReorder._issue_index(prefix, 599.0, 0, 4, -1) == 2, "600 is later than the slot"
-    assert H2dLoadReorder._issue_index(prefix, 0.0, 0, 4, -1) == 0
+    assert scheduler.issue_index(prefix, 300.0, 0, 4, -1) == 2
+    assert scheduler.issue_index(prefix, 599.0, 0, 4, -1) == 2, "600 is later than the slot"
+    assert scheduler.issue_index(prefix, 0.0, 0, 4, -1) == 0
 
-    assert H2dLoadReorder._issue_index(prefix, 1000.0, 0, 3, -1) == 2, "never past its own wait"
-    assert H2dLoadReorder._issue_index(prefix, 0.0, 2, 4, -1) == 2, "never before its producers"
-    assert H2dLoadReorder._issue_index(prefix, 0.0, 0, 4, 3) == 3, "never before the load ahead of it"
+    assert scheduler.issue_index(prefix, 1000.0, 0, 3, -1) == 2, "never past its own wait"
+    assert scheduler.issue_index(prefix, 0.0, 2, 4, -1) == 2, "never before its producers"
+    assert scheduler.issue_index(prefix, 0.0, 0, 4, 3) == 3, "never before the load ahead of it"
 
 
 def test_peak_counts_a_promoted_weight_twice_where_its_copy_runs():
@@ -800,11 +791,11 @@ def test_peak_counts_a_promoted_weight_twice_where_its_copy_runs():
     plans = [kept, resident]
     index_of = {kept.load: 0, resident.load: 10}
 
-    assert load_plan.device_peak(plans, {kept.load: 0}, index_of) == 8 * _MIB + 8 * _MIB
+    assert memory.device_peak(plans, {kept.load: 0}, index_of) == 8 * _MIB + 8 * _MIB
 
     resident.last_user = 3  # its buffer now overlaps the kept load's
     index_of[resident.load] = 1
-    assert load_plan.device_peak(plans, {kept.load: 0}, index_of) == 8 * _MIB + 12 * _MIB
+    assert memory.device_peak(plans, {kept.load: 0}, index_of) == 8 * _MIB + 12 * _MIB
 
 
 def test_inflight_occupancy_finds_the_earliest_fitting_start():
@@ -814,7 +805,7 @@ def test_inflight_occupancy_finds_the_earliest_fitting_start():
     graph; one that does not has to start past whatever is in its way, which is
     what turns a byte budget into a placement floor.
     """
-    live = load_plan.InflightMap(budget=10)
+    live = memory.InflightMap(budget=10)
     live.add(4, 8, 6)  # 6 bytes live over the closed range [4, 8]
 
     assert live.earliest_start(12, 4) == 0, "4 fits alongside 6 in a 10-byte budget"
@@ -834,17 +825,17 @@ def test_inflight_peak_counts_closed_interval_touch():
 
     class _Fake:
         def __init__(self, last_user, nbytes):
-            self.load = object()
+            self.anchor = object()
             self.last_user = last_user
             self.nbytes = nbytes
 
     earlier = _Fake(last_user=4, nbytes=100)
     later = _Fake(last_user=7, nbytes=50)
-    peak = load_plan.inflight_peak([earlier, later], {earlier.load: 0, later.load: 4})
+    peak = memory.inflight_peak([earlier, later], {earlier.anchor: 0, later.anchor: 4})
     assert peak == 150
 
     later_after = _Fake(last_user=7, nbytes=50)
-    peak_adjacent = load_plan.inflight_peak([earlier, later_after], {earlier.load: 0, later_after.load: 5})
+    peak_adjacent = memory.inflight_peak([earlier, later_after], {earlier.anchor: 0, later_after.anchor: 5})
     assert peak_adjacent == 100
 
 

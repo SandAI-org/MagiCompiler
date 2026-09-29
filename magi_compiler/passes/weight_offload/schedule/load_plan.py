@@ -12,15 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-load placement state and the device-memory accounting over it."""
+"""A weight load as an overlap task, and the bytes it moves."""
 
 from __future__ import annotations
 
-from bisect import insort
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from torch._inductor.scheduler import BaseSchedulerNode
 
+from ...overlap import TransferTask
 from ...snode_utils import is_multi_output
 
 
@@ -47,101 +47,29 @@ def load_bytes(group: list[BaseSchedulerNode]) -> int:
     return sum(snode_bytes(s) for s in (unpacks or group[:1]))
 
 
-@dataclass
-class LoadPlan:
-    """One load's placement problem: how much transfer to hide, and where it may go."""
+@dataclass(eq=False)
+class LoadPlan(TransferTask):
+    """One load's placement problem: how much transfer to hide, and where it may go.
 
-    load: BaseSchedulerNode
-    group: list  # the load plus the alias snodes that must travel with it
-    slots: list[int]  # host-pool slots this load pulls
-    wait_idx: int  # earliest wait: the load's hard upper bound
-    # Inclusive right end of the closed live range [target, last_user].
-    last_user: int
-    need: float  # ns of compute / bus time that would fully hide the transfer
-    lower: int  # earliest legal index (real-dep floor)
-    nbytes: int
-    exposed: float  # ns of transfer the placement could not cover; set by _sweep
-    promoted: bool = False  # bought out of the offload plan; transfer is now D2D
-    budget_floor: int = 0  # earliest index the in-flight budget left open
-    budget_bound: bool = False  # the in-flight budget, not the bus, is what stopped it
-
-
-class InflightMap:
-    """Occupancy of the in-flight byte budget over the snode index space.
-
-    Ranges are closed, ``[start, last_user]``, because ``_rebuild`` inserts a load
-    *before* the node at its target: that node already sees the new buffer, while
-    the earlier load's ``last_user`` still reads the old one.  Two ranges
-    therefore overlap iff ``earlier.last_user >= later.start``.
+    ``anchor`` is the load, ``deadline`` its earliest wait (the hard upper
+    bound), and ``inactive`` means bought out of the offload plan: resident, so
+    the transfer is now device-to-device and off the bus.
     """
 
-    def __init__(self, budget: int) -> None:
-        self.budget = budget
-        self._deltas: list[tuple[int, int]] = []
+    slots: list[int] = field(default_factory=list)  # host-pool slots this load pulls
 
-    def add(self, start: int, last_user: int, nbytes: int) -> None:
-        insort(self._deltas, (start, nbytes))
-        insort(self._deltas, (last_user + 1, -nbytes))
+    @property
+    def load(self) -> BaseSchedulerNode:
+        return self.anchor
 
-    def remove(self, start: int, last_user: int, nbytes: int) -> None:
-        self._deltas.remove((start, nbytes))
-        self._deltas.remove((last_user + 1, -nbytes))
+    @property
+    def wait_idx(self) -> int:
+        return self.deadline
 
-    def earliest_start(self, last_user: int, nbytes: int) -> int:
-        """Earliest index where ``[i, last_user]`` still fits ``nbytes`` in the budget."""
-        room = self.budget - nbytes
-        blocked = -1
-        occupied = 0
-        prev = 0
-        for idx, delta in self._deltas:
-            if prev > last_user:
-                break
-            if occupied > room and prev < idx:
-                blocked = max(blocked, min(idx - 1, last_user))
-            occupied += delta
-            prev = idx
-        return blocked + 1
+    @property
+    def promoted(self) -> bool:
+        return self.inactive
 
-
-def live_starts(plans, targets, index_of) -> dict:
-    """Where each load buffer still on the bus comes alive; resident ones never do."""
-    return {p.load: targets.get(p.load, index_of[p.load]) for p in plans if not p.promoted}
-
-
-def peak_point(plans, starts) -> tuple[int, int]:
-    events: list[tuple[int, int]] = []
-    for p in plans:
-        at = starts.get(p.load)
-        if at is not None:
-            events.append((at, p.nbytes))
-            events.append((p.last_user, -p.nbytes))
-    events.sort(key=lambda ev: (ev[0], ev[1] < 0))
-    peak = live = where = 0
-    for idx, delta in events:
-        live += delta
-        if live > peak:
-            peak, where = live, idx
-    return peak, where
-
-
-def inflight_peak(plans, starts) -> int:
-    return peak_point(plans, starts)[0]
-
-
-def peak_with(plans, starts, promoted) -> int:
-    permanent = sum(p.nbytes for p in plans if p.load in promoted)
-    return permanent + inflight_peak(plans, starts)
-
-
-def device_peak(plans, targets, index_of) -> int:
-    """Weight bytes on the device at the worst point in the graph.
-
-    Every load is counted where its buffer comes alive, promoted ones
-    included: residency removes the PCIe crossing, not the copy, so
-    ``h2d_load`` still allocates an output for a resident slot and its bytes
-    are on the device twice while that buffer lives.  The in-flight *budget*
-    deliberately does not charge for those (see ``H2dLoadReorder._sweep``);
-    this is the memory report, where it would be a lie not to.
-    """
-    starts = {p.load: targets.get(p.load, index_of[p.load]) for p in plans}
-    return peak_with(plans, starts, {p.load for p in plans if p.promoted})
+    @promoted.setter
+    def promoted(self, value: bool) -> None:
+        self.inactive = value

@@ -390,6 +390,15 @@ class FSDPConfig(BaseModel):
             "with the compute that hides them (~1.4-1.5x slower in-situ on 8xH100)."
         ),
     )
+    placement: Literal["index_sweep", "alap"] = Field(
+        "index_sweep",
+        description=(
+            "How the reorder places each all-gather launch. 'index_sweep': walk snodes back from the launch, "
+            "claiming whole compute kernels and carrying a long kernel's unspent remainder to the next gather. "
+            "'alap': the same deadline chain computed on the compute time axis by the shared scheduler the H2D "
+            "load reorder uses (each gather as late as its own position and the next gather's start allow)."
+        ),
+    )
     transport: Literal["nccl", "copy_engine"] = Field(
         "nccl",
         description=(
