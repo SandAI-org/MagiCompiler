@@ -332,18 +332,20 @@ class InductorStandaloneAdaptor(CompilerInterface):
     ) -> tuple[Callable | None, CacheHandle | None]:
         # Step1: Update compile settings
         compilation_counter.num_inductor_compiles += 1
-        current_config = {
-            # standalone_compile hardcodes autotune_at_compile_time=True, but
-            # Triton autotune benchmarks with unbacked SymInt dimensions cause
-            # CUDA illegal-memory-access errors.  Disable compile-time autotune
-            # so that tuning happens at first runtime invocation instead (same
-            # kernel quality, avoids the crash, and tunes on real shapes).
-            "triton.autotune_at_compile_time": False
-        }
+
+        # standalone_compile hardcodes autotune_at_compile_time=True, but
+        # unbacked SymInt dimensions cause CUDA illegal-memory-access when
+        # autotune benchmarks run at compile time (confirmed on PT 2.9 / B300).
+        # Override to False: autotuning defers to first forward pass instead.
+        #
+        # The runtime autotune results are persisted via TRITON_CACHE_AUTOTUNING=1
+        # (set in _api.py) — Triton writes .autotune.json to TRITON_CACHE_DIR
+        # (persistent AFS).  Subsequent cold starts read cached results and
+        # skip benchmarking, eliminating the ~3-5 min overhead.
+        current_config: dict[str, Any] = {"triton.autotune_at_compile_time": False}
         if inductor_compile_config is not None:
             current_config.update(inductor_compile_config)
         if isinstance(runtime_shape, int):
-            # for a specific sequence length, tuning triton kernel parameters can be beneficial
             current_config.update(
                 {
                     "max_autotune": self.compile_config.enable_inductor_max_autotune,
