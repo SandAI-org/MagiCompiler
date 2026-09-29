@@ -48,6 +48,14 @@ def is_ce_ag_ir(node) -> bool:
     return getattr(node, "op_overload", None) in ce_ag_ops()
 
 
+def is_ce_ag_coalesced(node) -> bool:
+    try:
+        from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER_COALESCED
+    except Exception:  # noqa: BLE001
+        return False
+    return CE_ALL_GATHER_COALESCED is not None and getattr(node, "op_overload", None) is CE_ALL_GATHER_COALESCED
+
+
 def is_gather_ir(node) -> bool:
     return node is not None and (is_collective(node) or is_ce_ag_ir(node))
 

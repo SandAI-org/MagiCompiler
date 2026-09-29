@@ -1318,24 +1318,23 @@ def test_storage_freed_shard_survives_a_real_inductor_compile():
 def test_inductor_lowers_the_load_to_a_snode_the_reorder_recognizes():
     """``h2d_load`` has to arrive at the scheduler as its own movable snode.
 
-    If Inductor inlined it, or if ``_is_h2d_load`` failed to recognize the
+    If Inductor inlined it, or if ``is_h2d_load`` failed to recognize the
     lowered form, both reorder passes would quietly do nothing: phase 1 would
     count the transfer as compute that hides an all-gather, and phase 2 would
     find nothing to hoist.  Neither shows up as an error, only as an overlap that
     never materializes -- so it is asserted here, inside a real compile.
     """
-    from magi_compiler.passes.fsdp_overlap.reorder import _is_h2d_load
+    from magi_compiler.passes.snode_utils import is_compute
     from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
+    from magi_compiler.passes.weight_offload.schedule.h2d_snode import is_h2d_load
 
     seen = {"loads": 0, "compute_misclassified": 0}
 
     def probe(snodes):
-        from magi_compiler.passes.fsdp_overlap.reorder import FsdpOverlapReorder
-
         for s in snodes:
-            if _is_h2d_load(s):
+            if is_h2d_load(s):
                 seen["loads"] += 1
-                if FsdpOverlapReorder._is_compute(s):
+                if is_compute(s):
                     seen["compute_misclassified"] += 1
         return snodes
 

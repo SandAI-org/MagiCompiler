@@ -35,7 +35,7 @@ actually matters is checked directly: the collective sequence of the FINAL sched
 is all_gathered and compared across ranks.
 
 With ``--modes-only`` (>=2 ranks, gloo, no CUDA / no compile): drive
-``_negotiate_mode`` directly with synthetic per-rank inputs and assert it returns
+``rank_sync.negotiate_mode`` directly with synthetic per-rank inputs and assert it returns
 the expected mode for each rung of the ladder (identical / slot / pinned / abort).
 
 With ``--copy-engine``: the same shape, but the gathers are
@@ -75,8 +75,10 @@ import torch  # noqa: E402
 import torch._inductor.config as inductor_config  # noqa: E402
 import torch.distributed as dist  # noqa: E402
 
-from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder
-from magi_compiler.passes.fsdp_overlap import reorder as _ro
+from magi_compiler.passes import snode_utils  # noqa: E402
+from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder  # noqa: E402
+from magi_compiler.passes.overlap import rank_sync  # noqa: E402
+from magi_compiler.utils import magi_logger  # noqa: E402
 
 
 class _FakeIR:
@@ -88,7 +90,7 @@ class _FakeIR:
 
 
 class _FakeSnode:
-    """Enough of a snode for ``_graph_fingerprint`` (the only thing the mode
+    """Enough of a snode for ``graph_fingerprint`` (the only thing the mode
     negotiation reads out of the schedule)."""
 
     snodes = None
@@ -98,10 +100,10 @@ class _FakeSnode:
 
 
 def _mode_ladder_selfcheck(rank: int) -> bool:
-    """Assert every rung of ``_negotiate_mode``'s ladder, with rank 1 feeding the
+    """Assert every rung of ``negotiate_mode``'s ladder, with rank 1 feeding the
     divergent input.  All ranks walk the cases in the same order, so the symmetric
     all_gather inside each call stays lockstep."""
-    negotiate = FsdpOverlapReorder._negotiate_mode
+    negotiate = rank_sync.negotiate_mode
     odd = rank == 1
     ag, other = (True, "ag", (8, 8)), (False, "cp", (4,))
     cases = [
@@ -214,7 +216,7 @@ def main() -> None:
 
     # magi_logger output from inside an Inductor compile does not reliably reach the
     # subprocess streams; intercept the warning call itself to detect the mode taken.
-    orig_warning = _ro.magi_logger.warning
+    orig_warning = magi_logger.warning
 
     def spy_warning(msg, *a, **kw):
         if "NOT structurally identical" in str(msg):
@@ -225,15 +227,15 @@ def main() -> None:
             print(f"REORDER_SLOT rank={rank}", flush=True)
         return orig_warning(msg, *a, **kw)
 
-    _ro.magi_logger.warning = spy_warning
+    magi_logger.warning = spy_warning
 
     def spy(self, snodes):
         calls["n"] += 1
-        calls["gathers"] += sum(1 for s in snodes if _ro._is_weight_gather(s))
+        calls["gathers"] += sum(1 for s in snodes if snode_utils.is_weight_gather(s))
         before = list(snodes)
         out = orig_call(self, snodes)
         calls["unchanged"] = len(out) == len(before) and all(a is b for a, b in zip(out, before))
-        skeletons.append(_ro._collective_skeleton(out)[1])
+        skeletons.append(rank_sync.collective_skeleton(out)[1])
         return out
 
     FsdpOverlapReorder.__call__ = spy
@@ -243,7 +245,7 @@ def main() -> None:
         fallback kernel at 0us, so without this the launches barely move."""
         from torch._inductor.comms import estimate_op_runtime
 
-        if _ro._is_ce_ag_ir(_ro._leaf_collective_node(snode)):
+        if snode_utils.is_ce_ag_ir(snode_utils.leaf_collective_node(snode)):
             return 1e7  # 10ms, far more than the whole graph's compute
         return estimate_op_runtime(snode)
 
@@ -268,7 +270,7 @@ def main() -> None:
         inductor_config.reorder_for_compute_comm_overlap_passes = prev_passes
         inductor_config.force_disable_caches = prev_cache
         FsdpOverlapReorder.__call__ = orig_call
-        _ro.magi_logger.warning = orig_warning
+        magi_logger.warning = orig_warning
 
     finite = bool(torch.isfinite(out).all().item())
     rel = ((out.float() - eager.float()).norm() / (eager.float().norm() + 1e-6)).item()

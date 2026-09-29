@@ -110,7 +110,7 @@ def test_fingerprint_canonicalizes_shape_symbols():
     """
     import sympy
 
-    from magi_compiler.passes.fsdp_overlap.reorder import _graph_fingerprint
+    from magi_compiler.passes.overlap.rank_sync import graph_fingerprint as _graph_fingerprint
 
     def syms(*names):
         return [sympy.Symbol(n, positive=True, integer=True) for n in names]
