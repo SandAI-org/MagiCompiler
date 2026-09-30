@@ -12,21 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .bucket_all_gather import bucket_weight_all_gather_coalesced
+from magi_compiler.passes.weight_offload.graph.weight_source import FsdpShardSource, shard_holder
+
+from .bucket_all_gather import bucket_weight_all_gather, bucket_weight_all_gather_coalesced
 from .copy_engine import bind_weights_for_copy_engine, copy_engine_weight_candidates, rewrite_weight_ag_to_copy_engine
-from .lower_and_bucket import lower_and_bucket_full_graph
 from .node_meta import CE_BOUND, UNEVEN_SHARD, WEIGHT_AG, is_ce_bound, is_uneven_shard, is_weight_ag
 from .redistribute_lowering import lower_prim_redistribute_to_collectives
 from .reorder import FsdpOverlapReorder
 
 __all__ = [
     "bind_weights_for_copy_engine",
+    "bucket_weight_all_gather",
     "bucket_weight_all_gather_coalesced",
     "copy_engine_weight_candidates",
     "lower_prim_redistribute_to_collectives",
-    "lower_and_bucket_full_graph",
     "rewrite_weight_ag_to_copy_engine",
     "FsdpOverlapReorder",
+    "FsdpShardSource",
+    "shard_holder",
     "CE_BOUND",
     "UNEVEN_SHARD",
     "WEIGHT_AG",

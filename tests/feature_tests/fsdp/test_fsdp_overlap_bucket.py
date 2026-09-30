@@ -13,8 +13,8 @@
 # limitations under the License.
 
 """Unit tests for the FSDP-overlap weight all-gather bucketing pass
-(``magi_compiler.passes.fsdp_overlap.bucket_all_gather`` +
-``lower_and_bucket_full_graph``).
+(``magi_compiler.passes.fsdp_overlap.bucket_all_gather``: the coalescing pass
+itself and the ``bucket_mode`` entry point in front of it).
 
 Pure-CPU: the bucketing pass operates on ``all_gather_into_tensor`` fx nodes tagged
 ``magi_fsdp_weight_ag`` (it never runs the ops), so we drive it with SYNTHETIC fx
@@ -30,7 +30,7 @@ import pytest
 import torch
 import torch.fx as fx
 
-from magi_compiler.passes.fsdp_overlap import bucket_weight_all_gather_coalesced, lower_and_bucket_full_graph
+from magi_compiler.passes.fsdp_overlap import bucket_weight_all_gather, bucket_weight_all_gather_coalesced
 
 _AG = torch.ops._c10d_functional.all_gather_into_tensor.default
 _AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
@@ -75,7 +75,7 @@ def _build_ag_graph(specs, world=2, group="grp0"):
         chunk = s["shape"][0]
         rest = s["shape"][1:]
         gathered = torch.empty(chunk * world, *rest, dtype=s["dtype"], device="meta")
-        ag = g.call_function(_AG, (loc, world, group))
+        ag = g.call_function(_AG, (loc, world, s.get("group", group)))
         ag.meta["example_value"] = gathered
         mark_weight_ag(ag, uneven=False)
         w = g.call_function(_WAIT, (ag,))
@@ -184,6 +184,63 @@ def test_bucket_cap_does_not_depend_on_the_local_shard_length():
     assert _bucket_sizes(gm_even) == _bucket_sizes(gm_tail) == [2, 2]
 
 
+def test_another_mesh_between_two_gathers_breaks_the_bucket():
+    """Adjacency is in the GRAPH, not within a process group.
+
+    Fusing two gathers makes the earlier one's shard -- and the unsharded output
+    it becomes -- live until the later one's consumer.  Across a mesh boundary
+    that is unbounded: on a 40-layer MoE this had layer 0's attention weight
+    sharing a bucket with layer 30's, holding gigabytes of gathered weight for
+    most of a forward, because the two were neighbours among dense gathers while
+    hundreds of expert gathers sat between them.
+    """
+    bf16 = torch.bfloat16
+    gm = _build_ag_graph(
+        [
+            {"shape": (4, 8), "dtype": bf16, "group": "dense"},
+            {"shape": (4, 8), "dtype": bf16, "group": "experts"},
+            {"shape": (4, 8), "dtype": bf16, "group": "dense"},
+        ]
+    )
+    assert bucket_weight_all_gather_coalesced(gm) == 0, "no two launches are neighbours here"
+    assert _n(gm, _AG) == 3, "each one keeps its own all_gather"
+    assert _n(gm, _AG_COALESCED) == 0
+
+
+def test_a_differently_transported_gather_does_not_split_its_neighbours():
+    """``split_by`` marks one odd gather, not a stretch of the model.
+
+    A weight that could not be bound to the copy engine, or that stayed resident
+    rather than offloaded, sits alone between its neighbours.  Ending the run
+    there would split the bucket around it and cost throughput for a distance of
+    exactly one launch -- which is why only a mesh change cuts a run.
+    """
+    bf16 = torch.bfloat16
+    gm = _build_ag_graph([{"shape": (4, 8), "dtype": bf16}] * 4)
+    gathers = [n for n in gm.graph.nodes if n.op == "call_function" and n.target is _AG]
+    odd = gathers[1]
+
+    assert bucket_weight_all_gather_coalesced(gm, split_by=lambda n: n is odd) == 1
+    (coalesced,) = [n for n in gm.graph.nodes if n.target is _AG_COALESCED]
+    assert len(coalesced.args[0]) == 3, "the three alike gathers stay in one bucket"
+    assert _n(gm, _AG) == 1, "the odd one keeps its own launch"
+
+
+def test_adjacent_gathers_on_one_mesh_still_fuse():
+    """The rule must only cost fusions that actually span something."""
+    bf16 = torch.bfloat16
+    gm = _build_ag_graph(
+        [
+            {"shape": (4, 8), "dtype": bf16, "group": "dense"},
+            {"shape": (4, 8), "dtype": bf16, "group": "dense"},
+            {"shape": (4, 8), "dtype": bf16, "group": "experts"},
+        ]
+    )
+    assert bucket_weight_all_gather_coalesced(gm) == 1
+    assert _n(gm, _AG_COALESCED) == 1
+    assert _n(gm, _AG) == 1, "the lone gather on the other mesh is left alone"
+
+
 def test_compute_between_gathers_does_not_break_bucket():
     """Whole-graph bucketing: an interleaved compute op between gathers does NOT
     split them into separate buckets (no region boundaries)."""
@@ -203,35 +260,35 @@ def test_compute_between_gathers_does_not_break_bucket():
 
 
 # ---------------------------------------------------------------------------
-# lower_and_bucket_full_graph (entry point)
+# bucket_weight_all_gather (bucket_mode entry point)
 # ---------------------------------------------------------------------------
-def test_lower_and_bucket_mode_none_returns_zero():
-    """mode 'none' -> lowering only, no bucketing -> 0 buckets, gathers untouched."""
+def test_bucket_mode_none_returns_zero():
+    """mode 'none' -> no bucketing -> 0 buckets, gathers untouched."""
     gm = _build_ag_graph([{"shape": (4, 8), "dtype": torch.bfloat16}] * 3)
-    n = lower_and_bucket_full_graph(gm, "none")
+    n = bucket_weight_all_gather(gm, "none")
     assert n == 0
     assert _n(gm, _AG) == 3
     assert _n(gm, _AG_COALESCED) == 0
 
 
-def test_lower_and_bucket_mode_coalesced():
+def test_bucket_mode_coalesced():
     """mode 'coalesced' -> all same-(group,dtype) gathers in one whole-graph bucket."""
     gm = _build_ag_graph([{"shape": (4, 8), "dtype": torch.bfloat16}] * 3)
-    n = lower_and_bucket_full_graph(gm, "coalesced")
+    n = bucket_weight_all_gather(gm, "coalesced")
     assert n == 1
     assert _n(gm, _AG_COALESCED) == 1
 
 
-def test_lower_and_bucket_size_cap():
+def test_bucket_mode_size_cap():
     """bucket_size_bytes flows through the entry point: cap 128 B on 4x64 B shards
     -> 2 buckets of 2."""
     gm = _build_ag_graph([{"shape": (4, 8), "dtype": torch.bfloat16}] * 4)
-    n = lower_and_bucket_full_graph(gm, "coalesced", bucket_size_bytes=128)
+    n = bucket_weight_all_gather(gm, "coalesced", bucket_size_bytes=128)
     assert n == 2
     assert _n(gm, _AG_COALESCED) == 2
 
 
-def test_lower_and_bucket_unknown_mode_raises():
+def test_bucket_mode_unknown_raises():
     gm = _build_ag_graph([{"shape": (4, 8), "dtype": torch.bfloat16}] * 2)
     with pytest.raises(ValueError, match="expected 'none' or 'coalesced'"):
-        lower_and_bucket_full_graph(gm, "concat")
+        bucket_weight_all_gather(gm, "concat")

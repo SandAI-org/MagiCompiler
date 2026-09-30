@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-"""Profiling-based ``estimate_op_runtime`` replacement (the reorder pass's cost_fn).
+"""Profiling-based ``estimate_op_runtime`` replacement, driven by ``SnodeCostProfile``.
 
 Inductor's analytical roofline is unreliable for exactly the nodes the FSDP
 overlap reorder must size: fused pointwise (~60x under), matmul (~1500x over on
@@ -26,6 +26,10 @@ Collectives -- and, in sync mode, externs with an INTERNAL collective (CP
 attention / MoE) -- are never benchmarked in ``__call__`` (per-rank compile-time
 NCCL desyncs ranks -> hang); they are seeded with the analytical estimate and
 re-measured for real in the rank-lockstep ``warm_and_sync``.
+
+``magi::h2d_load`` is never priced here at all: replaying it would move real
+bytes over PCIe at compile time, and ``H2dLoadReorder`` prices a load from its
+bytes and the configured bandwidth instead.
 
 ``warm_and_sync`` lockstep-measures the INTERSECTION of structural keys present
 on every rank (with a stashed snode): full key-set identity is not required, so
@@ -71,6 +75,14 @@ def snode_issues_collective(snode: BaseSchedulerNode) -> bool:
     if not isinstance(snode, ExternKernelSchedulerNode):
         return False
     return _extern_has_internal_collective(snode)
+
+
+def _is_h2d_load(snode: BaseSchedulerNode) -> bool:
+    # Imported per call: ``magi_compiler.passes`` imports this module lazily, and
+    # a module-level import here would close that cycle.
+    from magi_compiler.passes.weight_offload.schedule.h2d_snode import is_h2d_load
+
+    return is_h2d_load(snode)
 
 
 def _get_cost_sync_group():
@@ -305,6 +317,62 @@ def _extern_replay_fn(snode: ExternKernelSchedulerNode):
     return fn
 
 
+def _argument_bytes(snode: BaseSchedulerNode) -> int:
+    """Bytes in this kernel's tensor arguments, from the fx node's metas."""
+    origin = _fx_node_of(getattr(snode, "node", None))
+    if origin is None:
+        return 0
+    nbytes = 0
+    for ev in _iter_tensor_metas((*origin.args, *getattr(origin, "kwargs", {}).values())):
+        numel = 1
+        for s in _static(ev.shape):
+            numel *= s[1] if isinstance(s, tuple) else s
+        nbytes += numel * ev.dtype.itemsize
+    return nbytes
+
+
+_DRAM_FLOOR_SLACK = 0.5
+"""How far under the DRAM floor a measurement may land before we distrust it.
+
+Not 1.0: a kernel can legitimately beat the floor by reading an argument it only
+partially touches, or out of L2.  Half the floor is well outside that, and the
+replay failures this catches come in two orders of magnitude low.
+"""
+
+
+def _warn_if_implausible(snode: BaseSchedulerNode, ns: float) -> None:
+    """Flag a measurement too fast to have read the kernel's own arguments.
+
+    Not a cost model -- a plausibility check.  A replay landing far under the
+    time it takes to merely stream its operands did not do the kernel's work:
+    the usual cause is an argument whose VALUES drive the work (expert offsets,
+    tile counts, sequence bounds) arriving zero-filled from the generic realize,
+    which makes the kernel exit without touching its operands.  Worth the check
+    because the failure mode is otherwise invisible -- a kernel that does nothing
+    measures as free, and every pass reading the cost table then treats a real
+    kernel as a gap it can hoist transfers across.
+    """
+    from torch._inductor.utils import get_gpu_dram_gbps
+
+    nbytes = _argument_bytes(snode)
+    gbps = max(1.0, float(get_gpu_dram_gbps()))
+    floor_ns = nbytes / gbps  # bytes / (GB/s) == ns
+    if floor_ns <= 0.0 or ns >= floor_ns * _DRAM_FLOOR_SLACK:
+        return
+    magi_logger.warning(
+        "profiling: %s measured %.1fus, but its arguments are %.0f MiB and take %.1fus to even read "
+        "at %.0f GB/s -- the replay is not doing the kernel's work, so this op is priced at near "
+        "zero and every pass reading the cost table will treat it as a gap. When an argument's "
+        "VALUES are what drive the work, give the op a materialize_inputs hook, or draw the custom-"
+        "op boundary around whatever produces those values so the replay produces them too",
+        _snode_label(snode),
+        ns / 1e3,
+        nbytes / 2**20,
+        floor_ns / 1e3,
+        gbps,
+    )
+
+
 def _measure_extern(snode: ExternKernelSchedulerNode, fixed_iters: bool = False) -> float:
     """Time an extern (matmul / custom-op) snode by replaying its aten op.
 
@@ -537,23 +605,23 @@ class ProfilingRuntimeEstimator:
     """Callable ``snode -> ns`` (see module docstring).  Never raises -- any
     measurement failure falls back to the analytical estimate."""
 
-    def __init__(self) -> None:
+    def __init__(self, sync_across_ranks: bool = False) -> None:
         # op -> time table, keyed by structural identity (see module docstring).
         self._table: dict[tuple, ProfileEntry] = {}
         self.n_measured = 0
         self.n_cache_hits = 0
-        # True (profile_sync): the reorder pass calls warm_and_sync() to reconcile
+        # True (profile_sync): SnodeCostProfile calls warm_and_sync() to reconcile
         # costs across ranks.
-        self._sync_across_ranks = False
+        self._sync_across_ranks = sync_across_ranks
         # Transient {key -> representative snode} for warm_and_sync re-measurement.
         # Kept OFF ProfileEntry: snodes hold unpicklable FakeTensors and the entry
         # is pickled into the fx-graph cache key.
         self._key_snode: dict = {}
+        self._count_reuse = True
 
     def __deepcopy__(self, memo):
         # Config serialization deepcopies the pass list; return a clean instance.
-        new = ProfilingRuntimeEstimator()
-        new._sync_across_ranks = self._sync_across_ranks
+        new = ProfilingRuntimeEstimator(sync_across_ranks=self._sync_across_ranks)
         memo[id(self)] = new
         return new
 
@@ -575,14 +643,16 @@ class ProfilingRuntimeEstimator:
 
         Full key-set identity is NOT required: per-rank tables may diverge on
         rank-local compute, but shared kernels remain isomorphic and are still
-        lockstep-measured.  Returns #entries whose cost changed."""
+        lockstep-measured.  Returns #entries whose cost changed.
+
+        With a single rank there is nobody to desync, so the deferred entries are
+        simply measured in place -- otherwise they would keep their analytical
+        seed for good."""
         import torch.distributed as dist
 
-        if not (dist.is_available() and dist.is_initialized()):
-            return 0
+        if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() <= 1:
+            return self._measure_deferred_locally()
         world = dist.get_world_size()
-        if world <= 1:
-            return 0
         group = _get_cost_sync_group()
 
         keys = sorted(self._table.keys(), key=repr)
@@ -663,6 +733,22 @@ class ProfilingRuntimeEstimator:
         self._key_snode.clear()  # drop snode refs (unpicklable) once sync is done
         return n
 
+    def _measure_deferred_locally(self) -> int:
+        n = 0
+        for k, snode in self._key_snode.items():
+            e = self._table.get(k)
+            if e is None:
+                continue
+            ns, ok = self._measure_one(snode)
+            if not ok:
+                continue
+            e.measured = True
+            if ns != e.ns:
+                e.ns = ns
+                n += 1
+        self._key_snode.clear()
+        return n
+
     def _measure_one(self, snode: BaseSchedulerNode) -> tuple[float, bool]:
         """Lockstep-safe single measurement (fixed iters for anything containing a
         collective).  Never raises; returns ``(ns, measured)`` so the caller can
@@ -676,6 +762,7 @@ class ProfilingRuntimeEstimator:
                 fixed = _extern_has_internal_collective(snode)
                 with _shapeenv_sandbox(), _suppress_guards():
                     ns = _measure_extern(snode, fixed_iters=fixed)
+                _warn_if_implausible(snode, ns)
                 self.n_measured += 1
                 return ns, True
             return self._measure(snode), True
@@ -686,8 +773,20 @@ class ProfilingRuntimeEstimator:
     def summary(self) -> str:
         """One line per distinct op + a machine-parseable ``ESTLINE`` tag
         (kind|label|per_call_us|calls|total_us|measured) for diffing against an
-        nsys trace."""
+        nsys trace.
+
+        The per-kind totals are what an nsys trace is actually comparable to, so
+        they are spelled out rather than left to be re-summed by hand.  They
+        cover every cost query this process made: one estimator serves every
+        graph it compiles, so a model compiled twice reports twice the work of
+        one forward.
+        """
         lines = []
+        totals: dict[str, float] = {}
+        calls_by_kind: dict[str, int] = {}
+        for e in self._table.values():
+            totals[e.kind] = totals.get(e.kind, 0.0) + e.ns * (e.reuse_count + 1)
+            calls_by_kind[e.kind] = calls_by_kind.get(e.kind, 0) + e.reuse_count + 1
         for e in sorted(self._table.values(), key=lambda e: -e.ns * (e.reuse_count + 1)):
             calls = e.reuse_count + 1  # first encounter + reuses
             per_us = e.ns / 1e3
@@ -696,10 +795,30 @@ class ProfilingRuntimeEstimator:
             lines.append(f"  [{e.kind:10}] {e.label:<48} {per_us:9.2f}us/call x{calls:<4} " f"= {total_us:11.2f}us  ({meas})")
             # grep-friendly: ESTLINE|kind|label|per_call_us|calls|total_us|measured
             lines.append(f"  ESTLINE|{e.kind}|{e.label}|{per_us:.3f}|{calls}|{total_us:.3f}|{meas}")
+        totals_str = ", ".join(
+            f"{kind}={ns / 1e6:.1f}ms over {calls_by_kind[kind]} call(s)" for kind, ns in sorted(totals.items())
+        )
         return (
             f"profile table: {len(self._table)} distinct ops, "
-            f"{self.n_measured} measured, {self.n_cache_hits} reuses\n" + "\n".join(lines)
+            f"{self.n_measured} measured, {self.n_cache_hits} reuses; "
+            f"cumulative estimate {totals_str}\n" + "\n".join(lines)
         )
+
+    def requery(self, snode: BaseSchedulerNode) -> float:
+        """``self(snode)`` without counting it as a reuse: for re-reading a cost
+        that ``warm_and_sync`` may have changed, so ``summary()`` still reports
+        one call per snode."""
+        self._count_reuse = False
+        try:
+            return self(snode)
+        finally:
+            self._count_reuse = True
+
+    def _reuse(self, entry: ProfileEntry) -> float:
+        if self._count_reuse:
+            entry.reuse_count += 1
+            self.n_cache_hits += 1
+        return entry.ns
 
     def __call__(self, snode: BaseSchedulerNode) -> float:
         # A wait_tensor kernel itself takes ~0 time (the collective's cost is
@@ -707,7 +826,7 @@ class ProfilingRuntimeEstimator:
         if contains_wait(snode) and not contains_collective(snode):
             return _safe_analytical(snode)
 
-        if _is_multi_output_unpack(snode):
+        if _is_multi_output_unpack(snode) or _is_h2d_load(snode):
             return 0.0
 
         if _leaf_ce_ag(snode) is not None:
@@ -719,9 +838,7 @@ class ProfilingRuntimeEstimator:
             ckey = ("ce_ag", group_size, shapes, str(dtype))
             entry = self._table.get(ckey)
             if entry is not None:
-                entry.reuse_count += 1
-                self.n_cache_hits += 1
-                return entry.ns
+                return self._reuse(entry)
             ns = _safe_analytical(snode)
             self._table[ckey] = ProfileEntry(ns=ns, kind="ce_ag", label=_ce_ag_label(snode), measured=False)
             if self._sync_across_ranks:
@@ -742,9 +859,7 @@ class ProfilingRuntimeEstimator:
             ckey = ("collective", str(op), group_size, tuple((tuple(shape), str(dt)) for shape, dt, _dev in specs))
             entry = self._table.get(ckey)
             if entry is not None:
-                entry.reuse_count += 1
-                self.n_cache_hits += 1
-                return entry.ns
+                return self._reuse(entry)
             ns = _safe_analytical(snode)  # Inductor static estimate as the seed
             self._table[ckey] = ProfileEntry(ns=ns, kind="collective", label=_collective_label(snode), measured=False)
             if self._sync_across_ranks:
@@ -769,9 +884,7 @@ class ProfilingRuntimeEstimator:
         if key is not None:
             entry = self._table.get(key)
             if entry is not None:
-                entry.reuse_count += 1
-                self.n_cache_hits += 1
-                return entry.ns
+                return self._reuse(entry)
 
         # Extern with an INTERNAL collective (CP attention / MoE): in sync mode,
         # never measure it here -- the warm-up runs per-rank without barriers, and
@@ -790,6 +903,8 @@ class ProfilingRuntimeEstimator:
         measured = True
         try:
             ns = self._measure_extern_safe(snode) if is_extern else self._measure(snode)
+            if is_extern:
+                _warn_if_implausible(snode, ns)
         except BaseException as exc:  # noqa: BLE001
             magi_logger.debug("Profiling estimator fell back to analytical for %s: %s", snode.get_name(), exc)
             ns = _safe_analytical(snode)
