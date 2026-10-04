@@ -233,19 +233,9 @@ class OffloadConfig(BaseModel):
         1.0,
         ge=0.0,
         description=(
-            "Minimum local-shard MiB to offload. Below this the transfer is dominated by fixed DMA "
-            "overhead rather than bandwidth, so it costs schedule slack and frees almost nothing."
-        ),
-    )
-    offload_group_mib: int = Field(
-        0,
-        ge=0,
-        description=(
-            "Cap on the MiB of weights merged into one load, for models WITHOUT FSDP (with FSDP the "
-            "loads mirror the all-gather buckets instead). Merging amortizes the ~10us of CPU each "
-            "load pays for its stream sync, event and Work registration, which on a model with "
-            "hundreds of weights is milliseconds sitting in front of the first one. 0 = one load "
-            "per weight."
+            "Minimum local-shard MiB to offload. Every offloaded weight is its own load, and below "
+            "this its fixed submission cost (~40us of CPU; 1 MiB crosses PCIe in ~20us) rather than "
+            "bandwidth dominates the transfer, so it costs schedule slack and frees almost nothing."
         ),
     )
     offload_max_resident_mib: int = Field(
@@ -353,7 +343,11 @@ class FSDPConfig(BaseModel):
         description=(
             "'none' = one all_gather + wait per weight; 'coalesced' = one all_gather_into_tensor_coalesced "
             "per bucket (single launch, N getitems/waits). Buckets are whole-graph, broken only by "
-            "program-order dtype changes and the bucket_size_mib cap."
+            "program-order dtype changes and the bucket_size_mib cap. 'auto' = buckets decided during "
+            "Inductor scheduling from the measured all-gather costs: a gather large enough that its "
+            "launch is at most auto_bucket_overhead_ratio of its time goes alone, and the smaller ones are "
+            "merged with their neighbours until it is (see auto_bucket_overhead_ratio); bucket_size_mib "
+            "additionally caps a bucket's local bytes. transport='copy_engine' falls back to 'coalesced'."
         ),
     )
     bucket_size_mib: int = Field(
@@ -361,7 +355,36 @@ class FSDPConfig(BaseModel):
         ge=0,
         description=(
             "Per-bucket cap on accumulated local-shard MiB for coalesced bucketing. 0 = no cap "
-            "(one bucket per (group, dtype) run)."
+            "(one bucket per (group, dtype) run). Under bucket_mode='auto' a hard cap on what the "
+            "planner may choose (0 = none)."
+        ),
+    )
+    auto_bucket_overhead_ratio: float = Field(
+        0.1,
+        gt=0.0,
+        lt=1.0,
+        description=(
+            "bucket_mode='auto': the share of a gather's time its fixed launch cost may take. With the "
+            "measured cost alpha + beta * bytes, a gather of alpha * (1 - ratio) / (ratio * beta) gathered "
+            "bytes or more goes alone; smaller ones are merged with their program-order neighbours until a "
+            "bucket reaches that size, never past twice it. Smaller ratios merge more and allocate more "
+            "gathered weight early. On gaga4 400B (alpha ~71us, beta ~2.7us/MiB) 0.1 gives ~240 MiB."
+        ),
+    )
+    auto_bucket_launch_overhead_us: float = Field(
+        10.0,
+        ge=0.0,
+        description=(
+            "bucket_mode='auto': the fixed cost per all-gather launch, in us, assumed when every measured "
+            "gather has the same size and the fit cannot tell the fixed cost from the per-byte one."
+        ),
+    )
+    memory_probe: bool = Field(
+        False,
+        description=(
+            "Log Inductor's estimated peak memory between the overlap passes (baseline, after bucket_mode='auto' "
+            "bucketing, after the all-gather reorder, after the load reorder), split by what is live at the peak, "
+            "plus the auto planner's own prediction. Diagnostic only; the schedule is unchanged."
         ),
     )
     cost_mode: Literal["profile_sync", "analytical"] = Field(
@@ -382,7 +405,7 @@ class FSDPConfig(BaseModel):
         ),
     )
     comm_overlap_window_scale: float = Field(
-        1.0,
+        1.1,
         ge=1.0,
         description=(
             "Multiplier on each collective's estimated runtime when sizing its compute window "

@@ -98,7 +98,7 @@ def _fill_shards(model: nn.Module, ref: nn.Module, rank: int, world: int) -> flo
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--bucket-mode", default="none", choices=["none", "coalesced"])
+    ap.add_argument("--bucket-mode", default="none", choices=["none", "coalesced", "auto"])
     ap.add_argument("--bucket-size-mib", type=int, default=0)
     ap.add_argument("--cost-mode", default="analytical", choices=["analytical", "profile_sync"])
     ap.add_argument("--hidden", type=int, default=1024)

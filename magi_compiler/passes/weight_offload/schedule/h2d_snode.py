@@ -29,9 +29,9 @@ def h2d_ops() -> tuple:
     """The host-to-device load ops, imported lazily so this module stays
     importable without a CUDA build."""
     try:
-        from ..runtime.h2d_op import H2D_LOAD, H2D_LOAD_COALESCED
+        from ..runtime.h2d_op import H2D_LOAD
 
-        return (H2D_LOAD, H2D_LOAD_COALESCED)
+        return (H2D_LOAD,)
     except Exception:  # noqa: BLE001
         return ()
 
@@ -60,8 +60,7 @@ def slots_of(snode: BaseSchedulerNode) -> list[int]:
     """The host-pool slots a load node pulls.
 
     Inductor flattens a custom op's non-tensor arguments into ``constant_args``,
-    and both load ops take exactly one such argument -- the slot, or the list of
-    them -- so this is the whole of it for the plain and the coalesced form alike.
+    and the load op takes exactly one such argument -- the slot.
     """
     node = getattr(snode, "node", None)
     try:

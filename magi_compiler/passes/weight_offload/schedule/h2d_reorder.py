@@ -100,7 +100,7 @@ at a nominal bandwidth, and eight ranks pulling from the same host in lockstep
 do not get it.  So the buy-out runs in two phases: first the priced one, which
 aims the budget at whatever the sweep still cannot hide, then a fill that hands
 out the remainder largest-first.  Per byte the bus saving is identical whichever
-weight is chosen, so the fill takes the big buckets: they dominate the in-flight
+weight is chosen, so the fill takes the big loads: they dominate the in-flight
 peak and the allocator churn that goes with it.
 """
 
@@ -195,7 +195,7 @@ class H2dLoadReorder(OverlapPass):
     # -- planning ---------------------------------------------------------
     @staticmethod
     def _group_and_waits(load, graph: SnodeGraph) -> tuple[list, list]:
-        """The load plus the unpacks that travel with it, and the waits guarding it."""
+        """The load plus the ``MultiOutput`` unpack its result reaches readers through, and the waits guarding it."""
 
         def classify(u):
             if contains_wait(u):
@@ -270,9 +270,9 @@ class H2dLoadReorder(OverlapPass):
         and the split is not symmetric: residency takes bytes off the bus for
         every step, while in-flight room only decides how far upstream a load may
         start.  So the first attempt keeps in-flight at the minimum that can
-        pipeline at all -- the unhoisted floor, or two buckets, whichever is
+        pipeline at all -- the unhoisted floor, or two loads, whichever is
         larger -- and spends everything else on residency; later attempts buy
-        in-flight room back one bucket at a time, and only if the sweep says the
+        in-flight room back one load at a time, and only if the sweep says the
         budget and not the bus is what left transfer exposed.
         """
         floor = inflight_peak(plans, {p.load: unhoisted_index(p) for p in plans})

@@ -14,13 +14,16 @@
 
 from magi_compiler.passes.weight_offload.graph.weight_source import FsdpShardSource, shard_holder
 
+from .auto_bucket import FsdpAutoBucket
 from .bucket_all_gather import bucket_weight_all_gather, bucket_weight_all_gather_coalesced
 from .copy_engine import bind_weights_for_copy_engine, copy_engine_weight_candidates, rewrite_weight_ag_to_copy_engine
+from .memory_probe import MemoryProbe
 from .node_meta import CE_BOUND, UNEVEN_SHARD, WEIGHT_AG, is_ce_bound, is_uneven_shard, is_weight_ag
 from .redistribute_lowering import lower_prim_redistribute_to_collectives
 from .reorder import FsdpOverlapReorder
 
 __all__ = [
+    "FsdpAutoBucket",
     "bind_weights_for_copy_engine",
     "bucket_weight_all_gather",
     "bucket_weight_all_gather_coalesced",
@@ -28,6 +31,7 @@ __all__ = [
     "lower_prim_redistribute_to_collectives",
     "rewrite_weight_ag_to_copy_engine",
     "FsdpOverlapReorder",
+    "MemoryProbe",
     "FsdpShardSource",
     "shard_holder",
     "CE_BOUND",

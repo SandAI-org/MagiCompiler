@@ -487,7 +487,7 @@ def test_bind_and_insert_puts_the_load_between_the_shard_and_the_gather(dist_1ra
     gm, param = _lowered_weight_graph(dist_1rank)
     _park(param._local_tensor)
     assert bind_weights_to_host(gm, [param], FsdpShardSource(), min_bytes=0) == 1
-    assert insert_h2d_loads(gm, FsdpShardSource()) == 1
+    assert insert_h2d_loads(gm) == 1
 
     loads = _nodes(gm, H2D_LOAD)
     assert len(loads) == 1
@@ -518,7 +518,7 @@ def test_load_sits_above_the_dtype_cast(dist_1rank):
     gm, param = _lowered_weight_graph(dist_1rank, forward_dtype=torch.float32)
     _park(param._local_tensor)
     assert bind_weights_to_host(gm, [param], FsdpShardSource(), min_bytes=0) == 1
-    assert insert_h2d_loads(gm, FsdpShardSource()) == 1
+    assert insert_h2d_loads(gm) == 1
 
     order = {n: i for i, n in enumerate(gm.graph.nodes)}
     (load,) = _nodes(gm, H2D_LOAD)
@@ -545,13 +545,13 @@ def test_second_graph_over_the_same_parameters_still_gets_its_loads(dist_1rank):
     gm1, param = _lowered_weight_graph(dist_1rank)
     _park(param._local_tensor)
     assert bind_weights_to_host(gm1, [param], FsdpShardSource(), min_bytes=0) == 1
-    assert insert_h2d_loads(gm1, FsdpShardSource()) == 1
+    assert insert_h2d_loads(gm1) == 1
     assert param._local_tensor.untyped_storage().nbytes() == 0
 
     # A second graph over the same live parameter, as a second shape would give.
     gm2, _ = _lowered_weight_graph(dist_1rank)
     assert bind_weights_to_host(gm2, [param], FsdpShardSource(), min_bytes=0) == 1, "the adopted shard is still a candidate"
-    assert insert_h2d_loads(gm2, FsdpShardSource()) == 1, "the second graph needs its own load"
+    assert insert_h2d_loads(gm2) == 1, "the second graph needs its own load"
 
     slots = {n.args[1] for n in _nodes(gm2, H2D_LOAD)}
     assert slots == {n.args[1] for n in _nodes(gm1, H2D_LOAD)}, "both graphs must read the same slot"
@@ -606,7 +606,7 @@ def test_a_weight_two_gathers_read_gets_a_load_for_each(dist_1rank):
     assert host_pool.num_bound() == 1, "one shard, one set of host bytes"
     torch.testing.assert_close(host_pool.get(0).cuda(), expected)
 
-    assert insert_h2d_loads(gm, FsdpShardSource()) == 2
+    assert insert_h2d_loads(gm) == 2
     loads = _nodes(gm, H2D_LOAD)
     assert {n.args[1] for n in loads} == {0}, "both loads read the one slot"
 
@@ -715,7 +715,7 @@ def test_a_replicated_weight_is_offloaded_even_though_nothing_gathers_it(dist_1r
     assert param._local_tensor.untyped_storage().nbytes() == 0, "the full copy must leave the device"
     torch.testing.assert_close(host_pool.get(0).cuda(), expected)
 
-    assert insert_h2d_loads(gm, FsdpShardSource()) == 1
+    assert insert_h2d_loads(gm) == 1
     (load,) = _nodes(gm, H2D_LOAD)
     # The load reads the to_local, and the reader reads the load's wait -- not
     # the to_local, whose storage no longer exists.
@@ -726,18 +726,14 @@ def test_a_replicated_weight_is_offloaded_even_though_nothing_gathers_it(dist_1r
 
 @requires_cuda
 def test_an_ungathered_weight_gets_a_load_to_itself(dist_1rank):
-    """It has no bucket to mirror, and merging it into one would be wrong twice.
+    """A replicated weight has no gather, but still one load, like every other weight.
 
-    Its bytes live to the last matmul that reads them rather than dying at a
-    gather, so a shared bucket would hold a full-size buffer open for as long as
-    its shortest-lived member needs. And the splice hoists a group's holders to
-    their earliest common reader, which is only legal while a holder reads
-    nothing but a placeholder -- this one reads a redistribute.
+    Its load sits in front of its own first reader -- a redistribute, not a
+    placeholder -- and its readers read the loaded copy.
     """
     from magi_compiler.passes.fsdp_overlap import FsdpShardSource
     from magi_compiler.passes.weight_offload import bind_weights_to_host, insert_h2d_loads
-    from magi_compiler.passes.weight_offload.node_meta import host_slot
-    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD, H2D_LOAD_COALESCED
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     gm, shard, repl = _mixed_weight_graph(dist_1rank)
     _park(shard._local_tensor)
@@ -748,12 +744,10 @@ def test_an_ungathered_weight_gets_a_load_to_itself(dist_1rank):
     assert len(plan) == 2, ([c.name for c in plan], skipped)
 
     assert bind_weights_to_host(gm, list(examples.values()), FsdpShardSource(), min_bytes=0) == 2
-    groups = FsdpShardSource().group(gm, {n for n in gm.graph.nodes if host_slot(n) is not None})
-    assert [len(g) for g in groups] == [1, 1], "the replicated weight may not share the shard's load"
-
-    assert insert_h2d_loads(gm, FsdpShardSource()) == 2
-    assert len(_nodes(gm, H2D_LOAD)) == 2
-    assert not _nodes(gm, H2D_LOAD_COALESCED), "two separate submissions, not one merged"
+    assert insert_h2d_loads(gm) == 2
+    loads = _nodes(gm, H2D_LOAD)
+    assert len(loads) == 2
+    assert {load.args[0].name for load in loads} == {c.holder.name for c in plan}
 
 
 @requires_cuda
@@ -891,7 +885,7 @@ def test_a_promoted_load_still_returns_its_own_buffer():
     test on the op's contract rather than on any one graph that trips it.
     """
     from magi_compiler.passes.weight_offload import host_pool
-    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD, H2D_LOAD_COALESCED
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     shards = [torch.randn(128, 64, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
     expected = [s.clone() for s in shards]
@@ -899,22 +893,16 @@ def test_a_promoted_load_still_returns_its_own_buffer():
     for slot in slots:
         host_pool.make_resident(slot)
 
-    single = H2D_LOAD(shards[0], slots[0])
-    coalesced = H2D_LOAD_COALESCED(shards, slots)
+    outs = [H2D_LOAD(shard, slot) for shard, slot in zip(shards, slots)]
     torch.cuda.synchronize()
 
-    assert single.data_ptr() != shards[0].data_ptr(), "the output must own its storage"
-    for out, shard in zip(coalesced, shards):
+    for out, shard, want in zip(outs, shards, expected):
         assert out.data_ptr() != shard.data_ptr(), "the output must own its storage"
-
-    torch.testing.assert_close(single, expected[0])
-    for out, want in zip(coalesced, expected):
         torch.testing.assert_close(out, want)
 
     # Writing into the outputs, as a reusing kernel would, must leave the
     # weights alone.
-    single.zero_()
-    for out in coalesced:
+    for out in outs:
         out.zero_()
     torch.cuda.synchronize()
     for shard, want in zip(shards, expected):
@@ -1172,7 +1160,7 @@ def test_a_pre_parked_shard_needs_no_binding(dist_1rank):
     # Re-point the graph's placeholder at the handed-off parameter.
     assert bind_weights_to_host(gm, [param], FsdpShardSource(), min_bytes=0) == 1
     assert host_pool.num_bound() == 2, "tagging a pre-parked shard must not adopt it a second time"
-    assert insert_h2d_loads(gm, FsdpShardSource()) == 1
+    assert insert_h2d_loads(gm) == 1
 
     (load,) = _nodes(gm, H2D_LOAD)
     assert load.args[1] == host_pool.slot_of(param._local_tensor)
