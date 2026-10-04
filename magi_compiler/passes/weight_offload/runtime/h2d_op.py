@@ -41,7 +41,6 @@ from .slot_remap import resolve_slot
 
 _LIB = torch.library.Library("magi", "FRAGMENT")
 _SCHEMA = "h2d_load(Tensor shard, int slot) -> Tensor"
-_SCHEMA_COALESCED = "h2d_load_coalesced(Tensor[] shards, int[] slots) -> Tensor[]"
 
 
 @lru_cache(maxsize=1)
@@ -55,40 +54,36 @@ def h2d_stream() -> torch.cuda.Stream:
     return torch.cuda.Stream()
 
 
-def _issue_loads(shards: list[torch.Tensor], slots: list[int]) -> list[torch.Tensor]:
-    """Submit every load as one batch; publish one event for all of them.
+def _check_shard(shard: torch.Tensor, slot: int) -> None:
+    host = host_pool.source(slot)
+    if tuple(shard.shape) != tuple(host.shape) or shard.dtype != host.dtype:
+        raise RuntimeError(
+            f"magi::h2d_load slot {slot} ({host_pool.name_of(slot)!r}) is "
+            f"{tuple(host.shape)} {host.dtype}, but the graph asked for "
+            f"{tuple(shard.shape)} {shard.dtype}. The compiled artifact's slot "
+            "ids do not match this process's host pool."
+        )
 
-    The stream sync, the event and its ``Work`` are paid once for the whole
-    bucket rather than once per weight.  That fixed cost is ~10us of CPU per
-    load, which on a model with hundreds of weights is milliseconds of launch
-    overhead sitting directly in front of the first all-gather -- and it inflates
-    the very window the reorder pass is trying to size.
-    """
+
+def _h2d_load(shard: torch.Tensor, slot: int) -> torch.Tensor:
     # ``source``, not ``get``: a slot the placement pass promoted back onto the
     # device copies from there instead, which turns this into a D2D copy without
     # any other part of the op, the graph or the schedule having to know.
-    slots = [resolve_slot(slot) for slot in slots]
-    hosts = [host_pool.source(slot) for slot in slots]
-    for shard, host, slot in zip(shards, hosts, slots):
-        if tuple(shard.shape) != tuple(host.shape) or shard.dtype != host.dtype:
-            raise RuntimeError(
-                f"magi::h2d_load slot {slot} ({host_pool.name_of(slot)!r}) is "
-                f"{tuple(host.shape)} {host.dtype}, but the graph asked for "
-                f"{tuple(shard.shape)} {shard.dtype}. The compiled artifact's slot "
-                "ids do not match this process's host pool."
-            )
+    slot = resolve_slot(slot)
+    _check_shard(shard, slot)
+    host = host_pool.source(slot)
     # Allocated on the COMPUTE stream, deliberately: the caching allocator ties a
-    # block to the stream it was allocated on, and these buffers are consumed by
+    # block to the stream it was allocated on, and this buffer is consumed by
     # compute.  ``record_stream`` below is what tells it the load stream wrote
-    # them, so a freed block is not handed out before the copy lands.
-    outs = [torch.empty(h.shape, dtype=h.dtype, device=s.device) for s, h in zip(shards, hosts)]
+    # it, so a freed block is not handed out before the copy lands.
+    out = torch.empty(host.shape, dtype=host.dtype, device=shard.device)
 
-    if all(host_pool.is_resident(slot) for slot in slots):
-        # Nothing to hide and nothing to wait for: every shard in this group is
-        # already on the device, so the transfer is a short D2D hop rather than
-        # a trip across PCIe.  Doing it inline on the compute stream skips two
-        # cross-stream synchronizations, the event and its Work registration --
-        # all of which exist to overlap a transfer that no longer happens.  The
+    if host_pool.is_resident(slot):
+        # Nothing to hide and nothing to wait for: the shard is already on the
+        # device, so the transfer is a short D2D hop rather than a trip across
+        # PCIe.  Doing it inline on the compute stream skips two cross-stream
+        # synchronizations, the event and its Work registration -- all of which
+        # exist to overlap a transfer that no longer happens.  The
         # ``wait_tensor`` downstream then finds no Work and is a no-op.
         #
         # The buffer is still a real copy, and that is not an oversight: a
@@ -97,44 +92,25 @@ def _issue_loads(shards: list[torch.Tensor], slots: list[int]) -> list[torch.Ten
         # allocate a fallback kernel's output but does put it in the reuse pool,
         # so the next same-sized allocation would take over the parameter's
         # storage and the following kernel would write into the weight.
-        #
-        # Whole group or nothing.  Promotion is per load and a load is a bucket,
-        # so a mixed group does not arise.
-        for out, host in zip(outs, hosts):
-            out.copy_(host)
-        return outs
+        out.copy_(host)
+        return out
 
     stream = h2d_stream()
-    # The shards' own producers are on the compute stream; ordering after them
-    # costs nothing here and keeps the op correct if a caller ever writes them.
+    # The shard's own producers are on the compute stream; ordering after them
+    # costs nothing here and keeps the op correct if a caller ever writes it.
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        for out, host in zip(outs, hosts):
-            out.copy_(host, non_blocking=True)
+        out.copy_(host, non_blocking=True)
         event = torch.cuda.Event()
         event.record(stream)
-
-    for out in outs:
-        out.record_stream(stream)
-        # The registry takes ownership of each Work; members share the event.
-        _c10d._register_work(out, EventWork(event))
-    return outs
-
-
-def _h2d_load(shard: torch.Tensor, slot: int) -> torch.Tensor:
-    return _issue_loads([shard], [slot])[0]
+    out.record_stream(stream)
+    # The registry takes ownership of the Work.
+    _c10d._register_work(out, EventWork(event))
+    return out
 
 
 def _h2d_load_meta(shard: torch.Tensor, slot: int) -> torch.Tensor:
     return torch.empty_like(shard)
-
-
-def _h2d_load_coalesced(shards: list[torch.Tensor], slots: list[int]) -> list[torch.Tensor]:
-    return _issue_loads(list(shards), list(slots))
-
-
-def _h2d_load_coalesced_meta(shards: list[torch.Tensor], slots: list[int]) -> list[torch.Tensor]:
-    return [torch.empty_like(s) for s in shards]
 
 
 def _register() -> None:
@@ -142,13 +118,8 @@ def _register() -> None:
     _LIB.impl("h2d_load", _h2d_load, "CUDA")
     _LIB.impl("h2d_load", _h2d_load_meta, "Meta")
 
-    _LIB.define(_SCHEMA_COALESCED)
-    _LIB.impl("h2d_load_coalesced", _h2d_load_coalesced, "CUDA")
-    _LIB.impl("h2d_load_coalesced", _h2d_load_coalesced_meta, "Meta")
-
 
 _register()
 
-# Importing this module is what makes the ops exist, so these are always bound.
+# Importing this module is what makes the op exist, so this is always bound.
 H2D_LOAD = torch.ops.magi.h2d_load.default
-H2D_LOAD_COALESCED = torch.ops.magi.h2d_load_coalesced.default

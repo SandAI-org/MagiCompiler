@@ -94,7 +94,7 @@ def test_a_plain_parameter_is_offloaded_without_any_fsdp():
     source = PlainParamSource()
     assert bind_weights_to_host(gm, examples, source, min_bytes=0) == 1
     assert w.untyped_storage().nbytes() == 0, "the stand-in must stay empty"
-    assert insert_h2d_loads(gm, source) == 1
+    assert insert_h2d_loads(gm) == 1
 
     (load,) = _nodes(gm, H2D_LOAD)
     assert load.args[1] == 0, "the load carries the host-pool slot"
@@ -119,34 +119,31 @@ def test_only_parameters_are_taken_not_activations():
 
 
 @requires_cuda
-def test_weights_group_by_first_use_not_by_declaration():
+def test_each_load_sits_at_its_own_first_reader_not_at_the_declaration():
     """Dynamo lifts every parameter to the top of the graph, so their placeholder
-    order says nothing about when they run.  Grouping by it would put the first
-    layer and the last in one submission -- a load that has to land before layer
-    0 and is not needed until layer N."""
-    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD, H2D_LOAD_COALESCED
+    order says nothing about when they run.  A load placed by it would land layer
+    N's weight before layer 0 runs."""
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     params = [torch.nn.Parameter(torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)) for _ in range(4)]
     for p in params:
         _park(p)
     gm, examples = _linear_graph(*params)
 
-    # Room for two weights per load (128 KiB each).
-    source = PlainParamSource(group_bytes=2 * 256 * 256 * 2)
-    assert bind_weights_to_host(gm, examples, source, min_bytes=0) == 4
-    assert insert_h2d_loads(gm, source) == 2
+    assert bind_weights_to_host(gm, examples, PlainParamSource(), min_bytes=0) == 4
+    assert insert_h2d_loads(gm) == 4
 
-    coalesced = _nodes(gm, H2D_LOAD_COALESCED)
-    assert len(coalesced) == 2 and not _nodes(gm, H2D_LOAD)
-    # Each group holds consecutive layers, never the first paired with the last.
-    for node in coalesced:
-        names = [h.name for h in node.args[0]]
-        idx = sorted(int(n.split("layers_")[1].split("_")[0]) for n in names)
-        assert idx[-1] - idx[0] == len(idx) - 1, f"group spans non-adjacent layers: {idx}"
+    order = {n: i for i, n in enumerate(gm.graph.nodes)}
+    loads = sorted(_nodes(gm, H2D_LOAD), key=order.__getitem__)
+    layers = [int(load.args[0].name.split("layers_")[1].split("_")[0]) for load in loads]
+    assert layers == sorted(layers), f"loads out of layer order: {layers}"
+    first_readers = [min(next(iter(load.users)).users, key=order.__getitem__) for load in loads]
+    for k in range(1, len(loads)):
+        assert order[loads[k]] > order[first_readers[k - 1]], "a later layer's load went ahead of an earlier layer's compute"
 
 
 @requires_cuda
-def test_one_load_per_weight_when_no_group_cap_is_set():
+def test_one_load_per_weight():
     from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     params = [torch.nn.Parameter(torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)) for _ in range(3)]
@@ -156,7 +153,7 @@ def test_one_load_per_weight_when_no_group_cap_is_set():
 
     source = PlainParamSource()
     assert bind_weights_to_host(gm, examples, source, min_bytes=0) == 3
-    assert insert_h2d_loads(gm, source) == 3
+    assert insert_h2d_loads(gm) == 3
     assert len(_nodes(gm, H2D_LOAD)) == 3
 
 
@@ -429,7 +426,7 @@ def test_a_pre_parked_plain_parameter_needs_no_binding():
     source = PlainParamSource()
     assert bind_weights_to_host(gm, examples, source, min_bytes=0) == 1
     assert host_pool.num_bound() == 2, "tagging a pre-parked Parameter must not adopt it a second time"
-    assert insert_h2d_loads(gm, source) == 1
+    assert insert_h2d_loads(gm) == 1
 
     (load,) = _nodes(gm, H2D_LOAD)
     assert load.args[1] == host_pool.slot_of(w)

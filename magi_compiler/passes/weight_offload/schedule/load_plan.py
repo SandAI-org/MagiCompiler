@@ -38,10 +38,9 @@ def snode_bytes(snode: BaseSchedulerNode) -> int:
 def load_bytes(group: list[BaseSchedulerNode]) -> int:
     """Bytes this load pulls across PCIe.
 
-    Measured on the unpacks rather than on the load itself: a coalesced load is a
-    multi-output kernel whose own ``get_size`` describes no single tensor, and
-    sizing a whole bucket's window from one member would under-count it by the
-    bucket factor.
+    Measured on the ``MultiOutput`` unpack rather than on the load itself: a
+    custom op lowers to a ``FallbackKernel`` whose own ``get_size`` describes no
+    tensor, so the load alone would size as zero.
     """
     unpacks = [s for s in group if is_multi_output(s)]
     return sum(snode_bytes(s) for s in (unpacks or group[:1]))

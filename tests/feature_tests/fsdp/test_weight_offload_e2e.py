@@ -129,13 +129,9 @@ def test_offload_with_coalesced_buckets():
 
 @requires_cuda
 @requires_torchrun
-def test_loads_are_coalesced_to_match_the_buckets():
-    """One submission per bucket, not per weight.
-
-    The per-load fixed cost -- stream sync, event, Work registration -- is ~10us
-    of CPU sitting directly in front of the first all-gather, and it inflates the
-    very window the placement pass is trying to size.
-    """
+def test_every_bucketed_weight_gets_its_own_load():
+    """One load per weight, however the gathers are bucketed: a bucket's launch
+    waits for each member's load separately."""
     p = _run(1, "--bucket-mode", "coalesced", "--bucket-size-mib", "4", "--n-layers", "6")
     out = _check(p)
     assert "OFFLOAD_PASS" in p.stdout, out[-4000:]
@@ -144,8 +140,20 @@ def test_loads_are_coalesced_to_match_the_buckets():
     loads = int(next(l for l in out.splitlines() if "inserted" in l and "h2d_load" in l).split("inserted ")[1].split()[0])
     shards = _marker(p.stdout, "OFFLOAD_FREED", "shards")
     assert buckets > 1, "this shape is supposed to produce several buckets"
-    assert loads == buckets, f"expected one load per bucket, got {loads} for {buckets}"
-    assert loads < shards, "coalescing is supposed to be fewer loads than weights"
+    assert loads == shards, f"expected one load per weight, got {loads} for {shards}"
+
+
+@requires_cuda
+@requires_torchrun
+def test_offload_with_scheduler_stage_buckets():
+    """``bucket_mode='auto'`` buckets during scheduling, after the loads exist;
+    the coalesced launch still has to wait for every member's own load."""
+    p = _run(2, "--bucket-mode", "auto", "--n-layers", "6")
+    out = _check(p)
+    assert "OFFLOAD_PASS" in p.stdout, out[-4000:]
+    assert "FSDP auto bucket:" in out, out[-4000:]
+    loads = int(next(l for l in out.splitlines() if "inserted" in l and "h2d_load" in l).split("inserted ")[1].split()[0])
+    assert loads == _marker(p.stdout, "OFFLOAD_FREED", "shards")
 
 
 _REORDER_REPORT = "h2d load reorder: "

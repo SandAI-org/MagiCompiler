@@ -28,7 +28,9 @@ HOST_SLOT = "magi_host_offload_slot"
 
 # On a node downstream of an offloaded weight, so a later pass can keep
 # offloaded and resident work apart -- the FSDP bucketing reads this to avoid
-# putting both kinds in one all-gather.
+# putting both kinds in one all-gather.  Mirrored under ``meta["custom"]``, the
+# one field AOT autograd's re-trace carries over, so the scheduler-stage
+# bucketing can read it off an IR node's origins too.
 HOST_OFFLOADED = "magi_host_offloaded"
 
 
@@ -38,7 +40,7 @@ def host_slot(node: fx.Node) -> int | None:
 
 
 def is_host_offloaded(node: fx.Node) -> bool:
-    return bool(node.meta.get(HOST_OFFLOADED))
+    return bool(node.meta.get(HOST_OFFLOADED) or (node.meta.get("custom") or {}).get(HOST_OFFLOADED))
 
 
 def mark_host_slot(node: fx.Node, slot: int) -> None:
@@ -47,3 +49,4 @@ def mark_host_slot(node: fx.Node, slot: int) -> None:
 
 def mark_host_offloaded(node: fx.Node) -> None:
     node.meta[HOST_OFFLOADED] = True
+    node.meta["custom"] = {**(node.meta.get("custom") or {}), HOST_OFFLOADED: True}

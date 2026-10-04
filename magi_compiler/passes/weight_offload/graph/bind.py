@@ -24,11 +24,18 @@ Weights reach the host pool only through host-first materialization
     changes, and no bytes move -- a failure here is a no-op.
 
 ``insert_h2d_loads``
-    splices ``magi::h2d_load`` + ``wait_tensor`` in behind each tagged weight.
-    The load goes ABOVE every reader of that weight, so anything the graph did
-    to it -- a dtype cast, an uneven-shard pad -- still runs on the device:
-    casting on the host would both burn CPU and, for a fp32-master/bf16-forward
-    weight, double the bytes crossing PCIe.
+    splices ``magi::h2d_load`` + ``wait_tensor`` in behind each tagged weight,
+    one load per weight.  The load goes ABOVE every reader of that weight, so
+    anything the graph did to it -- a dtype cast, an uneven-shard pad -- still
+    runs on the device: casting on the host would both burn CPU and, for a
+    fp32-master/bf16-forward weight, double the bytes crossing PCIe.
+
+    Loads are not merged.  A submission costs ~25us of CPU on top of the copy,
+    which from ~4 MiB up is under the transfer time it rides along with, and
+    the size floor keeps smaller weights resident; on gaga4 400B per-weight
+    loads ran within noise of loads merged to the all-gather buckets.  A merged
+    load would also hold its whole group in flight from the first member's
+    deadline to the last member's read.
 
 What a weight *is* belongs to the source (see ``weight_source.py``); everything
 here is written once and works for a sharded model and a plain one alike.
@@ -36,7 +43,6 @@ here is written once and works for a sharded model and a plain one alike.
 
 from __future__ import annotations
 
-import operator
 from collections import Counter
 from typing import Any, Mapping, Sequence
 
@@ -197,32 +203,25 @@ def apply_weight_offload(
 ) -> int:
     """Bind then splice loads, for a graph that is NOT going through FSDP bucketing.
 
-    FSDP cannot use this: it must bind *before* bucketing and insert *after*, so
-    a bucket's members share one load.  The backend's weight pipeline keeps the
-    two calls apart for that reason and does not go through here.
+    FSDP cannot use this: it must bind *before* bucketing (bucketing keeps
+    offloaded and resident gathers apart on the tag binding sets) and insert
+    *after*.  The backend's weight pipeline keeps the two calls apart for that
+    reason and does not go through here.
     """
     bound = bind_weights_to_host(graph, example_inputs, source, min_bytes=min_bytes)
     if not bound:
         return 0
-    return insert_h2d_loads(graph, source)
+    return insert_h2d_loads(graph)
 
 
-def insert_h2d_loads(graph: fx.GraphModule, source: WeightSource) -> int:
-    """Splice a load in for every tagged weight, grouped as the source asks.
+def insert_h2d_loads(graph: fx.GraphModule) -> int:
+    """Splice a load in for every tagged weight.
 
     Returns how many load nodes were inserted.
     """
-    holders = {n for n in graph.graph.nodes if host_slot(n) is not None}
-    if not holders:
-        magi_logger.info("host offload: inserted 0 h2d_load node(s) into the graph")
-        return 0
-
     order = {n: i for i, n in enumerate(graph.graph.nodes)}
-    inserted = 0
-    for group in source.group(graph, holders):
-        pairs = [(h, host_slot(h)) for h in group if host_slot(h) is not None]
-        if pairs:
-            inserted += _splice_loads(graph, pairs, order)
+    holders = sorted((n for n in graph.graph.nodes if host_slot(n) is not None), key=order.__getitem__)
+    inserted = sum(_splice_load(graph, h, host_slot(h), order) for h in holders)
 
     if inserted:
         graph.graph.lint()
@@ -231,64 +230,27 @@ def insert_h2d_loads(graph: fx.GraphModule, source: WeightSource) -> int:
     return inserted
 
 
-def _claim(slots) -> None:
-    """Record that these shards now have a load that will put their bytes back."""
-    from ..runtime import host_pool
+def _splice_load(graph: fx.GraphModule, holder: fx.Node, slot: int, order) -> int:
+    """Insert a load for ``holder`` in front of its first reader and re-point its readers at it.
 
-    for slot in slots:
-        host_pool.mark_claimed(slot)
-
-
-def _splice_loads(graph: fx.GraphModule, pairs, order) -> int:
-    """Insert one load for ``pairs`` and re-point the weights' readers at it.
-
-    The load has to sit above every reader of every weight in the group, so
-    whatever the graph does to the weight still runs on the device.  The weights
-    themselves are hoisted to meet it; they read nothing but a placeholder, so
-    moving them up is always legal.
+    The load has to sit above every reader, so whatever the graph does to the
+    weight still runs on the device; the reorder pass is what places it properly.
     """
-    from ..runtime.h2d_op import H2D_LOAD, H2D_LOAD_COALESCED
+    from ..runtime import host_pool
+    from ..runtime.h2d_op import H2D_LOAD
 
-    holders = [h for h, _ in pairs]
-    slots = [s for _, s in pairs]
-    examples = [h.meta.get("example_value") for h in holders]
-
-    readers = [u for h in holders for u in h.users]
+    readers = list(holder.users)
     if not readers:
         return 0
     anchor = min(readers, key=lambda n: order.get(n, len(order)))
-    for holder in sorted(holders, key=lambda n: order.get(n, 0)):
-        if holder.op in ("placeholder", "get_attr"):
-            continue
-        # Only a holder that reads nothing but a placeholder.  The anchor is the
-        # group's EARLIEST reader, so for any other holder the move can be
-        # upwards -- past a producer of its own.  An unsharded weight's holder
-        # reads a redistribute and is exactly that case; leaving it where it is
-        # costs nothing, since the load is spliced in front of the anchor either
-        # way and the reorder pass is what places it properly.
-        if all(inp.op in ("placeholder", "get_attr") for inp in holder.all_input_nodes):
-            anchor.prepend(holder)
-
+    example = holder.meta.get("example_value")
     with graph.graph.inserting_before(anchor):
-        if len(pairs) == 1:
-            load = graph.graph.call_function(H2D_LOAD, (holders[0], slots[0]))
-            load.meta["example_value"] = examples[0]
-            outs = [load]
-        else:
-            load = graph.graph.call_function(H2D_LOAD_COALESCED, (list(holders), list(slots)))
-            load.meta["example_value"] = list(examples)
-            outs = []
-            for i, example in enumerate(examples):
-                out = graph.graph.call_function(operator.getitem, (load, i))
-                out.meta["example_value"] = example
-                outs.append(out)
-
-        for holder, out, example in zip(holders, outs, examples):
-            wait = graph.graph.call_function(_WAIT, (out,))
-            wait.meta["example_value"] = example
-            # Everything that read the (now storage-free) weight reads the loaded
-            # copy instead -- except the load itself, which still needs it.
-            holder.replace_all_uses_with(wait, delete_user_cb=lambda user: user is not load)
-
-    _claim(slots)
+        load = graph.graph.call_function(H2D_LOAD, (holder, slot))
+        load.meta["example_value"] = example
+        wait = graph.graph.call_function(_WAIT, (load,))
+        wait.meta["example_value"] = example
+    # Everything that read the (now storage-free) weight reads the loaded copy
+    # instead -- except the load itself, which still needs it.
+    holder.replace_all_uses_with(wait, delete_user_cb=lambda user: user is not load)
+    host_pool.mark_claimed(slot)
     return 1

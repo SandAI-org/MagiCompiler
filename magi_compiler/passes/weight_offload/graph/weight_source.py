@@ -87,15 +87,6 @@ class WeightSource(Protocol):
     ) -> tuple[list[OffloadCandidate], Counter]:
         """Every candidate, plus a tally of why the rest were passed over."""
 
-    def group(self, graph: fx.GraphModule, holders: set[fx.Node]) -> list[list[fx.Node]]:
-        """Which tagged weights share one load.
-
-        A group is one submission: one stream sync, one event, one wait.  Takes
-        graph nodes rather than the candidates ``collect`` returned, because
-        bucketing runs in between and rebuilds nodes -- only what is still in the
-        graph, carrying its slot in ``node.meta``, is safe to read here.
-        """
-
 
 def parked_slot(local: Any, min_bytes: int) -> tuple[int | None, str | None]:
     """The host-pool slot for ``local``, or ``(None, why)`` if it cannot be loaded.
@@ -123,14 +114,7 @@ class PlainParamSource(WeightSource):
     so a weight is just a graph input that happens to be a ``Parameter``.  The
     load goes directly in front of its first reader, and its bytes stay live
     until the last one -- there is no gather to hand them off to.
-
-    Weights are grouped into one load while they are consumed close together and
-    the group stays under ``group_bytes``, for the same reason the FSDP path
-    buckets: the per-load stream sync, event and Work registration is ~10us of
-    CPU that would otherwise be paid once per weight.
     """
-
-    group_bytes: int = 0  # 0 = one load per weight
 
     def collect(
         self, graph: fx.GraphModule, placeholder_examples: Mapping[str, Any], min_bytes: int
@@ -168,31 +152,6 @@ class PlainParamSource(WeightSource):
                 )
             )
         return candidates, skipped
-
-    def group(self, graph: fx.GraphModule, holders: set[fx.Node]) -> list[list[fx.Node]]:
-        from ..node_meta import host_slot
-        from ..runtime import host_pool
-
-        order = {n: i for i, n in enumerate(graph.graph.nodes)}
-
-        # By first reader, not by declaration: Dynamo lifts every parameter to the
-        # top of the graph, so their placeholder order says nothing about when
-        # they are used, and grouping by it would put layer 0 and layer 39 in one
-        # submission -- which is the thing that makes a bucket span a model.
-        def first_use(node: fx.Node) -> int:
-            return min((order.get(u, len(order)) for u in node.users), default=len(order))
-
-        groups: list[list[fx.Node]] = []
-        run_bytes = 0
-        for node in sorted(holders, key=first_use):
-            nbytes = host_pool.slot_bytes(host_slot(node))
-            if groups and self.group_bytes > 0 and run_bytes + nbytes <= self.group_bytes:
-                groups[-1].append(node)
-                run_bytes += nbytes
-            else:
-                groups.append([node])
-                run_bytes = nbytes
-        return groups
 
 
 _ALL_GATHER = torch.ops._c10d_functional.all_gather_into_tensor.default
@@ -283,14 +242,11 @@ class FsdpShardSource(WeightSource):
     the loads here are cheaper to schedule than a plain parameter's: the live
     range is a handful of snodes rather than the rest of the layer.
 
-    The two halves see different graphs, and that is forced rather than
-    incidental.  ``collect`` runs BEFORE bucketing, so it only ever meets the
+    ``collect`` runs BEFORE bucketing, so it only ever meets the
     one-gather-per-weight form the lowering produces: bucketing needs to know
     which shards are offloaded to keep a bucket single-kind, and that is exactly
-    what binding decides.  ``group`` runs AFTER, so a bucket's members are known
-    and their loads can be merged to match, and it has to understand the
-    coalesced form as well.  Swapping the order looks harmless and is not --
-    see the note in ``collect``.
+    what binding decides.  Every weight still gets a load of its own after
+    bucketing; a bucket's launch waits for each member's load separately.
     """
 
     def collect(
@@ -378,7 +334,7 @@ class FsdpShardSource(WeightSource):
 
         What changes downstream is when the bytes die: a shard is consumed by its
         gather and freed, while these ARE the weight the matmul reads and live to
-        its last consumer.  ``group`` gives each its own load for that reason.
+        its last consumer.
         """
         from ..runtime import host_pool
 
@@ -410,69 +366,3 @@ class FsdpShardSource(WeightSource):
                     group=mesh_group(param),
                 )
             )
-
-    def group(self, graph: fx.GraphModule, holders: set[fx.Node]) -> list[list[fx.Node]]:
-        """One load per all-gather bucket, plus one apiece for the ungathered weights.
-
-        Runs after bucketing, so a bucket's members are known and their loads can
-        be merged to match: one submission and one wait per bucket, not per
-        weight.  Mirroring the buckets is not an optimization but the point --
-        every member has to have landed before the single launch that reads them
-        all.
-
-        A weight with no gather has no bucket to mirror, so it gets a load to
-        itself.  Merging it into one would be wrong twice over: its bytes live
-        until its last reader rather than dying at a gather, so it would hold a
-        full-size buffer open for as long as the bucket's shortest-lived member
-        needs; and the splice hoists a group's holders to their earliest common
-        reader, which is only safe while a holder reads nothing but a
-        placeholder -- these read a redistribute.
-        """
-        from magi_compiler.passes.fsdp_overlap.node_meta import is_weight_ag
-
-        groups: list[list[fx.Node]] = []
-        done: set[fx.Node] = set()
-        for gather in graph.graph.nodes:
-            if gather.op != "call_function" or gather.target not in (_ALL_GATHER, _ALL_GATHER_COALESCED):
-                continue
-            # The same question ``collect`` asks. A model has other collectives --
-            # gaga4 alone gathers activations for context parallelism -- and
-            # walking back from their arguments only fails to find a tagged
-            # holder, which is the right answer arrived at the slow way.
-            if not is_weight_ag(gather):
-                continue
-            shard_args = gather.args[0] if gather.target is _ALL_GATHER_COALESCED else [gather.args[0]]
-            members = []
-            for shard in shard_args:
-                holder = shard if shard in holders else self._holder_of(shard, holders)
-                if holder is not None and holder not in done:
-                    members.append(holder)
-            if not members:
-                continue
-            if len(members) != len(shard_args):
-                # split_by keeps buckets single-kind, so a partial bucket means an
-                # assumption broke somewhere upstream.
-                from magi_compiler.utils import magi_logger
-
-                magi_logger.warning(
-                    "host offload: %s mixes %d offloaded and %d resident shard(s); loading them "
-                    "separately rather than as one bucket",
-                    gather.name,
-                    len(members),
-                    len(shard_args) - len(members),
-                )
-            done.update(members)
-            groups.append(members)
-
-        order = {n: i for i, n in enumerate(graph.graph.nodes)}
-        groups.extend([h] for h in sorted(holders - done, key=lambda n: order.get(n, len(order))))
-        return groups
-
-    @staticmethod
-    def _holder_of(node, holders: set[fx.Node]) -> fx.Node | None:
-        """Walk back from a gather's shard argument to the tagged ``to_local``."""
-        from ..node_meta import host_slot
-
-        if not isinstance(node, fx.Node):
-            return None
-        return walk_back_to_holder(node, lambda n: n in holders and host_slot(n) is not None)

@@ -112,11 +112,10 @@ def _gather(name, deps, cost, coalesced=False):
     return _Snode(name, _ir(ir._CollectiveKernel, op=_AG_COALESCED if coalesced else _AG), deps, cost)
 
 
-def _load(name, mib, deps=(), slots=(), coalesced=False):
-    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD, H2D_LOAD_COALESCED
+def _load(name, mib, deps=(), slots=()):
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
-    op = H2D_LOAD_COALESCED if coalesced else H2D_LOAD
-    return _Snode(name, _ir(_Compute, op=op, numel=mib * _MIB // 2, slots=slots), deps)
+    return _Snode(name, _ir(_Compute, op=H2D_LOAD, numel=mib * _MIB // 2, slots=slots), deps)
 
 
 # -- graph builders -----------------------------------------------------------
@@ -189,25 +188,16 @@ def _fsdp_heavy_graph(seed, comm_ratio):
     return order
 
 
-def _h2d_graph(seed, slots, *, coalesced_every=0):
+def _h2d_graph(seed, slots):
     """One load per layer, parked directly in front of its wait (phase 1)."""
     rng = random.Random(seed)
     order = [_compute("embed", rng.uniform(1e5, 4e6))]
     act = "embed"
     for i, slot in enumerate(slots):
         mib = 4 + 4 * (i % 3)
-        if coalesced_every and i % coalesced_every == 0:
-            order.append(_load(f"ld{i}", mib, slots=[slot], coalesced=True))
-            order.append(_unpack(f"mo{i}_0", f"ld{i}", numel=mib * _MIB // 4))
-            order.append(_unpack(f"mo{i}_1", f"ld{i}", numel=mib * _MIB // 4))
-            order.append(_wait(f"w{i}_0", f"mo{i}_0"))
-            order.append(_wait(f"w{i}_1", f"mo{i}_1"))
-            deps = [f"w{i}_0", f"w{i}_1"]
-        else:
-            order.append(_load(f"ld{i}", mib, slots=[slot]))
-            order.append(_wait(f"w{i}", f"ld{i}"))
-            deps = [f"w{i}"]
-        order.append(_compute(f"mm{i}", rng.uniform(1e5, 3e6), [*deps, act]))
+        order.append(_load(f"ld{i}", mib, slots=[slot]))
+        order.append(_wait(f"w{i}", f"ld{i}"))
+        order.append(_compute(f"mm{i}", rng.uniform(1e5, 3e6), [f"w{i}", act]))
         order.append(_compute(f"pw{i}", rng.uniform(1e3, 5e5), [f"mm{i}"]))
         act = f"pw{i}"
         if rng.random() < 0.3:
@@ -227,17 +217,17 @@ _FSDP_CASES = [
 ]
 
 _H2D_CASES = [
-    ("h2d_default_s1", 1, 8, {}, 0),
-    ("h2d_default_s2", 2, 10, {}, 3),
-    ("h2d_inflight_s3", 3, 10, {"max_inflight_bytes": 24 * _MIB}, 0),
-    ("h2d_inflight_s4", 4, 12, {"max_inflight_bytes": 40 * _MIB}, 4),
-    ("h2d_resident_s5", 5, 10, {"max_resident_bytes": 24 * _MIB}, 0),
-    ("h2d_resident_s6", 6, 12, {"max_resident_bytes": 48 * _MIB, "max_inflight_bytes": 32 * _MIB}, 3),
-    ("h2d_device_s7", 7, 12, {"max_device_weight_bytes": 64 * _MIB}, 0),
-    ("h2d_device_s8", 8, 14, {"max_device_weight_bytes": 40 * _MIB}, 4),
-    ("h2d_util_s9", 9, 10, {"bus_utilization": 0.6, "max_resident_bytes": 32 * _MIB}, 0),
-    ("h2d_slowbus_s10", 10, 10, {"bandwidth_bytes_per_ns": 2.0, "max_resident_bytes": 40 * _MIB}, 2),
-    ("h2d_margin_s11", 11, 10, {"window_margin_ns": 2e5, "window_scale": 1.3}, 0),
+    ("h2d_default_s1", 1, 8, {}),
+    ("h2d_default_s2", 2, 10, {}),
+    ("h2d_inflight_s3", 3, 10, {"max_inflight_bytes": 24 * _MIB}),
+    ("h2d_inflight_s4", 4, 12, {"max_inflight_bytes": 40 * _MIB}),
+    ("h2d_resident_s5", 5, 10, {"max_resident_bytes": 24 * _MIB}),
+    ("h2d_resident_s6", 6, 12, {"max_resident_bytes": 48 * _MIB, "max_inflight_bytes": 32 * _MIB}),
+    ("h2d_device_s7", 7, 12, {"max_device_weight_bytes": 64 * _MIB}),
+    ("h2d_device_s8", 8, 14, {"max_device_weight_bytes": 40 * _MIB}),
+    ("h2d_util_s9", 9, 10, {"bus_utilization": 0.6, "max_resident_bytes": 32 * _MIB}),
+    ("h2d_slowbus_s10", 10, 10, {"bandwidth_bytes_per_ns": 2.0, "max_resident_bytes": 40 * _MIB}),
+    ("h2d_margin_s11", 11, 10, {"window_margin_ns": 2e5, "window_scale": 1.3}),
 ]
 
 
@@ -308,8 +298,8 @@ def test_fsdp_alap_is_the_index_sweep_on_the_time_axis(world_of_one, key, form, 
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="promotion moves real bytes")
-@pytest.mark.parametrize("key,seed,n,kwargs,coalesced_every", _H2D_CASES, ids=[c[0] for c in _H2D_CASES])
-def test_h2d_schedule_is_frozen(golden, key, seed, n, kwargs, coalesced_every):
+@pytest.mark.parametrize("key,seed,n,kwargs", _H2D_CASES, ids=[c[0] for c in _H2D_CASES])
+def test_h2d_schedule_is_frozen(golden, key, seed, n, kwargs):
     from magi_compiler.passes.weight_offload import H2dLoadReorder, host_pool
 
     host_pool.reset()
@@ -322,7 +312,7 @@ def test_h2d_schedule_is_frozen(golden, key, seed, n, kwargs, coalesced_every):
             host.copy_(shard)
             shard.untyped_storage().resize_(0)
             slots.append(host_pool.adopt(host, shard, name=f"w{i}"))
-        order = _h2d_graph(seed, slots, coalesced_every=coalesced_every)
+        order = _h2d_graph(seed, slots)
         params = {"bandwidth_bytes_per_ns": 10.0, "window_margin_ns": 0.0, "bus_utilization": 0.9, **kwargs}
         reorder = H2dLoadReorder(cost_fn=lambda s: s.cost, **params)
         names = [s.name for s in reorder(order)]

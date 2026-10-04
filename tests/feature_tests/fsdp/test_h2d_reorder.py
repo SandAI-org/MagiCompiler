@@ -120,8 +120,9 @@ def _wait(name, load_name):
 
 
 def _unpack(name, load_name, mib):
-    """The unpack carries the member's layout -- that is where the pass reads the
-    transfer size from, since a coalesced load's own size describes no one tensor."""
+    """The unpack carries the output's layout -- that is where the pass reads the
+    transfer size from, since a load lowers to a FallbackKernel whose own size
+    describes no tensor."""
     return _Snode(name, "unpack", deps=[load_name], numel=mib * _MIB // 2)
 
 
@@ -839,30 +840,22 @@ def test_inflight_peak_counts_closed_interval_touch():
     assert peak_adjacent == 100
 
 
-def test_coalesced_load_window_covers_the_whole_bucket():
-    """A bucket's window is sized from every member, not from one of them.
+def test_a_load_window_is_sized_from_its_unpack():
+    """The load itself carries no size (a FallbackKernel); reading it there would
+    size every window as zero and leave every load where phase 1 parked it."""
 
-    Reading the size off the coalesced load itself, or off a single unpack, would
-    under-size the window by the bucket factor -- and the symptom is not a wrong
-    answer, it is a hoist that stops several kernels too late.
-    """
-
-    def build(members):
+    def build(mib):
         order = [_compute(f"c{i}", 3e5) for i in range(6)]
-        order.append(_load("ld", 0))  # a coalesced load carries no size of its own
-        for i in range(members):
-            order.append(_unpack(f"mo{i}", "ld", 4))
-        for i in range(members):
-            order.append(_wait(f"w{i}", f"mo{i}"))
-        order.append(_compute("user", 1e6, deps=[f"w{i}" for i in range(members)]))
+        order.append(_load("ld", 0))
+        order.append(_unpack("mo", "ld", mib))
+        order.append(_wait("w", "mo"))
+        order.append(_compute("user", 1e6, deps=["w"]))
         return order
 
-    one = _reorder(build(1), bandwidth=10.0)
-    four = _reorder(build(4), bandwidth=10.0)
-    assert four.index("ld") < one.index("ld"), "four members need four times the window"
-    # Every unpack travels with the load, so the bucket stays one block.
-    assert [n for n in four if n.startswith("mo")] == ["mo0", "mo1", "mo2", "mo3"]
-    assert four.index("mo3") == four.index("ld") + 4
+    small = _reorder(build(1), bandwidth=10.0)
+    big = _reorder(build(4), bandwidth=10.0)
+    assert big.index("ld") < small.index("ld") < small.index("c5"), "a bigger load needs a longer window"
+    assert big.index("mo") == big.index("ld") + 1
 
 
 def test_a_late_small_load_is_not_dragged_to_the_front_of_the_graph():
