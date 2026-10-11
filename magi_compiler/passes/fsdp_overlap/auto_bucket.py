@@ -49,7 +49,10 @@ The graphs are compared first (``rank_sync.negotiate_mode`` must answer
 ``identical``), but the costs are not: most snodes are priced on each rank from
 its own measurements, so the fitted ``alpha``/``beta`` can differ slightly.  So
 every rank plans, and every rank then takes rank 0's plan, checks it is legal
-on its own order, and touches the IR only once every rank has said yes.
+on its own order, and touches the IR only once every rank has said yes.  A rank
+with fewer than two gathers still joins that comparison: the candidate count is
+rank-local, and returning before the exchange leaves the other ranks blocked in
+it.  Every rank leaves the gathers unbucketed only after the exchange says so.
 """
 
 from __future__ import annotations
@@ -246,12 +249,13 @@ class FsdpAutoBucket:
     def __call__(self, snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         order = list(snodes)
         cands = self._candidates(order)
-        if len(cands) < 2:
-            return snodes
         world = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
         cost = CostView(self._cost_fn)
         group = None
         if world > 1:
+            # Candidate count is rank-local. Every rank joins the exchange below,
+            # including one that found nothing to merge. Returning here skips the
+            # all_gather and blocks whichever ranks do enter it.
             _, skel_kinds = rank_sync.collective_skeleton(order)
             mode, group, world = rank_sync.negotiate_mode(order, cands, skel_kinds, cost.ok, who=self.name)
             if mode != "identical":
@@ -259,6 +263,8 @@ class FsdpAutoBucket:
                     "%s: per-rank graphs are not identical (mode=%s); leaving every weight gather unbucketed", self.name, mode
                 )
                 return snodes
+        if len(cands) < 2:
+            return snodes
 
         ok, buckets, report = True, [], {}
         try:

@@ -14,7 +14,7 @@
 
 """Scheduler-stage weight all-gather bucketing (``bucket_mode='auto'``).
 
-Two layers, tested separately:
+Tested separately:
 
 * the planner -- ``fit_alpha_beta``, the amortizing target and
   ``plan_segments`` -- on synthetic members, where every case the rule
@@ -23,7 +23,9 @@ Two layers, tested separately:
 * the IR surgery and the pass, end to end on a 2-rank SimpleFSDP model through
   ``fsdp_overlap_helper/ir_coalesce_helper.py``: the compiled output must match
   eager, the wrapper must launch coalesced gathers, and every wait must still
-  read a buffer the coalesced launch's unpack produced under its old name.
+  read a buffer the coalesced launch's unpack produced under its old name;
+* the cross-rank skip, on gloo without a compile: a rank with fewer than two
+  candidates still joins mode negotiation, then every rank leaves the graph alone.
 """
 
 import os
@@ -41,6 +43,7 @@ from magi_compiler.passes.fsdp_overlap.auto_bucket import Member, PlanParams, am
 MiB = 2**20
 
 _HELPER = Path(__file__).parent / "fsdp_overlap_helper" / "ir_coalesce_helper.py"
+_RANK_HELPER = Path(__file__).parent / "fsdp_overlap_helper" / "auto_bucket_rank_helper.py"
 
 requires_2gpu = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.device_count() < 2 or shutil.which("torchrun") is None,
@@ -349,3 +352,40 @@ def test_a_rank_whose_own_plan_differs_takes_rank_0s():
     assert "unbucketed" not in out, out[-4000:]
     per_rank = next(l for l in p.stdout.splitlines() if l.startswith("IRC_RANK_BUCKETS")).split()[1:]
     assert len(set(per_rank)) == 1 and per_rank[0].split("/")[0] != "0", per_rank
+
+
+requires_torchrun = pytest.mark.skipif(shutil.which("torchrun") is None, reason="requires torchrun")
+
+
+@requires_torchrun
+def test_a_rank_with_one_candidate_still_negotiates():
+    """Rank 0 has one gather and rank 1 has two, and their graph fingerprints differ.
+
+    Both must enter ``negotiate_mode``'s gloo all_gather and then leave the schedule
+    unchanged. Returning before that exchange stalls the rank that still has a pair.
+    The helper stubs only candidate discovery and the fingerprint.
+    """
+    root = str(Path(__file__).resolve().parents[3])
+    env = os.environ.copy()
+    prev = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = root if not prev else root + os.pathsep + prev
+    env["PYTHONUNBUFFERED"] = "1"
+    env["MAGI_LOGGING_LEVEL"] = env.get("MAGI_LOGGING_LEVEL", "info")
+    p = subprocess.run(
+        ["torchrun", "--nproc_per_node=2", f"--master_port={_free_port()}", str(_RANK_HELPER)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    out = p.stdout + p.stderr
+    assert p.returncode == 0, out[-4000:]
+    lines = [line for line in p.stdout.splitlines() if "BUCKET_NEGOTIATED" in line]
+    assert len(lines) == 2, out[-4000:]
+
+    def negotiated(rank: str, n: str) -> bool:
+        needle = (f"rank={rank}", "mode=abort", f"n={n}", "unchanged=True")
+        return any(all(part in line for part in needle) for line in lines)
+
+    assert negotiated("0", "1") and negotiated("1", "2"), lines
+    assert "BUCKET_RANK_PASS" in p.stdout, out[-4000:]
