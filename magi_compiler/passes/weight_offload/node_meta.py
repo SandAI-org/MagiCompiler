@@ -14,8 +14,9 @@
 
 """Node-meta keys the offload passes share.
 
-``node.meta`` is the only channel that survives bucketing, which rebuilds nodes.
-Keys live here so a typo cannot silently leave a weight on the device.
+``node.meta`` is the channel from the FX passes to the scheduler passes (through
+``meta["custom"]``, see below).  Keys live here so a typo cannot silently leave a
+weight on the device.
 """
 
 from __future__ import annotations
@@ -27,10 +28,10 @@ import torch.fx as fx
 HOST_SLOT = "magi_host_offload_slot"
 
 # On a node downstream of an offloaded weight, so a later pass can keep
-# offloaded and resident work apart -- the FSDP bucketing reads this to avoid
-# putting both kinds in one all-gather.  Mirrored under ``meta["custom"]``, the
-# one field AOT autograd's re-trace carries over, so the scheduler-stage
-# bucketing can read it off an IR node's origins too.
+# offloaded and resident work apart -- the scheduler-stage FSDP bucketing reads
+# this to avoid putting both kinds in one all-gather.  Mirrored under
+# ``meta["custom"]``, the one field AOT autograd's re-trace carries over, so it
+# can be read off an IR node's origins.
 HOST_OFFLOADED = "magi_host_offloaded"
 
 

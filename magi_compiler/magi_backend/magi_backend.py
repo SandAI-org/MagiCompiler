@@ -39,8 +39,6 @@ from magi_compiler.passes.fsdp_overlap import (
     FsdpOverlapReorder,
     MemoryProbe,
     bind_weights_for_copy_engine,
-    bucket_weight_all_gather,
-    is_ce_bound,
     lower_prim_redistribute_to_collectives,
     rewrite_weight_ag_to_copy_engine,
 )
@@ -54,7 +52,6 @@ from magi_compiler.passes.weight_offload import (
     bind_weights_to_host,
     host_pool,
     insert_h2d_loads,
-    is_host_offloaded,
 )
 from magi_compiler.profiling import ProfilingRuntimeEstimator
 from magi_compiler.utils import compilation_counter, compute_code_hash, compute_graph_hash, compute_hash, magi_logger
@@ -719,7 +716,7 @@ class MagiBackend:
                 "copy-engine gather reads its peers' device-resident shards, which offloading frees"
             )
 
-        bucket_mode = self._bucket_mode() if enable_fsdp else "none"
+        bucket_mode = fsdp_cfg.bucket_mode if enable_fsdp else "none"
         source = FsdpShardSource() if enable_fsdp else PlainParamSource()
 
         if enable_fsdp:
@@ -738,20 +735,9 @@ class MagiBackend:
             )
 
         if enable_fsdp:
-            # "auto" buckets during scheduling (FsdpAutoBucket), not here.
-            n_buckets = bucket_weight_all_gather(
-                graph,
-                "none" if bucket_mode == "auto" else bucket_mode,
-                bucket_size_bytes=int(fsdp_cfg.bucket_size_mib) * 1024 * 1024,
-                split_by=is_ce_bound if copy_engine else (is_host_offloaded if bound else None),
-            )
-            magi_logger.info(
-                "FSDP fullgraph overlap: transport=%s bucket_mode=%s bucket_size=%d MiB created %d buckets",
-                fsdp_cfg.transport,
-                bucket_mode,
-                fsdp_cfg.bucket_size_mib,
-                n_buckets,
-            )
+            # Weight gathers stay one per weight here; bucket_mode='auto' merges
+            # them during scheduling (FsdpAutoBucket), once their costs are known.
+            magi_logger.info("FSDP fullgraph overlap: transport=%s bucket_mode=%s", fsdp_cfg.transport, bucket_mode)
 
         if bound:
             insert_h2d_loads(graph)
@@ -767,21 +753,6 @@ class MagiBackend:
             # would be read there, not at the first real forward.
             self._reclaim_unloaded_weights()
             self.compiler_manager.bind_offload_cache(graph)
-
-    def _bucket_mode(self) -> str:
-        """``fsdp_config.bucket_mode`` as it will actually run."""
-        fsdp_cfg = self.compile_config.fsdp_config
-        mode = (fsdp_cfg.bucket_mode or "none").lower()
-        if mode not in ("none", "coalesced", "auto"):
-            raise ValueError(f"fsdp_config.bucket_mode={fsdp_cfg.bucket_mode!r}; expected 'none', 'coalesced' or 'auto'")
-        if mode == "auto" and fsdp_cfg.enable_fsdp and fsdp_cfg.transport == "copy_engine":
-            magi_logger.warning(
-                "fsdp_config.bucket_mode='auto' buckets NCCL gathers only; transport='copy_engine' falls back to "
-                "'coalesced' with bucket_size_mib=%d",
-                fsdp_cfg.bucket_size_mib,
-            )
-            return "coalesced"
-        return mode
 
     def _configure_overlap_passes(self, *, loads_inserted: bool, auto_bucket: bool = False) -> None:
         """Install the Inductor scheduler passes the weight rewrite needs.
@@ -815,7 +786,7 @@ class MagiBackend:
                 FsdpAutoBucket(
                     cost_fn=costs,
                     max_bucket_bytes=int(fsdp_cfg.bucket_size_mib) * 1024 * 1024,
-                    overhead_ratio=float(fsdp_cfg.auto_bucket_overhead_ratio),
+                    overhead_ratio=fsdp_cfg.auto_bucket_overhead_ratio,
                     launch_overhead_ns=float(fsdp_cfg.auto_bucket_launch_overhead_us) * 1e3,
                     comm_overlap_window_scale=fsdp_cfg.comm_overlap_window_scale,
                     comm_overlap_window_margin_ns=fsdp_cfg.comm_overlap_window_margin_ns,
