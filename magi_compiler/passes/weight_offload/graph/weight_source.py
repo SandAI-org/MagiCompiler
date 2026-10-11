@@ -155,7 +155,6 @@ class PlainParamSource(WeightSource):
 
 
 _ALL_GATHER = torch.ops._c10d_functional.all_gather_into_tensor.default
-_ALL_GATHER_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
 
 
 def _is_to_local(node: fx.Node) -> bool:
@@ -207,7 +206,7 @@ def _feeds_a_weight_gather(node: fx.Node) -> bool:
         if user in seen:
             continue
         seen.add(user)
-        if user.op == "call_function" and user.target in (_ALL_GATHER, _ALL_GATHER_COALESCED):
+        if user.op == "call_function" and user.target is _ALL_GATHER:
             return True
         name = getattr(user.target, "__name__", "") or str(user.target)
         if is_prep(user) or "h2d_load" in name or "wait_tensor" in name:
@@ -242,11 +241,10 @@ class FsdpShardSource(WeightSource):
     the loads here are cheaper to schedule than a plain parameter's: the live
     range is a handful of snodes rather than the rest of the layer.
 
-    ``collect`` runs BEFORE bucketing, so it only ever meets the
-    one-gather-per-weight form the lowering produces: bucketing needs to know
-    which shards are offloaded to keep a bucket single-kind, and that is exactly
-    what binding decides.  Every weight still gets a load of its own after
-    bucketing; a bucket's launch waits for each member's load separately.
+    ``collect`` meets the one-gather-per-weight form the lowering produces;
+    gathers are bucketed only later, during scheduling, where the offloaded tag
+    binding sets keeps a bucket single-kind.  Every weight gets a load of its
+    own; a bucket's launch waits for each member's load separately.
     """
 
     def collect(
@@ -262,15 +260,6 @@ class FsdpShardSource(WeightSource):
 
         for node in graph.graph.nodes:
             if node.op != "call_function" or not is_weight_ag(node):
-                continue
-            if node.target is _ALL_GATHER_COALESCED:
-                # Binding has to precede bucketing -- bucketing splits offloaded
-                # from resident gathers on the tag binding sets -- so a bucket
-                # here means the two ran in the wrong order.  Counted rather than
-                # ignored: every weight would drop out, the caller would log
-                # "nothing to offload", and the first sign of it would be the
-                # OOM that offload was turned on to prevent.
-                skipped["weight gather was already bucketed; binding must run before bucketing"] += 1
                 continue
             if node.target is not _ALL_GATHER:
                 continue
@@ -359,8 +348,8 @@ class FsdpShardSource(WeightSource):
                     local=local,
                     name=param_name(src),
                     nbytes=host_pool.slot_bytes(slot),
-                    # No gather to tag: bucketing splits offloaded gathers from
-                    # resident ones, and this weight has neither.
+                    # No gather to tag: bucketing keeps offloaded gathers apart
+                    # from resident ones, and this weight has neither.
                     tag=None,
                     slot=slot,
                     group=mesh_group(param),

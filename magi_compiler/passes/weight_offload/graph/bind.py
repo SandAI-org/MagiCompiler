@@ -201,12 +201,10 @@ def bind_weights_to_host(
 def apply_weight_offload(
     graph: fx.GraphModule, example_inputs: Sequence[Any] | None, source: WeightSource, *, min_bytes: int = 0
 ) -> int:
-    """Bind then splice loads, for a graph that is NOT going through FSDP bucketing.
+    """Bind then splice loads in one step.
 
-    FSDP cannot use this: it must bind *before* bucketing (bucketing keeps
-    offloaded and resident gathers apart on the tag binding sets) and insert
-    *after*.  The backend's weight pipeline keeps the two calls apart for that
-    reason and does not go through here.
+    The backend's weight pipeline makes the two calls itself, with the FSDP
+    lowering's bookkeeping between them, and does not go through here.
     """
     bound = bind_weights_to_host(graph, example_inputs, source, min_bytes=min_bytes)
     if not bound:

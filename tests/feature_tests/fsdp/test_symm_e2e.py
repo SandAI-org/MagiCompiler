@@ -27,6 +27,7 @@ asserts on its stdout markers.
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -38,9 +39,19 @@ requires_2gpu = pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requir
 requires_torchrun = pytest.mark.skipif(shutil.which("torchrun") is None, reason="requires torchrun")
 
 
-def _run(transport: str, port: str) -> subprocess.CompletedProcess:
+def _run(transport: str, port: str, *shape: str, ratio: float | None = None) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env["MAGI_LOGGING_LEVEL"] = env.get("MAGI_LOGGING_LEVEL", "info")
+    if ratio is not None:
+        env["MAGI_COMPILE_FSDP_CONFIG__AUTO_BUCKET_OVERHEAD_RATIO"] = str(ratio)
+    # A cache root of its own: a replayed artifact skips the scheduler passes
+    # whose work the helper counts.
+    with tempfile.TemporaryDirectory(prefix="magi_symm_e2e_") as cache_root:
+        env["MAGI_COMPILE_CACHE_ROOT_DIR"] = cache_root
+        return _launch(transport, port, env, shape)
+
+
+def _launch(transport: str, port: str, env: dict, shape) -> subprocess.CompletedProcess:
     return subprocess.run(
         [
             "torchrun",
@@ -51,12 +62,7 @@ def _run(transport: str, port: str) -> subprocess.CompletedProcess:
             transport,
             # Small enough to compile quickly, big enough that the gather is a
             # real cross-rank transfer rather than a rounding error.
-            "--hidden",
-            "1024",
-            "--n-layers",
-            "4",
-            "--n-tokens",
-            "512",
+            *(shape or ("--hidden", "1024", "--n-layers", "4", "--n-tokens", "512")),
         ],
         env=env,
         capture_output=True,
@@ -71,11 +77,17 @@ def test_copy_engine_end_to_end():
     """Weights land in symmetric memory, the gathers get retargeted, and two
     consecutive steps both match an unsharded eager model -- the second step
     is where a missing wait would show up."""
-    p = _run("copy_engine", "29641")
+    # The copy engine's default ratio (0.5) leaves gathers this small alone; 0.1
+    # makes the scheduler stage merge them, which is the path under test.
+    p = _run("copy_engine", "29641", ratio=0.1)
     out = p.stdout + p.stderr
     assert p.returncode == 0, f"script failed:\n{out[-4000:]}"
     assert "CHECK placement: 4/4 block shards" in p.stdout, out[-4000:]
     assert "CHECK rewrite: 4/4 gathers" in p.stdout, out[-4000:]
+    # Four 2 MiB gathers are far under the launch-amortizing size: the scheduler
+    # stage has to merge them into coalesced copy-engine launches.
+    line = next(l for l in p.stdout.splitlines() if l.startswith("CHECK auto buckets:"))
+    assert int(line.split(":")[1].split()[0]) >= 1, line
     assert "E2E_PASS" in p.stdout, out[-4000:]
 
 
@@ -89,4 +101,21 @@ def test_nccl_transport_is_untouched():
     assert p.returncode == 0, f"script failed:\n{out[-4000:]}"
     assert "CHECK placement: 0/4 block shards in 0 window(s)" in p.stdout, out[-4000:]
     assert "CHECK rewrite: 0/0 gathers" in p.stdout, out[-4000:]
+    assert "E2E_PASS" in p.stdout, out[-4000:]
+
+
+@requires_2gpu
+@requires_torchrun
+def test_copy_engine_many_scheduler_stage_buckets():
+    """Dozens of copy-engine merges in one graph.
+
+    Each merge leaves its members' launches unscheduled but in the graph's
+    lists; dropping them once made a later merge's new node reuse a live name
+    and attach another bucket's unpacks to the wrong launch.
+    """
+    p = _run("copy_engine", "29643", "--hidden", "512", "--n-layers", "48", "--n-tokens", "256", ratio=0.1)
+    out = p.stdout + p.stderr
+    assert p.returncode == 0, f"script failed:\n{out[-4000:]}"
+    line = next(l for l in p.stdout.splitlines() if l.startswith("CHECK auto buckets:"))
+    assert int(line.split(":")[1].split()[0]) >= 10, line
     assert "E2E_PASS" in p.stdout, out[-4000:]

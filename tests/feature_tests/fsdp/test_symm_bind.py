@@ -135,30 +135,23 @@ def _bind(gm, examples, **kw):
     return bind_graph_weights(gm, copy_engine_weight_candidates(gm), dict(zip(names, examples)), **kw)
 
 
-def _pipeline(gm, examples, *, transport="copy_engine", bucket_size_bytes=0) -> int:
+def _pipeline(gm, examples, *, transport="copy_engine") -> int:
     """``MagiBackend._apply_weight_pipeline`` with host offload off, inlined.
 
-    Lower, bind, bucket what bound, retarget -- the order matters and is the
-    thing several tests below are about.  Returns the bucket count.
+    Lower, bind, retarget what bound -- one gather per weight; bucketing happens
+    later, during scheduling.  Returns how many gathers were retargeted.
     """
     from magi_compiler.passes.fsdp_overlap import (
         bind_weights_for_copy_engine,
-        bucket_weight_all_gather,
-        is_ce_bound,
         lower_prim_redistribute_to_collectives,
         rewrite_weight_ag_to_copy_engine,
     )
 
-    copy_engine = transport == "copy_engine"
     lower_prim_redistribute_to_collectives(gm)
-    if copy_engine:
-        bind_weights_for_copy_engine(gm, examples, 0)
-    n = bucket_weight_all_gather(
-        gm, "coalesced", bucket_size_bytes=bucket_size_bytes, split_by=is_ce_bound if copy_engine else None
-    )
-    if copy_engine:
-        rewrite_weight_ag_to_copy_engine(gm)
-    return n
+    if transport != "copy_engine":
+        return 0
+    bind_weights_for_copy_engine(gm, examples, 0)
+    return rewrite_weight_ag_to_copy_engine(gm)
 
 
 # ---------------------------------------------------------------------------
@@ -508,65 +501,29 @@ def test_bind_parameters_skips_what_it_cannot_gather(mesh_1rank):
 
 
 @requires_cuda
-def test_bound_weights_are_bucketed_and_retargeted(mesh_1rank):
-    """The pipeline end to end: bind, then bucket only what bound, then retarget.
-    Binding before bucketing is what keeps a bucket homogeneous."""
-    from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER_COALESCED
+def test_bound_weights_are_retargeted_one_gather_each(mesh_1rank):
+    """The pipeline end to end: bind, then retarget what bound."""
+    from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER
 
     gm, examples = _graph([_param(mesh_1rank) for _ in range(4)])
-    n = _pipeline(gm, examples)
-
-    assert n == 1
-    coalesced = [x for x in gm.graph.nodes if x.target is CE_ALL_GATHER_COALESCED]
-    assert len(coalesced) == 1
-    assert len(coalesced[0].args[0]) == 4
+    assert _pipeline(gm, examples) == 4
+    assert len([x for x in gm.graph.nodes if x.target is CE_ALL_GATHER]) == 4
+    assert not [x for x in gm.graph.nodes if x.target is _AG]
 
 
 @requires_cuda
-def test_an_unbound_weight_keeps_its_neighbours_on_the_copy_engine(mesh_1rank):
-    """Only the weight that could not be bound loses the copy engine. Excluding it
-    must not split the bucket around it, or one odd weight would cost throughput
-    across the whole model."""
+def test_an_unbound_weight_alone_stays_on_nccl(mesh_1rank):
+    """Only the weight that could not be bound loses the copy engine."""
     from magi_compiler.passes.fsdp_overlap.node_meta import UNEVEN_SHARD
-    from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER_COALESCED
+    from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER
 
     gm, examples = _graph([_param(mesh_1rank) for _ in range(4)])
     gathers = [n for n in gm.graph.nodes if n.target is _AG]
     gathers[1].meta[UNEVEN_SHARD] = True
 
-    _pipeline(gm, examples)
-
-    coalesced = [n for n in gm.graph.nodes if n.target is CE_ALL_GATHER_COALESCED]
-    assert len(coalesced) == 1
-    assert len(coalesced[0].args[0]) == 3  # the three bound weights, in one bucket
+    assert _pipeline(gm, examples) == 3
+    assert len([n for n in gm.graph.nodes if n.target is CE_ALL_GATHER]) == 3
     assert len([n for n in gm.graph.nodes if n.target is _AG]) == 1  # the uneven one, on NCCL
-
-
-@requires_cuda
-def test_unbound_weights_are_still_bucketed_as_nccl(mesh_1rank):
-    """Losing the copy engine must not also lose bucketing.
-
-    Bucketing partitions by transport rather than filtering on it: if unbound
-    gathers were simply dropped out of the pass, a model that declines binding
-    wholesale would go from a handful of coalesced launches to one launch per
-    weight, which costs far more memory than the copy engine ever saved.
-    """
-    from magi_compiler.passes.fsdp_overlap.node_meta import UNEVEN_SHARD
-    from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER_COALESCED
-
-    _AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
-
-    gm, examples = _graph([_param(mesh_1rank) for _ in range(4)])
-    for node in [n for n in gm.graph.nodes if n.target is _AG][2:]:
-        node.meta[UNEVEN_SHARD] = True  # two weights the copy engine cannot serve
-
-    assert _pipeline(gm, examples) == 2
-
-    (ce,) = [n for n in gm.graph.nodes if n.target is CE_ALL_GATHER_COALESCED]
-    (nccl,) = [n for n in gm.graph.nodes if n.target is _AG_COALESCED]
-    assert len(ce.args[0]) == 2
-    assert len(nccl.args[0]) == 2
-    assert not [n for n in gm.graph.nodes if n.target is _AG]
 
 
 @requires_cuda

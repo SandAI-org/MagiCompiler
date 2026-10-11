@@ -14,10 +14,11 @@
 
 """Weight all-gather bucketing sized to amortize the launch, inside the Inductor scheduler.
 
-``bucket_mode="auto"`` replaces the FX pass's fixed ``bucket_size_mib``.  This
-pass runs right after ``SnodeCostProfile`` and before ``FsdpOverlapReorder``, so
-it sees the fused graph with every gather priced, and the reorder then places
-the buckets it built exactly as it places FX-built ones.
+``bucket_mode="auto"`` is the only weight-gather bucketing there is.  This pass
+runs right after ``SnodeCostProfile`` and before ``FsdpOverlapReorder``, so it
+sees the fused graph with every gather priced, and the reorder then places the
+buckets it built.  NCCL and copy-engine gathers are bucketed alike, never into
+one bucket together (see ``ir_coalesce``).
 
 The rule.  A gather of ``S`` gathered bytes costs ``T(S) = alpha + beta * S`` on
 its stream, fitted to the measured single gathers.  Merging only ever saves the
@@ -35,6 +36,13 @@ set): that bounds what a bucket can allocate early to about one target's worth
 of small weights.  A merge also stops at the first member whose shard is not
 ready before the bucket's earliest wait, and a last bucket under half the
 target folds into the one before it when that fits.
+
+``alpha``/``beta`` are fitted, and ``ratio`` chosen, per transport: a copy-engine
+gather pays a much larger fixed cost per launch and a much smaller one per byte
+than an NCCL one, so one ratio gives it a target several times the NCCL one.
+Unless set, ``ratio`` is 0.1 for NCCL and 0.5 for the copy engine -- the values
+at which gaga4 400B ran level with the old fixed 512 MiB buckets on each
+transport, without allocating more gathered weight early.
 
 Every rank must build the same buckets, or the collective sequence diverges.
 The graphs are compared first (``rank_sync.negotiate_mode`` must answer
@@ -64,7 +72,8 @@ from .node_meta import is_weight_ag
 from .reorder import FsdpOverlapReorder
 
 DEFAULT_LAUNCH_OVERHEAD_NS = 10_000.0
-DEFAULT_OVERHEAD_RATIO = 0.1
+DEFAULT_OVERHEAD_RATIOS = {"nccl": 0.1, "ce": 0.5}
+"""Launch share per transport (``GatherInfo.kind``) when ``overhead_ratio`` is not set."""
 
 
 # -- the pure planning problem ----------------------------------------------
@@ -121,7 +130,7 @@ def amortizing_bytes(alpha_ns: float, beta_ns_per_byte: float, ratio: float) -> 
 class PlanParams:
     alpha_ns: float
     beta_ns_per_byte: float
-    overhead_ratio: float = DEFAULT_OVERHEAD_RATIO
+    overhead_ratio: float = DEFAULT_OVERHEAD_RATIOS["nccl"]
     max_local_bytes: int = 0  # ``bucket_size_mib``: local-shard bytes per bucket, 0 = no cap
     # The placement model's (``bucket_eval``) window terms, as the reorder applies them.
     scale: float = 1.0
@@ -207,17 +216,18 @@ class FsdpAutoBucket:
         self,
         cost_fn=None,
         max_bucket_bytes: int = 0,
-        overhead_ratio: float = DEFAULT_OVERHEAD_RATIO,
+        overhead_ratio: float | None = None,
         launch_overhead_ns: float = DEFAULT_LAUNCH_OVERHEAD_NS,
         comm_overlap_window_scale: float = 1.0,
         comm_overlap_window_margin_ns: float = DEFAULT_WINDOW_MARGIN_NS,
         memory_probe: bool = False,
     ) -> None:
-        if not 0.0 < overhead_ratio < 1.0:
+        if overhead_ratio is not None and not 0.0 < overhead_ratio < 1.0:
             raise ValueError(f"FsdpAutoBucket: overhead_ratio must be in (0, 1), got {overhead_ratio}")
         self._cost_fn = cost_fn if cost_fn is not None else default_cost_fn()
         self.max_bucket_bytes = int(max_bucket_bytes)
-        self.overhead_ratio = float(overhead_ratio)
+        # None: per transport, from DEFAULT_OVERHEAD_RATIOS.
+        self.overhead_ratio = None if overhead_ratio is None else float(overhead_ratio)
         # The fixed cost assumed when every measured gather has one size, so the
         # fit cannot separate it from the per-byte cost.
         self.launch_overhead_ns = float(launch_overhead_ns)
@@ -277,8 +287,9 @@ class FsdpAutoBucket:
 
         for members in buckets:
             out_bytes = sum(gather_info(m).shard_bytes * gather_info(m).world for m in members)
+            params = report["params"][gather_info(members[0]).kind]
             order, packed, unpacks = ir_coalesce.coalesce_all_gathers(order, members)
-            self._record(packed, unpacks, out_bytes, report["params"])
+            self._record(packed, unpacks, out_bytes, params)
         snodes[:] = order
         ir_coalesce.refresh_memory_planning(snodes)
         self._report(report, len(buckets))
@@ -287,7 +298,7 @@ class FsdpAutoBucket:
     # -- candidates -----------------------------------------------------------
     @staticmethod
     def _candidates(order: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
-        """Plain gathers tagged as weight gathers; every plain gather if none is tagged.
+        """Single-weight gathers (NCCL or copy engine) tagged as weight gathers; every one if none is tagged.
 
         The untagged fallback matches ``FsdpOverlapReorder``, which treats every
         gather as a weight gather; a graph whose lowering tags weights at all has
@@ -300,10 +311,10 @@ class FsdpAutoBucket:
     @staticmethod
     def _kind(snode: BaseSchedulerNode, info: GatherInfo) -> tuple:
         offloaded = any(is_host_offloaded(o) for o in getattr(snode.node, "origins", ()) or ())
-        return (info.dtype, offloaded)
+        return (info.kind, info.dtype, offloaded)
 
     def _runs(self, cands: list[BaseSchedulerNode]) -> list[list[BaseSchedulerNode]]:
-        """Consecutive gathers on one group, split by (dtype, host-offloaded) like the FX pass."""
+        """Consecutive gathers on one group, split by (transport, dtype, host-offloaded): one launch is one op."""
         runs: list[list[BaseSchedulerNode]] = []
         last = object()
         for s in cands:
@@ -340,22 +351,34 @@ class FsdpAutoBucket:
             out_bytes=info.shard_bytes * info.world,
         )
 
+    def _params_by_kind(self, cands, cost: CostView) -> dict[str, PlanParams]:
+        """One fit and one ratio per transport: their fixed and per-byte costs are nothing alike."""
+        points: dict[str, list[tuple[float, float]]] = {}
+        for s in cands:
+            info = gather_info(s)
+            points.setdefault(info.kind, []).append((info.shard_bytes * info.world, cost(s)))
+        out = {}
+        for kind, pts in points.items():
+            alpha, beta = fit_alpha_beta(pts, alpha_guess_ns=self.launch_overhead_ns)
+            out[kind] = PlanParams(
+                alpha_ns=alpha,
+                beta_ns_per_byte=beta,
+                overhead_ratio=self.overhead_ratio if self.overhead_ratio is not None else DEFAULT_OVERHEAD_RATIOS[kind],
+                max_local_bytes=self.max_bucket_bytes,
+                scale=self.comm_overlap_window_scale,
+                margin_ns=self.comm_overlap_window_margin_ns,
+            )
+        return out
+
     def _plan(self, order, cands, cost: CostView):
         graph = SnodeGraph(order)
-        points = [(gather_info(s).shard_bytes * gather_info(s).world, cost(s)) for s in cands]
-        alpha, beta = fit_alpha_beta(points, alpha_guess_ns=self.launch_overhead_ns)
-        params = PlanParams(
-            alpha_ns=alpha,
-            beta_ns_per_byte=beta,
-            overhead_ratio=self.overhead_ratio,
-            max_local_bytes=self.max_bucket_bytes,
-            scale=self.comm_overlap_window_scale,
-            margin_ns=self.comm_overlap_window_margin_ns,
-        )
+        params_by_kind = self._params_by_kind(cands, cost)
         buckets: list[list[BaseSchedulerNode]] = []
         report = {"n": len(cands), "solo": 0, "share_before": 0.0, "share_after": 0.0, "launches": 0, "sizes": []}
         stream_ns = launch_ns_before = launch_ns_after = 0.0
         for run in self._runs(cands):
+            params = params_by_kind[gather_info(run[0]).kind]
+            alpha, beta = params.alpha_ns, params.beta_ns_per_byte
             pairs = [(s, self._member(s, graph, cost)) for s in run]
             usable = [(s, m) for s, m in pairs if m is not None]
             if len(usable) < 2:
@@ -384,7 +407,7 @@ class FsdpAutoBucket:
             raise RuntimeError("the merged order is not topological")
         report["sizes"] = [sum(gather_info(s).shard_bytes for s in b) for b in kept]
         report["members"] = sum(len(b) for b in kept)
-        report["params"] = params
+        report["params"] = params_by_kind
         return kept, report
 
     def _adopt(self, ok: bool, buckets, order, cands, group, world: int):
@@ -443,7 +466,7 @@ class FsdpAutoBucket:
                 return False
         return SnodeGraph(order).validate(sim)
 
-    def _model_report(self, order, cands, buckets, cost: CostView, params: PlanParams) -> str:
+    def _model_report(self, order, cands, buckets, cost: CostView, params_by_kind: dict[str, PlanParams]) -> str:
         """What the exact placement model predicts for no buckets and for ``buckets``, on this order."""
         from .bucket_eval import peak_with, place
         from .memory_probe import GiB, memory_timeline
@@ -458,6 +481,7 @@ class FsdpAutoBucket:
             if not pairs:
                 continue
             members = [m for _, m in pairs]
+            params = params_by_kind[gather_info(run[0]).kind]
             segs: list[tuple[int, int]] = []
             for i, (s, _) in enumerate(pairs):
                 b = bucket_of.get(s)
@@ -496,14 +520,18 @@ class FsdpAutoBucket:
     def _report(self, report: dict, n_buckets: int) -> None:
         if not report or "params" not in report:
             return
-        params: PlanParams = report["params"]
+        fits = ", ".join(
+            f"{kind}: alpha={p.alpha_ns / 1e3:.1f}us beta={p.beta_ns_per_byte * 2**20 / 1e3:.3f}us/MiB, "
+            f"ratio {p.overhead_ratio:.2f} -> target {p.target_bytes / 2**20:.1f} MiB gathered (cap {p.cap_bytes / 2**20:.1f})"
+            for kind, p in sorted(report["params"].items())
+        )
         sizes = sorted(report.get("sizes") or [0])
         mib = [x / 2**20 for x in sizes]
         n = report.get("n", 0)
         launches = n - report.get("members", 0) + n_buckets
         magi_logger.info(
             "%s: %d bucket(s) from %d weight gather(s) (%d merged, %d large enough to go alone); "
-            "%d -> %d launch(es); alpha=%.1fus beta=%.3fus/MiB, ratio %.2f -> target %.1f MiB gathered (cap %.1f); "
+            "%d -> %d launch(es); %s; "
             "bucket local MiB min/median/max %.1f/%.1f/%.1f; launch share of stream time %.1f%% -> %.1f%%",
             self.name,
             n_buckets,
@@ -512,11 +540,7 @@ class FsdpAutoBucket:
             report.get("solo", 0),
             n,
             launches,
-            params.alpha_ns / 1e3,
-            params.beta_ns_per_byte * 2**20 / 1e3,
-            params.overhead_ratio,
-            params.target_bytes / 2**20,
-            params.cap_bytes / 2**20,
+            fits,
             mib[0],
             mib[len(mib) // 2],
             mib[-1],

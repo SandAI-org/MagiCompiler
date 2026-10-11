@@ -17,14 +17,13 @@ SimpleFSDP-style model, and print machine-checkable markers to stdout for the py
 driver (tests/feature_tests/test_fsdp_overlap_e2e.py).
 
 Chain under test (magi_backend._apply_weight_pipeline):
-  redistribute lowering  ->  whole-graph bucketing (coalesced)  ->  FsdpOverlapReorder
+  redistribute lowering  ->  FsdpAutoBucket (scheduler stage)  ->  FsdpOverlapReorder
 
 Model: two Linear layers whose params are Shard(0) DTensors (via torchtitan
 ``data_parallel(mode="fully_shard")``), with an
 opaque ``@magi_register_custom_op(is_subgraph_boundary=True)`` op between them so the
 graph contains an opaque extern call alongside the
-weight ``prim_redistribute`` nodes the lowering pass rewrites.  Bucketing is
-whole-graph: the boundary op does NOT split buckets.
+weight ``prim_redistribute`` nodes the lowering pass rewrites.
 
 Run: torchrun --nproc_per_node=N tests/feature_tests/fsdp_overlap_helper/e2e_helper.py
      [--cost-mode analytical|profile_sync]
@@ -135,7 +134,7 @@ def main() -> None:
         cfg.cudagraph_mode = CudaGraphMode.NONE
         cfg.disable_graph_split = True
         cfg.fsdp_config.enable_fsdp = True
-        cfg.fsdp_config.bucket_mode = "coalesced"
+        cfg.fsdp_config.bucket_mode = "auto"
         cfg.fsdp_config.cost_mode = args.cost_mode
         return cfg
 

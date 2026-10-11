@@ -37,10 +37,12 @@ import torch
 
 _HELPER = Path(__file__).parent / "fsdp_overlap_helper" / "offload_e2e_helper.py"
 
-# Several 4 MiB buckets back to back, close enough together that the sweep cannot
-# hide them all: the shape where placement has to choose between residency and
-# exposure, and therefore the one the budget tests are worth running on.
-_MULTI_BUCKET_SHAPE = ("--bucket-mode", "coalesced", "--bucket-size-mib", "4", "--n-layers", "6")
+# Several 4 MiB buckets back to back, close enough together that the sweep
+# cannot hide them all: the shape where placement has to choose between
+# residency and exposure, and therefore the one the budget tests are worth
+# running on.  At one rank a gather moves no bytes, so the fitted per-byte cost
+# is zero and only the cap sizes the buckets.
+_MULTI_LOAD_SHAPE = ("--bucket-mode", "auto", "--bucket-size-mib", "4", "--n-layers", "6")
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 requires_torchrun = pytest.mark.skipif(shutil.which("torchrun") is None, reason="requires torchrun")
@@ -119,41 +121,17 @@ def test_both_reorder_phases_run():
 
 @requires_cuda
 @requires_torchrun
-def test_offload_with_coalesced_buckets():
-    """Bucketing must keep offloaded and resident gathers apart: a bucket is one
-    launch, so every member has to have landed before it."""
-    p = _run(1, "--bucket-mode", "coalesced")
-    out = _check(p)
-    assert "OFFLOAD_PASS" in p.stdout, out[-4000:]
-
-
-@requires_cuda
-@requires_torchrun
-def test_every_bucketed_weight_gets_its_own_load():
-    """One load per weight, however the gathers are bucketed: a bucket's launch
-    waits for each member's load separately."""
-    p = _run(1, "--bucket-mode", "coalesced", "--bucket-size-mib", "4", "--n-layers", "6")
-    out = _check(p)
-    assert "OFFLOAD_PASS" in p.stdout, out[-4000:]
-
-    buckets = int(next(l for l in out.splitlines() if "FSDP fullgraph overlap" in l).split("created ")[1].split()[0])
-    loads = int(next(l for l in out.splitlines() if "inserted" in l and "h2d_load" in l).split("inserted ")[1].split()[0])
-    shards = _marker(p.stdout, "OFFLOAD_FREED", "shards")
-    assert buckets > 1, "this shape is supposed to produce several buckets"
-    assert loads == shards, f"expected one load per weight, got {loads} for {shards}"
-
-
-@requires_cuda
-@requires_torchrun
 def test_offload_with_scheduler_stage_buckets():
     """``bucket_mode='auto'`` buckets during scheduling, after the loads exist;
-    the coalesced launch still has to wait for every member's own load."""
+    the coalesced launch still has to wait for every member's own load, and
+    bucketing keeps offloaded and resident gathers apart."""
     p = _run(2, "--bucket-mode", "auto", "--n-layers", "6")
     out = _check(p)
     assert "OFFLOAD_PASS" in p.stdout, out[-4000:]
-    assert "FSDP auto bucket:" in out, out[-4000:]
+    line = next(l for l in out.splitlines() if "FSDP auto bucket:" in l)
+    assert int(line.split("FSDP auto bucket: ")[1].split()[0]) >= 1, line
     loads = int(next(l for l in out.splitlines() if "inserted" in l and "h2d_load" in l).split("inserted ")[1].split()[0])
-    assert loads == _marker(p.stdout, "OFFLOAD_FREED", "shards")
+    assert loads == _marker(p.stdout, "OFFLOAD_FREED", "shards"), "one load per weight"
 
 
 _REORDER_REPORT = "h2d load reorder: "
@@ -187,7 +165,7 @@ def test_the_inflight_budget_is_never_exceeded():
     schedule has to fit inside it -- overshooting reads as a working run until the
     day the model is big enough to OOM on the difference.
     """
-    p = _run(1, *_MULTI_BUCKET_SHAPE)
+    p = _run(1, *_MULTI_LOAD_SHAPE)
     out = _check(p)
     peak, budget = _inflight(out)
     assert 0 < peak <= budget, f"in-flight peak {peak} MiB over the {budget} MiB budget"
@@ -204,13 +182,13 @@ def test_inflight_budget_buys_concurrency():
     exposed.  Room for several buckets is what lets those overlap, and both sides
     of the trade have to be visible: exposure down, peak up.
     """
-    one_bucket = _run(1, *_MULTI_BUCKET_SHAPE, "--max-inflight-mib", "4")
+    one_bucket = _run(1, *_MULTI_LOAD_SHAPE, "--max-inflight-mib", "4")
     out = _check(one_bucket)
     tight_peak, tight_budget = _inflight(out)
     tight_exposed = _exposed_ms(out)
     assert tight_budget == 4 and tight_peak <= 4, f"one bucket asked for, one bucket used: {out[-2000:]}"
 
-    p = _run(1, *_MULTI_BUCKET_SHAPE, "--max-inflight-mib", "32")
+    p = _run(1, *_MULTI_LOAD_SHAPE, "--max-inflight-mib", "32")
     out = _check(p)
     wide_peak, wide_budget = _inflight(out)
     assert "OFFLOAD_PASS" in p.stdout, out[-4000:]
@@ -229,7 +207,7 @@ def test_no_residency_budget_keeps_nothing_resident():
     only when a budget asks for it -- doing it uninvited is how a run OOMs, and
     the numerics have to come out right either way.
     """
-    p = _run(1, *_MULTI_BUCKET_SHAPE)
+    p = _run(1, *_MULTI_LOAD_SHAPE)
     out = _check(p)
     assert "OFFLOAD_PASS" in p.stdout, out[-4000:]
     assert _marker(p.stdout, "OFFLOAD_FREED", "promoted_mib") == 0, "an empty budget must not promote"
@@ -244,7 +222,7 @@ def test_residency_budget_is_spent_and_not_exceeded():
     out, so the budget is the binding constraint and both halves of the contract
     are observable: something gets bought, and not more than was offered.
     """
-    p = _run(1, *_MULTI_BUCKET_SHAPE, "--max-resident-mib", "8")
+    p = _run(1, *_MULTI_LOAD_SHAPE, "--max-resident-mib", "8")
     out = _check(p)
     promoted = _marker(p.stdout, "OFFLOAD_FREED", "promoted_mib")
     assert "OFFLOAD_PASS" in p.stdout, out[-4000:]

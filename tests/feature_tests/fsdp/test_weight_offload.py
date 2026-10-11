@@ -751,31 +751,6 @@ def test_an_ungathered_weight_gets_a_load_to_itself(dist_1rank):
 
 
 @requires_cuda
-def test_binding_after_bucketing_is_reported_rather_than_silently_empty(dist_1rank):
-    """The one ordering ``FsdpShardSource`` depends on, and how it fails.
-
-    Binding has to precede bucketing, because bucketing splits offloaded from
-    resident gathers on the tag binding sets. Running them the other way round
-    leaves ``collect`` looking at coalesced gathers it does not match, every
-    weight drops out, and the only symptom is a "nothing to offload" line --
-    followed much later by the OOM offload was enabled to prevent. So the
-    mismatch is counted and named.
-    """
-    from magi_compiler.passes.fsdp_overlap import bucket_weight_all_gather_coalesced
-    from magi_compiler.passes.weight_offload import bind_weights_to_host
-    from magi_compiler.passes.weight_offload.graph.weight_source import FsdpShardSource
-
-    # Two gathers, because a bucket of one is left as its own all_gather.
-    gm, param = _twice_gathered_weight_graph(dist_1rank)
-    assert bucket_weight_all_gather_coalesced(gm, bucket_size_bytes=0) == 1
-
-    _, skipped = FsdpShardSource().collect(gm, {"model_shared_weight_parameter": param}, 0)
-    assert any("must run before bucketing" in why for why in skipped), skipped
-    assert bind_weights_to_host(gm, [param], FsdpShardSource(), min_bytes=0) == 0
-    assert param._local_tensor.untyped_storage().nbytes() > 0, "nothing may be parked on the failed path"
-
-
-@requires_cuda
 def test_the_pool_remembers_which_parameter_each_shard_came_from(dist_1rank):
     """The placement log is unreadable without it.
 
