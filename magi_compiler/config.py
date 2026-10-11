@@ -333,42 +333,41 @@ class FSDPConfig(BaseModel):
     enable_fsdp: bool = Field(
         False,
         description=(
-            "Lower SimpleFSDP weight prim_redistribute to explicit collectives, bucket them (bucket_mode), "
+            "Lower SimpleFSDP weight prim_redistribute to explicit collectives, bucket them during scheduling "
+            "(bucket_mode), "
             "and install the latest-safe-launch reorder pass that hoists each all-gather launch just far "
             "enough upstream for compute to hide it. Requires disable_graph_split=True and cudagraph_mode=NONE."
         ),
     )
-    bucket_mode: str = Field(
-        "none",
+    bucket_mode: Literal["none", "auto"] = Field(
+        "auto",
         description=(
-            "'none' = one all_gather + wait per weight; 'coalesced' = one all_gather_into_tensor_coalesced "
-            "per bucket (single launch, N getitems/waits). Buckets are whole-graph, broken only by "
-            "program-order dtype changes and the bucket_size_mib cap. 'auto' = buckets decided during "
-            "Inductor scheduling from the measured all-gather costs: a gather large enough that its "
+            "'none' = one all-gather + wait per weight. 'auto' (default) = small weight gathers are merged "
+            "during Inductor scheduling, from the measured all-gather costs: a gather large enough that its "
             "launch is at most auto_bucket_overhead_ratio of its time goes alone, and the smaller ones are "
-            "merged with their neighbours until it is (see auto_bucket_overhead_ratio); bucket_size_mib "
-            "additionally caps a bucket's local bytes. transport='copy_engine' falls back to 'coalesced'."
+            "merged with their program-order neighbours until it is. Applies to NCCL and copy-engine "
+            "(transport='copy_engine') gathers alike."
         ),
     )
     bucket_size_mib: int = Field(
-        0,
-        ge=0,
-        description=(
-            "Per-bucket cap on accumulated local-shard MiB for coalesced bucketing. 0 = no cap "
-            "(one bucket per (group, dtype) run). Under bucket_mode='auto' a hard cap on what the "
-            "planner may choose (0 = none)."
-        ),
+        0, ge=0, description="bucket_mode='auto': hard cap on a bucket's accumulated local-shard MiB (0 = none)."
     )
-    auto_bucket_overhead_ratio: float = Field(
-        0.1,
+    auto_bucket_overhead_ratio: float | None = Field(
+        None,
         gt=0.0,
         lt=1.0,
         description=(
             "bucket_mode='auto': the share of a gather's time its fixed launch cost may take. With the "
-            "measured cost alpha + beta * bytes, a gather of alpha * (1 - ratio) / (ratio * beta) gathered "
-            "bytes or more goes alone; smaller ones are merged with their program-order neighbours until a "
-            "bucket reaches that size, never past twice it. Smaller ratios merge more and allocate more "
-            "gathered weight early. On gaga4 400B (alpha ~71us, beta ~2.7us/MiB) 0.1 gives ~240 MiB."
+            "measured cost alpha + beta * bytes (fitted per transport), a gather of "
+            "alpha * (1 - ratio) / (ratio * beta) gathered bytes or more goes alone; smaller ones are merged "
+            "with their program-order neighbours until a bucket reaches that size, never past twice it. "
+            "Smaller ratios merge more and allocate more gathered weight early. "
+            "None (default) picks per transport: 0.1 for NCCL gathers and 0.5 for copy-engine gathers. "
+            "A copy-engine launch costs far more fixed time and far less per byte, so one ratio would give it "
+            "a target several times the NCCL one; on gaga4 400B (8 ranks) these defaults give targets of "
+            "~240 MiB (NCCL) and ~150 MiB (copy engine) and ran level with the old fixed 512 MiB buckets, "
+            "while 0.1 on the copy engine (~1.4 GiB) was ~3% slower and held ~2 GiB more. "
+            "A value set here applies to both transports."
         ),
     )
     auto_bucket_launch_overhead_us: float = Field(

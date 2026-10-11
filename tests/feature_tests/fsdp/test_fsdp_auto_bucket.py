@@ -137,6 +137,18 @@ def test_the_target_is_where_the_launch_is_the_given_share():
     assert amortizing_bytes(_ALPHA, 0.0, 0.1) == float("inf"), "free bytes: merge whatever is legal"
 
 
+def test_the_ratio_defaults_per_transport():
+    """A copy-engine launch costs far more fixed time and far less per byte than an
+    NCCL one: one ratio would give it a target several times the NCCL one."""
+    from magi_compiler.passes.fsdp_overlap.auto_bucket import DEFAULT_OVERHEAD_RATIOS, FsdpAutoBucket
+
+    assert DEFAULT_OVERHEAD_RATIOS == {"nccl": 0.1, "ce": 0.5}
+    assert FsdpAutoBucket(cost_fn=lambda s: 0.0).overhead_ratio is None
+    assert FsdpAutoBucket(cost_fn=lambda s: 0.0, overhead_ratio=0.3).overhead_ratio == 0.3
+    with pytest.raises(ValueError):
+        FsdpAutoBucket(cost_fn=lambda s: 0.0, overhead_ratio=1.5)
+
+
 def test_large_gathers_go_alone():
     members = _members([400, 150, 100, 120])
     assert plan_segments(members, _params()) == [(0, 1), (1, 2), (2, 3), (3, 4)]
