@@ -242,6 +242,13 @@ def _magi_compile_bound_method(
         return instance
 
     if isinstance(instance, nn.Module) and conf.offload_config.graph_weight_offload:
+        if conf.compile_mode != CompileMode.MAGI_COMPILE:
+            raise ValueError(
+                "offload_config.graph_weight_offload requires compile_mode=MAGI_COMPILE: "
+                "host-first parks selected weights as empty CUDA stand-ins and only the Magi "
+                f"backend inserts magi::h2d_load. Got compile_mode={conf.compile_mode.value}. "
+                "TORCH_COMPILE and NONE skip that rewrite and would read the empty stand-in."
+            )
         from magi_compiler.passes.weight_offload import patch_materialize
 
         # Here rather than at first call: the weights this module will be
