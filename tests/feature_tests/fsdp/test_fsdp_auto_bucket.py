@@ -25,7 +25,9 @@ Tested separately:
   eager, the wrapper must launch coalesced gathers, and every wait must still
   read a buffer the coalesced launch's unpack produced under its old name;
 * the cross-rank skip, on gloo without a compile: a rank with fewer than two
-  candidates still joins mode negotiation, then every rank leaves the graph alone.
+  candidates still joins mode negotiation, then every rank leaves the graph alone;
+* ``slot`` mode, on gloo without a compile: rank 0's plan is applied only where
+  every rank's merge keeps the collective order.
 """
 
 import os
@@ -44,6 +46,7 @@ MiB = 2**20
 
 _HELPER = Path(__file__).parent / "fsdp_overlap_helper" / "ir_coalesce_helper.py"
 _RANK_HELPER = Path(__file__).parent / "fsdp_overlap_helper" / "auto_bucket_rank_helper.py"
+_SLOT_HELPER = Path(__file__).parent / "fsdp_overlap_helper" / "auto_bucket_slot_helper.py"
 
 requires_2gpu = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.device_count() < 2 or shutil.which("torchrun") is None,
@@ -354,6 +357,22 @@ def test_a_rank_whose_own_plan_differs_takes_rank_0s():
     assert len(set(per_rank)) == 1 and per_rank[0].split("/")[0] != "0", per_rank
 
 
+@requires_2gpu
+def test_auto_bucketing_on_per_rank_graphs_that_differ_in_compute():
+    """Rank 1 compiles one extra pointwise op: the graphs differ, the collective
+    skeleton does not, so the pass runs in ``slot`` mode and must still bucket,
+    the same buckets on both ranks, with eager's output."""
+    p = _run("--pair", "0", "--n-layers", "8", "--hidden", "1024", "--mismatch")
+    out = p.stdout + p.stderr
+    assert p.returncode == 0 and "IRC_PASS" in p.stdout, out[-4000:]
+    assert "FSDP auto bucket reorder: per-rank graphs are NOT structurally identical" in out, out[-4000:]
+    assert "SLOT-consensus" in out, out[-4000:]
+    assert "unbucketed" not in out, out[-4000:]
+    per_rank = next(l for l in p.stdout.splitlines() if l.startswith("IRC_RANK_BUCKETS")).split()[1:]
+    assert len(set(per_rank)) == 1 and per_rank[0].split("/")[0] != "0", per_rank
+    assert _field(p.stdout, "IRC_CODE", "coalesced_calls") >= 1
+
+
 requires_torchrun = pytest.mark.skipif(shutil.which("torchrun") is None, reason="requires torchrun")
 
 
@@ -389,3 +408,26 @@ def test_a_rank_with_one_candidate_still_negotiates():
 
     assert negotiated("0", "1") and negotiated("1", "2"), lines
     assert "BUCKET_RANK_PASS" in p.stdout, out[-4000:]
+
+
+@requires_torchrun
+def test_slot_mode_buckets_only_where_every_rank_merges_into_one_collective_order():
+    """Per-rank graphs differ but their skeletons match: rank 0's plan is applied
+    only if every rank's merge leaves the collectives in the same order and the
+    candidates correspond one to one."""
+    root = str(Path(__file__).resolve().parents[3])
+    env = os.environ.copy()
+    prev = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = root if not prev else root + os.pathsep + prev
+    env["PYTHONUNBUFFERED"] = "1"
+    p = subprocess.run(
+        ["torchrun", "--nproc_per_node=2", f"--master_port={_free_port()}", str(_SLOT_HELPER)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    out = p.stdout + p.stderr
+    # SLOT_PASS is the all-reduced verdict of every rank's cases; the per-case
+    # lines are for reading only, as two ranks' prints can share a line.
+    assert p.returncode == 0 and "SLOT_PASS" in p.stdout, out[-4000:]
