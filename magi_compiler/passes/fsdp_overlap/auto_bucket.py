@@ -46,13 +46,22 @@ transport, without allocating more gathered weight early.
 
 Every rank must build the same buckets, or the collective sequence diverges.
 The graphs are compared first (``rank_sync.negotiate_mode`` must answer
-``identical``), but the costs are not: most snodes are priced on each rank from
-its own measurements, so the fitted ``alpha``/``beta`` can differ slightly.  So
-every rank plans, and every rank then takes rank 0's plan, checks it is legal
-on its own order, and touches the IR only once every rank has said yes.  A rank
-with fewer than two gathers still joins that comparison: the candidate count is
-rank-local, and returning before the exchange leaves the other ranks blocked in
-it.  Every rank leaves the gathers unbucketed only after the exchange says so.
+``identical`` or ``slot``), but the costs are not: most snodes are priced on
+each rank from its own measurements, so the fitted ``alpha``/``beta`` can differ
+slightly.  So every rank plans, and every rank then takes rank 0's plan, checks
+it is legal on its own order, and touches the IR only once every rank has said
+yes.  A rank with fewer than two gathers still joins that comparison: the
+candidate count is rank-local, and returning before the exchange leaves the
+other ranks blocked in it.  Every rank leaves the gathers unbucketed only after
+the exchange says so.
+
+In ``slot`` mode the graphs differ in rank-private compute but their collective
+skeletons match, so candidate ``j`` is the same weight on every rank.  Where a
+bucket's launch lands is decided by each rank's own producers, though, and two
+ranks can put it on opposite sides of a CP / EP collective.  So each rank also
+reports the order its skeleton takes after the merges, and the plan is applied
+only where that order is the same everywhere.  ``pinned`` has no skeleton to
+compare against and is left unbucketed.
 """
 
 from __future__ import annotations
@@ -251,18 +260,21 @@ class FsdpAutoBucket:
         cands = self._candidates(order)
         world = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
         cost = CostView(self._cost_fn)
-        group = None
+        group, mode, skeleton = None, "identical", []
         if world > 1:
             # Candidate count is rank-local. Every rank joins the exchange below,
             # including one that found nothing to merge. Returning here skips the
             # all_gather and blocks whichever ranks do enter it.
-            _, skel_kinds = rank_sync.collective_skeleton(order)
+            skel_idx, skel_kinds = rank_sync.collective_skeleton(order)
             mode, group, world = rank_sync.negotiate_mode(order, cands, skel_kinds, cost.ok, who=self.name)
-            if mode != "identical":
+            if mode not in ("identical", "slot"):
                 magi_logger.warning(
-                    "%s: per-rank graphs are not identical (mode=%s); leaving every weight gather unbucketed", self.name, mode
+                    "%s: per-rank collective skeletons cannot be matched (mode=%s); leaving every weight gather unbucketed",
+                    self.name,
+                    mode,
                 )
                 return snodes
+            skeleton = [order[i] for i in skel_idx]
         if len(cands) < 2:
             return snodes
 
@@ -274,7 +286,7 @@ class FsdpAutoBucket:
         except Exception as exc:  # noqa: BLE001
             magi_logger.warning("%s: planning failed (%s); leaving every weight gather unbucketed", self.name, exc, rank="all")
             ok, buckets = False, []
-        adopted = self._adopt(ok, buckets, order, cands, group, world)
+        adopted = self._adopt(ok, buckets, order, cands, group, world, mode, skeleton)
         if adopted is None:
             return snodes
         if adopted is not buckets:
@@ -320,7 +332,11 @@ class FsdpAutoBucket:
         return (info.kind, info.dtype, offloaded)
 
     def _runs(self, cands: list[BaseSchedulerNode]) -> list[list[BaseSchedulerNode]]:
-        """Consecutive gathers on one group, split by (transport, dtype, host-offloaded): one launch is one op."""
+        """Consecutive gathers on one group, split by (transport, dtype, host-offloaded).
+
+        Transport and dtype because one launch is one op.  Host offload only
+        because a resident member would wait for its bucket-mates' host loads.
+        """
         runs: list[list[BaseSchedulerNode]] = []
         last = object()
         for s in cands:
@@ -416,10 +432,12 @@ class FsdpAutoBucket:
         report["params"] = params_by_kind
         return kept, report
 
-    def _adopt(self, ok: bool, buckets, order, cands, group, world: int):
+    def _adopt(self, ok: bool, buckets, order, cands, group, world: int, mode: str = "identical", skeleton=()):
         """Rank 0's buckets, as this rank's snodes, once every rank has found them legal; None to leave the graph alone.
 
         Returns ``buckets`` itself when this rank's own plan is the one adopted.
+        In ``slot`` mode every rank must also merge into the same collective order
+        (see the module docstring).
         """
         if world <= 1:
             return buckets if ok else None
@@ -427,7 +445,7 @@ class FsdpAutoBucket:
         mine = [[pos[s] for s in b] for b in buckets] if ok else None
         peers: list = [None] * world
         try:
-            dist.all_gather_object(peers, (ok, mine), group=group)
+            dist.all_gather_object(peers, (ok, mine, self._signature(cands)), group=group)
         except Exception as exc:  # noqa: BLE001
             magi_logger.warning("%s: cross-rank plan exchange failed (%s); leaving gathers unbucketed", self.name, exc)
             return None
@@ -438,6 +456,13 @@ class FsdpAutoBucket:
                 [r for r, p in enumerate(peers) if not p[0]],
             )
             return None
+        if any(p[2] != peers[0][2] for p in peers[1:]):
+            magi_logger.warning(
+                "%s: the ranks' weight gathers do not correspond one to one (transport, world or dtype "
+                "differ at the same position); leaving every weight gather unbucketed",
+                self.name,
+            )
+            return None
         lead = peers[0][1]
         distinct = len({hashlib.sha256(repr(p[1]).encode()).hexdigest() for p in peers})
         if distinct > 1:
@@ -446,31 +471,76 @@ class FsdpAutoBucket:
                 self.name,
                 distinct,
             )
-        if lead == mine:
+        slot = mode == "slot"
+        merged, legal = None, True
+        if lead == mine and not slot:
             adopted = buckets
-            legal = True
         else:
             try:
-                adopted = [[cands[i] for i in b] for b in lead]
-                legal = self._legal(order, adopted)
+                adopted = buckets if lead == mine else [[cands[i] for i in b] for b in lead]
+                merged = self._merged(order, adopted)
+                legal = merged is not None
             except Exception:  # noqa: BLE001 - an unmappable plan is simply not legal here
                 adopted, legal = None, False
-        if not rank_sync.agree(legal, group, world, who=self.name):
+        skeleton_order = self._skeleton_order(merged, skeleton) if slot and legal else None
+        return adopted if self._commit(legal, skeleton_order, group, world) else None
+
+    def _commit(self, legal: bool, skeleton_order: str | None, group, world: int) -> bool:
+        """Rank-identical go / no-go: every rank found the plan legal and merges into one collective order."""
+        peers: list = [None] * world
+        try:
+            dist.all_gather_object(peers, (bool(legal), skeleton_order), group=group)
+        except Exception as exc:  # noqa: BLE001
+            magi_logger.warning("%s: cross-rank agreement failed (%s); leaving gathers unbucketed", self.name, exc)
+            return False
+        if not all(p[0] for p in peers):
             magi_logger.warning(
-                "%s: rank 0's bucket plan is not legal on every rank; leaving every weight gather unbucketed", self.name
+                "%s: rank 0's bucket plan is not legal on rank(s) %s; leaving every weight gather unbucketed",
+                self.name,
+                [r for r, p in enumerate(peers) if not p[0]],
             )
-            return None
-        return adopted
+            return False
+        if len({p[1] for p in peers}) > 1:
+            magi_logger.warning(
+                "%s: rank 0's buckets would land in different collective slots across ranks (per-rank graphs differ); "
+                "leaving every weight gather unbucketed",
+                self.name,
+            )
+            return False
+        return True
 
     @staticmethod
-    def _legal(order, buckets) -> bool:
-        """Whether merging ``buckets`` in sequence keeps ``order`` topological (see ``_plan``)."""
+    def _signature(cands) -> list[tuple]:
+        """What has to match at each candidate position for rank 0's indices to mean the same collectives here.
+
+        The group name is left out: it can be rank-specific for one logical group.
+        So is host offload: a shard's load is rank-private, and a bucket mixing
+        offloaded and resident members is legal, only slower (see ``_runs``).
+        """
+        return [(info.kind, info.world, str(info.dtype)) for info in map(gather_info, cands)]
+
+    @staticmethod
+    def _skeleton_order(merged, skeleton) -> str:
+        """Digest of the order the original collective skeleton takes in ``merged``.
+
+        In a merged stand-in order the members of a bucket sit together where its
+        packed launch will go, so equal digests mean the same collective sequence.
+        """
+        ordinal = {s: j for j, s in enumerate(skeleton)}
+        return hashlib.sha256(repr([ordinal[s] for s in merged if s in ordinal]).encode()).hexdigest()
+
+    @staticmethod
+    def _merged(order, buckets):
+        """``order`` with ``buckets`` merged in sequence (members as stand-ins, see ``_plan``); None if not legal here."""
         sim = order
         for members in buckets:
+            infos = [gather_info(m) for m in members]
+            if any(i is None for i in infos) or len({(i.kind, i.group_name, i.world, i.dtype) for i in infos}) != 1:
+                return None
             sim = ir_coalesce.simulate_coalesce(sim, members)
             if sim is None:
-                return False
-        return SnodeGraph(order).validate(sim)
+                return None
+        return sim if SnodeGraph(order).validate(sim) else None
 
     def _model_report(self, order, cands, buckets, cost: CostView, params_by_kind: dict[str, PlanParams]) -> str:
         """What the exact placement model predicts for no buckets and for ``buckets``, on this order."""

@@ -62,11 +62,16 @@ class Block(nn.Module):
 
 
 class TinyModel(nn.Module):
-    def __init__(self, hidden: int, n_layers: int):
+    def __init__(self, hidden: int, n_layers: int, extra_op: bool = False):
         super().__init__()
         self.layers = nn.ModuleList(Block(hidden) for _ in range(n_layers))
+        self.extra_op = extra_op
 
     def forward(self, x):
+        if self.extra_op:
+            # Same values, different graph: rank-private compute for ``slot`` mode
+            # (``sin(x) * 0`` would be folded away).
+            x = torch.where(torch.isnan(x), torch.sin(x), x)
         for layer in self.layers:
             x = layer(x)
         return x
@@ -173,6 +178,7 @@ def main() -> None:
     ap.add_argument("--cost-mode", default="analytical", choices=["analytical", "profile_sync"])
     ap.add_argument("--memory-probe", action="store_true")
     ap.add_argument("--diverge", action="store_true", help="non-zero ranks plan one bucket fewer")
+    ap.add_argument("--mismatch", action="store_true", help="rank 1 compiles a structurally different graph")
     args = ap.parse_args()
 
     dist.init_process_group("cpu:gloo,cuda:nccl")
@@ -186,12 +192,13 @@ def main() -> None:
     from torchtitan.experiments.simple_fsdp.simple_fsdp import data_parallel
 
     mesh = init_device_mesh("cuda", (world,))
-    ref = TinyModel(args.hidden, args.n_layers).to(dev).to(torch.bfloat16)
+    extra_op = args.mismatch and rank == 1
+    ref = TinyModel(args.hidden, args.n_layers, extra_op).to(dev).to(torch.bfloat16)
     x = torch.randn(64, args.hidden, device=dev, dtype=torch.bfloat16)
     with torch.no_grad():
         eager_out = ref(x)
 
-    model = TinyModel(args.hidden, args.n_layers).to(dev).to(torch.bfloat16)
+    model = TinyModel(args.hidden, args.n_layers, extra_op).to(dev).to(torch.bfloat16)
     with torch.no_grad():
         for (_, dst), (_, src) in zip(model.named_parameters(), ref.named_parameters()):
             dst.copy_(src)
