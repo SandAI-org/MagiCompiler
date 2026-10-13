@@ -60,10 +60,6 @@ class OffloadCache:
         self._remap: dict[int, int] | None = None
         self._miss_reason: str | None = None
 
-    @property
-    def remap(self) -> dict[int, int] | None:
-        return self._remap
-
     def initialize(self, cache_dir: Path) -> None:
         self.host_slots_path = cache_dir / "host_slots.py"
         self._slot_table = {}

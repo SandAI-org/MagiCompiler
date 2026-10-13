@@ -471,37 +471,26 @@ def _collective_spec(node):
     return op, group_name, group_size, specs
 
 
-def _ce_ag_ops():
-    """Copy-engine gather ops, or empty when the runtime is unavailable."""
-    try:
-        from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER, CE_ALL_GATHER_COALESCED
-
-        return tuple(op for op in (CE_ALL_GATHER, CE_ALL_GATHER_COALESCED) if op is not None)
-    except Exception:  # noqa: BLE001
-        return ()
-
-
 def _leaf_ce_ag(snode: BaseSchedulerNode):
     """The copy-engine gather IR node inside ``snode``, or None.
 
     It is an ordinary FallbackKernel, not a ``_CollectiveKernel``, so none of
     Inductor's collective predicates see it.
     """
-    ops = _ce_ag_ops()
-    if not ops:
-        return None
+    # Imported per call, like ``_is_h2d_load``: a module-level import would close
+    # the ``magi_compiler.passes`` import cycle.
+    from magi_compiler.passes.snode_utils import is_ce_ag_ir
+
     for n in (getattr(snode, "node", None), *(getattr(c, "node", None) for c in getattr(snode, "snodes", []) or [])):
-        if n is not None and getattr(n, "op_overload", None) in ops:
+        if n is not None and is_ce_ag_ir(n):
             return n
     return None
 
 
 def _is_ce_ag_coalesced_ir(node) -> bool:
-    try:
-        from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER_COALESCED
-    except Exception:  # noqa: BLE001
-        return False
-    return CE_ALL_GATHER_COALESCED is not None and getattr(node, "op_overload", None) is CE_ALL_GATHER_COALESCED
+    from magi_compiler.passes.snode_utils import is_ce_ag_coalesced
+
+    return is_ce_ag_coalesced(node)
 
 
 def _ce_ag_spec(node):

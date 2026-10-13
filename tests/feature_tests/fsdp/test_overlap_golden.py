@@ -126,7 +126,7 @@ def _fsdp_graph(seed, *, form):
 
     ``form``: ``plain`` (1 launch / 1 wait), ``coalesced`` (packed launch + N
     unpacks + N waits) or ``prep`` (an h2d load and a cast feeding the gather,
-    the chain ``move_prep_chain`` has to carry).
+    the chain the launch has to carry).
     """
     rng = random.Random(seed)
     order = [_compute("embed", rng.uniform(1e4, 4e6))]
@@ -269,10 +269,7 @@ def test_fsdp_schedule_is_frozen(world_of_one, golden, key, form, seed, scale, m
 
     order = _fsdp_graph(seed, form=form)
     reorder = FsdpOverlapReorder(
-        comm_overlap_window_margin_ns=margin,
-        comm_overlap_window_scale=scale,
-        cost_fn=lambda s: s.cost,
-        move_prep_chain=form == "prep",
+        comm_overlap_window_margin_ns=margin, comm_overlap_window_scale=scale, cost_fn=lambda s: s.cost
     )
     _check(golden, key, [s.name for s in reorder(order)])
 
@@ -291,10 +288,29 @@ def test_fsdp_alap_is_the_index_sweep_on_the_time_axis(world_of_one, key, form, 
 
     def placed(placement):
         order = _fsdp_graph(seed, form=form) if form else _fsdp_heavy_graph(seed, ratio)
-        reorder = FsdpOverlapReorder(cost_fn=lambda s: s.cost, move_prep_chain=form == "prep", placement=placement)
+        reorder = FsdpOverlapReorder(cost_fn=lambda s: s.cost, placement=placement)
         return [s.name for s in reorder(order)]
 
     assert placed("alap") == placed("index_sweep")
+
+
+@pytest.mark.parametrize("placement", ["index_sweep", "alap"])
+def test_fsdp_prep_cost_hides_nothing(world_of_one, placement):
+    """The cast travels with its gather, so it is never compute in front of it:
+    counted, it alone would cover the gather and leave it where it is."""
+    from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder
+
+    order = [
+        _compute("embed", 1e6),
+        _compute("mm_a", 1e6, ["embed"]),
+        _compute("cast", 5e6),
+        _gather("ag", ["cast"], 3e6),
+        _wait("w", "ag"),
+        _compute("mm", 1e6, ["w", "mm_a"]),
+    ]
+    reorder = FsdpOverlapReorder(comm_overlap_window_margin_ns=0.0, cost_fn=lambda s: s.cost, placement=placement)
+    names = [s.name for s in reorder(order)]
+    assert names == ["cast", "ag", "embed", "mm_a", "w", "mm"]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="promotion moves real bytes")

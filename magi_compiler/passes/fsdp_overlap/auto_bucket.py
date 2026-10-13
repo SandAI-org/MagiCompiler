@@ -37,9 +37,11 @@ of small weights.  A merge also stops at the first member whose shard is not
 ready before the bucket's earliest wait, and a last bucket under half the
 target folds into the one before it when that fits.
 
-``alpha``/``beta`` are fitted, and ``ratio`` chosen, per transport: a copy-engine
-gather pays a much larger fixed cost per launch and a much smaller one per byte
-than an NCCL one, so one ratio gives it a target several times the NCCL one.
+``alpha``/``beta`` are fitted per transport and process group, and ``ratio`` is
+chosen per transport: a copy-engine gather pays a much larger fixed cost per
+launch and a much smaller one per byte than an NCCL one, so one ratio gives it a
+target several times the NCCL one; and a group's per-byte cost depends on how
+many ranks it gathers from.
 Unless set, ``ratio`` is 0.1 for NCCL and 0.5 for the copy engine -- the values
 at which gaga4 400B ran level with the old fixed 512 MiB buckets on each
 transport, without allocating more gathered weight early.
@@ -305,7 +307,7 @@ class FsdpAutoBucket:
 
         for members in buckets:
             out_bytes = sum(gather_info(m).shard_bytes * gather_info(m).world for m in members)
-            params = report["params"][gather_info(members[0]).kind]
+            params = report["params"][self._fit_key(gather_info(members[0]))]
             order, packed, unpacks = ir_coalesce.coalesce_all_gathers(order, members)
             self._record(packed, unpacks, out_bytes, params)
         snodes[:] = order
@@ -373,16 +375,28 @@ class FsdpAutoBucket:
             out_bytes=info.shard_bytes * info.world,
         )
 
-    def _params_by_kind(self, cands, cost: CostView) -> dict[str, PlanParams]:
-        """One fit and one ratio per transport: their fixed and per-byte costs are nothing alike."""
-        points: dict[str, list[tuple[float, float]]] = {}
+    @staticmethod
+    def _fit_key(info: GatherInfo) -> tuple[str, str, int]:
+        return (info.kind, info.group_name, info.world)
+
+    def _params_by_group(self, cands, cost: CostView) -> dict[tuple[str, str, int], PlanParams]:
+        """One fit per (transport, process group), and one ratio per transport.
+
+        Per transport because a copy-engine gather's fixed and per-byte costs are
+        nothing like an NCCL one's.  Per group because the per-byte cost depends on
+        who the bytes come from: a one-rank group's gather is a local copy at device
+        bandwidth, and fitted together with an eight-rank group's its gigabyte-sized
+        points pull ``beta`` down by an order of magnitude for every other gather.
+        """
+        points: dict[tuple[str, str, int], list[tuple[float, float]]] = {}
         for s in cands:
             info = gather_info(s)
-            points.setdefault(info.kind, []).append((info.shard_bytes * info.world, cost(s)))
+            points.setdefault(self._fit_key(info), []).append((info.shard_bytes * info.world, cost(s)))
         out = {}
-        for kind, pts in points.items():
+        for key, pts in points.items():
+            kind = key[0]
             alpha, beta = fit_alpha_beta(pts, alpha_guess_ns=self.launch_overhead_ns)
-            out[kind] = PlanParams(
+            out[key] = PlanParams(
                 alpha_ns=alpha,
                 beta_ns_per_byte=beta,
                 overhead_ratio=self.overhead_ratio if self.overhead_ratio is not None else DEFAULT_OVERHEAD_RATIOS[kind],
@@ -394,12 +408,12 @@ class FsdpAutoBucket:
 
     def _plan(self, order, cands, cost: CostView):
         graph = SnodeGraph(order)
-        params_by_kind = self._params_by_kind(cands, cost)
+        params_by_group = self._params_by_group(cands, cost)
         buckets: list[list[BaseSchedulerNode]] = []
         report = {"n": len(cands), "solo": 0, "share_before": 0.0, "share_after": 0.0, "launches": 0, "sizes": []}
         stream_ns = launch_ns_before = launch_ns_after = 0.0
         for run in self._runs(cands):
-            params = params_by_kind[gather_info(run[0]).kind]
+            params = params_by_group[self._fit_key(gather_info(run[0]))]
             alpha, beta = params.alpha_ns, params.beta_ns_per_byte
             pairs = [(s, self._member(s, graph, cost)) for s in run]
             usable = [(s, m) for s, m in pairs if m is not None]
@@ -429,7 +443,7 @@ class FsdpAutoBucket:
             raise RuntimeError("the merged order is not topological")
         report["sizes"] = [sum(gather_info(s).shard_bytes for s in b) for b in kept]
         report["members"] = sum(len(b) for b in kept)
-        report["params"] = params_by_kind
+        report["params"] = params_by_group
         return kept, report
 
     def _adopt(self, ok: bool, buckets, order, cands, group, world: int, mode: str = "identical", skeleton=()):
@@ -542,7 +556,9 @@ class FsdpAutoBucket:
                 return None
         return sim if SnodeGraph(order).validate(sim) else None
 
-    def _model_report(self, order, cands, buckets, cost: CostView, params_by_kind: dict[str, PlanParams]) -> str:
+    def _model_report(
+        self, order, cands, buckets, cost: CostView, params_by_group: dict[tuple[str, str, int], PlanParams]
+    ) -> str:
         """What the exact placement model predicts for no buckets and for ``buckets``, on this order."""
         from .bucket_eval import peak_with, place
         from .memory_probe import GiB, memory_timeline
@@ -557,7 +573,7 @@ class FsdpAutoBucket:
             if not pairs:
                 continue
             members = [m for _, m in pairs]
-            params = params_by_kind[gather_info(run[0]).kind]
+            params = params_by_group[self._fit_key(gather_info(run[0]))]
             segs: list[tuple[int, int]] = []
             for i, (s, _) in enumerate(pairs):
                 b = bucket_of.get(s)
@@ -597,9 +613,10 @@ class FsdpAutoBucket:
         if not report or "params" not in report:
             return
         fits = ", ".join(
-            f"{kind}: alpha={p.alpha_ns / 1e3:.1f}us beta={p.beta_ns_per_byte * 2**20 / 1e3:.3f}us/MiB, "
-            f"ratio {p.overhead_ratio:.2f} -> target {p.target_bytes / 2**20:.1f} MiB gathered (cap {p.cap_bytes / 2**20:.1f})"
-            for kind, p in sorted(report["params"].items())
+            f"{kind} ws={world} group {group}: alpha={p.alpha_ns / 1e3:.1f}us "
+            f"beta={p.beta_ns_per_byte * 2**20 / 1e3:.3f}us/MiB, ratio {p.overhead_ratio:.2f} -> "
+            f"target {p.target_bytes / 2**20:.1f} MiB gathered (cap {p.cap_bytes / 2**20:.1f})"
+            for (kind, group, world), p in sorted(report["params"].items())
         )
         sizes = sorted(report.get("sizes") or [0])
         mib = [x / 2**20 for x in sizes]

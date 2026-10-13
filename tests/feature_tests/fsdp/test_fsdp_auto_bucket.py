@@ -155,6 +155,39 @@ def test_the_ratio_defaults_per_transport():
         FsdpAutoBucket(cost_fn=lambda s: 0.0, overhead_ratio=1.5)
 
 
+def test_each_process_group_gets_its_own_fit(monkeypatch):
+    """A one-rank group's gather is a local copy; pooled with an eight-rank group's
+    gathers, its gigabyte points pull ``beta`` down for every gather.
+
+    The points are gaga4 400B at ep=8 (expert mesh one rank wide): pooled, they
+    fit 0.39 us/MiB and a 4.4 GiB target, so dense gathers were merged into buckets
+    priced at a seventh of what they took.
+    """
+    from magi_compiler.passes.fsdp_overlap import auto_bucket
+    from magi_compiler.passes.fsdp_overlap.ir_coalesce import GatherInfo
+    from magi_compiler.passes.overlap import CostView
+
+    class _Gather:
+        def __init__(self, group, world, local_mib, us_per_gathered_mib, fixed_us):
+            self.info = GatherInfo(group, world, torch.bfloat16, int(local_mib * MiB))
+            self.ns = (fixed_us + us_per_gathered_mib * local_mib * world) * 1e3
+
+    dense = [_Gather("dense", 8, mib, 3.9, 44.0) for mib in (22.5, 15.0, 144.0, 9.0, 36.0)]
+    expert = [_Gather("expert", 1, mib, 0.32, 10.0) for mib in (1920.0, 960.0)]
+    cands = dense + expert
+    monkeypatch.setattr(auto_bucket, "gather_info", lambda s: s.info)
+
+    params = auto_bucket.FsdpAutoBucket(cost_fn=lambda s: s.ns)._params_by_group(cands, CostView(lambda s: s.ns))
+
+    assert set(params) == {("nccl", "dense", 8), ("nccl", "expert", 1)}
+    assert params[("nccl", "dense", 8)].beta_ns_per_byte * MiB == pytest.approx(3.9e3)
+    assert params[("nccl", "dense", 8)].target_bytes / MiB == pytest.approx(44 * 0.9 / (0.1 * 3.9), rel=1e-6)
+    assert params[("nccl", "expert", 1)].beta_ns_per_byte * MiB == pytest.approx(0.32e3)
+
+    _, pooled_beta = fit_alpha_beta([(s.info.shard_bytes * s.info.world, s.ns) for s in cands])
+    assert pooled_beta < 0.2 * params[("nccl", "dense", 8)].beta_ns_per_byte, "pooled, the copies set beta for all"
+
+
 def test_large_gathers_go_alone():
     members = _members([400, 150, 100, 120])
     assert plan_segments(members, _params()) == [(0, 1), (1, 2), (2, 3), (3, 4)]
