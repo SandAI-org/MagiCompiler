@@ -56,19 +56,3 @@ class LoadPlan(TransferTask):
     """
 
     slots: list[int] = field(default_factory=list)  # host-pool slots this load pulls
-
-    @property
-    def load(self) -> BaseSchedulerNode:
-        return self.anchor
-
-    @property
-    def wait_idx(self) -> int:
-        return self.deadline
-
-    @property
-    def promoted(self) -> bool:
-        return self.inactive
-
-    @promoted.setter
-    def promoted(self, value: bool) -> None:
-        self.inactive = value

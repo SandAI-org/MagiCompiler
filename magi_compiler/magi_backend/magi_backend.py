@@ -801,7 +801,6 @@ class MagiBackend:
                     comm_overlap_window_margin_ns=fsdp_cfg.comm_overlap_window_margin_ns,
                     cost_fn=costs,
                     comm_overlap_window_scale=fsdp_cfg.comm_overlap_window_scale,
-                    move_prep_chain=loads_inserted,
                     placement=fsdp_cfg.placement,
                 )
             )

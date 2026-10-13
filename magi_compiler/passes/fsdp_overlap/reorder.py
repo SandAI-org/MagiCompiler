@@ -79,17 +79,12 @@ class FsdpOverlapReorder(OverlapPass):
         comm_overlap_window_margin_ns: float = DEFAULT_WINDOW_MARGIN_NS,
         cost_fn=None,
         comm_overlap_window_scale: float = 1.0,
-        move_prep_chain: bool = False,
         placement: str = "index_sweep",
     ) -> None:
         super().__init__(cost_fn)
         if placement not in _PLACEMENTS:
             raise ValueError(f"FsdpOverlapReorder: placement must be one of {_PLACEMENTS}, got {placement!r}")
         self.placement = placement
-        # Offload's h2d_load + wait sit between the placeholder and the gather,
-        # so the gather cannot move unless that prep chain travels with it.
-        # Off by default: without offload this also hoists casts and pads.
-        self.move_prep_chain = move_prep_chain
         self.comm_overlap_window_margin_ns = comm_overlap_window_margin_ns
         # need = comm * scale + margin: collectives are measured in isolation but
         # run concurrent with the compute that hides them.
@@ -136,6 +131,11 @@ class FsdpOverlapReorder(OverlapPass):
         return tasks
 
     def place(self, graph: SnodeGraph, cost: CostView, tasks: list[TransferTask], ctx: dict) -> None:
+        # A group member (the shard prep above all) is rebuilt ahead of its own
+        # launch, out of every window it sits in now: it hides no gather.
+        moving = {m for t in tasks for m in t.group}
+        full = cost
+        cost = CostView(lambda s: 0.0 if s in moving else full(s))
         if self.placement == "alap":
             # No in-flight byte budget on gathers, and a gather issued late behind
             # a stalled wait idles the stream: issue from the deadline chain alone.
@@ -172,7 +172,7 @@ class FsdpOverlapReorder(OverlapPass):
         Coalesced: packed collective + its MultiOutput members (they depend on the
         packed buffer and must stay immediately after it, before any wait).
         no-bucket: just the launch (the wait stays put).
-        With ``move_prep_chain``: plus the upstream shard prep (see _prep_chain).
+        Always plus the upstream shard prep (see _prep_chain).
         """
         order = graph.order
         group = [launch]
@@ -196,8 +196,7 @@ class FsdpOverlapReorder(OverlapPass):
                 deps = [d for d in s.unmet_dependencies if not _is_fake_dep(d)]
                 if deps and all(d.name in produced for d in deps):
                     group.append(s)
-        if self.move_prep_chain:
-            group.extend(self._prep_chain(group, graph))
+        group.extend(self._prep_chain(group, graph))
         return group
 
     @staticmethod

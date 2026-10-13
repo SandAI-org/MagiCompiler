@@ -358,7 +358,7 @@ class FSDPConfig(BaseModel):
         lt=1.0,
         description=(
             "bucket_mode='auto': the share of a gather's time its fixed launch cost may take. With the "
-            "measured cost alpha + beta * bytes (fitted per transport), a gather of "
+            "measured cost alpha + beta * bytes (fitted per transport and process group), a gather of "
             "alpha * (1 - ratio) / (ratio * beta) gathered bytes or more goes alone; smaller ones are merged "
             "with their program-order neighbours until a bucket reaches that size, never past twice it. "
             "Smaller ratios merge more and allocate more gathered weight early. "
@@ -413,7 +413,7 @@ class FSDPConfig(BaseModel):
         ),
     )
     placement: Literal["index_sweep", "alap"] = Field(
-        "index_sweep",
+        "alap",
         description=(
             "How the reorder places each all-gather launch. 'index_sweep': walk snodes back from the launch, "
             "claiming whole compute kernels and carrying a long kernel's unspent remainder to the next gather. "

@@ -18,6 +18,7 @@ import inspect
 import math
 
 import torch
+import torch.distributed as dist
 import torch.fx as fx
 
 from magi_compiler.utils import magi_logger
@@ -97,9 +98,19 @@ def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
     are kept as separate nodes.  Only ``Shard(0)`` is handled; anything else is
     left as the original prim path and logged.
 
-    Returns the number of redistribute pairs lowered.
+    A weight whose mesh is a single rank inside a multi-rank job (expert
+    parallelism as wide as the job leaves each expert mesh one rank) is its own
+    full weight, so it becomes just the ``to_local`` and the cast: a gather there
+    would be a device-to-device copy of the whole weight, and its local-copy cost
+    would be mistaken for collective cost by anything pricing gathers.  A
+    single-process run keeps the gather, so its graph has the same shape a
+    multi-rank run of the same model produces.
+
+    Returns the number of redistribute pairs lowered to a gather.
     """
+    multi_rank = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
     lowered = 0
+    local_only = 0
     skipped = 0
 
     for node in list(graph.graph.nodes):
@@ -160,6 +171,14 @@ def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
                 cur.meta["example_value"] = local.to(fwd_dtype)
                 cur_dtype = fwd_dtype
 
+        if world == 1 and multi_rank:
+            to_local.replace_all_uses_with(cur)
+            graph.graph.erase_node(to_local)
+            graph.graph.erase_node(node)
+            local_only += 1
+            continue
+
+        with graph.graph.inserting_before(node):
             # Pad the local shard up to `chunk` rows when this rank owns fewer
             # (uneven Shard(0): trailing ranks get remainder/empty).
             #
@@ -193,10 +212,14 @@ def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
         graph.graph.erase_node(node)
         lowered += 1
 
-    if lowered:
+    if lowered or local_only:
         graph.graph.lint()
         graph.recompile()
     magi_logger.info(
-        "FSDP redistribute lowering: lowered %d weight redistribute -> explicit collectives (skipped %d)", lowered, skipped
+        "FSDP redistribute lowering: lowered %d weight redistribute -> explicit collectives, %d on a one-rank mesh "
+        "-> local shard with no gather (skipped %d)",
+        lowered,
+        local_only,
+        skipped,
     )
     return lowered

@@ -61,18 +61,10 @@ from torch._inductor.utils import contains_wait
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
+from ..snode_utils import ce_ag_ops
+
 _AG = torch.ops._c10d_functional.all_gather_into_tensor.default
 _AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
-
-
-def _ce_ops() -> tuple:
-    """(single, coalesced) copy-engine gather ops; (None, None) without symmetric memory."""
-    try:
-        from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER, CE_ALL_GATHER_COALESCED
-
-        return CE_ALL_GATHER, CE_ALL_GATHER_COALESCED
-    except Exception:  # noqa: BLE001
-        return None, None
 
 
 @dataclass(frozen=True)
@@ -98,7 +90,7 @@ def gather_info(snode: BaseSchedulerNode) -> GatherInfo | None:
         if not isinstance(node.layout, ir.Layout):
             return None
         kind = "nccl"
-    elif isinstance(node, ir.FallbackKernel) and op is not None and op is _ce_ops()[0]:
+    elif isinstance(node, ir.FallbackKernel) and op is not None and op is ce_ag_ops()[0]:
         kind = "ce"
     else:
         return None
@@ -378,7 +370,7 @@ def coalesce_all_gathers(
             if len(unpacks) != 1:
                 raise ValueError(f"copy-engine gather {m.get_name()} has {len(unpacks)} unpacks, expected one")
             keep_snodes.append(unpacks[0])
-        op = _ce_ops()[1]
+        op = ce_ag_ops()[1]
     else:
         keep_snodes = list(members)
         op = _AG_COALESCED

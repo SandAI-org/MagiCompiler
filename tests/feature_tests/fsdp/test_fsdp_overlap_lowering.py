@@ -192,6 +192,33 @@ def test_lowering_reads_forward_dtype_from_method_kwargs(dist_1rank):
 
 
 @requires_cuda
+def test_a_one_rank_mesh_in_a_multi_rank_job_reads_its_local_shard(dist_1rank, monkeypatch):
+    """Expert parallelism as wide as the job leaves each expert mesh one rank.
+
+    That shard is the whole weight, so there is nothing to gather: the gather would
+    be a device copy of the full weight, priced by the bucketing as if it were a
+    collective.  The cast still runs, and nothing is tagged as a weight gather.
+    """
+    import torch.distributed as dist
+
+    from magi_compiler.passes.fsdp_overlap import is_weight_ag, lower_prim_redistribute_to_collectives
+
+    monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: 8)
+    gm = _build_method_redistribute_graph(dist_1rank, "layer_weight", forward_dtype=torch.float32)
+    assert lower_prim_redistribute_to_collectives(gm) == 0
+
+    targets = _targets(gm)
+    assert _AG not in targets and _WAIT not in targets
+    assert not any(is_weight_ag(n) for n in gm.graph.nodes)
+    methods = [n.target for n in gm.graph.nodes if n.op == "call_method"]
+    assert "redistribute" not in methods and methods.count("to_local") == 1
+
+    (out,) = [n for n in gm.graph.nodes if n.op == "output"][0].args[0]
+    assert out.target is _TO_COPY and out.kwargs["dtype"] is torch.float32
+    assert out.args[0].op == "call_method" and out.args[0].target == "to_local"
+
+
+@requires_cuda
 def test_lowering_records_shard_evenness_on_the_gather(dist_1rank):
     """The gather carries whether its ``Shard(0)`` divides evenly.
 
