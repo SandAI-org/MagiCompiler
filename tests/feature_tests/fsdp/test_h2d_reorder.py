@@ -534,7 +534,7 @@ def test_last_user_is_the_consumer_not_the_wait():
     graph = SnodeGraph(order)
     plans = H2dLoadReorder(bandwidth_bytes_per_ns=10.0, window_margin_ns=0.0, cost_fn=lambda s: s.cost)._plan(graph)
     assert len(plans) == 1
-    assert plans[0].wait_idx == graph.index_of[order[2]]
+    assert plans[0].deadline == graph.index_of[order[2]]
     assert plans[0].last_user == graph.index_of[order[3]]
 
 
@@ -736,36 +736,36 @@ def test_adjacent_closed_ranges_both_stay_offloaded():
     assert out.index("user0") < out.index("ld1"), "closed ranges may touch, not overlap"
 
 
-def _plan_stub(name, *, wait_idx, last_user, nbytes, need=0.0, lower=0, promoted=False):
-    """A ``_Plan`` carrying only the fields the memory and pricing helpers read."""
+def _plan_stub(name, *, deadline, last_user, nbytes, need=0.0, lower=0, inactive=False):
+    """A ``LoadPlan`` carrying only the fields the memory and pricing helpers read."""
     return load_plan.LoadPlan(
         anchor=_Snode(name, "load"),
         group=[],
         slots=[],
-        deadline=wait_idx,
+        deadline=deadline,
         last_user=last_user,
         need=need,
         lower=lower,
         nbytes=nbytes,
         exposed=need,
-        inactive=promoted,
+        inactive=inactive,
     )
 
 
 def test_latest_finish_chains_the_deadlines_backwards():
     """A transfer may not end after its own wait, nor after the next one starts."""
     prefix = [0.0, 100.0, 300.0, 600.0, 1000.0]
-    early = _plan_stub("early", wait_idx=2, last_user=4, nbytes=_MIB, need=100.0)
-    late = _plan_stub("late", wait_idx=4, last_user=5, nbytes=_MIB, need=250.0)
+    early = _plan_stub("early", deadline=2, last_user=4, nbytes=_MIB, need=100.0)
+    late = _plan_stub("late", deadline=4, last_user=5, nbytes=_MIB, need=250.0)
 
     limits = scheduler.latest_finish([early, late], prefix)
-    assert limits[late.load] == 1000.0, "the last one is held only by its own wait"
-    assert limits[early.load] == 300.0, "its own wait is tighter than 1000 - 250"
+    assert limits[late.anchor] == 1000.0, "the last one is held only by its own wait"
+    assert limits[early.anchor] == 300.0, "its own wait is tighter than 1000 - 250"
 
     # Grow the later transfer until it is what binds the earlier one.
     late.need = 800.0
     limits = scheduler.latest_finish([early, late], prefix)
-    assert limits[early.load] == 200.0, "it now has to be done before `late` starts"
+    assert limits[early.anchor] == 200.0, "it now has to be done before `late` starts"
 
 
 def test_issue_index_is_just_in_time():
@@ -787,16 +787,16 @@ def test_peak_counts_a_promoted_weight_twice_where_its_copy_runs():
     ``h2d_load`` copies even a resident slot into a fresh buffer, so a promoted
     weight costs its bytes for the whole graph AND again where its load runs.
     """
-    kept = _plan_stub("kept", wait_idx=4, last_user=3, nbytes=4 * _MIB)
-    resident = _plan_stub("resident", wait_idx=11, last_user=11, nbytes=8 * _MIB, promoted=True)
+    kept = _plan_stub("kept", deadline=4, last_user=3, nbytes=4 * _MIB)
+    resident = _plan_stub("resident", deadline=11, last_user=11, nbytes=8 * _MIB, inactive=True)
     plans = [kept, resident]
-    index_of = {kept.load: 0, resident.load: 10}
+    index_of = {kept.anchor: 0, resident.anchor: 10}
 
-    assert memory.device_peak(plans, {kept.load: 0}, index_of) == 8 * _MIB + 8 * _MIB
+    assert memory.device_peak(plans, {kept.anchor: 0}, index_of) == 8 * _MIB + 8 * _MIB
 
     resident.last_user = 3  # its buffer now overlaps the kept load's
-    index_of[resident.load] = 1
-    assert memory.device_peak(plans, {kept.load: 0}, index_of) == 8 * _MIB + 12 * _MIB
+    index_of[resident.anchor] = 1
+    assert memory.device_peak(plans, {kept.anchor: 0}, index_of) == 8 * _MIB + 12 * _MIB
 
 
 def test_inflight_occupancy_finds_the_earliest_fitting_start():

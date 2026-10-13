@@ -37,18 +37,9 @@ UNEVEN_SHARD = "magi_fsdp_uneven_shard"
 CE_BOUND = "magi_ce_bound"
 
 
-def _mark_traced(node: fx.Node, key: str) -> None:
-    node.meta[key] = True
-    node.meta["custom"] = {**(node.meta.get("custom") or {}), key: True}
-
-
-def _traced(node: fx.Node, key: str) -> bool:
-    return bool(node.meta.get(key) or (node.meta.get("custom") or {}).get(key))
-
-
 def is_weight_ag(node: fx.Node) -> bool:
     """Also true on the nodes AOT autograd re-traced from a tagged gather."""
-    return _traced(node, WEIGHT_AG)
+    return bool(node.meta.get(WEIGHT_AG) or (node.meta.get("custom") or {}).get(WEIGHT_AG))
 
 
 def is_uneven_shard(node: fx.Node) -> bool:
@@ -64,7 +55,8 @@ def mark_weight_ag(node: fx.Node, *, uneven: bool) -> None:
 
     ``uneven`` is keyword-only: omitting it would default to the unsafe answer.
     """
-    _mark_traced(node, WEIGHT_AG)
+    node.meta[WEIGHT_AG] = True
+    node.meta["custom"] = {**(node.meta.get("custom") or {}), WEIGHT_AG: True}
     node.meta[UNEVEN_SHARD] = uneven
 
 

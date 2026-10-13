@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from magi_compiler.passes.weight_offload.graph.weight_source import FsdpShardSource, shard_holder
+from magi_compiler.passes.weight_offload.graph.weight_source import FsdpShardSource
 
 from .auto_bucket import FsdpAutoBucket
 from .copy_engine import bind_weights_for_copy_engine, copy_engine_weight_candidates, rewrite_weight_ag_to_copy_engine
@@ -30,7 +30,6 @@ __all__ = [
     "FsdpOverlapReorder",
     "MemoryProbe",
     "FsdpShardSource",
-    "shard_holder",
     "CE_BOUND",
     "UNEVEN_SHARD",
     "WEIGHT_AG",

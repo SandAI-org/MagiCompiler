@@ -22,6 +22,8 @@ happen.
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
 from torch._inductor.comms import _is_fake_dep
 from torch._inductor.ir import MultiOutput
@@ -31,29 +33,28 @@ from torch._inductor.utils import contains_collective, contains_wait, is_collect
 from magi_compiler.utils import magi_logger
 
 
+@lru_cache(maxsize=1)
 def ce_ag_ops() -> tuple:
-    """Copy-engine gather ops, imported lazily so this stays importable without a
-    CUDA build."""
+    """``(single, coalesced)`` copy-engine gather ops, or ``(None, None)`` without
+    symmetric memory.  Imported lazily so this stays importable without a CUDA build."""
     try:
         from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER, CE_ALL_GATHER_COALESCED
 
-        return tuple(op for op in (CE_ALL_GATHER, CE_ALL_GATHER_COALESCED) if op is not None)
+        return CE_ALL_GATHER, CE_ALL_GATHER_COALESCED
     except Exception:  # noqa: BLE001
-        return ()
+        return None, None
 
 
 def is_ce_ag_ir(node) -> bool:
     """``magi::ce_all_gather`` lowers to an ordinary FallbackKernel, so Inductor's
     ``is_collective`` does not recognize it."""
-    return getattr(node, "op_overload", None) in ce_ag_ops()
+    op = getattr(node, "op_overload", None)
+    return op is not None and op in ce_ag_ops()
 
 
 def is_ce_ag_coalesced(node) -> bool:
-    try:
-        from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER_COALESCED
-    except Exception:  # noqa: BLE001
-        return False
-    return CE_ALL_GATHER_COALESCED is not None and getattr(node, "op_overload", None) is CE_ALL_GATHER_COALESCED
+    op = getattr(node, "op_overload", None)
+    return op is not None and op is ce_ag_ops()[1]
 
 
 def is_gather_ir(node) -> bool:

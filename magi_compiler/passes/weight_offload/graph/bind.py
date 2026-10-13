@@ -198,20 +198,6 @@ def bind_weights_to_host(
     return len(parked)
 
 
-def apply_weight_offload(
-    graph: fx.GraphModule, example_inputs: Sequence[Any] | None, source: WeightSource, *, min_bytes: int = 0
-) -> int:
-    """Bind then splice loads in one step.
-
-    The backend's weight pipeline makes the two calls itself, with the FSDP
-    lowering's bookkeeping between them, and does not go through here.
-    """
-    bound = bind_weights_to_host(graph, example_inputs, source, min_bytes=min_bytes)
-    if not bound:
-        return 0
-    return insert_h2d_loads(graph)
-
-
 def insert_h2d_loads(graph: fx.GraphModule) -> int:
     """Splice a load in for every tagged weight.
 

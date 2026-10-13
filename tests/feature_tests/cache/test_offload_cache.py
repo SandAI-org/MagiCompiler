@@ -112,7 +112,7 @@ def test_disabled_offload_cache_is_a_noop(tmp_path: Path):
     assert cache.bind(gm) is CacheValidity.KEEP
     assert cache.allows_load()
     assert cache.allows_store()
-    assert cache.remap is None
+    assert cache._remap is None
     assert cache.miss_reason() is None
     cache.save()
     assert cache.host_slots_path is not None
@@ -166,7 +166,7 @@ def test_bind_matches_sidecar_and_replays_resident(tmp_path: Path):
     assert cache.bind(_tagged_graph(slot)) is CacheValidity.KEEP
     assert cache.allows_load()
     assert not cache.allows_store()
-    assert cache.remap == {99: slot}
+    assert cache._remap == {99: slot}
     assert cache.miss_reason() is None
     assert host_pool.is_resident(slot)
 
@@ -179,7 +179,7 @@ def test_bind_misses_without_sidecar(tmp_path: Path):
     assert cache.bind(_tagged_graph(slot)) is CacheValidity.DROP
     assert not cache.allows_load()
     assert cache.allows_store()
-    assert cache.remap is None
+    assert cache._remap is None
     assert cache.miss_reason() is not None
 
 
@@ -222,7 +222,7 @@ def test_bind_miss_drops_compile_indices(tmp_path: Path):
 
     assert mgr.cache == {}
     assert not mgr.offload_cache.allows_load()
-    assert mgr.offload_cache.remap is None
+    assert mgr.offload_cache._remap is None
 
 
 @requires_cuda
@@ -256,7 +256,7 @@ def test_replay_does_not_store_a_mixed_slot_artifact(tmp_path: Path):
     mgr = _offload_manager(tmp_path)
     mgr.offload_cache.host_slots_path.write_text(repr(sidecar))
     mgr.bind_offload_cache(_tagged_graph(slot))
-    assert mgr.offload_cache.remap == {3: slot}
+    assert mgr.offload_cache._remap == {3: slot}
     assert not mgr.offload_cache.allows_store()
 
     stored = mgr._maybe_store_cache_entry(

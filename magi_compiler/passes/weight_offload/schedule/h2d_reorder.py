@@ -129,12 +129,6 @@ from ...snode_utils import is_multi_output
 from .h2d_snode import H2D_OPS, is_h2d_load, slots_of
 from .load_plan import LoadPlan, load_bytes
 
-
-def _magi_logger_enabled_for_debug() -> bool:
-    """The per-load report builds a string per line; skip it when nobody reads it."""
-    return logging.getLogger("magi_compiler").isEnabledFor(logging.DEBUG)
-
-
 _MAX_SPLIT_ROUNDS = 5
 """Times ``_schedule`` may grow the in-flight budget out of the residency one."""
 
@@ -155,7 +149,7 @@ class H2dLoadReorder(OverlapPass):
         max_resident_bytes: int = 0,
         max_inflight_bytes: int = 0,
         max_device_weight_bytes: int = 0,
-        bus_utilization: float = 0.9,
+        bus_utilization: float = 1.0,
         cost_fn=None,
     ) -> None:
         super().__init__(cost_fn)
@@ -240,7 +234,7 @@ class H2dLoadReorder(OverlapPass):
         Floored at what phase 1's own order already needs.  Unasked, that floor
         plus one load -- the least memory any overlap at all can cost.
         """
-        floor = inflight_peak(plans, {p.load: unhoisted_index(p) for p in plans})
+        floor = inflight_peak(plans, {p.anchor: unhoisted_index(p) for p in plans})
         if self.max_inflight_bytes <= 0:
             return floor + max((p.nbytes for p in plans), default=0)
         if self.max_inflight_bytes < floor:
@@ -260,7 +254,7 @@ class H2dLoadReorder(OverlapPass):
         Bounded by the compute upstream of the *last* wait, not by the whole
         graph: compute after every load's deadline can hide nothing.
         """
-        last_wait = max(p.wait_idx for p in plans)
+        last_wait = max(p.deadline for p in plans)
         return self.bus_utilization * prefix[min(last_wait, len(prefix) - 1)] * self.bandwidth_bytes_per_ns
 
     def _budget_splits(self, plans):
@@ -275,7 +269,7 @@ class H2dLoadReorder(OverlapPass):
         in-flight room back one load at a time, and only if the sweep says the
         budget and not the bus is what left transfer exposed.
         """
-        floor = inflight_peak(plans, {p.load: unhoisted_index(p) for p in plans})
+        floor = inflight_peak(plans, {p.anchor: unhoisted_index(p) for p in plans})
         biggest = max((p.nbytes for p in plans), default=0)
         if self.max_device_weight_bytes <= 0:
             yield self.max_resident_bytes, self._inflight_budget(plans)
@@ -317,7 +311,7 @@ class H2dLoadReorder(OverlapPass):
         _, targets, inflight_budget, promoted = best
         # Re-run the winner so the plans carry its placement, not the last try's.
         targets = self._sweep(plans, order, index_of, prefix, promoted, inflight_budget)
-        self._log_shortfall(total, hideable, sum(p.nbytes for p in plans if p.promoted), sum(p.exposed for p in plans))
+        self._log_shortfall(total, hideable, sum(p.nbytes for p in plans if p.inactive), sum(p.exposed for p in plans))
         return targets, inflight_budget
 
     def _select_resident_at(self, plans, prefix, resident_budget, density) -> tuple[set, int, bool]:
@@ -348,11 +342,11 @@ class H2dLoadReorder(OverlapPass):
         on_bus: list = []
         kept = spent = 0
         feasible = True
-        for plan in sorted(plans, key=lambda p: (p.wait_idx, -p.nbytes)):
+        for plan in sorted(plans, key=lambda p: (p.deadline, -p.nbytes)):
             kept += plan.nbytes
             if plan.slots:  # only a load with host slots can be given back
                 on_bus.append(plan)
-            allowance = rate * prefix[min(plan.wait_idx, len(prefix) - 1)]
+            allowance = rate * prefix[min(plan.deadline, len(prefix) - 1)]
             while kept > allowance:
                 pick = self._best_fit(on_bus, kept - allowance, resident_budget - spent)
                 if pick is None:
@@ -362,7 +356,7 @@ class H2dLoadReorder(OverlapPass):
                     feasible = feasible and not on_bus
                     break
                 on_bus.remove(pick)
-                promoted.add(pick.load)
+                promoted.add(pick.anchor)
                 kept -= pick.nbytes
                 spent += pick.nbytes
         return promoted, spent, feasible
@@ -427,7 +421,7 @@ class H2dLoadReorder(OverlapPass):
         comes straight out of residency and back onto the bus.
         """
         for plan in plans:
-            plan.promoted = plan.load in promoted
+            plan.inactive = plan.anchor in promoted
         return alap_schedule(plans, prefix, index_of, budget)
 
     # -- committing --------------------------------------------------------
@@ -437,22 +431,22 @@ class H2dLoadReorder(OverlapPass):
 
         slots: list[int] = []
         for p in plans:
-            if not p.promoted:
+            if not p.inactive:
                 continue
             if not p.slots:
-                p.promoted = False
+                p.inactive = False
                 continue
             slots.extend(p.slots)
         return host_pool.make_resident_many(slots)
 
     # -- reporting --------------------------------------------------------
     def _report(self, plans, targets, index_of, given_back, budget, n_snodes, prefix) -> None:
-        resident = [p for p in plans if p.promoted]
+        resident = [p for p in plans if p.inactive]
         exposed = sum(p.exposed for p in plans)
         by_budget = sum(p.exposed for p in plans if p.budget_bound)
         inflight = inflight_peak(plans, live_starts(plans, targets, index_of))
         moved = sum(1 for load, target in targets.items() if target != index_of[load])
-        on_bus = sum(p.nbytes for p in plans if not p.promoted)
+        on_bus = sum(p.nbytes for p in plans if not p.inactive)
         total = sum(p.nbytes for p in plans)
         hideable = self._hideable_bytes(plans, prefix)
         compute_ns = hideable / self.bus_utilization / self.bandwidth_bytes_per_ns
@@ -502,12 +496,12 @@ class H2dLoadReorder(OverlapPass):
         A max above 1.0 is a schedule that does not exist: that prefix has more
         transfer than compute and the excess is exposed wherever it is placed.
         """
-        if not _magi_logger_enabled_for_debug():
+        if not logging.getLogger("magi_compiler").isEnabledFor(logging.DEBUG):
             return
         by_wait: dict[int, int] = defaultdict(int)
         for p in plans:
-            if not p.promoted:
-                by_wait[p.wait_idx] += p.nbytes
+            if not p.inactive:
+                by_wait[p.deadline] += p.nbytes
         ratios = []
         cumulative = 0
         for wait in sorted(by_wait):
@@ -538,7 +532,7 @@ class H2dLoadReorder(OverlapPass):
         return ", ".join(names[:3]) + (f", +{len(names) - 3} more" if len(names) > 3 else "")
 
     def _log_placement(self, plans, targets, index_of, n_snodes) -> None:
-        if not _magi_logger_enabled_for_debug():
+        if not logging.getLogger("magi_compiler").isEnabledFor(logging.DEBUG):
             return
         magi_logger.debug(
             "h2d load placement (%d loads over %d snodes; 'at' is where the load ended up, "
@@ -547,8 +541,8 @@ class H2dLoadReorder(OverlapPass):
             len(plans),
             n_snodes,
         )
-        for p in sorted(plans, key=lambda p: index_of[p.load]):
-            if p.promoted:
+        for p in sorted(plans, key=lambda p: index_of[p.anchor]):
+            if p.inactive:
                 verdict = f"RESIDENT: {p.need / 1e6:.1f}ms off the bus"
             elif p.exposed <= 0:
                 verdict = "hidden"
@@ -556,14 +550,14 @@ class H2dLoadReorder(OverlapPass):
                 verdict = f"EXPOSED {p.exposed / 1e6:.1f}ms (in-flight budget)"
             else:
                 verdict = f"EXPOSED {p.exposed / 1e6:.1f}ms (bus/compute)"
-            at = targets.get(p.load, index_of[p.load])
+            at = targets.get(p.anchor, index_of[p.anchor])
             magi_logger.debug(
                 "  %-10s %2d slot(s) %7.1f MiB  at %5d (from %5d, floor %5d/%5d)  last_user %5d  " "need %6.1fms  %-38s  %s",
-                p.load.get_name(),
+                p.anchor.get_name(),
                 len(p.slots),
                 p.nbytes / 2**20,
                 at,
-                index_of[p.load],
+                index_of[p.anchor],
                 p.lower,
                 p.budget_floor,
                 p.last_user,
