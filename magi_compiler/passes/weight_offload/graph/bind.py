@@ -156,8 +156,8 @@ def bind_weights_to_host(
     """Tag already-parked weights on the graph so a later splice can load them.
 
     A weight reaches the pool only through host-first materialization.  This
-    step does not copy or free anything.  Failures are logged and dropped,
-    never raised: the un-offloaded graph is always a valid fallback.
+    step does not copy or free anything. Candidate disagreement or failed
+    agreement drops the affected candidates; mesh group lookup errors propagate.
 
     Returns how many weights are now served from host memory.
     """
@@ -168,34 +168,28 @@ def bind_weights_to_host(
 
     # Before the empty check, so every rank still enters each of its groups.
     plan = _align_across_ranks(plan, placeholder_examples, skipped)
-    parked: list[OffloadCandidate] = []
-    for c in plan:
-        if c.slot is None:
-            skipped["weight was not materialized in host memory"] += 1
-            continue
-        parked.append(c)
-    if not parked:
+    if not plan:
         magi_logger.info("host offload: nothing to offload (%s)", _describe(skipped))
         return 0
 
-    for c in parked:
+    for c in plan:
         mark_host_slot(c.holder, c.slot)
         if c.tag is not None:
             mark_host_offloaded(c.tag)
 
-    sizes = sorted(c.nbytes for c in parked)
+    sizes = sorted(c.nbytes for c in plan)
     magi_logger.info(
         "host offload: %d weight(s) served from host memory (%.1f MiB never allocated on device); "
         "sizes %.1f / %.1f / %.1f MiB (min/median/max, floor %.1f); %s",
-        len(parked),
-        sum(c.nbytes for c in parked) / 2**20,
+        len(plan),
+        sum(c.nbytes for c in plan) / 2**20,
         sizes[0] / 2**20,
         sizes[len(sizes) // 2] / 2**20,
         sizes[-1] / 2**20,
         min_bytes / 2**20,
         _describe(skipped),
     )
-    return len(parked)
+    return len(plan)
 
 
 def insert_h2d_loads(graph: fx.GraphModule) -> int:
@@ -204,7 +198,7 @@ def insert_h2d_loads(graph: fx.GraphModule) -> int:
     Returns how many load nodes were inserted.
     """
     order = {n: i for i, n in enumerate(graph.graph.nodes)}
-    holders = sorted((n for n in graph.graph.nodes if host_slot(n) is not None), key=order.__getitem__)
+    holders = [n for n in graph.graph.nodes if host_slot(n) is not None]
     inserted = sum(_splice_load(graph, h, host_slot(h), order) for h in holders)
 
     if inserted:

@@ -47,8 +47,8 @@ at which gaga4 400B ran level with the old fixed 512 MiB buckets on each
 transport, without allocating more gathered weight early.
 
 Every rank must build the same buckets, or the collective sequence diverges.
-The graphs are compared first (``rank_sync.negotiate_mode`` must answer
-``identical`` or ``slot``), but the costs are not: most snodes are priced on
+The collective skeletons are compared first (``rank_sync.negotiate_mode`` must
+answer ``slot``), but the costs are not: most snodes are priced on
 each rank from its own measurements, so the fitted ``alpha``/``beta`` can differ
 slightly.  So every rank plans, and every rank then takes rank 0's plan, checks
 it is legal on its own order, and touches the IR only once every rank has said
@@ -57,9 +57,8 @@ candidate count is rank-local, and returning before the exchange leaves the
 other ranks blocked in it.  Every rank leaves the gathers unbucketed only after
 the exchange says so.
 
-In ``slot`` mode the graphs differ in rank-private compute but their collective
-skeletons match, so candidate ``j`` is the same weight on every rank.  Where a
-bucket's launch lands is decided by each rank's own producers, though, and two
+Matching collective skeletons align candidate ``j`` across ranks even when
+rank-private compute differs.  A bucket's launch depends on local producers, so two
 ranks can put it on opposite sides of a CP / EP collective.  So each rank also
 reports the order its skeleton takes after the merges, and the plan is applied
 only where that order is the same everywhere.  ``pinned`` has no skeleton to
@@ -244,14 +243,16 @@ class FsdpAutoBucket:
         cands = self._candidates(order)
         world = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
         cost = CostView(self._cost_fn)
-        group, mode, skeleton = None, "identical", []
+        group, skeleton = None, []
         if world > 1:
             # Candidate count is rank-local. Every rank joins the exchange below,
             # including one that found nothing to merge. Returning here skips the
             # all_gather and blocks whichever ranks do enter it.
             skel_idx, skel_kinds = rank_sync.collective_skeleton(order)
-            mode, group, world = rank_sync.negotiate_mode(order, cands, skel_kinds, cost.ok, who=self.name)
-            if mode not in ("identical", "slot"):
+            mode, group, world = rank_sync.negotiate_mode(
+                anchors=cands, skel_kinds=skel_kinds, costs_ok=cost.ok, who=self.name
+            )
+            if mode != "slot":
                 magi_logger.warning(
                     "%s: per-rank collective skeletons cannot be matched (mode=%s); leaving every weight gather unbucketed",
                     self.name,
@@ -270,7 +271,7 @@ class FsdpAutoBucket:
         except Exception as exc:  # noqa: BLE001
             magi_logger.warning("%s: planning failed (%s); leaving every weight gather unbucketed", self.name, exc, rank="all")
             ok, buckets = False, []
-        adopted = self._adopt(ok, buckets, order, cands, group, world, mode, skeleton)
+        adopted = self._adopt(ok=ok, buckets=buckets, order=order, cands=cands, group=group, world=world, skeleton=skeleton)
         if adopted is None:
             return snodes
         if adopted is not buckets:
@@ -420,12 +421,11 @@ class FsdpAutoBucket:
         report["params"] = params_by_group
         return kept, report
 
-    def _adopt(self, ok: bool, buckets, order, cands, group, world: int, mode: str = "identical", skeleton=()):
+    def _adopt(self, ok: bool, buckets, order, cands, group, world: int, skeleton):
         """Rank 0's buckets, as this rank's snodes, once every rank has found them legal; None to leave the graph alone.
 
         Returns ``buckets`` itself when this rank's own plan is the one adopted.
-        In ``slot`` mode every rank must also merge into the same collective order
-        (see the module docstring).
+        Every rank must also merge into the same collective order (see the module docstring).
         """
         if world <= 1:
             return buckets if ok else None
@@ -459,18 +459,13 @@ class FsdpAutoBucket:
                 self.name,
                 distinct,
             )
-        slot = mode == "slot"
-        merged, legal = None, True
-        if lead == mine and not slot:
-            adopted = buckets
-        else:
-            try:
-                adopted = buckets if lead == mine else [[cands[i] for i in b] for b in lead]
-                merged = self._merged(order, adopted)
-                legal = merged is not None
-            except Exception:  # noqa: BLE001 - an unmappable plan is simply not legal here
-                adopted, legal = None, False
-        skeleton_order = self._skeleton_order(merged, skeleton) if slot and legal else None
+        try:
+            adopted = buckets if lead == mine else [[cands[i] for i in b] for b in lead]
+            merged = self._merged(order, adopted)
+            legal = merged is not None
+        except Exception:  # noqa: BLE001 - an unmappable plan is simply not legal here
+            adopted, legal = None, False
+        skeleton_order = self._skeleton_order(merged, skeleton) if legal else None
         return adopted if self._commit(legal, skeleton_order, group, world) else None
 
     def _commit(self, legal: bool, skeleton_order: str | None, group, world: int) -> bool:

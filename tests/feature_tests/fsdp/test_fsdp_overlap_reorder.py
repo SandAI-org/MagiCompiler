@@ -71,86 +71,9 @@ def test_reorder_multi_rank():
     assert "REORDER_PASS" in p.stdout, out[-3000:]
 
 
-class _FakeIR:
-    """Sizes are REAL sympy expressions, as ``node.get_size()`` returns: the
-    canonicalization must survive sympy's StrPrinter, which orders commutative
-    terms by symbol NAME -- a hand-written repr string would bypass exactly the
-    layer the bug lives in."""
-
-    def __init__(self, size):
-        self.op_overload = "fake.op"
-        self._size = size
-        self.origins = None
-
-    def get_size(self):
-        return self._size
-
-
-class _FakeSnode:
-    snodes = None
-
-    def __init__(self, size):
-        self.node = _FakeIR(size)
-
-
-def _graph(*sizes):
-    """Build a fake snode list; each size is a list of sympy exprs / ints."""
-    return [_FakeSnode(size) for size in sizes]
-
-
-def test_fingerprint_canonicalizes_shape_symbols():
-    """Dynamic-shape symbol NAMES are per-rank numbering noise (the same
-    logical dim is s82 on rank 0 and s74 on rank 1 for the same graph): the
-    fingerprint must be invariant under symbol renaming, while still
-    distinguishing genuinely different symbolic structure.
-
-    Modeled like the real wan graph: the local-seq symbol first appears alone
-    in a placeholder-like dim, then the CP all_to_all output sums it with the
-    fresh cross-rank symbol, then downstream nodes use the fresh symbol alone.
-    """
-    import sympy
-
-    from magi_compiler.passes.overlap.rank_sync import graph_fingerprint as _graph_fingerprint
-
-    def syms(*names):
-        return [sympy.Symbol(n, positive=True, integer=True) for n in names]
-
-    # Same digit count (the case the string-level rename happened to handle).
-    (a0, b0), (a1, b1) = syms("s27", "s82"), syms("s27", "s74")
-    rank0 = _graph([a0, 3072], [a0 + b0, 6, 64], [b0, 64])
-    rank1 = _graph([a1, 3072], [a1 + b1, 6, 64], [b1, 64])
-    assert _graph_fingerprint(rank0) == _graph_fingerprint(rank1)
-
-    # Digit-count crossing: sympy prints ``s27 + s174`` as ``s174 + s27``
-    # (StrPrinter sorts terms by name), so any rename applied AFTER printing
-    # sees a different first-appearance order and diverges.
-    (a2, b2) = syms("s27", "s174")
-    rank2 = _graph([a2, 3072], [a2 + b2, 6, 64], [b2, 64])
-    assert _graph_fingerprint(rank0) == _graph_fingerprint(rank2)
-
-    # Same digit count but flipped relative order: fresh symbol sorts BEFORE
-    # the shared one on one rank (s34 < s50) and AFTER it on the other.
-    (a3, b3), (a4, b4) = syms("s50", "s82"), syms("s50", "s34")
-    rank3 = _graph([a3, 3072], [a3 + b3, 6, 64], [b3, 64])
-    rank4 = _graph([a4, 3072], [a4 + b4, 6, 64], [b4, 64])
-    assert _graph_fingerprint(rank3) == _graph_fingerprint(rank4)
-
-    # Genuinely different LINKAGE must still differ: downstream node reuses the
-    # local-seq symbol instead of the cross-rank one.
-    linked_other = _graph([a0, 3072], [a0 + b0, 6, 64], [a0, 64])
-    assert _graph_fingerprint(rank0) != _graph_fingerprint(linked_other)
-
-    # Genuinely different EXPRESSION structure must differ: 2*s vs s + s'.
-    doubled = _graph([a0, 3072], [2 * a0, 6, 64], [b0, 64])
-    assert _graph_fingerprint(rank0) != _graph_fingerprint(doubled)
-
-
 @requires_torchrun
 def test_reorder_mode_ladder():
-    """The cross-rank safety ladder, driven directly on synthetic inputs (gloo, no
-    CUDA): identical graphs, graphs differing only in compute (-> slot consensus),
-    differing collective skeletons (-> pinned) and differing weight-AG counts
-    (-> abort)."""
+    """Matching skeletons use slots; mismatched skeletons pin, and failed pricing or counts abort."""
     p = _run(2, "--modes-only", port="29633")
     out = p.stdout + p.stderr
     assert p.returncode == 0, f"helper failed:\n{out[-3000:]}"
@@ -161,18 +84,11 @@ def test_reorder_mode_ladder():
 @requires_torchrun
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires >=2 GPUs")
 def test_reorder_graph_mismatch_slot_mode():
-    """world=2 with rank1 compiling a structurally DIFFERENT graph: the cross-rank
-    graph-fingerprint check must fire on both ranks (warning) and continue in
-    SLOT-consensus mode -- the graphs differ only in compute, so the collective
-    skeleton still matches and the gather may hop the graph's other collective, as
-    long as every rank hops it.  The emitted collective sequence must come out
-    identical on both ranks (REORDER_SKELETON), which is what rules out deadlock."""
+    """Different rank-local compute must still emit matching collective order and match eager."""
     p = _run(2, "--mismatch", port="29632")
     out = p.stdout + p.stderr
     assert p.returncode == 0, f"helper failed:\n{out[-3000:]}"
-    assert "REORDER_MISMATCH local=True" in p.stdout, out[-3000:]
-    assert "REORDER_WARNED" in p.stdout, out[-3000:]  # the divergent-graph warning fired
-    assert "REORDER_SLOT" in p.stdout, out[-3000:]  # ... and it chose SLOT consensus
+    assert "REORDER_SLOT" in p.stdout, out[-3000:]
     assert "REORDER_SKELETON ok=True" in p.stdout, out[-3000:]
     assert "REORDER_PASS" in p.stdout, out[-3000:]
 

@@ -244,12 +244,7 @@ def test_fixed_pairs_coalesce_under_their_old_names():
         # Inject a missing bucket on rank 1; both ranks must adopt rank 0's plan.
         pytest.param(("--bucket-size-mib", "4", "--diverge"), 4.0, ("every rank takes rank 0's",), id="divergent-plan"),
         # Rank 1 adds compute but keeps the collective skeleton: exercise SLOT consensus.
-        pytest.param(
-            ("--mismatch",),
-            None,
-            ("FSDP auto bucket reorder: per-rank graphs are NOT structurally identical", "SLOT-consensus"),
-            id="different-compute-graphs",
-        ),
+        pytest.param(("--mismatch",), None, (), id="different-compute-graphs"),
     ],
 )
 def test_auto_bucketing_end_to_end(extra, cap_mib, expected_messages):
@@ -300,7 +295,7 @@ def test_auto_bucket_rank_consensus():
 
     A rank with one candidate must still negotiate abort with its peer. Then
     check matching slots, changed collective order, mismatched signatures, and
-    identical-graph mode. The helper restores patches between these cases.
+    illegal merges even when both ranks planned the same buckets.
     """
     p = _run_gloo_helper(_RANK_HELPER)
     out = p.stdout + p.stderr
