@@ -66,8 +66,9 @@ def _input_signature(x: Any) -> str:
 
 
 def compute_graph_hash(graph: fx.GraphModule, example_inputs: Sequence[Any]) -> str:
-    # DTensor placements live in the inputs, not in the traced source files (e.g. SimpleFSDP fully_shard vs replicate).
-    return compute_hash([graph.code, [_input_signature(x) for x in example_inputs]])
+    # Placements live on the inputs, not in traced source files. graph.code is omitted:
+    # restart-analysis retraces with different node names and would miss the first-pass cache.
+    return compute_hash([_input_signature(x) for x in example_inputs])
 
 
 def compute_code_hash(files: set[str]) -> str:
