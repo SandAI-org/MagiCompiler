@@ -40,11 +40,11 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requir
 
 @pytest.fixture(autouse=True)
 def clean_pool():
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
 
-    host_pool.reset()
+    host_weights.reset()
     yield
-    host_pool.reset()
+    host_weights.reset()
 
 
 def _info(name, shape, dtype="torch.bfloat16", nbytes=32, resident=False):
@@ -76,13 +76,13 @@ def test_slot_identity_uses_name_and_layout():
 
 @requires_cuda
 def test_collect_and_refresh_read_the_live_pool():
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
 
     local = torch.randn(16, 8, device="cuda", dtype=torch.bfloat16)
-    host = host_pool.reserve(tuple(local.shape), local.dtype, name="layers.0.w")
+    host = host_weights.reserve(tuple(local.shape), local.dtype, name="layers.0.w")
     host.copy_(local.detach())
     local.untyped_storage().resize_(0)
-    slot = host_pool.adopt(host, local, name="layers.0.w")
+    slot = host_weights.adopt(host, local, name="layers.0.w")
 
     g = fx.Graph()
     node = g.placeholder("L_self_modules_layers_0_parameters_weight_")
@@ -96,7 +96,7 @@ def test_collect_and_refresh_read_the_live_pool():
     assert table[slot]["shape"] == (16, 8)
     assert table[slot]["resident"] is False
 
-    host_pool.make_resident(slot)
+    host_weights.make_resident(slot)
     refreshed = refresh_resident_flags(table)
     assert refreshed[slot]["resident"] is True
 
@@ -142,23 +142,29 @@ def _tagged_graph(slot: int) -> fx.GraphModule:
 
 
 def _adopt_weight(name: str = "w", shape=(8, 8)):
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
 
     local = torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
-    host = host_pool.reserve(tuple(local.shape), local.dtype, name=name)
+    host = host_weights.reserve(tuple(local.shape), local.dtype, name=name)
     host.copy_(local.detach())
     local.untyped_storage().resize_(0)
-    slot = host_pool.adopt(host, local, name=name)
+    slot = host_weights.adopt(host, local, name=name)
     return slot, local
 
 
 @requires_cuda
 def test_bind_matches_sidecar_and_replays_resident(tmp_path: Path):
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
 
     slot, local = _adopt_weight()
     sidecar = {
-        99: {"name": "w", "shape": (8, 8), "dtype": str(local.dtype), "nbytes": host_pool.slot_bytes(slot), "resident": True}
+        99: {
+            "name": "w",
+            "shape": (8, 8),
+            "dtype": str(local.dtype),
+            "nbytes": host_weights.slot_bytes(slot),
+            "resident": True,
+        }
     }
     cache = _offload_cache(tmp_path)
     cache.host_slots_path.write_text(repr(sidecar))
@@ -168,7 +174,7 @@ def test_bind_matches_sidecar_and_replays_resident(tmp_path: Path):
     assert not cache.allows_store()
     assert cache._remap == {99: slot}
     assert cache.miss_reason() is None
-    assert host_pool.is_resident(slot)
+    assert host_weights.is_resident(slot)
 
 
 @requires_cuda
@@ -198,11 +204,17 @@ def test_save_writes_host_slots_sidecar(tmp_path: Path):
 
 @requires_cuda
 def test_replay_does_not_rewrite_sidecar(tmp_path: Path):
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
 
     slot, local = _adopt_weight()
     sidecar = {
-        3: {"name": "w", "shape": (8, 8), "dtype": str(local.dtype), "nbytes": host_pool.slot_bytes(slot), "resident": False}
+        3: {
+            "name": "w",
+            "shape": (8, 8),
+            "dtype": str(local.dtype),
+            "nbytes": host_weights.slot_bytes(slot),
+            "resident": False,
+        }
     }
     cache = _offload_cache(tmp_path)
     cache.host_slots_path.write_text(repr(sidecar))
@@ -228,11 +240,17 @@ def test_bind_miss_drops_compile_indices(tmp_path: Path):
 @requires_cuda
 def test_bind_hit_keeps_compile_indices(tmp_path: Path):
     from magi_compiler.magi_backend._cache_data_cls import CacheEntry, CacheHandle
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
 
     slot, local = _adopt_weight()
     sidecar = {
-        3: {"name": "w", "shape": (8, 8), "dtype": str(local.dtype), "nbytes": host_pool.slot_bytes(slot), "resident": False}
+        3: {
+            "name": "w",
+            "shape": (8, 8),
+            "dtype": str(local.dtype),
+            "nbytes": host_weights.slot_bytes(slot),
+            "resident": False,
+        }
     }
     mgr = _offload_manager(tmp_path)
     entry = CacheEntry(None, 0, "inductor_standalone")
@@ -247,11 +265,17 @@ def test_bind_hit_keeps_compile_indices(tmp_path: Path):
 @requires_cuda
 def test_replay_does_not_store_a_mixed_slot_artifact(tmp_path: Path):
     from magi_compiler.magi_backend._cache_data_cls import CacheEntry, CacheHandle
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
 
     slot, local = _adopt_weight()
     sidecar = {
-        3: {"name": "w", "shape": (8, 8), "dtype": str(local.dtype), "nbytes": host_pool.slot_bytes(slot), "resident": False}
+        3: {
+            "name": "w",
+            "shape": (8, 8),
+            "dtype": str(local.dtype),
+            "nbytes": host_weights.slot_bytes(slot),
+            "resident": False,
+        }
     }
     mgr = _offload_manager(tmp_path)
     mgr.offload_cache.host_slots_path.write_text(repr(sidecar))
@@ -268,12 +292,18 @@ def test_replay_does_not_store_a_mixed_slot_artifact(tmp_path: Path):
 
 @requires_cuda
 def test_wrap_loaded_applies_slot_remap(tmp_path: Path):
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
     from magi_compiler.passes.weight_offload.runtime import slot_remap
 
     slot, local = _adopt_weight()
     sidecar = {
-        99: {"name": "w", "shape": (8, 8), "dtype": str(local.dtype), "nbytes": host_pool.slot_bytes(slot), "resident": False}
+        99: {
+            "name": "w",
+            "shape": (8, 8),
+            "dtype": str(local.dtype),
+            "nbytes": host_weights.slot_bytes(slot),
+            "resident": False,
+        }
     }
     cache = _offload_cache(tmp_path)
     cache.host_slots_path.write_text(repr(sidecar))

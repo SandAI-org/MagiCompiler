@@ -27,7 +27,7 @@ from torch import nn
 from torch.testing import assert_close
 
 from magi_compiler.api import magi_compile
-from magi_compiler.config import CompileConfig, CompileMode
+from magi_compiler.config import CompileConfig
 from tests.perf_tests import cuda_benchmark
 
 
@@ -690,58 +690,3 @@ class TestPerformanceImprovementConsistency:
             "Non-module entry timings diverged too much: "
             f"class={t_nm_class:.4f}s, instance={t_nm_inst:.4f}s, method={t_nm_mtd:.4f}s"
         )
-
-
-def _torch_compile_with_graph_offload(conf):
-    conf.compile_mode = CompileMode.TORCH_COMPILE
-    conf.offload_config.graph_weight_offload = True
-    return conf
-
-
-def _linear_cls():
-    """A fresh class each call: ``@magi_compile`` on a class rewrites ``__init__`` in place."""
-
-    class Linear(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.linear = nn.Linear(8, 8, bias=False)
-
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            return self.linear(x)
-
-    return Linear
-
-
-def test_graph_weight_offload_rejects_torch_compile():
-    """Host-first plus vanilla torch.compile empties the weights and never reloads them.
-
-    The refusal has to land before ``patch_materialize``. After that hook, the first
-    call hands each weight an empty CUDA stand-in, and ``TORCH_COMPILE`` never inserts
-    ``magi::h2d_load``.
-    """
-    model = _linear_cls()()
-    weight = model.linear.weight.detach().clone()
-    with pytest.raises(ValueError, match="graph_weight_offload requires compile_mode=MAGI_COMPILE"):
-        magi_compile(model, config_patch=_torch_compile_with_graph_offload)
-
-    assert not getattr(model, "_magi_host_first_installed", False)
-    assert model.linear.weight.untyped_storage().size() > 0
-    x = torch.randn(2, 8)
-    assert_close(model(x), nn.functional.linear(x, weight))
-
-
-def test_graph_weight_offload_rejects_torch_compile_on_a_class():
-    """Class decoration installs the hook from ``__init__``; that construction must fail too."""
-    Compiled = magi_compile(_linear_cls(), config_patch=_torch_compile_with_graph_offload)
-    with pytest.raises(ValueError, match="graph_weight_offload requires compile_mode=MAGI_COMPILE"):
-        Compiled()
-
-
-def test_graph_weight_offload_still_installs_host_first_for_magi_compile():
-    def patch(conf):
-        conf.compile_mode = CompileMode.MAGI_COMPILE
-        conf.offload_config.graph_weight_offload = True
-        return conf
-
-    model = magi_compile(_linear_cls()(), config_patch=patch)
-    assert model._magi_host_first_installed

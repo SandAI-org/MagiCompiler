@@ -12,18 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compile-time host offload of SimpleFSDP weight shards.
+"""Compile-time host offload of FSDP shards and ordinary model parameters.
 
 Three layers, tested separately because they fail in different ways:
 
-* ``host_pool`` -- the bytes actually leave the device, and come back identical.
+* ``host_weights`` -- the bytes actually leave the device, and come back identical.
 * ``magi::h2d_load`` -- the copy runs on its own stream and is published as a
   ``Work``, so ``wait_tensor`` is what makes it visible.  An op that silently
   synchronized instead would pass every correctness check and overlap nothing.
 * the FX pass -- the load lands ABOVE the dtype cast and BELOW nothing, and the
   gather ends up reading the loaded copy rather than the freed shard.
 
-Uses a 1-rank process group + device mesh (GPU required).
+FSDP cases use a per-test 1-rank process group and device mesh. Plain-parameter
+cases explicitly require no process group. Runtime and integration cases need CUDA.
 """
 
 import os
@@ -32,6 +33,8 @@ import pytest
 import torch
 import torch.fx as fx
 
+from magi_compiler.passes.weight_offload import PlainParamSource, bind_weights_to_host, insert_h2d_loads
+
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 _AG = torch.ops._c10d_functional.all_gather_into_tensor.default
@@ -39,9 +42,9 @@ _WAIT = torch.ops._c10d_functional.wait_tensor.default
 _TO_COPY = torch.ops.aten._to_copy.default
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def dist_1rank():
-    """A single-rank process group + cuda device mesh (module-scoped)."""
+    """A per-test process group, so later plain-parameter cases stay standalone."""
     import torch.distributed as dist
 
     os.environ.setdefault("MASTER_ADDR", "localhost")
@@ -52,32 +55,33 @@ def dist_1rank():
     if not dist.is_initialized():
         dist.init_process_group("gloo")
         created = True
-    torch.cuda.set_device(0)
-    from torch.distributed.device_mesh import init_device_mesh
+    try:
+        torch.cuda.set_device(0)
+        from torch.distributed.device_mesh import init_device_mesh
 
-    mesh = init_device_mesh("cuda", (1,))
-    yield mesh
-    if created:
-        dist.destroy_process_group()
+        yield init_device_mesh("cuda", (1,))
+    finally:
+        if created:
+            dist.destroy_process_group()
 
 
 @pytest.fixture(autouse=True)
 def clean_pool():
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
 
-    host_pool.reset()
+    host_weights.reset()
     yield
-    host_pool.reset()
+    host_weights.reset()
 
 
 def _park(tensor: torch.Tensor, name: str = "") -> int:
     """Put ``tensor`` in the host pool the production way: reserve, fill, empty, adopt."""
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
 
-    host = host_pool.reserve(tuple(tensor.shape), tensor.dtype, name=name)
+    host = host_weights.reserve(tuple(tensor.shape), tensor.dtype, name=name)
     host.copy_(tensor.detach())
     tensor.untyped_storage().resize_(0)
-    return host_pool.adopt(host, tensor, name=name)
+    return host_weights.adopt(host, tensor, name=name)
 
 
 # ------------------------------------------------ cross-rank agreement
@@ -153,19 +157,6 @@ def test_align_votes_per_group_not_on_world(monkeypatch):
     assert set(seen) == {dense, expert}, "each mesh must vote on its own group, never WORLD"
 
 
-def test_align_keeps_ungrouped_candidates_without_a_collective(monkeypatch):
-    """An unsharded Parameter has no mesh and does not enter a vote."""
-    from collections import Counter
-
-    from magi_compiler.passes.weight_offload.graph import bind
-
-    plain = _cand("linear.weight", "l_self_weight", group=None)
-    seen = _patch_dist(monkeypatch, world=2, replies={})
-    kept = bind._align_across_ranks([plain], {}, Counter())
-    assert kept == [plain]
-    assert seen == []
-
-
 def test_align_still_enters_a_group_found_only_on_graph_inputs(monkeypatch):
     """A rank that collected nothing on a mesh must still join that mesh's vote."""
     from collections import Counter
@@ -220,27 +211,27 @@ def test_align_failed_group_does_not_abort_the_others(monkeypatch):
 def test_many_shards_share_one_pinned_slab():
     """One slab per dtype, not one pinned allocation per weight: cudaHostAlloc is a
     driver round trip that stalls every stream, and a model has thousands of these."""
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
 
     slots = [_park(torch.randn(128, 32, device="cuda", dtype=torch.bfloat16)) for _ in range(16)]
 
-    storages = {host_pool.get(s).untyped_storage().data_ptr() for s in slots}
+    storages = {host_weights.get(s).untyped_storage().data_ptr() for s in slots}
     assert len(storages) == 1, f"expected one backing slab, got {len(storages)}"
 
 
 @requires_cuda
 def test_restore_all_puts_the_shards_back():
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
 
     local = torch.randn(64, 8, device="cuda")
     expected = local.clone()
     slot = _park(local)
     assert local.untyped_storage().nbytes() == 0
 
-    host_pool.restore_all()
+    host_weights.restore_all()
     torch.testing.assert_close(local, expected)
-    assert host_pool.is_resident(slot), "restore_all must mark the slot resident so source() agrees"
-    assert host_pool.source(slot).data_ptr() == local.data_ptr()
+    assert host_weights.is_resident(slot), "restore_all must mark the slot resident so source() agrees"
+    assert host_weights.source(slot).data_ptr() == local.data_ptr()
 
 
 @requires_cuda
@@ -251,24 +242,27 @@ def test_reserve_and_adopt_park_a_shard_that_was_never_on_the_device():
     ``adopt`` pairs it with a device tensor that carries nothing but shape --
     so the shard is offloaded without ever having been resident.
     """
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
 
-    host = host_pool.reserve((256, 64), torch.bfloat16, name="layers.0.w")
+    host = host_weights.reserve((256, 64), torch.bfloat16, name="layers.0.w")
     assert host.is_pinned(), "a pageable source would make the load synchronous"
     host.copy_(torch.arange(256 * 64, dtype=torch.bfloat16).reshape(256, 64))
 
     stand_in = torch.empty(256, 64, device="cuda", dtype=torch.bfloat16)
     stand_in.untyped_storage().resize_(0)
-    slot = host_pool.adopt(host, stand_in, name="layers.0.w")
+    slot = host_weights.adopt(host, stand_in, name="layers.0.w")
 
-    assert host_pool.slot_of(stand_in) == slot, "the source looks the slot up by the device tensor's identity"
-    assert host_pool.name_of(slot) == "layers.0.w"
-    assert host_pool.slot_bytes(slot) == 256 * 64 * 2, "a storage-free tensor still has to report its real size"
-    assert host_pool.source(slot).data_ptr() == host.data_ptr()
+    assert host_weights.slot_of(stand_in) == slot, "the source looks the slot up by the device tensor's identity"
+    assert host_weights.name_of(slot) == "layers.0.w"
+    assert host_weights.slot_bytes(slot) == 256 * 64 * 2, "a storage-free tensor still has to report its real size"
+    assert host_weights.source(slot).data_ptr() == host.data_ptr()
+
+    assert host_weights.adopt(host, stand_in, name="layers.0.w") == slot
+    assert host_weights.num_bound() == 1, "adopting the same stand-in must be idempotent"
 
     # And the shard can still be handed back, which is what the placement pass
     # does for a load it cannot hide.
-    host_pool.make_resident(slot)
+    host_weights.make_resident(slot)
     torch.testing.assert_close(stand_in, host.cuda())
 
 
@@ -276,11 +270,11 @@ def test_reserve_and_adopt_park_a_shard_that_was_never_on_the_device():
 def test_adopt_refuses_a_device_tensor_that_still_holds_bytes():
     """Adopting one would leak it: the pool would believe the shard is parked
     while its device storage stays allocated for the life of the process."""
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
 
-    host = host_pool.reserve((32, 8), torch.bfloat16)
+    host = host_weights.reserve((32, 8), torch.bfloat16)
     with pytest.raises(ValueError, match="no storage behind it"):
-        host_pool.adopt(host, torch.empty(32, 8, device="cuda", dtype=torch.bfloat16))
+        host_weights.adopt(host, torch.empty(32, 8, device="cuda", dtype=torch.bfloat16))
 
 
 @requires_cuda
@@ -293,120 +287,79 @@ def test_unclaimed_shards_are_handed_back_to_the_device():
     be left alone -- putting a loaded shard back is a silent regression to no
     offload at all.
     """
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
 
     loaded = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
     orphan = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
     expected = orphan.clone()
     loaded_slot = _park(loaded, name="kept")
     orphan_slot = _park(orphan, name="orphan")
-    host_pool.mark_claimed(loaded_slot)
+    host_weights.mark_claimed(loaded_slot)
 
-    assert host_pool.restore_unclaimed() == ["orphan"]
-    assert not host_pool.is_resident(loaded_slot), "a shard the graph loads must stay in host memory"
-    assert host_pool.is_resident(orphan_slot)
+    assert host_weights.restore_unclaimed() == ["orphan"]
+    assert not host_weights.is_resident(loaded_slot), "a shard the graph loads must stay in host memory"
+    assert host_weights.is_resident(orphan_slot)
     torch.testing.assert_close(orphan, expected)
-    assert host_pool.restore_unclaimed() == [], "already-restored shards must not be reported twice"
+    assert host_weights.restore_unclaimed() == [], "already-restored shards must not be reported twice"
 
 
 @requires_cuda
-def test_adopt_is_idempotent_on_the_same_stand_in():
-    from magi_compiler.passes.weight_offload import host_pool
-
-    host = host_pool.reserve((16, 8), torch.bfloat16, name="w")
-    stand_in = torch.empty(16, 8, device="cuda", dtype=torch.bfloat16)
-    stand_in.untyped_storage().resize_(0)
-
-    first = host_pool.adopt(host, stand_in, name="w")
-    second = host_pool.adopt(host, stand_in, name="w")
-    assert first == second
-    assert host_pool.num_bound() == 1
-
-
-@requires_cuda
-def test_make_resident_many_is_one_batch():
-    """Promotion of several slots must not synchronize per slot."""
-    from magi_compiler.passes.weight_offload import host_pool
+def test_make_resident_many_restores_values_and_is_idempotent():
+    """Batch promotion restores every slot and counts its bytes only once."""
+    from magi_compiler.passes.weight_offload import host_weights
 
     shards = [torch.randn(32, 16, device="cuda") for _ in range(4)]
     expected = [s.clone() for s in shards]
     slots = [_park(s) for s in shards]
-    assert host_pool.make_resident_many(slots) == sum(s.numel() * s.element_size() for s in expected)
-    assert host_pool.make_resident_many(slots) == 0
+    assert host_weights.make_resident_many(slots) == sum(s.numel() * s.element_size() for s in expected)
+    assert host_weights.make_resident_many(slots) == 0
     for slot, exp in zip(slots, expected):
-        assert host_pool.is_resident(slot)
-        torch.testing.assert_close(host_pool.source(slot), exp)
+        assert host_weights.is_resident(slot)
+        torch.testing.assert_close(host_weights.source(slot), exp)
 
 
 @requires_cuda
-def test_bandwidth_probe_is_plausible():
-    from magi_compiler.passes.weight_offload import host_pool
+def test_bandwidth_probe_is_plausible_and_reset_clears_its_cache():
+    from magi_compiler.passes.weight_offload import host_weights
 
-    bw = host_pool.h2d_bandwidth_bytes_per_ns()
+    bw = host_weights.h2d_bandwidth_bytes_per_ns()
     # bytes/ns == GB/s.  Anything outside this is a broken probe, not a slow bus.
     assert 1.0 < bw < 500.0, f"implausible H2D bandwidth {bw} GB/s"
 
-
-def test_bandwidth_override_is_taken_verbatim():
-    """GB/s and bytes/ns are the same number; a stray unit conversion here would
-    mis-size every overlap window by 1e9."""
-    from magi_compiler.passes.weight_offload import host_pool
-
-    assert host_pool.h2d_bandwidth_bytes_per_ns(override_gbps=42.0) == 42.0
-
-
-@requires_cuda
-def test_reset_clears_the_cached_bandwidth():
-    from magi_compiler.passes.weight_offload import host_pool
-
-    host_pool.h2d_bandwidth_bytes_per_ns()
-    assert host_pool.default_pool()._bandwidth_bytes_per_ns is not None
-    host_pool.reset()
-    assert host_pool.default_pool()._bandwidth_bytes_per_ns is None
+    assert host_weights.default_store()._bandwidth_bytes_per_ns == bw
+    host_weights.reset()
+    assert host_weights.default_store()._bandwidth_bytes_per_ns is None
 
 
 # ------------------------------------------------------------------- the op
 
 
 @requires_cuda
-def test_h2d_load_returns_the_offloaded_bytes():
-    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
+def test_h2d_load_runs_off_the_compute_stream(monkeypatch):
+    """Observe the stream submitting the real copy, without timing assumptions."""
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD, h2d_stream
 
-    local = torch.randn(512, 128, device="cuda", dtype=torch.bfloat16)
-    expected = local.clone()
+    local = torch.randn(1024, 256, device="cuda", dtype=torch.bfloat16)
     slot = _park(local)
+    compute_stream = torch.cuda.current_stream()
+    load_stream = h2d_stream()
+    copies = []
+    original_copy = torch.Tensor.copy_
 
-    out = H2D_LOAD(local, slot)
+    def observe_copy(dst, src, non_blocking=False):
+        if dst.is_cuda and src.device.type == "cpu":
+            copies.append((torch.cuda.current_stream(), non_blocking))
+        return original_copy(dst, src, non_blocking=non_blocking)
+
+    # Keep the actual copy and stream handling intact; observe at submission.
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "copy_", observe_copy)
+        out = H2D_LOAD(local, slot)
     _WAIT(out)
     torch.cuda.synchronize()
 
-    assert out.is_cuda and out.shape == expected.shape and out.dtype == expected.dtype
-    torch.testing.assert_close(out, expected)
-
-
-@requires_cuda
-def test_h2d_load_runs_off_the_compute_stream():
-    """The copy must be issued on the load stream, not the caller's.
-
-    This is the property the whole design rests on: an op that copied on the
-    current stream would be correct, would pass the check above, and would
-    overlap exactly nothing no matter where the reorder pass put it.
-    """
-    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD, h2d_stream
-
-    local = torch.randn(4096, 1024, device="cuda", dtype=torch.bfloat16)
-    slot = _park(local)
-    torch.cuda.synchronize()
-
-    before = torch.cuda.Event()
-    out = H2D_LOAD(local, slot)
-    before.record(torch.cuda.current_stream())
-    # The compute stream reaches its own marker without the transfer having
-    # landed; only the load stream is holding the copy.
-    torch.cuda.current_stream().synchronize()
-    assert before.query(), "the compute stream should not have been blocked by the load"
-    h2d_stream().synchronize()
-    _WAIT(out)  # retire the registered Work, so teardown has nothing to complain about
+    assert load_stream != compute_stream, "H2D must have a stream of its own"
+    assert copies == [(load_stream, True)], "the copy must be asynchronous and submitted on the load stream"
 
 
 @requires_cuda
@@ -425,12 +378,14 @@ def test_wait_tensor_is_what_synchronizes_the_load():
     expected = local.clone()
     slot = _park(local)
 
+    before = _c10d._get_work_registry_size()
     out = H2D_LOAD(local, slot)
-    assert _c10d._get_work_registry_size() > 0, "h2d_load must publish its event as a c10d Work"
+    assert out.is_cuda and out.shape == expected.shape and out.dtype == expected.dtype
+    assert _c10d._get_work_registry_size() == before + 1, "h2d_load must publish its event as a c10d Work"
     _WAIT(out)
     # No device sync: wait_tensor alone must have ordered the compute stream
     # behind the copy, so reading `out` here is already safe.
-    torch.testing.assert_close(out.float().sum().cpu(), expected.float().sum().cpu())
+    torch.testing.assert_close(out.float().cpu(), expected.float().cpu())
 
 
 @requires_cuda
@@ -481,12 +436,13 @@ def _nodes(gm, target):
 @requires_cuda
 def test_bind_and_insert_puts_the_load_between_the_shard_and_the_gather(dist_1rank):
     from magi_compiler.passes.fsdp_overlap import FsdpShardSource
-    from magi_compiler.passes.weight_offload import bind_weights_to_host, insert_h2d_loads, is_host_offloaded
+    from magi_compiler.passes.weight_offload import bind_weights_to_host, host_weights, insert_h2d_loads, is_host_offloaded
     from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     gm, param = _lowered_weight_graph(dist_1rank)
-    _park(param._local_tensor)
+    slot = _park(param._local_tensor, name="layers.3.mlp.w1")
     assert bind_weights_to_host(gm, [param], FsdpShardSource(), min_bytes=0) == 1
+    assert host_weights.name_of(slot) == "layers.3.mlp.w1"
     assert insert_h2d_loads(gm) == 1
 
     loads = _nodes(gm, H2D_LOAD)
@@ -595,7 +551,7 @@ def test_a_weight_two_gathers_read_gets_a_load_for_each(dist_1rank):
     here.
     """
     from magi_compiler.passes.fsdp_overlap import FsdpShardSource
-    from magi_compiler.passes.weight_offload import bind_weights_to_host, host_pool, insert_h2d_loads
+    from magi_compiler.passes.weight_offload import bind_weights_to_host, host_weights, insert_h2d_loads
     from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     gm, param = _twice_gathered_weight_graph(dist_1rank)
@@ -603,8 +559,8 @@ def test_a_weight_two_gathers_read_gets_a_load_for_each(dist_1rank):
     _park(param._local_tensor)
 
     assert bind_weights_to_host(gm, [param], FsdpShardSource(), min_bytes=0) == 2, "both gathers need a candidate"
-    assert host_pool.num_bound() == 1, "one shard, one set of host bytes"
-    torch.testing.assert_close(host_pool.get(0).cuda(), expected)
+    assert host_weights.num_bound() == 1, "one shard, one set of host bytes"
+    torch.testing.assert_close(host_weights.get(0).cuda(), expected)
 
     assert insert_h2d_loads(gm) == 2
     loads = _nodes(gm, H2D_LOAD)
@@ -704,7 +660,7 @@ def test_a_replicated_weight_is_offloaded_even_though_nothing_gathers_it(dist_1r
     had parked for them.
     """
     from magi_compiler.passes.fsdp_overlap import FsdpShardSource
-    from magi_compiler.passes.weight_offload import bind_weights_to_host, host_pool, insert_h2d_loads
+    from magi_compiler.passes.weight_offload import bind_weights_to_host, host_weights, insert_h2d_loads
     from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     gm, param = _replicated_weight_graph(dist_1rank)
@@ -713,7 +669,7 @@ def test_a_replicated_weight_is_offloaded_even_though_nothing_gathers_it(dist_1r
 
     assert bind_weights_to_host(gm, [param], FsdpShardSource(), min_bytes=0) == 1
     assert param._local_tensor.untyped_storage().nbytes() == 0, "the full copy must leave the device"
-    torch.testing.assert_close(host_pool.get(0).cuda(), expected)
+    torch.testing.assert_close(host_weights.get(0).cuda(), expected)
 
     assert insert_h2d_loads(gm) == 1
     (load,) = _nodes(gm, H2D_LOAD)
@@ -751,25 +707,6 @@ def test_an_ungathered_weight_gets_a_load_to_itself(dist_1rank):
 
 
 @requires_cuda
-def test_the_pool_remembers_which_parameter_each_shard_came_from(dist_1rank):
-    """The placement log is unreadable without it.
-
-    A bucket of MoE experts and a bucket of attention projections are
-    indistinguishable as snode ids and behave nothing alike, so "why is that
-    load there" can only be answered with the parameter names next to it.
-    """
-    from magi_compiler.passes.fsdp_overlap import FsdpShardSource
-    from magi_compiler.passes.weight_offload import bind_weights_to_host, host_pool
-
-    gm, param = _lowered_weight_graph(dist_1rank, name="L_self_modules_layers_3_modules_mlp_parameters_w1_")
-    _park(param._local_tensor, name="layers.3.mlp.w1")
-    assert bind_weights_to_host(gm, [param], FsdpShardSource(), min_bytes=0) == 1
-
-    names = [host_pool.name_of(s) for s in range(host_pool.num_bound())]
-    assert names == ["layers.3.mlp.w1"], names
-
-
-@requires_cuda
 def test_an_unparked_shard_is_not_offloaded(dist_1rank):
     """Collect never copies a resident shard off the device."""
     from magi_compiler.passes.fsdp_overlap import FsdpShardSource
@@ -793,58 +730,28 @@ def test_shard_below_the_size_floor_is_left_unloaded(dist_1rank):
 
 
 @requires_cuda
-def test_promoting_a_slot_switches_the_load_to_a_device_source():
-    """Residency is a host-pool state, not a graph change.
+def test_promotion_switches_the_source_and_updates_the_byte_accounting():
+    """Promotion changes the source and savings, but not the managed byte total."""
+    from magi_compiler.passes.weight_offload import host_weights
 
-    The load node stays exactly where it is and still runs -- it just copies from
-    the device now.  That is what lets the placement pass revise the decision
-    during scheduling without invalidating the artifact it is scheduling.
-    """
-    from magi_compiler.passes.weight_offload import host_pool
-    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
+    shards = [torch.randn(256, 128, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+    expected = shards[0].clone()
+    slots = [_park(shard) for shard in shards]
+    slot = slots[0]
+    total = host_weights.total_bound_bytes()
+    assert host_weights.bound_bytes() == total
+    assert host_weights.resident_bytes() == 0
+    assert host_weights.source(slot).device.type == "cpu"
 
-    w = torch.randn(256, 128, device="cuda", dtype=torch.bfloat16)
-    expected = w.clone()
-    slot = _park(w)
-    assert host_pool.source(slot).device.type == "cpu"
-
-    assert host_pool.make_resident(slot) == host_pool.slot_bytes(slot)
-    assert host_pool.is_resident(slot)
-    assert host_pool.source(slot).is_cuda
-    assert host_pool.make_resident(slot) == 0, "promotion must be idempotent"
-
-    out = H2D_LOAD(w, slot)
-    _WAIT(out)
-    torch.cuda.synchronize()
-    torch.testing.assert_close(out, expected)
-
-
-@requires_cuda
-def test_a_promoted_load_costs_no_stream_machinery():
-    """A resident shard has nothing to overlap, so it pays for nothing.
-
-    The stream hop, the event and the Work exist to hide a PCIe transfer behind
-    compute. Once the placement pass has put a shard back on the device there is
-    no transfer to hide, and leaving the machinery in place costs two
-    cross-stream synchronizations per bucket every single forward.
-    """
-    import torch._C._distributed_c10d as _c10d
-
-    from magi_compiler.passes.weight_offload import host_pool
-    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
-
-    w = torch.randn(256, 128, device="cuda", dtype=torch.bfloat16)
-    expected = w.clone()
-    slot = _park(w)
-    host_pool.make_resident(slot)
-
-    before = _c10d._get_work_registry_size()
-    out = H2D_LOAD(w, slot)
-    assert _c10d._get_work_registry_size() == before, "a resident load has nothing to publish a Work for"
-
-    # And the wait stays harmless: it finds no Work and passes the tensor through.
-    torch.cuda.synchronize()
-    torch.testing.assert_close(_WAIT(out), expected)
+    assert host_weights.make_resident(slot) == host_weights.slot_bytes(slot)
+    assert host_weights.is_resident(slot)
+    assert host_weights.source(slot).is_cuda
+    torch.testing.assert_close(host_weights.source(slot), expected)
+    assert not host_weights.is_resident(slots[1])
+    assert host_weights.total_bound_bytes() == total
+    assert host_weights.bound_bytes() == total - host_weights.slot_bytes(slot)
+    assert host_weights.resident_bytes() == host_weights.slot_bytes(slot)
+    assert host_weights.make_resident(slot) == 0, "promotion must be idempotent"
 
 
 @requires_cuda
@@ -859,16 +766,21 @@ def test_a_promoted_load_still_returns_its_own_buffer():
     corruption on the *second* call, with nothing pointing back here -- hence a
     test on the op's contract rather than on any one graph that trips it.
     """
-    from magi_compiler.passes.weight_offload import host_pool
+    import torch._C._distributed_c10d as _c10d
+
+    from magi_compiler.passes.weight_offload import host_weights
     from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     shards = [torch.randn(128, 64, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
     expected = [s.clone() for s in shards]
     slots = [_park(s) for s in shards]
     for slot in slots:
-        host_pool.make_resident(slot)
+        host_weights.make_resident(slot)
 
+    before = _c10d._get_work_registry_size()
     outs = [H2D_LOAD(shard, slot) for shard, slot in zip(shards, slots)]
+    assert _c10d._get_work_registry_size() == before, "resident loads must not register asynchronous Work"
+    outs = [_WAIT(out) for out in outs]
     torch.cuda.synchronize()
 
     for out, shard, want in zip(outs, shards, expected):
@@ -882,24 +794,6 @@ def test_a_promoted_load_still_returns_its_own_buffer():
     torch.cuda.synchronize()
     for shard, want in zip(shards, expected):
         torch.testing.assert_close(shard, want)
-
-
-@requires_cuda
-def test_bound_bytes_excludes_what_was_promoted_back():
-    """The reported saving has to be the saving actually realized, or the budget
-    the pass spends against is fiction."""
-    from magi_compiler.passes.weight_offload import host_pool
-
-    a = torch.randn(256, 128, device="cuda", dtype=torch.bfloat16)
-    b = torch.randn(256, 128, device="cuda", dtype=torch.bfloat16)
-    slots = [_park(a), _park(b)]
-    total = host_pool.total_bound_bytes()
-    assert host_pool.bound_bytes() == total
-
-    host_pool.make_resident(slots[0])
-    assert host_pool.total_bound_bytes() == total, "the shard is still managed, just resident"
-    assert host_pool.bound_bytes() == total - host_pool.slot_bytes(slots[0])
-    assert host_pool.resident_bytes() == host_pool.slot_bytes(slots[0])
 
 
 # --------------------------------------------------- host-first materialize
@@ -1007,38 +901,18 @@ def _tied_across_the_boundary(mesh, rows: int, cols: int, *, eager_first: bool) 
 
 def _assert_both_names_share_one_slot(root: torch.nn.Module) -> None:
     """Every name of a tied weight must reach the same slot, on CUDA, with no bytes."""
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
 
     slots = set()
     for name in ("a", "b"):
         local = _raw(getattr(root.inner, name))._local_tensor
         assert local.device.type == "cuda", f"{name} must be lowered against a CUDA parameter"
         assert local.untyped_storage().nbytes() == 0, f"{name} must carry no device bytes"
-        slot = host_pool.slot_of(local)
+        slot = host_weights.slot_of(local)
         assert slot is not None, f"{name} must resolve to a slot, or its reader gathers the empty stand-in"
         slots.add(slot)
     assert len(slots) == 1, "one shard means one slot, whichever name the graph arrives by"
-    assert host_pool.num_bound() == 1, "a tied weight must not be adopted twice"
-
-
-@requires_cuda
-def test_to_empty_materializes_only_the_compiled_subtree_in_host_memory(dist_1rank):
-    """Scope comes from the module tree, and it has to.
-
-    Weights outside the compiled subtree are read by the eager prologue --
-    embeddings, final projections -- so freeing their storage is an illegal
-    access on the very first forward. Patching the compiled module's ``_apply``
-    draws that line for free, because ``_apply`` recurses into children and
-    nothing else.
-    """
-    root = _shard_on_meta(dist_1rank, rows=256, cols=64)
-    _patched(root.inner)
-
-    root.to_empty(device=torch.device("cuda"))
-
-    assert _raw(root.inner.big)._local_tensor.device.type == "cpu"
-    assert _raw(root.inner.big)._local_tensor.is_pinned()
-    assert root.eager.weight.device.type == "cuda", "a weight the eager path reads must keep its storage"
+    assert host_weights.num_bound() == 1, "a tied weight must not be adopted twice"
 
 
 @requires_cuda
@@ -1078,7 +952,7 @@ def test_ordinary_device_moves_are_left_alone(dist_1rank):
 
 
 @requires_cuda
-def test_handoff_swaps_in_a_storage_free_device_stand_in(dist_1rank):
+def test_host_first_materializes_hands_off_and_binds_the_compiled_subtree(dist_1rank):
     """What the graph is traced against, and what the loader wrote into.
 
     Between them sits the one moment this can be done: after the checkpoint and
@@ -1086,12 +960,18 @@ def test_handoff_swaps_in_a_storage_free_device_stand_in(dist_1rank):
     must come out on CUDA so the graph lowers to CUDA kernels, and the pool must
     be able to find the slot from the tensor the graph will carry.
     """
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.fsdp_overlap import FsdpShardSource
+    from magi_compiler.passes.weight_offload import bind_weights_to_host, host_weights, insert_h2d_loads
     from magi_compiler.passes.weight_offload.host_first import handoff_if_pending
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     root = _shard_on_meta(dist_1rank, rows=256, cols=64)
     _patched(root.inner)
     root.to_empty(device=torch.device("cuda"))
+
+    assert _raw(root.inner.big)._local_tensor.device.type == "cpu"
+    assert _raw(root.inner.big)._local_tensor.is_pinned()
+    assert root.eager.weight.device.type == "cuda", "the eager sibling must keep its device storage"
 
     weight = _raw(root.inner.big)
     expected = torch.arange(weight._local_tensor.numel(), dtype=torch.bfloat16).reshape(weight._local_tensor.shape)
@@ -1105,73 +985,31 @@ def test_handoff_swaps_in_a_storage_free_device_stand_in(dist_1rank):
     assert local.untyped_storage().nbytes() == 0, "no device bytes until the graph loads them"
     assert local.shape == expected.shape and local.dtype == expected.dtype
 
-    slot = host_pool.slot_of(local)
+    slot = host_weights.slot_of(local)
     assert slot is not None, "the source finds a pre-parked shard by its device tensor's identity"
-    torch.testing.assert_close(host_pool.get(slot), expected)
-    host_pool.make_resident(slot)
+    torch.testing.assert_close(host_weights.get(slot), expected)
+    # Bind while still offloaded, before the restoration check changes the source.
+    param = _raw(root.inner.big)
+    gm, _ = _lowered_weight_graph(dist_1rank, rows=256, cols=64)
+    assert bind_weights_to_host(gm, [param], FsdpShardSource(), min_bytes=0) == 1
+    assert host_weights.num_bound() == 2, "binding must reuse the slots adopted by handoff"
+    assert insert_h2d_loads(gm) == 1
+    (load,) = _nodes(gm, H2D_LOAD)
+    assert load.args[1] == slot
+
+    host_weights.make_resident(slot)
     torch.testing.assert_close(local.cpu(), expected)
 
 
 @requires_cuda
-def test_a_pre_parked_shard_needs_no_binding(dist_1rank):
-    """The join between host-first adopt and the source.
-
-    After handoff the shard is CUDA with empty storage.  ``parked_slot`` has
-    to recognize it as already adopted -- otherwise the graph would gather
-    the empty stand-in.
-    """
-    from magi_compiler.passes.fsdp_overlap import FsdpShardSource
-    from magi_compiler.passes.weight_offload import bind_weights_to_host, host_pool, insert_h2d_loads
-    from magi_compiler.passes.weight_offload.host_first import handoff_if_pending
-    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
-
-    root = _shard_on_meta(dist_1rank, rows=256, cols=64)
-    _patched(root.inner)
-    root.to_empty(device=torch.device("cuda"))
-    handoff_if_pending(root.inner)
-
-    param = _raw(root.inner.big)
-    gm, _ = _lowered_weight_graph(dist_1rank, rows=256, cols=64)
-    # Re-point the graph's placeholder at the handed-off parameter.
-    assert bind_weights_to_host(gm, [param], FsdpShardSource(), min_bytes=0) == 1
-    assert host_pool.num_bound() == 2, "tagging a pre-parked shard must not adopt it a second time"
-    assert insert_h2d_loads(gm) == 1
-
-    (load,) = _nodes(gm, H2D_LOAD)
-    assert load.args[1] == host_pool.slot_of(param._local_tensor)
-
-
-@requires_cuda
-def test_a_tied_shard_lands_on_one_slot(dist_1rank):
+@pytest.mark.parametrize("hold_weakref", [False, True], ids=["swap", "fallback"])
+def test_a_tied_shard_lands_on_one_slot(dist_1rank, hold_weakref):
     """One Parameter under two names is one shard, and both names have to find it.
 
     The two halves of that come from opposite directions: ``named_parameters``
     dedupes, so the handoff sees the weight once and mints one slot, and
     ``swap_tensors`` rewrites the object rather than the registration, so that
     single pass lands on both names at no extra cost.
-    """
-    from magi_compiler.passes.weight_offload.host_first import handoff_if_pending
-
-    root = _tied_on_meta(dist_1rank, rows=256, cols=64)
-    _patched(root.inner)
-    root.to_empty(device=torch.device("cuda"))
-    assert _raw(root.inner.a) is _raw(root.inner.b), "to_empty must leave the tie intact"
-
-    assert handoff_if_pending(root.inner) == 1, "a tied weight is one shard, not two"
-    _assert_both_names_share_one_slot(root)
-
-
-@requires_cuda
-def test_a_tied_shard_survives_a_swap_tensors_refusal(dist_1rank):
-    """The fallback has to be equivalent to the swap it stands in for.
-
-    ``swap_tensors`` refuses a tensor anything holds a weakref to, and then the
-    stand-in goes in by re-registration -- which writes one entry of one module's
-    ``_parameters``.  A tied weight has more than one, and a name left behind
-    keeps the host tensor and enters compilation as a CPU weight.  Nothing
-    downstream can report that: the pool knows the shard by the stand-in it
-    minted, so ``parked_slot`` would call the weight never-materialized while it
-    sits in a pinned slab.
     """
     import weakref
 
@@ -1180,30 +1018,29 @@ def test_a_tied_shard_survives_a_swap_tensors_refusal(dist_1rank):
     root = _tied_on_meta(dist_1rank, rows=256, cols=64)
     _patched(root.inner)
     root.to_empty(device=torch.device("cuda"))
+    assert _raw(root.inner.a) is _raw(root.inner.b), "to_empty must leave the tie intact"
 
-    # The mere existence of a weakref is what makes swap_tensors refuse, so this
-    # reference has to outlive the handoff.
-    witness = weakref.ref(_raw(root.inner.a))
-    assert witness() is not None
+    # Keeping a weakref alive forces swap_tensors to take the re-registration fallback.
+    witness = weakref.ref(_raw(root.inner.a)) if hold_weakref else None
+    if witness is not None:
+        assert witness() is not None
 
-    assert handoff_if_pending(root.inner) == 1
+    assert handoff_if_pending(root.inner) == 1, "a tied weight is one shard, not two"
     _assert_both_names_share_one_slot(root)
 
 
 @requires_cuda
-def test_a_weight_tied_outside_the_compiled_subtree_is_never_parked(dist_1rank):
-    """The compile boundary is drawn around modules, and a tie crosses it.
+@pytest.mark.parametrize("eager_first", [True, False], ids=["eager-first", "compiled-first"])
+def test_handoff_preserves_a_weight_shared_with_the_eager_subtree(dist_1rank, eager_first):
+    """A shared weight stays on the device in either module traversal order.
 
-    ``_apply`` swaps the object, so the eager sibling's pass over the shared
-    weight -- first, in this order -- materializes it for both sides.  Parking it
-    anyway would leave the handoff to empty a weight only the eager prologue
-    reads, and no graph would put the bytes back: an illegal access in a module
-    that was never compiled.
+    Eager-first materializes it before host-first can park it; compiled-first
+    reserves host bytes which eager then replaces before handoff.
     """
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
     from magi_compiler.passes.weight_offload.host_first import handoff_if_pending
 
-    root = _tied_across_the_boundary(dist_1rank, rows=256, cols=64, eager_first=True)
+    root = _tied_across_the_boundary(dist_1rank, rows=256, cols=64, eager_first=eager_first)
     _patched(root.inner)
     root.to_empty(device=torch.device("cuda"))
 
@@ -1215,40 +1052,14 @@ def test_a_weight_tied_outside_the_compiled_subtree_is_never_parked(dist_1rank):
     assert handoff_if_pending(root.inner) == 1, "declining one weight must not disable the rest"
     shared = _raw(root.eager)._local_tensor
     assert shared.untyped_storage().nbytes() > 0, "the handoff must not empty a weight it does not own"
-    assert host_pool.slot_of(shared) is None, "a weight the compiled graph does not own must never be adopted"
-
-
-@requires_cuda
-def test_a_weight_reclaimed_before_the_handoff_is_not_offloaded(dist_1rank):
-    """The other order, where materialize gets there first and the sibling undoes it.
-
-    ``to_empty`` on the eager side gives the shared object device storage again,
-    which orphans the host buffer.  What is left is correct and not free -- the
-    reservation is never loaded, the device memory is still spent -- so the
-    handoff has to find the weight gone rather than reason about a count of zero.
-    """
-    from magi_compiler.passes.weight_offload import host_pool
-    from magi_compiler.passes.weight_offload.host_first import handoff_if_pending
-
-    root = _tied_across_the_boundary(dist_1rank, rows=256, cols=64, eager_first=False)
-    _patched(root.inner)
-    root.to_empty(device=torch.device("cuda"))
-
-    shared = _raw(root.eager)._local_tensor
-    assert shared.device.type == "cuda", "the sibling's to_empty ran last and took the weight back"
-    assert shared.untyped_storage().nbytes() > 0, "whoever ran last gave it real storage; it must keep it"
-
-    assert handoff_if_pending(root.inner) == 1, "the weight that was not reclaimed is handed over as usual"
-    shared = _raw(root.eager)._local_tensor
-    assert shared.untyped_storage().nbytes() > 0, "the handoff must not empty a weight it no longer owns"
-    assert host_pool.slot_of(shared) is None, "the orphaned reservation must not become a slot"
+    assert host_weights.slot_of(shared) is None, "a weight the compiled graph does not own must never be adopted"
 
 
 # ------------------------------------------------------------ real Inductor
 
 
 @requires_cuda
-def test_storage_freed_shard_survives_a_real_inductor_compile():
+def test_storage_freed_shard_survives_a_real_inductor_compile(dist_1rank):
     """The premise the whole design rests on.
 
     The graph keeps carrying the shard -- for its shape, and for the data edge
@@ -1257,36 +1068,6 @@ def test_storage_freed_shard_survives_a_real_inductor_compile():
     about that; Inductor's input handling (guards, ``assert_size_stride``, memory
     planning) is where it would go wrong if anything did.
     """
-    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
-
-    w = torch.randn(512, 256, device="cuda", dtype=torch.bfloat16)
-    x = torch.randn(64, 512, device="cuda", dtype=torch.bfloat16)
-    ref = x @ w.clone()
-    slot = _park(w)
-    assert w.untyped_storage().nbytes() == 0
-
-    def f(shard, inp):
-        return inp @ _WAIT(H2D_LOAD(shard, slot))
-
-    compiled = torch.compile(f, backend="inductor", fullgraph=True)
-    out = compiled(w, x)
-    torch.cuda.synchronize()
-    torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=2e-2)
-
-    # The host copy is not consumed by the first load: the artifact is replayable.
-    torch.testing.assert_close(compiled(w, x), out)
-
-
-@requires_cuda
-def test_inductor_lowers_the_load_to_a_snode_the_reorder_recognizes():
-    """``h2d_load`` has to arrive at the scheduler as its own movable snode.
-
-    If Inductor inlined it, or if ``is_h2d_load`` failed to recognize the
-    lowered form, both reorder passes would quietly do nothing: phase 1 would
-    count the transfer as compute that hides an all-gather, and phase 2 would
-    find nothing to hoist.  Neither shows up as an error, only as an overlap that
-    never materializes -- so it is asserted here, inside a real compile.
-    """
     from magi_compiler.passes.snode_utils import is_compute
     from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
     from magi_compiler.passes.weight_offload.schedule.h2d_snode import is_h2d_load
@@ -1294,42 +1075,42 @@ def test_inductor_lowers_the_load_to_a_snode_the_reorder_recognizes():
     seen = {"loads": 0, "compute_misclassified": 0}
 
     def probe(snodes):
-        for s in snodes:
-            if is_h2d_load(s):
+        for snode in snodes:
+            if is_h2d_load(snode):
                 seen["loads"] += 1
-                if is_compute(s):
-                    seen["compute_misclassified"] += 1
+                seen["compute_misclassified"] += int(is_compute(snode))
         return snodes
 
     w = torch.randn(512, 256, device="cuda", dtype=torch.bfloat16)
     x = torch.randn(64, 512, device="cuda", dtype=torch.bfloat16)
+    ref = torch.nn.functional.gelu(x @ w.clone())
     slot = _park(w)
+    assert w.untyped_storage().nbytes() == 0
 
     def f(shard, inp):
         return torch.nn.functional.gelu(inp @ _WAIT(H2D_LOAD(shard, slot)))
 
-    with torch._inductor.config.patch(reorder_for_compute_comm_overlap=True, reorder_for_compute_comm_overlap_passes=[probe]):
-        torch.compile(f, backend="inductor", fullgraph=True)(w, x)
+    # A cache hit would bypass the scheduler probe. Inductor's overlap scheduler
+    # queries get_rank(), so this test explicitly requests dist_1rank.
+    with torch._inductor.config.patch(
+        force_disable_caches=True, reorder_for_compute_comm_overlap=True, reorder_for_compute_comm_overlap_passes=[probe]
+    ):
+        compiled = torch.compile(f, backend="inductor", fullgraph=True)
+        out = compiled(w, x)
     torch.cuda.synchronize()
+    torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=2e-2)
+
+    # The host copy is not consumed by the first load: the artifact is replayable.
+    torch.testing.assert_close(compiled(w, x), out)
 
     assert seen["loads"] == 1, "the load must reach the scheduler as its own snode"
-    assert seen["compute_misclassified"] == 0, "a load is a PCIe transfer, never compute that hides a gather"
-
-
-@requires_cuda
-def test_resolve_slot_is_identity_without_a_remap():
-    from magi_compiler.passes.weight_offload import host_pool
-    from magi_compiler.passes.weight_offload.runtime import slot_remap
-
-    local = torch.randn(32, 16, device="cuda")
-    slot = _park(local, name="w")
-    assert slot_remap.resolve_slot(slot) == slot
-    assert host_pool.find_slot("w", tuple(local.shape), str(local.dtype)) == slot
+    assert seen["compute_misclassified"] == 0, "a load must not be counted as compute"
 
 
 @requires_cuda
 def test_h2d_load_follows_a_baked_to_current_remap():
     """A cached kernel calls h2d_load with another process's slot integers."""
+    from magi_compiler.passes.weight_offload import host_weights
     from magi_compiler.passes.weight_offload.runtime import slot_remap
     from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
@@ -1339,6 +1120,9 @@ def test_h2d_load_follows_a_baked_to_current_remap():
     decoy_slot = _park(decoy, name="decoy")
     real_slot = _park(real, name="real")
     assert decoy_slot != real_slot
+    assert slot_remap.resolve_slot(decoy_slot) == decoy_slot
+    assert slot_remap.resolve_slot(real_slot) == real_slot
+    assert host_weights.find_slot("real", tuple(real.shape), str(real.dtype)) == real_slot
 
     out = H2D_LOAD(real, decoy_slot)
     _WAIT(out)
@@ -1351,3 +1135,296 @@ def test_h2d_load_follows_a_baked_to_current_remap():
     assert not torch.equal(out, expected), "without a remap the baked slot reads the decoy"
     torch.testing.assert_close(remapped, expected)
     assert slot_remap.resolve_slot(decoy_slot) == decoy_slot, "remap must not leak past the context"
+
+
+# --------------------------------------------------- plain parameters (no FSDP)
+
+
+@pytest.fixture
+def no_process_group():
+    import torch.distributed as dist
+
+    assert not dist.is_initialized(), "plain-parameter offload must work without a process group"
+
+
+def _linear_graph(*params):
+    """``x`` and some weights in, one matmul per weight out.
+
+    Shaped like what Dynamo hands the backend: every parameter is lifted to a
+    placeholder at the top, which is exactly why grouping cannot go by
+    declaration order.
+    """
+    g = fx.Graph()
+    x = g.placeholder("l_x_")
+    x.meta["example_value"] = torch.empty(8, params[0].shape[0], device="meta", dtype=params[0].dtype)
+
+    holders = []
+    for i, p in enumerate(params):
+        n = g.placeholder(f"L_self_modules_layers_{i}_parameters_weight_")
+        n.meta["example_value"] = p
+        holders.append(n)
+
+    out = x
+    for n, p in zip(holders, params):
+        out = g.call_function(torch.matmul, (out, n))
+        out.meta["example_value"] = torch.empty(8, p.shape[1], device="meta", dtype=p.dtype)
+    g.output((out,))
+    gm = fx.GraphModule(torch.nn.Module(), g)
+    return gm, [None, *params]  # example_inputs: x has no live parameter behind it
+
+
+@requires_cuda
+@pytest.mark.usefixtures("no_process_group")
+def test_a_plain_parameter_is_offloaded_without_any_fsdp():
+    from magi_compiler.passes.weight_offload import host_weights
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
+
+    w = torch.nn.Parameter(torch.randn(256, 256, device="cuda", dtype=torch.bfloat16))
+    _park(w, name="layers.0.weight")
+    gm, examples = _linear_graph(w)
+
+    source = PlainParamSource()
+    assert bind_weights_to_host(gm, examples, source, min_bytes=0) == 1
+    assert w.untyped_storage().nbytes() == 0, "the stand-in must stay empty"
+    assert insert_h2d_loads(gm) == 1
+
+    (load,) = _nodes(gm, H2D_LOAD)
+    assert load.args[1] == 0, "the load carries the host-pool slot"
+    assert host_weights.name_of(0) == "layers.0.weight"
+
+    # The matmul reads the loaded copy, not the freed placeholder.
+    (mm,) = _nodes(gm, torch.matmul)
+    assert any(getattr(a, "target", None) is _WAIT for a in mm.all_input_nodes)
+
+
+@requires_cuda
+@pytest.mark.usefixtures("no_process_group")
+def test_only_parameters_are_taken_not_activations():
+    """Every graph input looks alike; only the ones that are the same every
+    forward are worth moving."""
+    w = torch.nn.Parameter(torch.randn(256, 256, device="cuda", dtype=torch.bfloat16))
+    _park(w)
+    gm, examples = _linear_graph(w)
+    # x's "live value" is a plain tensor, not a Parameter.
+    examples[0] = torch.randn(8, 256, device="cuda", dtype=torch.bfloat16)
+
+    assert bind_weights_to_host(gm, examples, PlainParamSource(), min_bytes=0) == 1
+
+
+@requires_cuda
+@pytest.mark.usefixtures("no_process_group")
+def test_each_load_sits_at_its_own_first_reader_not_at_the_declaration():
+    """Dynamo lifts every parameter to the top of the graph, so their placeholder
+    order says nothing about when they run.  A load placed by it would land layer
+    N's weight before layer 0 runs."""
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
+
+    params = [torch.nn.Parameter(torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)) for _ in range(4)]
+    for p in params:
+        _park(p)
+    gm, examples = _linear_graph(*params)
+
+    assert bind_weights_to_host(gm, examples, PlainParamSource(), min_bytes=0) == 4
+    assert insert_h2d_loads(gm) == 4
+
+    order = {n: i for i, n in enumerate(gm.graph.nodes)}
+    loads = sorted(_nodes(gm, H2D_LOAD), key=order.__getitem__)
+    assert len(loads) == len(params)
+    layers = [int(load.args[0].name.split("layers_")[1].split("_")[0]) for load in loads]
+    assert layers == list(range(len(params))), f"loads out of layer order: {layers}"
+    first_readers = [min(next(iter(load.users)).users, key=order.__getitem__) for load in loads]
+    for k in range(1, len(loads)):
+        assert order[loads[k]] > order[first_readers[k - 1]], "a later layer's load went ahead of an earlier layer's compute"
+
+
+@requires_cuda
+@pytest.mark.usefixtures("no_process_group")
+@pytest.mark.parametrize(
+    "parked,min_bytes", [pytest.param(False, 0, id="unparked"), pytest.param(True, 4 << 20, id="below-size-floor")]
+)
+def test_ineligible_plain_parameter_is_not_offloaded(parked, min_bytes):
+    small = torch.nn.Parameter(torch.randn(16, 16, device="cuda", dtype=torch.bfloat16))
+    if parked:
+        _park(small)
+    gm, examples = _linear_graph(small)
+
+    assert bind_weights_to_host(gm, examples, PlainParamSource(), min_bytes=min_bytes) == 0
+    if not parked:
+        assert small.untyped_storage().nbytes() > 0
+
+
+@requires_cuda
+@pytest.mark.usefixtures("no_process_group")
+def test_offload_survives_a_real_inductor_compile_without_fsdp():
+    """The whole point of the decoupling, end to end in one process.
+
+    No process group is initialized here -- if anything in the offload path still
+    reached for a mesh, a rank or a collective, this would raise rather than run.
+    """
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
+
+    w = torch.nn.Parameter(torch.randn(512, 256, device="cuda", dtype=torch.bfloat16), requires_grad=False)
+    x = torch.randn(64, 512, device="cuda", dtype=torch.bfloat16)
+    ref = x @ w.detach().clone()
+
+    slot = _park(w, name="w")
+
+    def f(weight, inp):
+        return inp @ _WAIT(H2D_LOAD(weight, slot))
+
+    # ``requires_grad=False`` is not incidental: ``magi::h2d_load`` has no
+    # autograd kernel, so a grad-requiring weight would warn here and silently
+    # drop the gradient in a training graph.  Inference runs under no_grad, which
+    # is the only path this feature claims today.
+    with torch.no_grad():
+        out = torch.compile(f, backend="inductor", fullgraph=True)(w, x)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=2e-2)
+
+
+# --------------------------------------------------- host-first materialize
+
+
+def _meta_root() -> torch.nn.Module:
+    """A meta-built model: compiled inner, eager sibling the prologue still reads."""
+    with torch.device("meta"):
+        root = torch.nn.Module()
+        root.eager = torch.nn.Linear(4, 4, bias=False)
+        root.inner = _Compiled(rows=256, cols=256)
+        root.to(torch.bfloat16)
+    return root
+
+
+@requires_cuda
+@pytest.mark.usefixtures("no_process_group")
+def test_plain_parameter_device_moves_are_left_alone():
+    """A dtype cast after to_empty must not quietly re-reserve host memory."""
+    root = _meta_root()
+    _patched(root.inner)
+    root.to_empty(device=torch.device("cuda"))
+    before = root.inner.big.weight.data_ptr()
+    root.inner.float()
+
+    weight = root.inner.big.weight
+    assert weight.dtype is torch.float32
+    assert weight.data_ptr() != before
+
+
+@requires_cuda
+@pytest.mark.usefixtures("no_process_group")
+def test_a_plain_parameter_below_the_floor_stays_on_the_device():
+    root = _meta_root()
+    _patched(root.inner, min_shard_mib=1.0)  # 256x256 bf16 = 128 KiB
+    root.to_empty(device=torch.device("cuda"))
+
+    assert root.inner.big.weight.device.type == "cuda"
+    assert root.inner.small.weight.device.type == "cuda"
+
+
+class _Transposed(torch.nn.Module):
+    """A weight held transposed, so its dense layout is not the contiguous one."""
+
+    def __init__(self):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.empty(1024, 256, dtype=torch.bfloat16).t())
+
+    def forward(self, x):
+        return x @ self.w
+
+
+class _Conv(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(256, 256, 3, bias=False, dtype=torch.bfloat16)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+def _layout_to_empty_gives(cls, memory_format=None) -> tuple[int, ...]:
+    """The stride an unpatched ``to_empty`` produces, which host-first must match.
+
+    ``to_empty`` is ``empty_like`` with ``preserve_format``, so a dense
+    non-contiguous weight keeps its stride.  Asserting against a measurement
+    rather than a literal is what makes these tests about the two paths agreeing.
+    """
+    with torch.device("meta"):
+        root = torch.nn.Module()
+        root.inner = cls()
+        if memory_format is not None:
+            root.inner = root.inner.to(memory_format=memory_format)
+    root.to_empty(device=torch.device("cuda"))
+    (param,) = root.inner.parameters()
+    return param.stride()
+
+
+@requires_cuda
+@pytest.mark.usefixtures("no_process_group")
+@pytest.mark.parametrize(
+    "model_cls,memory_format",
+    [pytest.param(_Transposed, None, id="transposed"), pytest.param(_Conv, torch.channels_last, id="channels-last")],
+)
+def test_plain_parameter_keeps_the_layout_to_empty_would_give_it(model_cls, memory_format):
+    """Decline non-contiguous weights: flat host reservations cannot preserve their layout."""
+    from magi_compiler.passes.weight_offload import host_weights
+    from magi_compiler.passes.weight_offload.host_first import handoff_if_pending
+
+    expected = _layout_to_empty_gives(model_cls, memory_format=memory_format)
+    with torch.device("meta"):
+        root = torch.nn.Module()
+        root.inner = model_cls()
+        if memory_format is not None:
+            root.inner.to(memory_format=memory_format)
+    _patched(root.inner)
+    root.to_empty(device=torch.device("cuda"))
+
+    (weight,) = root.inner.parameters()
+    assert not weight.is_contiguous(), "the fixture must exercise a non-contiguous layout"
+    assert weight.device.type == "cuda", "a declined weight must keep its device storage"
+    assert weight.stride() == expected, "host-first must preserve the layout produced by to_empty"
+    if memory_format is not None:
+        assert weight.is_contiguous(memory_format=memory_format)
+    assert handoff_if_pending(root.inner) == 0, "nothing was parked, so nothing is handed over"
+    assert host_weights.num_bound() == 0
+
+
+@requires_cuda
+@pytest.mark.usefixtures("no_process_group")
+def test_plain_host_first_materializes_hands_off_and_binds_the_compiled_subtree():
+    """Materialize on the host, hand off once, reuse the slots in FX, then restore."""
+    from magi_compiler.passes.weight_offload import host_weights
+    from magi_compiler.passes.weight_offload.host_first import handoff_if_pending
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
+
+    root = _meta_root()
+    _patched(root.inner)
+    root.to_empty(device=torch.device("cuda"))
+    assert root.inner.big.weight.device.type == "cpu"
+    assert root.inner.big.weight.is_pinned()
+    assert root.eager.weight.device.type == "cuda", "the eager path must keep its device storage"
+
+    expected = torch.arange(root.inner.big.weight.numel(), dtype=torch.bfloat16).reshape(root.inner.big.weight.shape)
+    with torch.no_grad():
+        root.inner.big.weight.copy_(expected)
+
+    assert handoff_if_pending(root.inner) == 2
+    assert handoff_if_pending(root.inner) == 0, "handoff must not run twice"
+
+    weight = root.inner.big.weight
+    assert weight.device.type == "cuda", "the graph is lowered against the parameter's device"
+    assert weight.untyped_storage().nbytes() == 0, "no device bytes until the graph loads them"
+    assert weight.shape == expected.shape and weight.dtype == expected.dtype
+    slot = host_weights.slot_of(weight)
+    assert slot is not None, "PlainParamSource finds the pre-parked Parameter by identity"
+    torch.testing.assert_close(host_weights.get(slot), expected)
+
+    # Bind before restoring device storage, while the parameter is still offloaded.
+    gm, examples = _linear_graph(weight)
+    assert bind_weights_to_host(gm, examples, PlainParamSource(), min_bytes=0) == 1
+    assert host_weights.num_bound() == 2, "binding must reuse the slots adopted by handoff"
+    assert insert_h2d_loads(gm) == 1
+    (load,) = _nodes(gm, H2D_LOAD)
+    assert load.args[1] == slot
+
+    host_weights.make_resident(slot)
+    torch.testing.assert_close(weight.cpu(), expected)

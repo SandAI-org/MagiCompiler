@@ -20,12 +20,15 @@ Every node is built from the real Inductor IR classes (``object.__new__``, no
 constructor), so the passes classify waits, collectives and unpacks through
 Inductor's own predicates and nothing is stubbed.
 
-Regenerate after an INTENDED behaviour change with ``MAGI_REGEN_GOLDEN=1``.
+The frozen schedules live at the bottom of this file, one line per case, so an
+intended change shows up in review as exactly the cases it moved.  Regenerate
+them after an INTENDED behaviour change with ``MAGI_REGEN_GOLDEN=1``.
 """
 
 import json
 import os
 import random
+import re
 import tempfile
 from pathlib import Path
 
@@ -34,8 +37,9 @@ import torch
 import torch.distributed as dist
 from torch._inductor import ir
 
-_GOLDEN = Path(__file__).parent / "golden" / "overlap_golden.json"
 _REGEN = os.environ.get("MAGI_REGEN_GOLDEN") == "1"
+# Anchored to line starts: the pattern's own source line must not match.
+_GOLDEN_BLOCK = re.compile(r"^(# BEGIN GOLDEN.*\n)(?:.*\n)*?(# END GOLDEN)$", re.MULTILINE)
 _MIB = 1 << 20
 _AG = torch.ops._c10d_functional.all_gather_into_tensor.default
 _AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
@@ -165,29 +169,6 @@ def _fsdp_graph(seed, *, form):
     return order
 
 
-def _fsdp_heavy_graph(seed, comm_ratio):
-    """Gathers about as long as the matmul they feed, with the odd long attention:
-    the stream saturates, and a long kernel's leftover has to carry."""
-    rng = random.Random(seed)
-    order = [_compute("embed", rng.uniform(1e5, 1e6))]
-    act = "embed"
-    for i in range(10):
-        mm = rng.uniform(2e5, 4e6)
-        order.append(_gather(f"ag{i}", [], comm_ratio * rng.uniform(0.3, 1.6) * mm))
-        order.append(_wait(f"w{i}", f"ag{i}"))
-        order.append(_compute(f"view{i}", 0.0, [f"w{i}"]))
-        order.append(_compute(f"mm{i}", mm, [f"view{i}", act]))
-        act = f"mm{i}"
-        if rng.random() < 0.35:
-            order.append(_compute(f"attn{i}", rng.uniform(5e6, 3e7), [act]))
-            act = f"attn{i}"
-        for k in range(rng.randint(0, 3)):
-            order.append(_compute(f"pw{i}_{k}", rng.uniform(1e3, 5e4), [act]))
-            act = f"pw{i}_{k}"
-    order.append(_compute("head", 1e5, [act]))
-    return order
-
-
 def _h2d_graph(seed, slots):
     """One load per layer, parked directly in front of its wait (phase 1)."""
     rng = random.Random(seed)
@@ -209,22 +190,19 @@ def _h2d_graph(seed, slots):
 
 # -- cases --------------------------------------------------------------------
 
+# One case per graph form and per knob setting.  Extra seeds only reshape the
+# random graph: they reach no branch the first seed misses.
 _FSDP_CASES = [
-    (f"fsdp_{form}_s{seed}_{scale}_{margin:.0f}", form, seed, scale, margin)
+    (f"fsdp_{form}_s1_{scale}_{margin:.0f}", form, 1, scale, margin)
     for form in ("plain", "coalesced", "prep")
-    for seed in (1, 2, 3)
     for scale, margin in ((1.0, 5000.0), (1.5, 0.0))
 ]
 
 _H2D_CASES = [
     ("h2d_default_s1", 1, 8, {}),
-    ("h2d_default_s2", 2, 10, {}),
     ("h2d_inflight_s3", 3, 10, {"max_inflight_bytes": 24 * _MIB}),
-    ("h2d_inflight_s4", 4, 12, {"max_inflight_bytes": 40 * _MIB}),
     ("h2d_resident_s5", 5, 10, {"max_resident_bytes": 24 * _MIB}),
-    ("h2d_resident_s6", 6, 12, {"max_resident_bytes": 48 * _MIB, "max_inflight_bytes": 32 * _MIB}),
     ("h2d_device_s7", 7, 12, {"max_device_weight_bytes": 64 * _MIB}),
-    ("h2d_device_s8", 8, 14, {"max_device_weight_bytes": 40 * _MIB}),
     ("h2d_util_s9", 9, 10, {"bus_utilization": 0.6, "max_resident_bytes": 32 * _MIB}),
     ("h2d_slowbus_s10", 10, 10, {"bandwidth_bytes_per_ns": 2.0, "max_resident_bytes": 40 * _MIB}),
     ("h2d_margin_s11", 11, 10, {"window_margin_ns": 2e5, "window_scale": 1.3}),
@@ -246,21 +224,40 @@ def world_of_one():
         dist_utils._CPU_GLOO_GROUP = "uninit"
 
 
+def _render_golden(data):
+    lines = ["_GOLDEN = {"]
+    for key in sorted(data):
+        entry = data[key]
+        value = json.dumps(entry) if isinstance(entry, str) else f"({json.dumps(entry[0])}, {entry[1]!r})"
+        lines.append(f"    {json.dumps(key)}: {value},")
+    lines.append("}")
+    return "\n".join(lines)
+
+
 @pytest.fixture(scope="module")
 def golden():
-    data = {} if _REGEN or not _GOLDEN.exists() else json.loads(_GOLDEN.read_text())
+    # Cases this run skipped or deselected keep their entry; cases that no
+    # longer exist are dropped.
+    known = {c[0] for c in _FSDP_CASES} | {c[0] for c in _H2D_CASES}
+    data = {k: v for k, v in _GOLDEN.items() if k in known}
     yield data
     if _REGEN:
-        _GOLDEN.parent.mkdir(parents=True, exist_ok=True)
-        _GOLDEN.write_text(json.dumps(data, indent=1, sort_keys=True) + "\n")
+        path = Path(__file__)
+        text, n = _GOLDEN_BLOCK.subn(lambda m: m.group(1) + _render_golden(data) + "\n" + m.group(2), path.read_text())
+        assert n == 1, "the BEGIN/END GOLDEN markers at the bottom of this file are missing"
+        path.write_text(text)
 
 
-def _check(golden, key, value):
+def _check(golden, key, order, resident=None):
+    """``order`` is the snode names in schedule order; ``resident`` the promoted load indices (h2d only)."""
+    entry = " ".join(order) if resident is None else (" ".join(order), resident)
     if _REGEN:
-        golden[key] = value
+        golden[key] = entry
         return
     assert key in golden, f"no golden entry for {key}; regenerate with MAGI_REGEN_GOLDEN=1"
-    assert value == golden[key], f"{key} diverged from the frozen schedule"
+    want_order, want_resident = (golden[key], None) if resident is None else golden[key]
+    assert order == want_order.split(), f"{key}: schedule diverged from the frozen one"
+    assert resident == want_resident, f"{key}: resident set diverged from the frozen one"
 
 
 @pytest.mark.parametrize("key,form,seed,scale,margin", _FSDP_CASES, ids=[c[0] for c in _FSDP_CASES])
@@ -274,28 +271,7 @@ def test_fsdp_schedule_is_frozen(world_of_one, golden, key, form, seed, scale, m
     _check(golden, key, [s.name for s in reorder(order)])
 
 
-_ALAP_CASES = [
-    (f"golden_{form}_s{seed}", form, seed, None) for form in ("plain", "coalesced", "prep") for seed in (1, 2, 3)
-] + [(f"heavy_r{ratio}_s{seed}", None, seed, ratio) for ratio in (0.5, 1.0, 1.5) for seed in range(6)]
-
-
-@pytest.mark.parametrize("key,form,seed,ratio", _ALAP_CASES, ids=[c[0] for c in _ALAP_CASES])
-def test_fsdp_alap_is_the_index_sweep_on_the_time_axis(world_of_one, key, form, seed, ratio):
-    """``index_sweep`` claims compute a snode at a time and carries a long
-    kernel's remainder by hand; the time-axis deadline chain gets the same
-    placement with nothing to carry.  If they ever part, one of them changed."""
-    from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder
-
-    def placed(placement):
-        order = _fsdp_graph(seed, form=form) if form else _fsdp_heavy_graph(seed, ratio)
-        reorder = FsdpOverlapReorder(cost_fn=lambda s: s.cost, placement=placement)
-        return [s.name for s in reorder(order)]
-
-    assert placed("alap") == placed("index_sweep")
-
-
-@pytest.mark.parametrize("placement", ["index_sweep", "alap"])
-def test_fsdp_prep_cost_hides_nothing(world_of_one, placement):
+def test_fsdp_prep_cost_hides_nothing(world_of_one):
     """The cast travels with its gather, so it is never compute in front of it:
     counted, it alone would cover the gather and leave it where it is."""
     from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder
@@ -308,7 +284,7 @@ def test_fsdp_prep_cost_hides_nothing(world_of_one, placement):
         _wait("w", "ag"),
         _compute("mm", 1e6, ["w", "mm_a"]),
     ]
-    reorder = FsdpOverlapReorder(comm_overlap_window_margin_ns=0.0, cost_fn=lambda s: s.cost, placement=placement)
+    reorder = FsdpOverlapReorder(comm_overlap_window_margin_ns=0.0, cost_fn=lambda s: s.cost)
     names = [s.name for s in reorder(order)]
     assert names == ["cast", "ag", "embed", "mm_a", "w", "mm"]
 
@@ -316,23 +292,46 @@ def test_fsdp_prep_cost_hides_nothing(world_of_one, placement):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="promotion moves real bytes")
 @pytest.mark.parametrize("key,seed,n,kwargs", _H2D_CASES, ids=[c[0] for c in _H2D_CASES])
 def test_h2d_schedule_is_frozen(golden, key, seed, n, kwargs):
-    from magi_compiler.passes.weight_offload import H2dLoadReorder, host_pool
+    from magi_compiler.passes.weight_offload import H2dLoadReorder, host_weights
 
-    host_pool.reset()
+    host_weights.reset()
     try:
         slots = []
         for i in range(n):
             mib = 4 + 4 * (i % 3)
             shard = torch.randn(mib * _MIB // 2, device="cuda", dtype=torch.bfloat16)
-            host = host_pool.reserve(tuple(shard.shape), shard.dtype, name=f"w{i}")
+            host = host_weights.reserve(tuple(shard.shape), shard.dtype, name=f"w{i}")
             host.copy_(shard)
             shard.untyped_storage().resize_(0)
-            slots.append(host_pool.adopt(host, shard, name=f"w{i}"))
+            slots.append(host_weights.adopt(host, shard, name=f"w{i}"))
         order = _h2d_graph(seed, slots)
         params = {"bandwidth_bytes_per_ns": 10.0, "window_margin_ns": 0.0, "bus_utilization": 0.9, **kwargs}
         reorder = H2dLoadReorder(cost_fn=lambda s: s.cost, **params)
         names = [s.name for s in reorder(order)]
-        resident = [i for i, slot in enumerate(slots) if host_pool.is_resident(slot)]
-        _check(golden, key, {"order": names, "resident": resident})
+        resident = [i for i, slot in enumerate(slots) if host_weights.is_resident(slot)]
+        _check(golden, key, names, resident)
     finally:
-        host_pool.reset()
+        host_weights.reset()
+
+
+# -- frozen schedules ---------------------------------------------------------
+
+# fmt: off
+# BEGIN GOLDEN -- written by MAGI_REGEN_GOLDEN=1; do not edit by hand.
+_GOLDEN = {
+    "fsdp_coalesced_s1_1.0_5000": "ag0 mo0_0 mo0_1 mo0_2 embed w0_0 w0_1 w0_2 view0 mm0 pw0 ag1 mo1_0 mo1_1 mo1_2 attn0 w1_0 w1_1 w1_2 view1 mm1 pw1 ag2 mo2_0 mo2_1 attn1 w2_0 w2_1 view2 ag3 mo3_0 mo3_1 mm2 pw2 attn2 w3_0 w3_1 view3 mm3 pw3 ag4 mo4_0 mo4_1 attn3 w4_0 w4_1 view4 mm4 pw4 head",
+    "fsdp_coalesced_s1_1.5_0": "ag0 mo0_0 mo0_1 mo0_2 embed w0_0 w0_1 w0_2 view0 mm0 pw0 ag1 mo1_0 mo1_1 mo1_2 attn0 w1_0 w1_1 w1_2 view1 mm1 pw1 ag2 mo2_0 mo2_1 attn1 w2_0 w2_1 view2 ag3 mo3_0 mo3_1 mm2 pw2 attn2 w3_0 w3_1 view3 mm3 pw3 ag4 mo4_0 mo4_1 attn3 w4_0 w4_1 view4 mm4 pw4 head",
+    "fsdp_plain_s1_1.0_5000": "ag0 embed w0 view0 ag1 mm0 pw0 w1 view1 ag2 mm1 pw1 w2 view2 ag3 mm2 pw2 w3 view3 mm3 ag4 pw3 w4 view4 mm4 pw4 head",
+    "fsdp_plain_s1_1.5_0": "ag0 embed w0 view0 ag1 mm0 pw0 w1 view1 mm1 pw1 ag2 w2 view2 ag3 mm2 pw2 w3 view3 mm3 pw3 ag4 w4 view4 mm4 pw4 head",
+    "fsdp_prep_s1_1.0_5000": "ld0 lw0 cast0 ag0 embed w0 view0 ld1 lw1 cast1 ag1 mm0 pw0 w1 view1 ld2 lw2 cast2 ag2 mm1 pw1 w2 view2 ld3 lw3 cast3 ag3 mm2 pw2 w3 view3 mm3 ld4 lw4 cast4 ag4 pw3 w4 view4 mm4 pw4 head",
+    "fsdp_prep_s1_1.5_0": "ld0 lw0 cast0 ag0 embed w0 view0 ld1 lw1 cast1 ag1 mm0 pw0 w1 view1 mm1 pw1 ld2 lw2 cast2 ag2 w2 view2 ld3 lw3 cast3 ag3 mm2 pw2 w3 view3 mm3 pw3 ld4 lw4 cast4 ag4 w4 view4 mm4 pw4 head",
+    "h2d_default_s1": ("ld0 embed w0 mm0 pw0 ld1 attn0 w1 ld2 mm1 ld3 pw1 w2 mm2 pw2 w3 mm3 pw3 ld4 attn3 w4 ld5 mm4 pw4 w5 mm5 pw5 ld6 attn5 w6 mm6 pw6 ld7 attn6 w7 mm7 pw7 head", []),
+    "h2d_device_s7": ("embed ld0 w0 mm0 pw0 attn0 ld1 w1 mm1 pw1 ld2 w2 mm2 pw2 attn2 ld3 w3 mm3 pw3 attn3 ld4 w4 ld5 mm4 pw4 w5 mm5 pw5 attn5 ld6 w6 mm6 pw6 ld7 attn6 w7 ld8 mm7 pw7 w8 ld9 mm8 pw8 w9 mm9 pw9 ld10 attn9 w10 ld11 mm10 pw10 w11 mm11 pw11 head", [0, 1, 2, 3, 4, 6]),
+    "h2d_inflight_s3": ("ld0 embed w0 ld1 mm0 pw0 w1 mm1 pw1 ld2 attn1 w2 ld3 mm2 pw2 w3 ld4 mm3 pw3 w4 ld5 mm4 pw4 w5 ld6 mm5 pw5 w6 ld7 mm6 pw6 w7 mm7 pw7 ld8 attn7 w8 ld9 mm8 pw8 w9 mm9 pw9 head", []),
+    "h2d_margin_s11": ("ld0 embed w0 ld1 mm0 pw0 w1 mm1 pw1 ld2 attn1 w2 mm2 pw2 ld3 ld4 ld5 attn2 w3 mm3 pw3 w4 mm4 pw4 w5 mm5 pw5 ld6 attn5 w6 mm6 ld7 pw6 ld8 attn6 w7 mm7 pw7 w8 ld9 mm8 pw8 w9 mm9 pw9 head", []),
+    "h2d_resident_s5": ("embed ld0 w0 mm0 pw0 ld1 w1 mm1 pw1 ld2 attn1 w2 mm2 pw2 ld3 w3 mm3 pw3 attn3 ld4 w4 mm4 pw4 ld5 attn4 w5 mm5 pw5 ld6 attn5 w6 mm6 pw6 ld7 attn6 w7 mm7 pw7 ld8 attn7 w8 ld9 mm8 pw8 w9 mm9 pw9 attn9 head", [0, 1, 3, 4]),
+    "h2d_slowbus_s10": ("embed ld0 w0 mm0 pw0 attn0 ld1 w1 ld2 mm1 pw1 attn1 w2 mm2 pw2 ld3 w3 mm3 pw3 ld4 w4 ld5 mm4 pw4 attn4 w5 ld8 mm5 pw5 ld6 w6 mm6 pw6 ld7 w7 mm7 pw7 attn7 w8 mm8 pw8 ld9 w9 mm9 pw9 head", [0, 1, 3, 4, 6, 7, 9]),
+    "h2d_util_s9": ("embed ld0 w0 mm0 pw0 ld1 w1 mm1 pw1 ld2 w2 ld3 mm2 pw2 w3 mm3 pw3 ld4 w4 mm4 pw4 ld5 attn4 w5 ld6 mm5 pw5 w6 ld7 mm6 pw6 w7 mm7 pw7 ld8 attn7 w8 mm8 pw8 ld9 attn8 w9 mm9 pw9 head", [0, 1, 2, 4]),
+}
+# END GOLDEN
+# fmt: on

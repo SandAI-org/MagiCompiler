@@ -37,7 +37,6 @@ from magi_compiler.passes import CustomJointGraphPartitionFn, FullGraphPassManag
 from magi_compiler.passes.fsdp_overlap import (
     FsdpAutoBucket,
     FsdpOverlapReorder,
-    MemoryProbe,
     bind_weights_for_copy_engine,
     lower_prim_redistribute_to_collectives,
     rewrite_weight_ag_to_copy_engine,
@@ -50,7 +49,7 @@ from magi_compiler.passes.weight_offload import (
     OffloadCache,
     PlainParamSource,
     bind_weights_to_host,
-    host_pool,
+    host_weights,
     insert_h2d_loads,
 )
 from magi_compiler.profiling import ProfilingRuntimeEstimator
@@ -673,19 +672,19 @@ class MagiBackend:
         Usually empty. Non-empty when ``host_first`` parked a weight from its
         placement but lowering never emitted an all-gather that reads it.
         """
-        from magi_compiler.passes.weight_offload import host_pool
+        from magi_compiler.passes.weight_offload import host_weights
 
         # Delta, not the pool total: the placement pass also promotes shards, and
         # ``make_resident_many`` only adds, so the difference is this call.
-        before = host_pool.resident_bytes()
-        restored = host_pool.restore_unclaimed()
+        before = host_weights.resident_bytes()
+        restored = host_weights.restore_unclaimed()
         if not restored:
             return
         magi_logger.warning(
             "host offload: %d parked weight(s) are not loaded by any compiled graph and have been put "
             "back on the device (%.1f MiB); offload is simply not helping for these. Weights: %s",
             len(restored),
-            (host_pool.resident_bytes() - before) / 2**20,
+            (host_weights.resident_bytes() - before) / 2**20,
             ", ".join(restored[:8]) + (f", +{len(restored) - 8} more" if len(restored) > 8 else ""),
         )
 
@@ -771,13 +770,7 @@ class MagiBackend:
         costs = SnodeCostTable()
         estimator = None if fsdp_cfg.cost_mode == "analytical" else ProfilingRuntimeEstimator(sync_across_ranks=True)
         passes: list = [SnodeCostProfile(costs, estimator)]
-        probe = fsdp_cfg.memory_probe
 
-        def checkpoint(tag: str) -> None:
-            if probe:
-                passes.append(MemoryProbe(tag))
-
-        checkpoint("baseline")
         if fsdp_cfg.enable_fsdp and auto_bucket:
             # Right behind the profile: it writes its result back into the list
             # Inductor passed in (see ir_coalesce), and prices the snodes it builds.
@@ -786,13 +779,8 @@ class MagiBackend:
                     cost_fn=costs,
                     max_bucket_bytes=int(fsdp_cfg.bucket_size_mib) * 1024 * 1024,
                     overhead_ratio=fsdp_cfg.auto_bucket_overhead_ratio,
-                    launch_overhead_ns=float(fsdp_cfg.auto_bucket_launch_overhead_us) * 1e3,
-                    comm_overlap_window_scale=fsdp_cfg.comm_overlap_window_scale,
-                    comm_overlap_window_margin_ns=fsdp_cfg.comm_overlap_window_margin_ns,
-                    memory_probe=probe,
                 )
             )
-            checkpoint("after auto bucket")
 
         if fsdp_cfg.enable_fsdp:
             passes.append(
@@ -800,10 +788,8 @@ class MagiBackend:
                     comm_overlap_window_margin_ns=fsdp_cfg.comm_overlap_window_margin_ns,
                     cost_fn=costs,
                     comm_overlap_window_scale=fsdp_cfg.comm_overlap_window_scale,
-                    placement=fsdp_cfg.placement,
                 )
             )
-            checkpoint("after FSDP reorder")
         else:
             # Append to Inductor's defaults.
             passes.extend(
@@ -813,17 +799,11 @@ class MagiBackend:
         if loads_inserted:
             offload_cfg = self.compile_config.offload_config
             reorder_loads = H2dLoadReorder(
-                bandwidth_bytes_per_ns=host_pool.h2d_bandwidth_bytes_per_ns(offload_cfg.offload_h2d_bandwidth_gbps),
-                window_margin_ns=offload_cfg.h2d_overlap_window_margin_ns,
-                window_scale=offload_cfg.h2d_overlap_window_scale,
-                max_resident_bytes=int(offload_cfg.offload_max_resident_mib) * 1024 * 1024,
-                max_inflight_bytes=int(offload_cfg.offload_max_inflight_mib) * 1024 * 1024,
+                bandwidth_bytes_per_ns=host_weights.h2d_bandwidth_bytes_per_ns(offload_cfg.offload_h2d_bandwidth_gbps),
                 max_device_weight_bytes=int(offload_cfg.offload_max_device_weight_mib) * 1024 * 1024,
-                bus_utilization=float(offload_cfg.offload_bus_utilization),
                 cost_fn=costs,
             )
             passes.append(reorder_loads)
-            checkpoint("after load reorder")
 
         self.inductor_compile_config["reorder_for_compute_comm_overlap"] = True
         self.inductor_compile_config["reorder_for_compute_comm_overlap_passes"] = passes
