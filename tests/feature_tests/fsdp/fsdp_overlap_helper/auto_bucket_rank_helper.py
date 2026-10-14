@@ -14,15 +14,16 @@
 
 """Two gloo ranks exercise auto-bucket consensus without CUDA or compilation.
 
-First, rank 0 discovers one candidate and rank 1 discovers two, with different
-fingerprints. Both must negotiate abort and leave their schedules unchanged;
+First, rank 0 discovers one candidate and rank 1 discovers two, with matching
+collective skeletons. Both must negotiate abort and leave their schedules unchanged;
 an early return hangs the peer and is caught by the process-group timeout.
 
 Then both ranks exercise adoption of rank 0's bucket plan:
 * same: matching collective order and signatures -> applied;
 * hop: rank 1 moves the bucket across another collective -> unbucketed;
 * signature: rank 1 has a different candidate dtype -> unbucketed;
-* identical: identical-graph mode bypasses the slot-order check -> applied.
+* same-plan-hop: both ranks planned the same buckets, but their merged orders differ -> unbucketed;
+* same-plan-illegal: rank 0's shared plan is illegal on rank 1 -> unbucketed.
 
 Each stage reports a verdict reduced across both ranks. All patches are scoped
 so that stages share only the process group, not substituted implementations.
@@ -86,22 +87,17 @@ def _check_candidate_negotiation() -> bool:
     def candidates(order):
         return list(order[:n_cands])
 
-    def fingerprint(order):
-        return f"fp-{rank}"
-
     seen: dict = {}
     real_negotiate = rank_sync.negotiate_mode
 
-    def negotiate(order, anchors, skel_kinds, costs_ok=True, who="FSDP overlap"):
-        mode, group, world = real_negotiate(order, anchors, skel_kinds, costs_ok, who=who)
+    def negotiate(anchors, skel_kinds, costs_ok=True, who="FSDP overlap"):
+        mode, group, world = real_negotiate(anchors=anchors, skel_kinds=skel_kinds, costs_ok=costs_ok, who=who)
         seen["mode"] = mode
         seen["n"] = len(anchors)
         return mode, group, world
 
-    with (
-        patch.object(FsdpAutoBucket, "_candidates", staticmethod(candidates)),
-        patch.object(rank_sync, "graph_fingerprint", fingerprint),
-        patch.object(rank_sync, "negotiate_mode", negotiate),
+    with patch.object(FsdpAutoBucket, "_candidates", staticmethod(candidates)), patch.object(
+        rank_sync, "negotiate_mode", negotiate
     ):
         snodes = [_CandidateSnode() for _ in range(3)]
         out = FsdpAutoBucket(cost_fn=lambda s: 0.0)(snodes)
@@ -121,23 +117,24 @@ def _check_slot_consensus() -> bool:
     odd_sig = [sig[0], ("nccl", 2, "torch.float32"), sig[2]]
 
     cases = [
-        # (name, mode, rank 1's merged order, rank 1's signature, expected)
-        ("same", "slot", before_x, sig, "applied"),
-        ("hop", "slot", after_x, sig, "unbucketed"),
-        ("signature", "slot", before_x, odd_sig, "unbucketed"),
-        ("identical", "identical", after_x, sig, "applied"),
+        # (name, rank 1's merged order, rank 1's signature, same plan, expected)
+        ("same", before_x, sig, False, "applied"),
+        ("hop", after_x, sig, False, "unbucketed"),
+        ("signature", before_x, odd_sig, False, "unbucketed"),
+        ("same-plan-hop", after_x, sig, True, "unbucketed"),
+        ("same-plan-illegal", None, sig, True, "unbucketed"),
     ]
     ok = True
-    for name, mode, odd_merged, odd_signature, expected in cases:
+    for name, odd_merged, odd_signature, same_plan, expected in cases:
         merged = odd_merged if rank == 1 else before_x
         signature = odd_signature if rank == 1 else sig
         with patch.object(FsdpAutoBucket, "_merged", staticmethod(lambda order, buckets, m=merged: m)), patch.object(
             FsdpAutoBucket, "_signature", staticmethod(lambda cands, s=signature: s)
         ):
             p = FsdpAutoBucket(cost_fn=lambda s: 0.0)
-            # Rank 1 planned no buckets of its own, so it must take rank 0's.
-            buckets = [[g0, g1]] if rank == 0 else []
-            out = p._adopt(True, buckets, order, cands, None, world, mode, skeleton)
+            # Every rank adopts rank 0's plan, even when its own plan differs.
+            buckets = [[g0, g1]] if rank == 0 or same_plan else []
+            out = p._adopt(ok=True, buckets=buckets, order=order, cands=cands, group=None, world=world, skeleton=skeleton)
         got = "unbucketed" if out is None else "applied"
         if out is not None and [[s.name for s in b] for b in out] != [["g0", "g1"]]:
             got = f"wrong:{out}"

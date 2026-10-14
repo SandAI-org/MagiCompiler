@@ -12,43 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Build a compiled module's weights in host memory, so they are never on the device.
+"""Materialize offloaded weights in pinned host memory before checkpoint loading.
 
-``to_empty`` is the single place a meta-built model turns into real storage, so a
-patched ``_apply`` hands back pinned host memory for the weights that offload is
-going to want.  The checkpoint reads straight into it.  Nothing about the loader
-changes: it still sees DTensors of the right global shape, dtype, layout and
-sharding, and ``dcp.load`` still writes them in place.  Peak device memory stays
-at the resident set instead of the whole model.  A weight whose layout a flat
-reservation cannot reproduce is left on the device rather than quietly
-straightened out, which is what keeps that list honest.
+A per-instance ``_apply`` hook redirects CUDA ``to_empty`` only for contiguous,
+meta-backed weights supported by the weight sources. Other weights keep their
+normal placement. DTensor mesh, placements and global shape are preserved.
 
-Two properties make this safe rather than clever:
-
-* **Scope comes from the module tree, not a list.**  ``nn.Module._apply``
-  recurses into children, so patching the class that ``@magi_compile`` decorates
-  intercepts exactly the subtree that will be compiled.  Weights outside it --
-  an embedding, a final projection, anything the eager prologue touches -- never
-  reach this code and keep their device storage.
-
-  The boundary is drawn around modules, and a weight tied across it belongs to
-  both sides: one Parameter object, registered inside the subtree and out.
-  ``_apply`` swaps the object rather than the registration, so whichever side
-  runs last decides what the object holds, and neither side can see the other.
-  Both orders are handled here instead of left to chance -- materialize declines
-  a weight that already has storage, and the handoff says so when one it parked
-  has been given storage again -- because the outcome of guessing is an illegal
-  access in a module that was never compiled.
-* **The graph never sees a host tensor.**  :func:`handoff` runs on the first
-  call, before Dynamo traces: each parked weight becomes a CUDA tensor with
-  zero-length storage, and the host buffer is adopted into the pool under its
-  slot.  From there ``slot_of`` finds the shard, ``h2d_load`` fetches it, and
-  ``H2dLoadReorder`` decides which ones go back to the device because nothing
-  could hide their transfer.
-
-The same path covers an unsharded ``nn.Parameter``.  There is no local shard
-and no mesh: the parameter itself is what gets reserved, adopted, and later
-looked up by ``PlainParamSource``.
+After loading and weight post-processing, ``handoff`` installs storage-free CUDA
+stand-ins before Dynamo traces and registers their host buffers by tensor identity.
+Tied weights share one reservation and slot, with every registration updated.
+Weights tied outside the compiled subtree stay resident if already materialized;
+ones reclaimed by a later external ``_apply`` are reported at handoff.
 """
 
 from __future__ import annotations
@@ -61,13 +35,7 @@ from magi_compiler.utils import magi_logger
 from .runtime import host_weights
 
 _TO_EMPTY = "Module.to_empty.<locals>.<lambda>"
-"""Qualname of the callable ``nn.Module.to_empty`` hands to ``_apply``.
-
-Matching on it rather than on every ``_apply`` is the difference between
-"materialize this meta model" and the dozen other things ``_apply`` does -- a
-dtype cast, a device move, pinning -- none of which should quietly redirect a
-weight into host memory.
-"""
+"""Only intercept ``to_empty``; other ``_apply`` uses must preserve device/dtype behavior."""
 
 _PENDING_ATTR = "_magi_host_first_pending"
 """Set on an instance whose weights are waiting in host memory for their handoff."""
@@ -88,21 +56,8 @@ def _is_dtensor(param: object) -> bool:
 
 
 def _is_offloadable(param: object) -> bool:
-    """True for a weight a later source can be made to load back.
-
-    Two shapes, matching the two ``WeightSource`` implementations:
-
-    * A ``Shard(0)`` or ``Replicate`` DTensor -- ``FsdpShardSource``.  Replicate
-      is the one worth spelling out: SimpleFSDP falls back to it for a weight
-      whose dim0 does not divide the mesh, so every rank holds a FULL copy, and
-      it is the last one to want left resident.
-    * An unsharded ``nn.Parameter`` -- ``PlainParamSource``.  No mesh, no local
-      shard; the parameter is the weight.
-
-    A weight parked here that the graph then declines to load would be read as
-    freed storage, so this has to agree with the source.  ``restore_unclaimed``
-    catches what they still miss.
-    """
+    """Must agree with the weight sources: plain Parameters or single Shard(0)/Replicate DTensors.
+    ``restore_unclaimed`` restores parked weights that no graph loads."""
     from torch.distributed.tensor import DTensor, Replicate, Shard
 
     if isinstance(param, DTensor):
@@ -115,25 +70,14 @@ def _is_offloadable(param: object) -> bool:
 
 
 def _pretty(name: str) -> str:
-    """``layers.0.attn.wq.parametrizations.weight.original`` -> ``layers.0.attn.wq.weight``.
-
-    SimpleFSDP's parametrization buries every weight two levels down, and the
-    placement log prints these next to each other at forty layers; ``param_name``
-    does the same tidying for the names Dynamo produces.
-    """
+    """``layers.0.attn.wq.parametrizations.weight.original`` -> ``layers.0.attn.wq.weight``."""
     parts = [p for p in name.split(".") if p not in ("parametrizations", "original")]
     return ".".join(parts) or name
 
 
 def _rebuild(param, local: torch.Tensor):
-    """``param`` with ``local`` behind it, same mesh, placements and global shape.
-
-    ``DTensor.from_local`` cannot be used: it moves the local tensor to the
-    mesh's device type, which for a CUDA mesh would pull the host buffer onto the
-    GPU and undo the whole point.  The low-level constructor takes the tensor as
-    given, which is what both directions of the swap need -- host on the way in,
-    storage-free CUDA on the way out.
-    """
+    """Preserve DTensor metadata without moving ``local`` to the mesh device.
+    ``DTensor.from_local`` would copy a host reservation onto CUDA."""
     from torch.distributed.tensor import DTensor
     from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 
@@ -143,37 +87,15 @@ def _rebuild(param, local: torch.Tensor):
 
 
 def _replace_param(module: nn.Module, names: list[str], param: nn.Parameter, new_data) -> nn.Parameter:
-    """Point every path in ``names`` at ``new_data``.  Returns the parameter that ended up registered.
-
-    ``swap_tensors`` first, because it keeps the very object SimpleFSDP's
-    parametrization registered and every other reference already points at.  It
-    refuses a tensor anything holds a weakref to, so re-registration by path is
-    the fallback; both are only legal before the first trace, which is where
-    this runs.
-
-    The two are not interchangeable, and a tied weight is where the difference
-    shows: ``swap_tensors`` rewrites the object, so one call reaches every name
-    that shares it, while re-registration writes one entry of one module's
-    ``_parameters``.  Walking ``names`` is what keeps the fallback equivalent --
-    a path left behind would still hold the host tensor and enter compilation as
-    a CPU weight, which nothing downstream can detect: the pool knows the shard
-    by the stand-in it minted, not by the bytes, so ``parked_slot`` would report
-    the weight as never materialized while it sits in a pinned slab.
-
-    Which object comes back matters, and not only for tidiness: ``nn.Parameter``
-    detaches what it is given, so the local tensor behind the registered
-    parameter is a *different object* from the one handed in, sharing its
-    storage.  The pool keys slots by object identity, so it has to be told about
-    the one that survived.
-    """
+    """Replace before tracing, updating every tied registration if ``swap_tensors`` fails.
+    Return the registered Parameter: construction can detach the input, and the
+    host store must key its slot on the object the graph will actually use."""
     replacement = nn.Parameter(new_data, requires_grad=param.requires_grad)
     try:
         torch.utils.swap_tensors(param, replacement)
         return param
     except Exception as exc:  # noqa: BLE001
-        # Warning, not debug: this is the branch where the in-place guarantee the
-        # rest of the handoff leans on is gone, and the re-registration below has
-        # to stand in for it.
+        # Re-registration must update every tied path when identity cannot be preserved.
         magi_logger.warning(
             "host offload: swap_tensors on %s failed (%s); re-registering %d path(s) instead", names[0], exc, len(names)
         )
@@ -186,22 +108,9 @@ def _replace_param(module: nn.Module, names: list[str], param: nn.Parameter, new
 
 
 def _parked_params(module: nn.Module) -> list[tuple[list[str], nn.Parameter]]:
-    """Every weight of ``module`` living in the host pool's slabs, with every path it answers to.
-
-    Identified by where the bytes are rather than by a side table: only this
-    file redirects a compiled module's weights onto the host, so after
-    ``to_empty(cuda)`` a CPU payload is unambiguous -- a DTensor local under a
-    CUDA mesh, or an unsharded Parameter that is itself on CPU.  Reading it off
-    the tensor cannot go stale the way a registry keyed on objects ``_apply``
-    swaps would.
-
-    A tied weight is one Parameter object registered under several names, and
-    the handoff needs both halves of that fact: grouping on identity is what
-    keeps the shard on a single slot, and keeping the names is what lets
-    :func:`_replace_param` reach every registration site.  ``named_parameters``
-    would hand back only the first name -- it dedupes by default -- so the walk
-    asks for the duplicates and does the grouping itself.
-    """
+    """Group CPU payloads by Parameter identity, retaining every tied registration.
+    After CUDA ``to_empty``, these are the weights redirected into host slabs;
+    all names are needed if handoff falls back to re-registration."""
     groups: dict[int, tuple[list[str], nn.Parameter]] = {}
     for name, param in module.named_parameters(recurse=True, remove_duplicate=False):
         if _is_dtensor(param):
@@ -214,28 +123,12 @@ def _parked_params(module: nn.Module) -> list[tuple[list[str], nn.Parameter]]:
 
 
 def _warn_about_reclaimed(module: nn.Module, parked: list[tuple[list[str], nn.Parameter]]) -> None:
-    """Say so when a weight materialize parked is no longer on the host.
-
-    One thing takes a parked weight back: an ``_apply`` outside the compiled
-    subtree reaching the same Parameter object, which is what a weight tied
-    across the compile boundary looks like from in here.  ``_apply`` swaps the
-    object rather than the registration, so the sibling's ``to_empty`` gives the
-    shared object device storage again and the host buffer is orphaned.
-
-    Nothing is broken afterwards -- the weight has real storage and every reader
-    of it works -- but the pinned reservation behind it will never be loaded and
-    the device memory the offload was asked to save is still spent, while the
-    materialize log has already claimed the opposite.  Silence is the wrong
-    default for that: an offload that quietly does nothing reads exactly like one
-    that worked, and the only visible difference is a high-water mark that did
-    not move.
-    """
+    """Report weights parked here but re-materialized by an external ``_apply``.
+    They remain readable on the device but no longer save offload memory."""
     expected = getattr(module, _PARKED_ATTR, None)
     if not expected:
         return
-    # One reconciliation per materialize: the record describes a single
-    # to_empty, and a second handoff over an already handed-off module would
-    # otherwise find every name missing and say so.
+    # Consume the record once; a repeated handoff would otherwise report every name missing.
     setattr(module, _PARKED_ATTR, [])
     found = {_pretty(name) for names, _ in parked for name in names}
     missing = [name for name in expected if name not in found]
@@ -251,14 +144,9 @@ def _warn_about_reclaimed(module: nn.Module, parked: list[tuple[list[str], nn.Pa
 
 
 def patch_materialize(instance: nn.Module, conf) -> None:
-    """Make ``to_empty`` on ``instance`` build its offloadable weights in host memory.
+    """Redirect CUDA ``to_empty`` for this compiled instance's offloadable weights.
 
-    Per instance rather than per class, because that is where the compile
-    decision is: ``@magi_compile`` on a class and ``magi_compile(module)`` on an
-    object both funnel through the same per-instance hook, and an instance of the
-    decorated class that is never compiled has no business losing its weights.
-    Every use of ``_apply`` other than ``to_empty`` passes straight through.
-    """
+    Other instances and other ``_apply`` operations retain their normal behavior."""
     if getattr(instance, "_magi_host_first_installed", False):
         return
     min_bytes = int(conf.offload_config.offload_min_shard_mib * 1024 * 1024)
@@ -276,9 +164,7 @@ def patch_materialize(instance: nn.Module, conf) -> None:
         if target.type != "cuda":
             return orig_apply(self, fn, recurse=recurse)
 
-        # Resolved before _apply runs: it swaps the parameter objects as it goes,
-        # so a predicate evaluated inside the callback would be reading tensors
-        # that are halfway through being replaced.
+        # Resolve candidates before _apply starts swapping parameter objects.
         chosen = {}
         shared = []
         strided = []
@@ -291,26 +177,12 @@ def patch_materialize(instance: nn.Module, conf) -> None:
             if payload.numel() * payload.element_size() < min_bytes:
                 continue
             if not payload.is_contiguous():
-                # A reservation is a flat span of a slab, so parking this one
-                # would hand both the loader and the graph a contiguous weight
-                # where ``to_empty`` keeps the stride -- silently, and to a kernel
-                # that reads the layout off the tensor that is a different weight.
-                # Preserving it is not a local change either: the load allocates
-                # its own output, and a copy whose two sides disagree about layout
-                # stages through a host bounce buffer, which is the pageable path
-                # this whole file exists to stay off.
+                # Flat host reservations and H2D outputs cannot preserve this stride.
                 strided.append(_pretty(name))
                 continue
             if not payload.is_meta:
-                # Host-first can only redirect a weight it materializes itself,
-                # and this one already has storage.  The reading worth guarding
-                # against is that another _apply got to the same Parameter object
-                # first, which is what a weight tied to a module outside the
-                # compiled subtree looks like from here: parking it would redirect
-                # a weight the eager prologue reads, and the handoff would then
-                # empty it with no load in that module's graph to put the bytes
-                # back.  Leave it alone either way -- the cost is one weight that
-                # is not offloaded, against an illegal access nothing traces here.
+                # An eager module may share this already materialized weight;
+                # emptying it at handoff would leave that reader without an H2D load.
                 shared.append(_pretty(name))
                 continue
             chosen[id(param)] = _pretty(name)
@@ -341,10 +213,7 @@ def patch_materialize(instance: nn.Module, conf) -> None:
             return orig_apply(self, fn, recurse=recurse)
 
         parked = []
-        # A tied weight reaches _apply once per module that registers it.  Both
-        # sites have to end up over the same bytes, which is what tying means,
-        # so the second one gets a fresh wrapper over the first one's buffer
-        # rather than a second reservation.
+        # _apply visits every tied registration; reuse one host buffer for all of them.
         hosts: dict[int, torch.Tensor] = {}
 
         def materialize(t):
@@ -378,29 +247,17 @@ def patch_materialize(instance: nn.Module, conf) -> None:
 
 
 def handoff_if_pending(instance: object) -> int:
-    """Complete the handoff for ``instance`` if its weights are still on the host.
-
-    On the call path, so it is a single attribute read once the first call is
-    past.
-    """
+    """Complete the handoff for ``instance`` if its weights are still on the host."""
     if not getattr(instance, _PENDING_ATTR, False):
         return 0
     return handoff(instance)
 
 
 def handoff(module: nn.Module) -> int:
-    """Swap each host-parked weight for a storage-free CUDA stand-in.  Returns the count.
+    """Install storage-free CUDA stand-ins and return the number of weights handed off.
 
-    This is the moment the model stops being loadable and starts being
-    compilable.  It has to happen before Dynamo traces -- the graph is lowered
-    against the parameter's device, and a CPU one would compile CPU kernels --
-    and it cannot happen any earlier, because everything between the two points
-    (``dcp.load``, ``reset_parameters``, the quantization post-hooks that rewrite
-    a weight's layout in place) is code that wants to read and write the bytes.
-
-    Peak cost is one shard: the stand-in is allocated at full size so its sizes
-    and strides are the real ones, then immediately emptied.
-    """
+    Run after checkpoint loading and weight post-processing, but before Dynamo
+    traces devices. Stand-in construction temporarily allocates one full shard."""
     parked = _parked_params(module)
     _warn_about_reclaimed(module, parked)
     if not parked:
@@ -410,9 +267,7 @@ def handoff(module: nn.Module) -> int:
     device = torch.device("cuda", torch.cuda.current_device())
     nbytes = 0
     for names, param in parked:
-        # Snapshot the host tensor before replace: for an unsharded Parameter
-        # the payload IS param, and swap_tensors would otherwise turn that
-        # reference into the CUDA stand-in.
+        # Detach plain Parameters before swap_tensors replaces their host payload.
         host = _payload(param)
         if host is param:
             host = param.detach()
