@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""compute_graph_hash must change when input dtypes change; placements are covered by test_placement_cache_key."""
+"""compute_graph_hash must stay stable across TensorifyScalarRestartAnalysis retrace."""
 
 from __future__ import annotations
 
@@ -27,9 +27,13 @@ class _Add(nn.Module):
         return x + 1
 
 
-def test_compute_graph_hash_changes_with_input_dtype() -> None:
+def test_compute_graph_hash_stable_across_tensorify_scalar() -> None:
+    """Restart-analysis retrace can replace a Tensor with a Python scalar.
+
+    Including those types in the cache key makes the second pass miss first-pass artifacts.
+    """
     graph = torch.fx.symbolic_trace(_Add())
-    fp32 = compute_graph_hash(graph, [torch.zeros(2, dtype=torch.float32)])
-    bf16 = compute_graph_hash(graph, [torch.zeros(2, dtype=torch.bfloat16)])
-    assert fp32 != bf16
-    assert fp32 == compute_graph_hash(graph, [torch.ones(8, dtype=torch.float32)])
+    tensor_inputs = compute_graph_hash(graph, [torch.zeros(2, dtype=torch.float32)])
+    scalar_inputs = compute_graph_hash(graph, [1])
+    assert tensor_inputs == scalar_inputs
+    assert tensor_inputs == compute_graph_hash(graph, [torch.zeros(2, dtype=torch.bfloat16)])

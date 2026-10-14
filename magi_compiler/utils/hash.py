@@ -18,7 +18,6 @@ from collections.abc import Sequence
 from functools import reduce
 from typing import Any, List, Union
 
-import torch
 import torch.fx as fx
 from torch.distributed.tensor import DTensor
 
@@ -57,18 +56,12 @@ def compute_code_hash_with_content(file_contents: dict[str, str]) -> str:
     return compute_hash("\n".join(hash_content))
 
 
-def _input_signature(x: Any) -> str:
-    if isinstance(x, DTensor):
-        return f"DTensor({x.dtype}, {x.placements}, {tuple(x.device_mesh.shape)})"
-    if isinstance(x, torch.Tensor):
-        return f"Tensor({x.dtype})"
-    return type(x).__name__
-
-
 def compute_graph_hash(graph: fx.GraphModule, example_inputs: Sequence[Any]) -> str:
-    # Placements live on the inputs, not in traced source files. graph.code is omitted:
-    # restart-analysis retraces with different node names and would miss the first-pass cache.
-    return compute_hash([_input_signature(x) for x in example_inputs])
+    # graph.code and Tensor/scalar types both change across TensorifyScalarRestartAnalysis.
+    # DTensor placements do not appear in traced source files.
+    return compute_hash(
+        [f"DTensor({x.dtype}, {x.placements}, {tuple(x.device_mesh.shape)})" for x in example_inputs if isinstance(x, DTensor)]
+    )
 
 
 def compute_code_hash(files: set[str]) -> str:
