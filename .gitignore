@@ -3,6 +3,9 @@ magi_compiler/_version.py
 magi_dump_src_dir/
 *.nsys-rep
 *.ncu-rep
+nsys_reports/
+output_audio/
+example/inference/*/output_audio/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
