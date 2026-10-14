@@ -34,7 +34,7 @@ from magi_compiler.config import CompileConfig, CompileMode, CudaGraphMode, indu
 from magi_compiler.magi_depyf.timeline import observe_lifecycle, observe_lifecycle_context
 from magi_compiler.offload.offload_warpper import OffloadWrapper
 from magi_compiler.passes import CustomJointGraphPartitionFn, FullGraphPassManager, PostGradPassManager, pass_context
-from magi_compiler.utils import compilation_counter, compute_code_hash, compute_hash, magi_logger
+from magi_compiler.utils import compilation_counter, compute_code_hash, compute_graph_hash, compute_hash, magi_logger
 from magi_compiler.utils.visualize import save_fx_graph_visualization
 
 from ._cache_data_cls import CacheEntry, CacheHandle
@@ -587,13 +587,14 @@ class MagiBackend:
 
         post_grad_pass_manager.snapshot_original_inductor_configs(self.inductor_compile_config)
 
-    def _init_cache(self) -> str:
+    def _init_cache(self, graph: fx.GraphModule, example_inputs) -> str:
         hash_key = compute_hash(
             [
                 self.compile_config.hash,
                 inductor_compile_config_hash(self.inductor_compile_config),
                 self.compiler_manager.hash,
                 compute_code_hash(self.traced_files),
+                compute_graph_hash(graph, example_inputs),
             ]
         )
 
@@ -677,8 +678,9 @@ class MagiBackend:
         magi_logger.info(f"Setting up FX-level graph split with ops: {fx_split_ops=}")
         magi_logger.info(f"Resolved splitting ops for FX-level graph split: {resolved_ops=}")
 
-        # Step 1.4: whole-graph FSDP overlap.
-        if self.compile_config.fsdp_config.enable_fsdp:
+        # Step 1.4: whole-graph FSDP overlap. enable_fsdp is a process-wide flag; VAE and other
+        # split-graph models share it with FSDP DiT, so skip unless this graph is fullgraph.
+        if self.compile_config.fsdp_config.enable_fsdp and self.compile_config.disable_graph_split:
             self._apply_fsdp_fullgraph_overlap(graph, example_inputs)
 
         # Step 2: split graph by ops, we split graph based on resolved_ops, which becomes the partitioned single graph.
@@ -736,7 +738,7 @@ class MagiBackend:
         magi_logger.info("Dynamo traced files (for compilation cache):\n%s", "\n".join(self.traced_files))
         compilation_counter.num_graphs_seen += 1
 
-        self._init_cache()
+        self._init_cache(graph=graph, example_inputs=example_inputs)
 
         self.full_graph_pass_manager(graph)
 

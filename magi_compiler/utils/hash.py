@@ -14,8 +14,13 @@
 
 import hashlib
 import os
+from collections.abc import Sequence
 from functools import reduce
 from typing import Any, List, Union
+
+import torch
+import torch.fx as fx
+from torch.distributed.tensor import DTensor
 
 HASH_LENGTH = 10
 
@@ -50,6 +55,19 @@ def compute_code_hash_with_content(file_contents: dict[str, str]) -> str:
             continue
         hash_content.append(content)
     return compute_hash("\n".join(hash_content))
+
+
+def _input_signature(x: Any) -> str:
+    if isinstance(x, DTensor):
+        return f"DTensor({x.dtype}, {x.placements}, {tuple(x.device_mesh.shape)})"
+    if isinstance(x, torch.Tensor):
+        return f"Tensor({x.dtype})"
+    return type(x).__name__
+
+
+def compute_graph_hash(graph: fx.GraphModule, example_inputs: Sequence[Any]) -> str:
+    # DTensor placements live in the inputs, not in the traced source files (e.g. SimpleFSDP fully_shard vs replicate).
+    return compute_hash([graph.code, [_input_signature(x) for x in example_inputs]])
 
 
 def compute_code_hash(files: set[str]) -> str:
