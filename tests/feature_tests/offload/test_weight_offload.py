@@ -87,12 +87,43 @@ def _park(tensor: torch.Tensor, name: str = "") -> int:
 # ------------------------------------------------ cross-rank agreement
 
 
+@requires_cuda
+@pytest.mark.parametrize("ndim", [1, 2])
+def test_alignment_resolves_mesh_groups_without_swallowing_errors(dist_1rank, monkeypatch, ndim):
+    """Even an empty plan must resolve its DTensor groups; lookup failure must not bypass voting."""
+    from collections import Counter
+
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Replicate
+
+    from magi_compiler.passes.weight_offload.graph import bind
+
+    mesh = init_device_mesh(device_type="cpu", mesh_shape=(1,) * ndim)
+    weight = torch.nn.Parameter(DTensor.from_local(torch.ones(4), device_mesh=mesh, placements=[Replicate()] * ndim))
+    examples = {"weight": weight, "plain": torch.nn.Parameter(torch.ones(4)), "activation": torch.ones(4)}
+    group = mesh.get_group(mesh_dim=0)
+    assert bind._groups_to_sync(plan=[], placeholder_examples=examples) == {id(group): group}
+    assert bind._align_across_ranks(plan=[], placeholder_examples=examples, skipped=Counter()) == []
+
+    failure = RuntimeError("mesh group lookup failed")
+
+    def fail_group(mesh_dim=None):
+        raise failure
+
+    monkeypatch.setattr(mesh, "get_group", fail_group)
+    with pytest.raises(RuntimeError, match="mesh group lookup failed") as caught:
+        bind._align_across_ranks(plan=[], placeholder_examples=examples, skipped=Counter())
+    assert caught.value is failure
+
+
 def _cand(name, holder_name, group, shape=(4, 4)):
     from magi_compiler.passes.weight_offload.graph.weight_source import OffloadCandidate
 
     holder = type("Node", (), {"name": holder_name})()
     local = torch.empty(shape, dtype=torch.float32)
-    return OffloadCandidate(holder=holder, local=local, name=name, nbytes=local.numel() * local.element_size(), group=group)
+    return OffloadCandidate(
+        holder=holder, local=local, name=name, nbytes=local.numel() * local.element_size(), slot=0, group=group
+    )
 
 
 def _patch_dist(monkeypatch, *, world, replies):
@@ -205,6 +236,30 @@ def test_align_failed_group_does_not_abort_the_others(monkeypatch):
 
 
 # ---------------------------------------------------------------- host pool
+
+
+def test_pinned_reservation_failure_is_not_downgraded(monkeypatch):
+    """A failed pinned reservation must raise instead of returning pageable storage."""
+    from magi_compiler.host_mem import HostMemPool
+    from magi_compiler.passes.weight_offload.runtime.host_weights import HostWeightStore
+
+    original_empty = torch.empty
+    failure = RuntimeError("pinned allocation failed")
+
+    def fail_pinned(*args, pin_memory=False, **kwargs):
+        if pin_memory:
+            raise failure
+        return original_empty(*args, pin_memory=False, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", fail_pinned)
+    store = HostWeightStore(pool=HostMemPool(pinned=True, slab_bytes=1024))
+    with pytest.raises(RuntimeError, match="pinned allocation failed") as caught:
+        store.reserve(shape=(8,), dtype=torch.float32, name="weight")
+    assert caught.value is failure
+
+    pageable = HostMemPool(pinned=False, slab_bytes=1024).alloc(shape=(8,), dtype=torch.float32)
+    assert not pageable.is_pinned()
+    assert pageable.shape == (8,)
 
 
 @requires_cuda
@@ -586,10 +641,9 @@ def _replicated_weight_graph(mesh, rows=9, cols=64):
     """A weight SimpleFSDP replicated instead of sharding, as the lowering leaves it.
 
     ``rows`` is deliberately indivisible: athena replicates a ``Shard(0)`` whose
-    dim0 does not divide its mesh, because padding only the trailing ranks makes
-    the graph differ per rank and deadlocks NCCL. The lowering then declines it
-    -- it only handles ``Shard(0)`` -- so the prim redistribute/to_local pair
-    stays in the graph and there is no all-gather to key off.
+    dim0 does not divide its mesh. Lowering only rewrites sharded gathers, so the
+    prim redistribute/to_local pair stays in the graph and there is no all-gather
+    to key off.
     """
     from torch.distributed.tensor import Replicate, distribute_tensor
 
@@ -1110,7 +1164,6 @@ def test_storage_freed_shard_survives_a_real_inductor_compile(dist_1rank):
 @requires_cuda
 def test_h2d_load_follows_a_baked_to_current_remap():
     """A cached kernel calls h2d_load with another process's slot integers."""
-    from magi_compiler.passes.weight_offload import host_weights
     from magi_compiler.passes.weight_offload.runtime import slot_remap
     from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
@@ -1122,7 +1175,6 @@ def test_h2d_load_follows_a_baked_to_current_remap():
     assert decoy_slot != real_slot
     assert slot_remap.resolve_slot(decoy_slot) == decoy_slot
     assert slot_remap.resolve_slot(real_slot) == real_slot
-    assert host_weights.find_slot("real", tuple(real.shape), str(real.dtype)) == real_slot
 
     out = H2D_LOAD(real, decoy_slot)
     _WAIT(out)

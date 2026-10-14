@@ -149,17 +149,6 @@ class HostWeightStore:
         """The slot this stand-in was adopted under, or None."""
         return self._by_tensor.get(id(local))
 
-    def find_slot(self, name: str, shape: Sequence[int], dtype: str) -> int | None:
-        """The unique slot matching ``name`` + layout, or None if missing or ambiguous."""
-        matches = [
-            slot
-            for slot, shard in enumerate(self._slots)
-            if shard.name == name
-            and tuple(shard.host.shape) == tuple(int(d) for d in shape)
-            and str(shard.host.dtype) == dtype
-        ]
-        return matches[0] if len(matches) == 1 else None
-
     def name_of(self, slot: int) -> str:
         """The parameter behind a slot, for the placement logs."""
         return self._entry(slot).name
@@ -323,10 +312,6 @@ def adopt(host: torch.Tensor, device_tensor: torch.Tensor, name: str = "") -> in
 
 def slot_of(local: torch.Tensor) -> int | None:
     return _STORE.slot_of(local)
-
-
-def find_slot(name: str, shape: Sequence[int], dtype: str) -> int | None:
-    return _STORE.find_slot(name, shape, dtype)
 
 
 def name_of(slot: int) -> str:

@@ -24,19 +24,9 @@ from __future__ import annotations
 
 from torch._inductor.scheduler import BaseSchedulerNode
 
+from ..runtime.h2d_op import H2D_LOAD
 
-def h2d_ops() -> tuple:
-    """The host-to-device load ops, imported lazily so this module stays
-    importable without a CUDA build."""
-    try:
-        from ..runtime.h2d_op import H2D_LOAD
-
-        return (H2D_LOAD,)
-    except Exception:  # noqa: BLE001
-        return ()
-
-
-H2D_OPS = h2d_ops()
+H2D_OPS = (H2D_LOAD,)
 
 
 def is_h2d_load(snode: BaseSchedulerNode) -> bool:

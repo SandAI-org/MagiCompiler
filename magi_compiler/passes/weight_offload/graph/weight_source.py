@@ -39,31 +39,19 @@ from typing import Any, Mapping, Protocol
 
 import torch
 import torch.fx as fx
+from torch.distributed.tensor import DTensor
 
 from .fx_walk import is_prep, param_name, resolve, walk_back_to_holder
 
 
-def mesh_group(param: Any):
-    """The process group this weight is sharded or replicated over, or None.
-
-    Binder agreement is per this group, not WORLD: an expert-parallel rank
-    only has to match the ranks that share its mesh.  A plain Parameter has
-    no mesh and does not enter a collective.
+def mesh_group(param: object):
+    """Binder agreement uses the DTensor's group, selecting dim 0 for a multi-dim mesh.
+    Non-DTensor inputs do not vote; group lookup errors propagate.
     """
-    mesh = getattr(getattr(param, "_spec", None), "mesh", None)
-    if mesh is None:
+    if not isinstance(param, DTensor):
         return None
-    try:
-        return mesh.get_group()
-    except RuntimeError:
-        # Multi-dim mesh needs an explicit dim; we only offload single Shard(0)
-        # / Replicate, which live on dim 0.
-        try:
-            return mesh.get_group(0)
-        except Exception:  # noqa: BLE001
-            return None
-    except Exception:  # noqa: BLE001
-        return None
+    mesh = param.device_mesh
+    return mesh.get_group(mesh_dim=0 if mesh.ndim > 1 else None)
 
 
 @dataclass
@@ -74,8 +62,8 @@ class OffloadCandidate:
     local: Any  # the live stand-in the slot is keyed on
     name: str  # the parameter it came from, for the placement logs
     nbytes: int
+    slot: int  # host-pool slot from adopt
     tag: fx.Node | None = None  # node to mark offloaded, so later passes can tell
-    slot: int | None = None  # host-pool slot from adopt; None = never parked
     group: Any = None  # ProcessGroup of the DTensor mesh; None = no cross-rank vote
 
 
@@ -309,21 +297,14 @@ class FsdpShardSource(WeightSource):
 
     @staticmethod
     def _collect_ungathered(graph, placeholder_examples, min_bytes, candidates, skipped, seen) -> None:
-        """Weights SimpleFSDP never shards, and which therefore have no gather.
+        """Weights SimpleFSDP replicates, so they have no all-gather to key off.
 
-        A ``Shard(0)`` whose dim0 does not divide its mesh pads only the trailing
-        ranks, which makes the graph differ per rank and deadlocks NCCL, so
-        athena replicates those weights instead.  The lowering then leaves them
-        on the prim path, and keying off all-gathers misses them entirely.
+        A ``Shard(0)`` whose dim0 does not divide its mesh is stored replicated.
+        NCCL agreement is the collective sequence; rank-private compute may differ.
+        Lowering only rewrites sharded gathers, so these stay on the prim path.
 
-        They are the ones most worth taking.  A replicated weight is a FULL copy
-        on every rank rather than 1/N, so per GPU it costs world_size times what
-        the same tensor costs sharded -- and it was excluded from the one feature
-        that exists to get weights off the device.
-
-        What changes downstream is when the bytes die: a shard is consumed by its
-        gather and freed, while these ARE the weight the matmul reads and live to
-        its last consumer.
+        Each rank holds the full tensor, and it stays live until its last matmul
+        consumer rather than being freed at a gather.
         """
         from ..runtime import host_weights
 

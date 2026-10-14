@@ -167,6 +167,20 @@ def _reorder(
     return [s.name for s in p(order)]
 
 
+def test_cost_query_failure_leaves_schedule_unchanged():
+    """An estimator bug must stop scheduling instead of turning compute into zero-cost work."""
+    order = [_compute("c", 2e6), _load("ld", 10), _wait("w", "ld"), _compute("user", 1e6, deps=["w"])]
+    before = list(order)
+
+    def failed_cost(snode):
+        raise RuntimeError("cost query failed")
+
+    reorder = H2dLoadReorder(bandwidth_bytes_per_ns=10.0, cost_fn=failed_cost)
+    with pytest.raises(RuntimeError, match="cost query failed"):
+        reorder(order)
+    assert order == before
+
+
 @pytest.mark.parametrize(
     "compute_ns,expected",
     [

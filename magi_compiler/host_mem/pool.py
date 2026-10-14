@@ -35,8 +35,6 @@ from typing import Sequence
 
 import torch
 
-from magi_compiler.utils import magi_logger
-
 SLAB_BYTES = 1 << 30
 """Default cap on one slab (1 GiB).
 
@@ -59,9 +57,7 @@ class _Slab:
 class HostMemPool:
     """Bump allocator over host slabs, one dtype per slab, pinned or paged.
 
-    A pinned pool whose pin fails falls back to paged memory for that slab
-    rather than failing the allocation; ``is_pinned`` on the returned region
-    tells the two apart.
+    Pinned allocation failures propagate; pageable storage requires ``pinned=False``.
     """
 
     def __init__(self, pinned: bool = True, slab_bytes: int = SLAB_BYTES, align_bytes: int = ALIGN_BYTES) -> None:
@@ -102,31 +98,6 @@ class HostMemPool:
                 slab.used += want
                 return slab.buf[start : start + numel]
 
-        buf = self._new_slab(dtype, max(want, self._slab_bytes // dtype.itemsize))
+        buf = torch.empty(max(want, self._slab_bytes // dtype.itemsize), dtype=dtype, device="cpu", pin_memory=self._pinned)
         self._slabs.append(_Slab(buf=buf, used=want))
         return buf[:numel]
-
-    def _new_slab(self, dtype: torch.dtype, numel: int) -> torch.Tensor:
-        if not self._pinned:
-            return torch.empty(numel, dtype=dtype, device="cpu")
-        try:
-            return torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True)
-        except RuntimeError as exc:
-            magi_logger.warning(
-                "host mem: could not pin a %.1f MiB slab (%s); falling back to pageable host memory, "
-                "which makes every copy out of it synchronous",
-                numel * dtype.itemsize / 2**20,
-                exc,
-            )
-            return torch.empty(numel, dtype=dtype, device="cpu")
-
-    def num_slabs(self) -> int:
-        return len(self._slabs)
-
-    def reserved_bytes(self) -> int:
-        """Host RAM the slabs hold, handed out or not."""
-        return sum(s.buf.numel() * s.buf.element_size() for s in self._slabs)
-
-    def used_bytes(self) -> int:
-        """Bytes handed out, alignment padding included."""
-        return sum(s.used * s.buf.element_size() for s in self._slabs)

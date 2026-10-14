@@ -12,12 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""How an overlap pass reads snode runtimes.
+"""Read snode runtimes in nanoseconds and clamp negative estimates to zero.
 
-``cost_fn`` is normally the ``SnodeCostTable`` that ``SnodeCostProfile`` filled
-at the head of the reorder chain, and Inductor's ``estimate_op_runtime`` when a
-pass runs on its own.  Either may raise or return garbage for an odd node; a
-placement must never crash the compile over one, so every read is clamped here.
+Measurement failures belong to the estimator or profiling table; unexpected
+cost-query errors propagate to the caller.
 """
 
 from __future__ import annotations
@@ -35,7 +33,7 @@ def default_cost_fn():
 
 
 class CostView:
-    """ns per snode, never negative, never raising."""
+    """Nonnegative nanoseconds per snode; cost-query errors propagate."""
 
     def __init__(self, cost_fn) -> None:
         self.cost_fn = cost_fn
@@ -46,10 +44,7 @@ class CostView:
         return bool(getattr(self.cost_fn, "ok", True))
 
     def __call__(self, snode: BaseSchedulerNode) -> float:
-        try:
-            return max(0.0, float(self.cost_fn(snode)))
-        except Exception:  # noqa: BLE001
-            return 0.0
+        return max(0.0, float(self.cost_fn(snode)))
 
     def prefix(self, order: list[BaseSchedulerNode]) -> list[float]:
         """``prefix[i]``: ns of compute that runs before the snode at index ``i``.

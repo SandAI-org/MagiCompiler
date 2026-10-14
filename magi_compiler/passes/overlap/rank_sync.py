@@ -19,7 +19,7 @@ every rank, or the ranks deadlock.  Costs are rank-local measurements and
 per-rank graphs can differ in compute, so agreement is negotiated, not assumed:
 
 * ``negotiate_mode`` picks how much freedom the ranks can share
-  (identical / slot / pinned / abort);
+  (slot / pinned / abort);
 * ``consensus_slot_targets`` puts each transfer in the same skeleton slot
   everywhere (the index inside the slot stays rank-local);
 * ``agree`` ANDs a local commit verdict across ranks -- committing on some
@@ -32,7 +32,6 @@ this.
 from __future__ import annotations
 
 import bisect
-import hashlib
 
 import torch
 import torch.distributed as dist
@@ -41,17 +40,6 @@ from torch._inductor.scheduler import BaseSchedulerNode
 from magi_compiler.utils import magi_logger
 
 from ..snode_utils import is_weight_gather, issues_transfer, leaf_collective_node
-
-
-def _size_hint_of(sym) -> int:
-    """Rank-identical size hint for a sympy symbol (0 if unavailable, e.g. in
-    unit tests without a live Inductor graph)."""
-    try:
-        from torch._inductor.virtualized import V
-
-        return int(V.graph.sizevars.size_hint(sym, fallback=0))
-    except Exception:  # noqa: BLE001
-        return 0
 
 
 def _collective_kind_key(snode: BaseSchedulerNode) -> tuple:
@@ -78,68 +66,18 @@ def collective_skeleton(order: list[BaseSchedulerNode]) -> tuple[list[int], list
     return idx, [_collective_kind_key(order[i]) for i in idx]
 
 
-def graph_fingerprint(order: list[BaseSchedulerNode]) -> str:
-    """Rank-comparable digest of the snode sequence: type + op identity + output
-    sizes + sorted origin fx TARGETS.  Origins are required -- a fused pointwise
-    kernel is one ComputedBuffer whose class/size hide its contents (relu vs
-    relu+sin look identical without them).  Targets only, not node names: names
-    carry per-rank numbering noise.
+def negotiate_mode(anchors, skel_kinds, costs_ok: bool = True, who: str = "FSDP overlap") -> tuple[str, object, int]:
+    """Return (mode, group, world) with a rank-identical placement policy.
 
-    """
-    import sympy
-
-    h = hashlib.sha256()
-    sym_canon: dict = {}  # sympy.Symbol -> canonical sympy.Symbol
-
-    def _canon_size(size) -> str:
-        dims = []
-        for d in size:
-            free = getattr(d, "free_symbols", None)
-            if not free:
-                dims.append(repr(d))
-                continue
-            fresh = [sym for sym in free if sym not in sym_canon]
-            # Name-free assignment order; symbol name only as the last-resort
-            # tie-break (see docstring: that case fails safe).
-            fresh.sort(key=lambda sym: (_size_hint_of(sym), d.count(sym), sym.name))
-            for sym in fresh:
-                sym_canon[sym] = sympy.Symbol(f"c{len(sym_canon):04d}")
-            dims.append(repr(d.xreplace(sym_canon)))
-        return "[" + ", ".join(dims) + "]"
-
-    for s in order:
-        h.update(type(s).__name__.encode())
-        for sub in getattr(s, "snodes", None) or (s,):
-            n = getattr(sub, "node", None)
-            if n is None:
-                continue
-            op = getattr(n, "op_overload", None) or getattr(n, "python_kernel_name", None) or type(n).__name__
-            h.update(str(op).encode())
-            try:
-                h.update(_canon_size(n.get_size()).encode())
-            except Exception:  # noqa: BLE001
-                pass
-            origins = getattr(n, "origins", None)
-            if origins:
-                h.update("|".join(sorted(str(getattr(o, "target", o)) for o in origins)).encode())
-    return h.hexdigest()
-
-
-def negotiate_mode(order, anchors, skel_kinds, costs_ok: bool = True, who: str = "FSDP overlap") -> tuple[str, object, int]:
-    """Rank-identical placement mode: (mode, group, world).
-
-    ``identical`` / ``slot``: skeletons match → consensus slots (in-slot index is per-rank).
-    ``pinned``: skeletons differ → keep each transfer between its neighboring NCCL snodes.
-    ``abort``: transfer counts differ, or some rank failed to price its graph
-    → leave the graph unchanged.  The pricing verdict travels in the same
-    exchange: a rank that bailed on its own would skip this collective and
-    leave its peers blocked in it.
+    Matching collective skeletons use consensus slots; differing skeletons pin
+    transfers between their existing neighbors. Candidate-count or pricing
+    failures abort on every rank, so no peer skips a later collective alone.
     """
     from magi_compiler.profiling.runtime_estimator import _get_cost_sync_group
 
     group = _get_cost_sync_group()
     world = dist.get_world_size()
-    mine = ((graph_fingerprint(order), len(order), len(anchors)), tuple(skel_kinds), bool(costs_ok))
+    mine = (len(anchors), tuple(skel_kinds), bool(costs_ok))
     peers: list = [None] * world
     dist.all_gather_object(peers, mine, group=group)
     failed = [rank for rank, p in enumerate(peers) if not p[2]]
@@ -150,34 +88,21 @@ def negotiate_mode(order, anchors, skel_kinds, costs_ok: bool = True, who: str =
             failed,
         )
         return "abort", group, world
-    if all(p == peers[0] for p in peers[1:]):
-        return "identical", group, world
 
-    desc = [(p[0][0][:12], p[0][1], p[0][2], len(p[1])) for p in peers]
-    n_ag = [p[0][2] for p in peers]
-    if any(g != n_ag[0] for g in n_ag[1:]):
+    desc = [(p[0], len(p[1])) for p in peers]
+    if any(p[0] != peers[0][0] for p in peers[1:]):
         magi_logger.warning(
-            who + " reorder: per-rank graphs differ AND weight-AG counts diverge "
-            "((digest, n_snodes, n_weight_gathers, n_collectives) per rank: %s). No rank "
-            "correspondence to reconcile; leaving the graph unchanged (overlap OFF).",
+            who + " reorder: weight-AG counts diverge ((n_weight_gathers, n_collectives) per rank: %s); "
+            "leaving the graph unchanged (overlap OFF).",
             desc,
         )
         return "abort", group, world
     if all(p[1] == peers[0][1] for p in peers[1:]):
-        magi_logger.warning(
-            who + " reorder: per-rank graphs are NOT structurally identical "
-            "((digest, n_snodes, n_weight_gathers, n_collectives) per rank: %s), but the "
-            "collective skeleton matches. Continuing in SLOT-consensus mode: gathers are "
-            "placed in a rank-negotiated skeleton slot (they MAY hop CP / EP kernels, as "
-            "long as every rank hops the same one).",
-            desc,
-        )
         return "slot", group, world
     magi_logger.warning(
-        who + " reorder: per-rank graphs are NOT structurally identical AND their "
-        "collective skeletons differ ((digest, n_snodes, n_weight_gathers, n_collectives) "
-        "per rank: %s). Continuing in PINNED mode: gathers keep their position relative to "
-        "every NCCL-issuing snode (no hop over CP / EP kernels).",
+        who + " reorder: collective skeletons differ ((n_weight_gathers, n_collectives) per rank: %s). "
+        "Continuing in PINNED mode: gathers keep their position relative to every NCCL-issuing snode "
+        "(no hop over CP / EP kernels).",
         desc,
     )
     return "pinned", group, world

@@ -89,7 +89,7 @@ class FsdpOverlapReorder(OverlapPass):
         order, index_of = graph.order, graph.index_of
         launches = [s for s in order if is_weight_gather(s)]  # program order
         skel_idx, skel_kinds = rank_sync.collective_skeleton(order)
-        mode, sync_group, world = rank_sync.negotiate_mode(order, launches, skel_kinds, cost.ok)
+        mode, sync_group, world = rank_sync.negotiate_mode(anchors=launches, skel_kinds=skel_kinds, costs_ok=cost.ok)
         ctx.update(launches=launches, skel_idx=skel_idx, mode=mode, sync_group=sync_group, world=world)
         if mode == "abort":
             return None

@@ -27,16 +27,15 @@ all_reduce stands in for a CP / EP kernel: the gather's compute window reaches p
 it, so hoisting requires hopping another collective.
 
 With ``--mismatch`` (needs >=2 ranks): rank 1's fn gets an EXTRA compute op so the
-per-rank graphs are structurally DIFFERENT.  The reorder pass's cross-rank
-graph-fingerprint check must fire on EVERY rank (symmetric all_gather), warn, and
-continue in SLOT-consensus mode (the collective skeleton still matches) -- the
+per-rank graphs are structurally DIFFERENT. Every rank must negotiate SLOT
+consensus because the collective skeleton still matches -- the
 gather may hop the all_reduce as long as EVERY rank hops it.  The invariant that
 actually matters is checked directly: the collective sequence of the FINAL schedule
 is all_gathered and compared across ranks.
 
 With ``--modes-only`` (>=2 ranks, gloo, no CUDA / no compile): drive
 ``rank_sync.negotiate_mode`` directly with synthetic per-rank inputs and assert it returns
-the expected mode for each rung of the ladder (identical / slot / pinned / abort).
+the expected mode for each rung of the ladder (slot / pinned / abort).
 
 With ``--copy-engine``: the same shape, but the gathers are
 ``magi::ce_all_gather`` reading a symmetric buffer.  Two things are checked that
@@ -54,11 +53,10 @@ Run: torchrun --nproc_per_node=1 tests/feature_tests/fsdp_overlap_helper/reorder
 
 Markers (rank 0):
   REORDER_CALLED gathers=<n>
-  REORDER_OK moved=<n>          (pass returned; N launches repositioned)
+  REORDER_OK ran=<bool>         (pass returned)
   REORDER_FINITE ok=<bool>      (compiled output finite + matches eager)
   REORDER_SKELETON ok=<bool>    (final collective sequence identical on all ranks)
-  REORDER_MISMATCH local=<bool>   (--mismatch only: divergent-graph path taken)
-  REORDER_SLOT rank=<n>           (--mismatch only: SLOT-consensus mode chosen)
+  REORDER_SLOT rank=<n>           (SLOT-consensus mode chosen)
   REORDER_MODES ok=<bool>         (--modes-only: the mode ladder returned as expected)
   REORDER_SLOTS ok=<bool>         (--copy-engine: no launch overwrites a live slot)
   REORDER_PASS / REORDER_FAIL
@@ -78,25 +76,6 @@ import torch.distributed as dist  # noqa: E402
 from magi_compiler.passes import snode_utils  # noqa: E402
 from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder  # noqa: E402
 from magi_compiler.passes.overlap import rank_sync  # noqa: E402
-from magi_compiler.utils import magi_logger  # noqa: E402
-
-
-class _FakeIR:
-    op_overload = "fake.op"
-    origins = None
-
-    def get_size(self):
-        return [8, 8]
-
-
-class _FakeSnode:
-    """Enough of a snode for ``graph_fingerprint`` (the only thing the mode
-    negotiation reads out of the schedule)."""
-
-    snodes = None
-
-    def __init__(self) -> None:
-        self.node = _FakeIR()
 
 
 def _mode_ladder_selfcheck(rank: int) -> bool:
@@ -107,17 +86,16 @@ def _mode_ladder_selfcheck(rank: int) -> bool:
     odd = rank == 1
     ag, other = (True, "ag", (8, 8)), (False, "cp", (4,))
     cases = [
-        # (expected mode, n_snodes, weight-AG count, skeleton kinds, costs_ok)
-        ("identical", 4, 2, [ag, other, ag], True),
-        ("slot", 5 if odd else 4, 2, [ag, other, ag], True),  # graphs differ, skeleton does not
-        ("pinned", 5 if odd else 4, 2, [ag, other, ag] if odd else [ag, ag, other], True),
-        ("abort", 5 if odd else 4, 3 if odd else 2, [ag, other, ag], True),
-        # identical graphs, but rank 1 failed to price its graph: every rank aborts
-        ("abort", 4, 2, [ag, other, ag], not odd),
+        # (expected mode, weight-AG count, skeleton kinds, costs_ok)
+        ("slot", 2, [ag, other, ag], True),
+        ("pinned", 2, [ag, other, ag] if odd else [ag, ag, other], True),
+        ("abort", 3 if odd else 2, [ag, other, ag], True),
+        # Matching skeletons, but rank 1 failed to price its graph: every rank aborts.
+        ("abort", 2, [ag, other, ag], not odd),
     ]
     ok = True
-    for expected, n_snodes, n_ag, kinds, costs_ok in cases:
-        got = negotiate([_FakeSnode() for _ in range(n_snodes)], [None] * n_ag, kinds, costs_ok)[0]
+    for expected, n_ag, kinds, costs_ok in cases:
+        got = negotiate(anchors=[None] * n_ag, skel_kinds=kinds, costs_ok=costs_ok)[0]
         ok = ok and got == expected
         print(f"REORDER_MODE_CASE rank={rank} expected={expected} got={got}", flush=True)
     return ok
@@ -208,33 +186,26 @@ def main() -> None:
                 acc = z if acc is None else acc + z
             return acc
 
-    # instrument the pass: count how many times it runs, how many launches move,
-    # and whether the returned schedule is identical to the input (LOCAL path).
-    calls = {"n": 0, "gathers": 0, "moved": 0, "unchanged": True, "warned_mismatch": False, "slot_mode": False}
+    # Instrument pass invocations, gather counts, and consensus mode.
+    calls = {"n": 0, "gathers": 0, "slot_mode": False}
     skeletons: list = []  # collective sequence of every schedule the pass returned
     orig_call = FsdpOverlapReorder.__call__
 
-    # magi_logger output from inside an Inductor compile does not reliably reach the
-    # subprocess streams; intercept the warning call itself to detect the mode taken.
-    orig_warning = magi_logger.warning
+    orig_negotiate = rank_sync.negotiate_mode
 
-    def spy_warning(msg, *a, **kw):
-        if "NOT structurally identical" in str(msg):
-            calls["warned_mismatch"] = True
-            print(f"REORDER_WARNED rank={rank}", flush=True)
-        if "SLOT-consensus" in str(msg):
+    def spy_negotiate(*a, **kw):
+        result = orig_negotiate(*a, **kw)
+        if result[0] == "slot":
             calls["slot_mode"] = True
             print(f"REORDER_SLOT rank={rank}", flush=True)
-        return orig_warning(msg, *a, **kw)
+        return result
 
-    magi_logger.warning = spy_warning
+    rank_sync.negotiate_mode = spy_negotiate
 
     def spy(self, snodes):
         calls["n"] += 1
         calls["gathers"] += sum(1 for s in snodes if snode_utils.is_weight_gather(s))
-        before = list(snodes)
         out = orig_call(self, snodes)
-        calls["unchanged"] = len(out) == len(before) and all(a is b for a, b in zip(out, before))
         skeletons.append(rank_sync.collective_skeleton(out)[1])
         return out
 
@@ -270,7 +241,7 @@ def main() -> None:
         inductor_config.reorder_for_compute_comm_overlap_passes = prev_passes
         inductor_config.force_disable_caches = prev_cache
         FsdpOverlapReorder.__call__ = orig_call
-        magi_logger.warning = orig_warning
+        rank_sync.negotiate_mode = orig_negotiate
 
     finite = bool(torch.isfinite(out).all().item())
     rel = ((out.float() - eager.float()).norm() / (eager.float().norm() + 1e-6)).item()
@@ -283,11 +254,8 @@ def main() -> None:
     dist.all_gather_object(peer_skeletons, skeletons)
     skeleton_ok = all(s == peer_skeletons[0] for s in peer_skeletons[1:])
 
-    # In --mismatch mode the divergent-graph path must warn on EVERY rank; agree
-    # across ranks before printing.  Schedule may change under SLOT reordering.
-    ok_local = calls["n"] > 0 and calls["gathers"] >= 1 and numeric_ok and skeleton_ok
-    if args.mismatch:
-        ok_local = ok_local and calls["warned_mismatch"] and calls["slot_mode"]
+    # Matching skeletons must use slot consensus on every rank, even when compute differs.
+    ok_local = calls["n"] > 0 and calls["gathers"] >= 1 and numeric_ok and skeleton_ok and calls["slot_mode"]
     if args.copy_engine:
         ok_local = ok_local and calls["gathers"] >= N_CE_LAYERS
     t = torch.tensor([1 if ok_local else 0], device=dev)
@@ -299,8 +267,6 @@ def main() -> None:
         print(f"REORDER_OK ran={calls['n'] > 0}", flush=True)
         print(f"REORDER_FINITE ok={numeric_ok} rel={rel:.5f}", flush=True)
         print(f"REORDER_SKELETON ok={skeleton_ok}", flush=True)
-        if args.mismatch:
-            print(f"REORDER_MISMATCH local={calls['warned_mismatch']} unchanged={calls['unchanged']}", flush=True)
         print("REORDER_PASS" if all_ok else "REORDER_FAIL", flush=True)
         rc = 0 if all_ok else 1
     else:

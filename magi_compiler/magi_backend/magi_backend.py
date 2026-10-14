@@ -233,9 +233,8 @@ class CompilerManager:
             f"Directly load the {cache_entry.graph_index}-th graph from {cache_entry.backend_name} via handle {cache_handle}",
         )
         compiled = self.compiler.load(graph, example_inputs, cache_entry, cache_handle)
-        if compiled is None:
-            return None
-        return self.offload_cache.wrap_loaded(compiled)
+        compiled = self.offload_cache.wrap_loaded(compiled) if compiled else None
+        return compiled
 
     @observe_lifecycle("compiler_manager_compile")
     def compile(
