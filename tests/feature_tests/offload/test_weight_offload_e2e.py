@@ -14,7 +14,7 @@
 
 """End-to-end compile-time weight offload on a SimpleFSDP model.
 
-Driven through a ``torchrun`` subprocess (fsdp_overlap_helper/offload_e2e_helper.py)
+Driven through a ``torchrun`` subprocess (h2d_helper/offload_e2e_helper.py)
 because the chain needs a process group inside a real compile -- same pattern as
 test_fsdp_overlap_e2e.py.
 
@@ -35,7 +35,7 @@ from pathlib import Path
 import pytest
 import torch
 
-_HELPER = Path(__file__).parent / "fsdp_overlap_helper" / "offload_e2e_helper.py"
+_HELPER = Path(__file__).parent / "h2d_helper" / "offload_e2e_helper.py"
 
 # Several 4 MiB buckets back to back, close enough together that the sweep
 # cannot hide them all: the shape where placement has to choose between
@@ -149,11 +149,6 @@ def _inflight(out: str) -> tuple[float, float]:
     return float(peak), float(rest.split(" MiB")[0])
 
 
-def _exposed_ms(out: str) -> float:
-    """Transfer the reorder could not get under compute, off the same report."""
-    return float(_reorder_report(out).split("at peak; ")[1].split("ms still exposed")[0])
-
-
 @requires_cuda
 @requires_torchrun
 def test_the_inflight_budget_is_never_exceeded():
@@ -174,32 +169,6 @@ def test_the_inflight_budget_is_never_exceeded():
 
 @requires_cuda
 @requires_torchrun
-def test_inflight_budget_buys_concurrency():
-    """The knob that decides how much of the bus's work moves under compute.
-
-    One 4 MiB bucket of budget means one transfer at a time, so a load whose
-    window overlaps its neighbour's live range has to wait its turn and ends up
-    exposed.  Room for several buckets is what lets those overlap, and both sides
-    of the trade have to be visible: exposure down, peak up.
-    """
-    one_bucket = _run(1, *_MULTI_LOAD_SHAPE, "--max-inflight-mib", "4")
-    out = _check(one_bucket)
-    tight_peak, tight_budget = _inflight(out)
-    tight_exposed = _exposed_ms(out)
-    assert tight_budget == 4 and tight_peak <= 4, f"one bucket asked for, one bucket used: {out[-2000:]}"
-
-    p = _run(1, *_MULTI_LOAD_SHAPE, "--max-inflight-mib", "32")
-    out = _check(p)
-    wide_peak, wide_budget = _inflight(out)
-    assert "OFFLOAD_PASS" in p.stdout, out[-4000:]
-    assert wide_budget == 32, f"the budget asked for is the budget used, got {wide_budget} MiB"
-    assert wide_peak <= wide_budget, f"and it must stay inside it, got {wide_peak} MiB"
-    assert wide_peak > tight_peak, f"concurrency has to be what it spent the budget on: {wide_peak}"
-    assert _exposed_ms(out) < tight_exposed, f"and exposure is what it bought: {_exposed_ms(out)} vs {tight_exposed}"
-
-
-@requires_cuda
-@requires_torchrun
 def test_no_residency_budget_keeps_nothing_resident():
     """The default, end to end.
 
@@ -215,18 +184,20 @@ def test_no_residency_budget_keeps_nothing_resident():
 
 @requires_cuda
 @requires_torchrun
-def test_residency_budget_is_spent_and_not_exceeded():
-    """The knob that decides how much traffic the bus carries at all.
+def test_device_weight_budget_is_spent_and_not_exceeded():
+    """The one budget: residency plus in-flight room, split by the pass.
 
-    This shape has more exposed transfer than one bucket of residency can buy
-    out, so the budget is the binding constraint and both halves of the contract
-    are observable: something gets bought, and not more than was offered.
+    This shape has more exposed transfer than the in-flight room alone can hide,
+    so part of the budget goes to residency, and the two halves together must
+    stay inside what was offered.
     """
-    p = _run(1, *_MULTI_LOAD_SHAPE, "--max-resident-mib", "8")
+    p = _run(1, *_MULTI_LOAD_SHAPE, "--max-device-weight-mib", "24")
     out = _check(p)
     promoted = _marker(p.stdout, "OFFLOAD_FREED", "promoted_mib")
+    _, inflight_budget = _inflight(out)
     assert "OFFLOAD_PASS" in p.stdout, out[-4000:]
-    assert 0 < promoted <= 8, f"the budget has to be spent and not overspent, got {promoted} MiB"
+    assert promoted > 0, f"some of the budget has to buy residency: {_reorder_report(out)}"
+    assert promoted + inflight_budget <= 24, f"residency {promoted} + in-flight {inflight_budget} MiB over 24 MiB"
 
 
 @requires_cuda

@@ -14,8 +14,8 @@
 
 """Probe of the pinned host-to-device bandwidth the load placement is priced at.
 
-The result is cached on the process's ``HostPool`` (see
-``HostPool.h2d_bandwidth_bytes_per_ns``); this module only runs the probe.
+The result is cached on the process's ``HostWeightStore`` (see
+``HostWeightStore.h2d_bandwidth_bytes_per_ns``); this module only runs the probe.
 """
 
 from __future__ import annotations

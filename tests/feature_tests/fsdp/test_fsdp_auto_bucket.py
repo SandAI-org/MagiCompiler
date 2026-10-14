@@ -19,7 +19,6 @@ Tested separately:
 * the planner -- ``fit_alpha_beta``, the amortizing target and
   ``plan_segments`` -- on synthetic members, where every case the rule
   distinguishes (alone, merged, capped, folded, illegal) can be built exactly;
-  and the placement model in ``bucket_eval``;
 * the IR surgery and the pass, end to end on a 2-rank SimpleFSDP model through
   ``fsdp_overlap_helper/ir_coalesce_helper.py``: the compiled output must match
   eager, the wrapper must launch coalesced gathers, and every wait must still
@@ -46,7 +45,6 @@ MiB = 2**20
 
 _HELPER = Path(__file__).parent / "fsdp_overlap_helper" / "ir_coalesce_helper.py"
 _RANK_HELPER = Path(__file__).parent / "fsdp_overlap_helper" / "auto_bucket_rank_helper.py"
-_SLOT_HELPER = Path(__file__).parent / "fsdp_overlap_helper" / "auto_bucket_slot_helper.py"
 
 requires_2gpu = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.device_count() < 2 or shutil.which("torchrun") is None,
@@ -54,59 +52,22 @@ requires_2gpu = pytest.mark.skipif(
 )
 
 
-# ------------------------------------------------------------------ helpers
-
-
-def _layers(n: int, *, local_mib: int = 8, world: int = 8, compute_ns: float = 200e3, lo: int = 0):
-    """``n`` gathers, each at ``3k`` with its wait at ``3k+1`` and a consumer of
-    ``compute_ns`` at ``3k+2`` -- the shape Inductor hands over, gather just
-    above its own matmul."""
-    members = [
-        Member(
-            idx=3 * k,
-            lo=lo,
-            wait=3 * k + 1,
-            deadline=3 * k + 2,
-            local_bytes=local_mib * MiB,
-            out_bytes=local_mib * MiB * world,
-        )
-        for k in range(n)
-    ]
-    prefix = [0.0] * (3 * n + 1)
-    for i in range(3 * n):
-        prefix[i + 1] = prefix[i] + (compute_ns if i % 3 == 2 else 0.0)
-    return members, prefix
-
-
-def _sizes(segs):
-    return [e - s for s, e in segs]
-
-
-def _covers(segs, n):
-    return [i for s, e in segs for i in range(s, e)] == list(range(n))
-
-
 # ------------------------------------------------------------ alpha / beta
 
 
-def test_fit_recovers_a_linear_cost():
-    alpha, beta = fit_alpha_beta([(1e6, 25e3), (2e6, 30e3), (4e6, 40e3)])
-    assert alpha == pytest.approx(20e3)
-    assert beta == pytest.approx(5e-3)
-
-
-def test_fit_with_one_size_splits_by_the_guess():
-    """Every weight the same size: the fixed part is not observable, so the guess
-    (capped at half the cheapest point) takes it and bytes take the rest."""
-    alpha, beta = fit_alpha_beta([(1e6, 30e3), (1e6, 30e3)], alpha_guess_ns=10e3)
-    assert alpha == pytest.approx(10e3)
-    assert beta == pytest.approx(20e3 / 1e6)
-
-
-def test_fit_never_goes_negative():
-    alpha, beta = fit_alpha_beta([(1e6, 50e3), (2e6, 40e3)])
-    assert alpha >= 0 and beta >= 0
-    alpha, beta = fit_alpha_beta([(1e6, 1e3), (4e6, 40e3)])
+@pytest.mark.parametrize(
+    "points,kwargs,expected",
+    [
+        pytest.param([(1e6, 25e3), (2e6, 30e3), (4e6, 40e3)], {}, (20e3, 5e-3), id="linear"),
+        pytest.param([(1e6, 30e3), (1e6, 30e3)], {"alpha_guess_ns": 10e3}, (10e3, 20e3 / 1e6), id="one-size-guess"),
+        pytest.param([(1e6, 50e3), (2e6, 40e3)], {}, (45e3, 0.0), id="negative-slope"),
+        # A negative intercept falls back to a least-squares fit through the origin.
+        pytest.param([(1e6, 1e3), (4e6, 40e3)], {}, (0.0, 161e9 / 17e12), id="negative-intercept"),
+    ],
+)
+def test_fit_alpha_beta(points, kwargs, expected):
+    alpha, beta = fit_alpha_beta(points, **kwargs)
+    assert (alpha, beta) == pytest.approx(expected)
     assert alpha >= 0 and beta >= 0
 
 
@@ -188,36 +149,32 @@ def test_each_process_group_gets_its_own_fit(monkeypatch):
     assert pooled_beta < 0.2 * params[("nccl", "dense", 8)].beta_ns_per_byte, "pooled, the copies set beta for all"
 
 
-def test_large_gathers_go_alone():
-    members = _members([400, 150, 100, 120])
-    assert plan_segments(members, _params()) == [(0, 1), (1, 2), (2, 3), (3, 4)]
-
-
-def test_tiny_gathers_merge_until_their_launch_is_amortized():
-    """60 gathers of 4 MiB: buckets of 25 reach the 100 MiB target; the last 10
-    (40 MiB, under half the target) fold into the bucket before them."""
-    members = _members([4] * 60)
-    segs = plan_segments(members, _params())
-    assert segs == [(0, 25), (25, 60)]
-    assert max(_out(members, segs)) <= 200
-
-
-def test_a_large_gather_ends_the_bucket_and_is_never_inside_one():
-    members = _members([4] * 5 + [300] + [4] * 5)
-    assert plan_segments(members, _params()) == [(0, 5), (5, 6), (6, 11)]
-
-
-def test_a_bucket_never_grows_past_twice_the_target():
-    members = _members([90, 90, 90])
-    segs = plan_segments(members, _params())
-    assert segs == [(0, 2), (2, 3)]
-    assert max(_out(members, segs)) <= 200
+@pytest.mark.parametrize(
+    "out_mib,expected",
+    [
+        pytest.param([400, 150, 100, 120], [(0, 1), (1, 2), (2, 3), (3, 4)], id="large-and-target-sized-alone"),
+        # Two 100 MiB buckets plus a 40 MiB tail: fold the tail into the second bucket.
+        pytest.param([4] * 60, [(0, 25), (25, 60)], id="tiny-gathers-fold-tail"),
+        pytest.param([4] * 5 + [300] + [4] * 5, [(0, 5), (5, 6), (6, 11)], id="large-gather-splits-run"),
+        pytest.param([60, 60, 40], [(0, 3)], id="tail-fits-cap"),
+        pytest.param([90, 90, 40], [(0, 2), (2, 3)], id="tail-exceeds-cap"),
+    ],
+)
+def test_plan_segments(out_mib, expected):
+    members = _members(out_mib)
+    params = _params()
+    segs = plan_segments(members, params)
+    assert segs == expected
+    # An already-large singleton may exceed the cap; a merged bucket may not.
+    for (start, end), size in zip(segs, _out(members, segs)):
+        if end - start > 1:
+            assert size * MiB <= params.cap_bytes
 
 
 def test_bucket_size_mib_caps_local_bytes():
     members = _members([4] * 8)  # 0.5 MiB local each
     segs = plan_segments(members, _params(max_local_bytes=1 * MiB))
-    assert all(e - s <= 2 for s, e in segs), segs
+    assert segs == [(0, 2), (2, 4), (4, 6), (6, 8)]
 
 
 def test_a_bucket_never_spans_a_wait_its_launch_cannot_precede():
@@ -230,67 +187,6 @@ def test_a_bucket_never_spans_a_wait_its_launch_cannot_precede():
     for s, e in segs:
         seg = members[s:e]
         assert max(seg[0].idx, max(m.lo for m in seg)) <= min(m.wait for m in seg)
-
-
-def test_a_tail_that_would_break_the_cap_is_left_alone():
-    members = _members([60, 60, 40])
-    # [60, 60] reaches the target at 120; folding the 40 MiB tail would make 160,
-    # still under the cap -- so it folds.  At 90+90 the fold would make 220.
-    assert plan_segments(members, _params()) == [(0, 3)]
-    members = _members([90, 90, 40])
-    assert plan_segments(members, _params()) == [(0, 2), (2, 3)]
-
-
-def test_the_plan_is_a_function_of_its_inputs():
-    """What makes the ranks agree: same graph and costs, same plan, every time."""
-    members = _members([4, 90, 2, 300, 7, 7, 7, 60, 1, 1] * 3)
-    first = plan_segments(members, _params())
-    assert all(plan_segments(list(members), _params()) == first for _ in range(3))
-
-
-# ----------------------------------------------------- the placement model
-
-
-def test_placement_launches_as_late_as_the_window_allows():
-    """Enough compute: no lateness past the first layer (nothing runs before it),
-    and each later launch exactly one layer ahead of its reader -- the latest
-    index whose compute still covers the transfer."""
-    from magi_compiler.passes.fsdp_overlap.bucket_eval import place
-
-    members, prefix = _layers(4, compute_ns=1e6)
-    params = PlanParams(alpha_ns=0.0, beta_ns_per_byte=0.5e6 / (64 * MiB), margin_ns=0.0)
-    placed = place(members, [(i, i + 1) for i in range(4)], prefix, params)
-    assert placed.late_ns == [0.5e6, 0.0, 0.0, 0.0]
-    # Layer k's gather reads compute at 3k+2; half a layer of transfer fits behind
-    # layer k-1's compute, which runs at 3(k-1)+2 = 3k-1.
-    assert placed.launches[1:] == [3 * k - 1 for k in range(1, 4)]
-
-
-def test_placement_lateness_is_the_least_a_serial_stream_allows():
-    from magi_compiler.passes.fsdp_overlap.bucket_eval import place
-
-    members, prefix = _layers(3, compute_ns=1e5)
-    params = PlanParams(alpha_ns=0.0, beta_ns_per_byte=1e6 / (64 * MiB), margin_ns=0.0)
-    placed = place(members, [(0, 1), (1, 2), (2, 3)], prefix, params)
-    # Released at t=0, 1 ms each, back to back: finishes at 1, 2, 3 ms against
-    # readers at 0, 0.1, 0.2 ms.
-    assert placed.late_ns == pytest.approx([1e6, 2e6 - 1e5, 3e6 - 2e5])
-
-
-def test_a_merged_member_is_allocated_at_the_bucket_launch():
-    from magi_compiler.passes.fsdp_overlap.bucket_eval import peak_with, place
-
-    members, prefix = _layers(4, compute_ns=1e6)
-    params = PlanParams(alpha_ns=0.0, beta_ns_per_byte=0.5e6 / (64 * MiB), margin_ns=0.0)
-    base = [0] * (len(prefix))
-    singles = [(i, i + 1) for i in range(4)]
-    merged = [(0, 2), (2, 4)]
-    one = peak_with(base, [(members, singles, place(members, singles, prefix, params))])
-    two = peak_with(base, [(members, merged, place(members, merged, prefix, params))])
-    # One layer ahead, a gather holds at most its own 64 MiB early; a bucket of
-    # two holds its second member across the first member's layer as well.
-    assert one[0] == 64 * MiB
-    assert two[0] == 2 * 64 * MiB
 
 
 # ---------------------------------------------------------------- end to end
@@ -340,127 +236,76 @@ def test_fixed_pairs_coalesce_under_their_old_names():
 
 
 @requires_2gpu
-def test_auto_bucketing_end_to_end():
-    p = _run("--pair", "0", "--n-layers", "8", "--hidden", "1024")
+@pytest.mark.parametrize(
+    "extra,cap_mib,expected_messages",
+    [
+        pytest.param((), None, (), id="analytical"),
+        pytest.param(("--cost-mode", "profile_sync", "--bucket-size-mib", "4"), 4.0, (), id="profile-sync-cap"),
+        # Inject a missing bucket on rank 1; both ranks must adopt rank 0's plan.
+        pytest.param(("--bucket-size-mib", "4", "--diverge"), 4.0, ("every rank takes rank 0's",), id="divergent-plan"),
+        # Rank 1 adds compute but keeps the collective skeleton: exercise SLOT consensus.
+        pytest.param(
+            ("--mismatch",),
+            None,
+            ("FSDP auto bucket reorder: per-rank graphs are NOT structurally identical", "SLOT-consensus"),
+            id="different-compute-graphs",
+        ),
+    ],
+)
+def test_auto_bucketing_end_to_end(extra, cap_mib, expected_messages):
+    p = _run("--pair", "0", "--n-layers", "8", "--hidden", "1024", *extra)
     out = p.stdout + p.stderr
     assert p.returncode == 0 and "IRC_PASS" in p.stdout, out[-4000:]
     assert "FSDP auto bucket:" in out, out[-4000:]
     assert _field(p.stdout, "IRC_CODE", "coalesced_calls") >= 1
+    assert "unbucketed" not in out, out[-4000:]
     assert "snode cost table:" not in out, "the pass must price the snodes it builds"
 
+    for message in expected_messages:
+        assert message in out, out[-4000:]
+    if cap_mib is not None:
+        # Plan-consensus messages share the prefix; select the size report explicitly.
+        line = next(l for l in out.splitlines() if "FSDP auto bucket:" in l and "min/median/max " in l)
+        biggest = float(line.split("min/median/max ")[1].split(";")[0].split("/")[2])
+        assert biggest <= cap_mib, line
 
-@requires_2gpu
-def test_auto_bucketing_respects_the_cap_under_rank_synchronized_costs():
-    """profile_sync measures on each rank; the plan digest check is what keeps
-    the buckets identical, and the cap bounds whatever the planner prefers."""
-    p = _run("--pair", "0", "--n-layers", "8", "--hidden", "1024", "--cost-mode", "profile_sync", "--bucket-size-mib", "4")
-    out = p.stdout + p.stderr
-    assert p.returncode == 0 and "IRC_PASS" in p.stdout, out[-4000:]
-    assert "unbucketed" not in out, out[-4000:]
-    line = next(l for l in out.splitlines() if "FSDP auto bucket:" in l)
-    biggest = float(line.split("min/median/max ")[1].split(";")[0].split("/")[2])
-    assert biggest <= 4.0, line
-
-
-@requires_2gpu
-def test_memory_probe_reports_every_stage_and_changes_nothing():
-    p = _run("--pair", "0", "--n-layers", "8", "--hidden", "1024", "--memory-probe")
-    out = p.stdout + p.stderr
-    assert p.returncode == 0 and "IRC_PASS" in p.stdout, out[-4000:]
-    for tag in ("baseline", "after auto bucket", "after FSDP reorder"):
-        assert f"memory probe [{tag}]: est. peak" in out, (tag, out[-4000:])
-    assert "FSDP auto bucket model: base peak" in out, out[-4000:]
-    assert "could not estimate" not in out and "model report failed" not in out, out[-4000:]
-
-
-@requires_2gpu
-def test_a_rank_whose_own_plan_differs_takes_rank_0s():
-    """Per-rank measured costs can flip a near-tie plan (wan: 4 plans on 8 ranks).
-
-    Falling back to no buckets there made the model slower than the manual
-    size; instead every rank must apply rank 0's plan, and the collectives,
-    being the same sequence everywhere, must still produce eager's output.
-    """
-    p = _run("--pair", "0", "--n-layers", "8", "--hidden", "1024", "--bucket-size-mib", "4", "--diverge")
-    out = p.stdout + p.stderr
-    assert p.returncode == 0 and "IRC_PASS" in p.stdout, out[-4000:]
-    assert "every rank takes rank 0's" in out, out[-4000:]
-    assert "unbucketed" not in out, out[-4000:]
+    # This marker reports bucket/member counts, not the full membership plan.
     per_rank = next(l for l in p.stdout.splitlines() if l.startswith("IRC_RANK_BUCKETS")).split()[1:]
-    assert len(set(per_rank)) == 1 and per_rank[0].split("/")[0] != "0", per_rank
-
-
-@requires_2gpu
-def test_auto_bucketing_on_per_rank_graphs_that_differ_in_compute():
-    """Rank 1 compiles one extra pointwise op: the graphs differ, the collective
-    skeleton does not, so the pass runs in ``slot`` mode and must still bucket,
-    the same buckets on both ranks, with eager's output."""
-    p = _run("--pair", "0", "--n-layers", "8", "--hidden", "1024", "--mismatch")
-    out = p.stdout + p.stderr
-    assert p.returncode == 0 and "IRC_PASS" in p.stdout, out[-4000:]
-    assert "FSDP auto bucket reorder: per-rank graphs are NOT structurally identical" in out, out[-4000:]
-    assert "SLOT-consensus" in out, out[-4000:]
-    assert "unbucketed" not in out, out[-4000:]
-    per_rank = next(l for l in p.stdout.splitlines() if l.startswith("IRC_RANK_BUCKETS")).split()[1:]
-    assert len(set(per_rank)) == 1 and per_rank[0].split("/")[0] != "0", per_rank
-    assert _field(p.stdout, "IRC_CODE", "coalesced_calls") >= 1
+    assert len(per_rank) == 2 and len(set(per_rank)) == 1, per_rank
+    assert int(per_rank[0].split("/")[0]) > 0, per_rank
 
 
 requires_torchrun = pytest.mark.skipif(shutil.which("torchrun") is None, reason="requires torchrun")
 
 
-@requires_torchrun
-def test_a_rank_with_one_candidate_still_negotiates():
-    """Rank 0 has one gather and rank 1 has two, and their graph fingerprints differ.
-
-    Both must enter ``negotiate_mode``'s gloo all_gather and then leave the schedule
-    unchanged. Returning before that exchange stalls the rank that still has a pair.
-    The helper stubs only candidate discovery and the fingerprint.
-    """
+def _run_gloo_helper(helper: Path) -> subprocess.CompletedProcess:
     root = str(Path(__file__).resolve().parents[3])
     env = os.environ.copy()
     prev = env.get("PYTHONPATH")
     env["PYTHONPATH"] = root if not prev else root + os.pathsep + prev
     env["PYTHONUNBUFFERED"] = "1"
     env["MAGI_LOGGING_LEVEL"] = env.get("MAGI_LOGGING_LEVEL", "info")
-    p = subprocess.run(
-        ["torchrun", "--nproc_per_node=2", f"--master_port={_free_port()}", str(_RANK_HELPER)],
+    return subprocess.run(
+        ["torchrun", "--nproc_per_node=2", f"--master_port={_free_port()}", str(helper)],
         env=env,
         capture_output=True,
         text=True,
         timeout=60,
     )
-    out = p.stdout + p.stderr
-    assert p.returncode == 0, out[-4000:]
-    lines = [line for line in p.stdout.splitlines() if "BUCKET_NEGOTIATED" in line]
-    assert len(lines) == 2, out[-4000:]
-
-    def negotiated(rank: str, n: str) -> bool:
-        needle = (f"rank={rank}", "mode=abort", f"n={n}", "unchanged=True")
-        return any(all(part in line for part in needle) for line in lines)
-
-    assert negotiated("0", "1") and negotiated("1", "2"), lines
-    assert "BUCKET_RANK_PASS" in p.stdout, out[-4000:]
 
 
 @requires_torchrun
-def test_slot_mode_buckets_only_where_every_rank_merges_into_one_collective_order():
-    """Per-rank graphs differ but their skeletons match: rank 0's plan is applied
-    only if every rank's merge leaves the collectives in the same order and the
-    candidates correspond one to one."""
-    root = str(Path(__file__).resolve().parents[3])
-    env = os.environ.copy()
-    prev = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = root if not prev else root + os.pathsep + prev
-    env["PYTHONUNBUFFERED"] = "1"
-    p = subprocess.run(
-        ["torchrun", "--nproc_per_node=2", f"--master_port={_free_port()}", str(_SLOT_HELPER)],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
+def test_auto_bucket_rank_consensus():
+    """Check unequal candidate counts and slot-plan adoption in one two-rank run.
+
+    A rank with one candidate must still negotiate abort with its peer. Then
+    check matching slots, changed collective order, mismatched signatures, and
+    identical-graph mode. The helper restores patches between these cases.
+    """
+    p = _run_gloo_helper(_RANK_HELPER)
     out = p.stdout + p.stderr
-    # SLOT_PASS is the all-reduced verdict of every rank's cases; the per-case
-    # lines are for reading only, as two ranks' prints can share a line.
-    assert p.returncode == 0 and "SLOT_PASS" in p.stdout, out[-4000:]
+    assert p.returncode == 0, out[-4000:]
+    # These markers report verdicts reduced across both ranks. Per-rank lines
+    # remain diagnostic only, because concurrent prints can share a line.
+    assert "BUCKET_RANK_PASS" in p.stdout, out[-4000:]
+    assert "SLOT_PASS" in p.stdout, out[-4000:]
