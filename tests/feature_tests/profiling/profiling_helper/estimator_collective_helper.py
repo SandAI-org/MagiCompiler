@@ -29,7 +29,7 @@ per-rank structural divergence), warm_and_sync must still lockstep-measure the S
 collective key (not abandon the whole table) and degrade only the rank-local
 collective-bearing keys to analytical -- completing at all proves no hang.
 
-Run: torchrun --nproc_per_node=2 .../estimator_collective_helper.py
+Run: torchrun --nproc_per_node=2 tests/feature_tests/profiling/profiling_helper/estimator_collective_helper.py
 
 Markers (rank 0):
   COLL_MEASURED est_us=<f> real_us=<f> ratio=<f>

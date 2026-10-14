@@ -59,24 +59,16 @@ def test_uneven_shard_transport_is_rank_identical():
 
     The even case is the control that keeps the fix honest: refusing the copy engine
     for everything would satisfy the uneven assertion and quietly cost the whole
-    feature, so ``rows=4`` has to still come out as one copy-engine bucket.
+    feature, so ``rows=4`` has to still come out on the copy engine.
 
-    The mixed graph interleaves the two: even weights stay on the copy engine, uneven
-    ones stay on NCCL, each as their own coalesced bucket, and every rank agrees.
+    The mixed graph interleaves the two: even weights go to the copy engine, uneven
+    ones stay on NCCL, and every rank agrees.
     """
     p = _run("29645")
     out = p.stdout + p.stderr
     assert p.returncode == 0, f"helper failed:\n{out[-4000:]}"
-    # even control: still bucketed onto the copy engine
-    assert "UNEVEN_TRANSPORT rows=4 agree=True targets={'ce_coalesced': 1}" in p.stdout, out[-4000:]
-    # uneven: every rank keeps it on NCCL -- but still buckets it there.  Losing the
-    # copy engine must not also cost bucketing, or one odd weight turns N gathers
-    # into N launches.
-    assert "UNEVEN_TRANSPORT rows=3 agree=True targets={'nccl_coalesced': 1}" in p.stdout, out[-4000:]
-    assert "UNEVEN_NCCL_BUCKETS rows=3 agree=True" in p.stdout, out[-4000:]
+    assert "UNEVEN_TRANSPORT rows=4 agree=True targets={'ce': 4}" in p.stdout, out[-4000:]
+    assert "UNEVEN_TRANSPORT rows=3 agree=True targets={'nccl': 4}" in p.stdout, out[-4000:]
     assert "UNEVEN_SYMM agree=True in_buffer=['even']" in p.stdout, out[-4000:]
-    assert (
-        "UNEVEN_MIXED agree=True targets={'ce_coalesced': 1, 'nccl_coalesced': 1} "
-        "sizes=[('ce_coalesced', 2), ('nccl_coalesced', 2)]" in p.stdout
-    ), out[-4000:]
+    assert "UNEVEN_MIXED agree=True targets={'ce': 2, 'nccl': 2}" in p.stdout, out[-4000:]
     assert "UNEVEN_PASS" in p.stdout, out[-4000:]

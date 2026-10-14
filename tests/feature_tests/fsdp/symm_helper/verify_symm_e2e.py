@@ -168,10 +168,13 @@ def main() -> None:
     ce = args.transport == "copy_engine"
 
     # -- count the rewrites, without asking the compiled model to confess ----
-    from magi_compiler.passes.fsdp_overlap import lower_and_bucket as _lb
+    # The backend binds the retarget by name at import, so its module attribute
+    # is the seam to patch (the package's too, for anything resolving it there).
+    import magi_compiler.magi_backend.magi_backend as _backend
+    import magi_compiler.passes.fsdp_overlap as _fsdp_overlap
 
     n_rewritten = 0
-    orig_rewrite = _lb.rewrite_weight_ag_to_copy_engine
+    orig_rewrite = _fsdp_overlap.rewrite_weight_ag_to_copy_engine
 
     def spy_rewrite(graph):
         nonlocal n_rewritten
@@ -179,7 +182,25 @@ def main() -> None:
         n_rewritten += got
         return got
 
-    _lb.rewrite_weight_ag_to_copy_engine = spy_rewrite
+    _fsdp_overlap.rewrite_weight_ag_to_copy_engine = spy_rewrite
+    _backend.rewrite_weight_ag_to_copy_engine = spy_rewrite
+
+    # -- count the scheduler-stage buckets the copy engine launches ---------
+    from magi_compiler.passes.fsdp_overlap.auto_bucket import FsdpAutoBucket
+    from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER_COALESCED
+
+    n_ce_buckets = 0
+    orig_bucket = FsdpAutoBucket.__call__
+
+    def spy_bucket(self, snodes):
+        nonlocal n_ce_buckets
+        out = orig_bucket(self, snodes)
+        n_ce_buckets += sum(
+            1 for s in out if getattr(getattr(s, "node", None), "op_overload", None) is CE_ALL_GATHER_COALESCED
+        )
+        return out
+
+    FsdpAutoBucket.__call__ = spy_bucket
 
     # -- the reference: unsharded, eager, same checkpoint -------------------
     torch.manual_seed(1234)
@@ -212,7 +233,9 @@ def main() -> None:
         out2 = model(x)
         torch.cuda.synchronize()
 
-    _lb.rewrite_weight_ag_to_copy_engine = orig_rewrite
+    _fsdp_overlap.rewrite_weight_ag_to_copy_engine = orig_rewrite
+    _backend.rewrite_weight_ag_to_copy_engine = orig_rewrite
+    FsdpAutoBucket.__call__ = orig_bucket
 
     # (2) placement: the block's shards are in a window, the head's are not.
     # Checked after the first forward, not before it: the weights move during
@@ -232,6 +255,7 @@ def main() -> None:
     expect_rewrites = args.n_layers if ce else 0
     rewrite_ok = n_rewritten == expect_rewrites
     log(f"CHECK rewrite: {n_rewritten}/{expect_rewrites} gathers on magi::ce_all_gather -> {'ok' if rewrite_ok else 'WRONG'}")
+    log(f"CHECK auto buckets: {n_ce_buckets} coalesced copy-engine launch(es)")
 
     def rel(a, b):
         return ((a.float() - b.float()).norm() / (b.float().norm() + 1e-6)).item()

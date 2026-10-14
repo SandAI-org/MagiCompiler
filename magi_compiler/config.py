@@ -207,6 +207,57 @@ class OffloadConfig(BaseModel):
             "Env var: MAGI_COMPILE_OFFLOAD_CONFIG__FORCE_PER_RANK_WEIGHTS (1/0/true/false)."
         ),
     )
+    graph_weight_offload: bool = Field(
+        False,
+        description=(
+            "Compile-time CPU offload of SimpleFSDP weight shards, scheduled at snode granularity. "
+            "Requires compile_mode=MAGI_COMPILE: host-first parks selected weights as empty CUDA "
+            "stand-ins and only the Magi backend inserts magi::h2d_load; TORCH_COMPILE and NONE "
+            "skip that rewrite and would leave the stand-in empty. "
+            "Parks each selected local shard in pinned host memory and loads it back inside the graph "
+            "with magi::h2d_load, placed far enough upstream for compute to hide the transfer before "
+            "its all-gather launches. offload_max_device_weight_mib bounds the weight bytes on the "
+            "device, which the placement pass splits between weights handed back permanently and "
+            "load buffers in flight. Works with SimpleFSDP (transport='nccl') and with unsharded "
+            "nn.Parameter models. Mutually exclusive with model_cpu_offload (the runtime-wrapper "
+            "path) because the two offload the same bytes through different mechanisms. "
+            "When this is on, a meta-built model's to_empty hands back pinned host memory and the "
+            "checkpoint loads into it directly, so the weights enter the host pool without occupying "
+            "a device byte."
+        ),
+    )
+    offload_min_shard_mib: float = Field(
+        1.0,
+        ge=0.0,
+        description=(
+            "Minimum local-shard MiB to offload. Every offloaded weight is its own load, and below "
+            "this its fixed submission cost (~40us of CPU; 1 MiB crosses PCIe in ~20us) rather than "
+            "bandwidth dominates the transfer, so it costs schedule slack and frees almost nothing."
+        ),
+    )
+    offload_max_device_weight_mib: int = Field(
+        0,
+        ge=0,
+        description=(
+            "Budget per GPU for the weight MiB on the device, which the placement pass splits between "
+            "residency and in-flight load buffers: the smallest in-flight budget that still hides every "
+            "transfer, and all the rest to residency. A resident weight pays no PCIe at all, so "
+            "residency decides how much traffic the bus carries: with T MiB of offloadable weight, a "
+            "bandwidth of B MiB/ms and C ms of compute per step, no schedule is compute-bound unless "
+            "(T - resident) / B <= C. In-flight room decides how far upstream a load may be hoisted. "
+            "0 = nothing resident, and in-flight room for one load on top of what the unhoisted order "
+            "already needs."
+        ),
+    )
+    offload_h2d_bandwidth_gbps: float = Field(
+        0.0,
+        ge=0.0,
+        description=(
+            "Override the measured host-to-device bandwidth (GB/s) used to size each load's overlap "
+            "window. 0 = calibrate once per process with a pinned probe. Under-estimating is the "
+            "safe direction: it hoists loads further than needed."
+        ),
+    )
 
 
 class FSDPConfig(BaseModel):
@@ -217,25 +268,41 @@ class FSDPConfig(BaseModel):
     enable_fsdp: bool = Field(
         False,
         description=(
-            "Lower SimpleFSDP weight prim_redistribute to explicit collectives, bucket them (bucket_mode), "
+            "Lower SimpleFSDP weight prim_redistribute to explicit collectives, bucket them during scheduling "
+            "(bucket_mode), "
             "and install the latest-safe-launch reorder pass that hoists each all-gather launch just far "
             "enough upstream for compute to hide it. Requires disable_graph_split=True and cudagraph_mode=NONE."
         ),
     )
-    bucket_mode: str = Field(
-        "none",
+    bucket_mode: Literal["none", "auto"] = Field(
+        "auto",
         description=(
-            "'none' = one all_gather + wait per weight; 'coalesced' = one all_gather_into_tensor_coalesced "
-            "per bucket (single launch, N getitems/waits). Buckets are whole-graph, broken only by "
-            "program-order dtype changes and the bucket_size_mib cap."
+            "'none' = one all-gather + wait per weight. 'auto' (default) = small weight gathers are merged "
+            "during Inductor scheduling, from the measured all-gather costs: a gather large enough that its "
+            "launch is at most auto_bucket_overhead_ratio of its time goes alone, and the smaller ones are "
+            "merged with their program-order neighbours until it is. Applies to NCCL and copy-engine "
+            "(transport='copy_engine') gathers alike."
         ),
     )
     bucket_size_mib: int = Field(
-        0,
-        ge=0,
+        0, ge=0, description="bucket_mode='auto': hard cap on a bucket's accumulated local-shard MiB (0 = none)."
+    )
+    auto_bucket_overhead_ratio: float | None = Field(
+        None,
+        gt=0.0,
+        lt=1.0,
         description=(
-            "Per-bucket cap on accumulated local-shard MiB for coalesced bucketing. 0 = no cap "
-            "(one bucket per (group, dtype) run)."
+            "bucket_mode='auto': the share of a gather's time its fixed launch cost may take. With the "
+            "measured cost alpha + beta * bytes (fitted per transport and process group), a gather of "
+            "alpha * (1 - ratio) / (ratio * beta) gathered bytes or more goes alone; smaller ones are merged "
+            "with their program-order neighbours until a bucket reaches that size, never past twice it. "
+            "Smaller ratios merge more and allocate more gathered weight early. "
+            "None (default) picks per transport: 0.1 for NCCL gathers and 0.5 for copy-engine gathers. "
+            "A copy-engine launch costs far more fixed time and far less per byte, so one ratio would give it "
+            "a target several times the NCCL one; on gaga4 400B (8 ranks) these defaults give targets of "
+            "~240 MiB (NCCL) and ~150 MiB (copy engine) and ran level with the old fixed 512 MiB buckets, "
+            "while 0.1 on the copy engine (~1.4 GiB) was ~3% slower and held ~2 GiB more. "
+            "A value set here applies to both transports."
         ),
     )
     cost_mode: Literal["profile_sync", "analytical"] = Field(
@@ -256,7 +323,7 @@ class FSDPConfig(BaseModel):
         ),
     )
     comm_overlap_window_scale: float = Field(
-        1.0,
+        1.1,
         ge=1.0,
         description=(
             "Multiplier on each collective's estimated runtime when sizing its compute window "

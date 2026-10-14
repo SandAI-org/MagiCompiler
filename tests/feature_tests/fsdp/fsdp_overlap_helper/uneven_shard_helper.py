@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""torchrun entrypoint: every rank must make the SAME transport and bucketing
-decision for an uneven ``Shard(0)`` weight.
+"""torchrun entrypoint: every rank must make the SAME transport decision for an
+uneven ``Shard(0)`` weight.
 
 A collective is a joint operation: if one rank keeps a weight gather on NCCL while
 its peers move it to the copy engine, the NCCL all-gather waits for peers that will
@@ -25,7 +25,7 @@ to the trailing ones, so with ``F % world != 0`` the ranks do not agree on the l
 shard length.  Two decisions were derived from that length and diverged because of
 it:
 
-  1. **Transport and bucket membership.**  The lowering pads the short shards up to a
+  1. **Transport.**  The lowering pads the short shards up to a
      full chunk, and copy-engine eligibility was decided by asking whether the
      gather's input was the shard itself -- which a pad makes false.  So the trailing
      ranks kept the gather on NCCL and every other rank moved it to the copy engine.
@@ -33,17 +33,14 @@ it:
      an uneven shard makes it rank-dependent -- and the gather copies one fixed-size
      slab per peer.
 
-The byte cap on bucket size is checked here too, though it never diverged: it was
-accounted from the gather's input, which the pad had already brought back to
-``chunk``.  It is asserted because that is a coincidence, not a design.
-
 A mixed graph (even and uneven weights interleaved, copy-engine transport) is the
 production shape: one odd weight must not drag its even neighbours onto NCCL, and
 the even ones must not drag the odd one onto the copy engine.
 
 Checked below, at ``world`` ranks, for an evenly and an unevenly divisible weight:
-the full set of gather targets and bucket sizes is all-gathered and compared, and so
-is the buffer window size.
+the full set of gather targets is all-gathered and compared, and so is the buffer
+window size.  (Bucketing happens later, during scheduling, where every rank adopts
+rank 0's plan.)
 
 Driven by ``tests/feature_tests/test_uneven_shard_transport.py``.  Run directly with::
 
@@ -51,9 +48,8 @@ Driven by ``tests/feature_tests/test_uneven_shard_transport.py``.  Run directly 
 
 Markers (rank 0):
   UNEVEN_TRANSPORT rows=<F> agree=<bool> targets=<counts>
-  UNEVEN_NCCL_BUCKETS rows=<F> agree=<bool> sizes=<list>
   UNEVEN_SYMM agree=<bool> in_buffer=<n> skipped=<n>
-  UNEVEN_MIXED agree=<bool> targets=<counts> sizes=<list>
+  UNEVEN_MIXED agree=<bool> targets=<counts>
   UNEVEN_PASS
 """
 
@@ -73,7 +69,6 @@ import torch.nn as nn  # noqa: E402
 from torch.distributed.device_mesh import init_device_mesh  # noqa: E402
 
 _NCCL_AG = torch.ops._c10d_functional.all_gather_into_tensor.default
-_NCCL_AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
 
 
 def _build_graph(mesh, row_counts: Sequence[int], cols: int, dtype=torch.bfloat16) -> fx.GraphModule:
@@ -117,28 +112,16 @@ def _example_inputs(gm) -> list[object]:
     return [n.meta["example_value"] for n in gm.graph.find_nodes(op="placeholder")]
 
 
-def _gather_targets(gm) -> tuple[dict[str, int], list[tuple[str, int]]]:
-    """Which transport each gather ended up on, and the size of each coalesced launch."""
-    from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER, CE_ALL_GATHER_COALESCED
+def _gather_targets(gm) -> dict[str, int]:
+    """How many gathers ended up on each transport."""
+    from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER
 
-    names = {
-        _NCCL_AG: "nccl",
-        _NCCL_AG_COALESCED: "nccl_coalesced",
-        CE_ALL_GATHER: "ce",
-        CE_ALL_GATHER_COALESCED: "ce_coalesced",
-    }
+    names = {_NCCL_AG: "nccl", CE_ALL_GATHER: "ce"}
     counts: Counter[str] = Counter()
-    sizes: list[tuple[str, int]] = []
     for node in gm.graph.nodes:
-        if node.op != "call_function":
-            continue
-        name = names.get(node.target)
-        if name is None:
-            continue
-        counts[name] += 1
-        if name.endswith("_coalesced"):
-            sizes.append((name, len(node.args[0])))
-    return dict(counts), sizes
+        if node.op == "call_function" and node.target in names:
+            counts[names[node.target]] += 1
+    return dict(sorted(counts.items()))
 
 
 def _agree(value) -> bool:
@@ -148,34 +131,34 @@ def _agree(value) -> bool:
     return all(v == seen[0] for v in seen)
 
 
+def _pipeline(gm, *, transport: str) -> None:
+    """``MagiBackend._apply_weight_pipeline`` with host offload off, inlined.
+
+    Lower, bind, retarget what bound -- the order is what decides transport per
+    weight, which is the thing every rank has to agree on.
+    """
+    from magi_compiler.passes.fsdp_overlap import (
+        bind_weights_for_copy_engine,
+        lower_prim_redistribute_to_collectives,
+        rewrite_weight_ag_to_copy_engine,
+    )
+
+    examples = _example_inputs(gm)
+    lower_prim_redistribute_to_collectives(gm)
+    if transport == "copy_engine":
+        bind_weights_for_copy_engine(gm, examples, 0)
+        rewrite_weight_ag_to_copy_engine(gm)
+
+
 def _check_transport(mesh, rows: int, *, n: int, cols: int, say) -> bool:
-    from magi_compiler.passes.fsdp_overlap import lower_and_bucket_full_graph
     from magi_compiler.symm_mem import reset_registry
 
     reset_registry()  # each check accounts for its own windows
     gm = _build_graph(mesh, [rows] * n, cols)
-    lower_and_bucket_full_graph(
-        gm, "coalesced", bucket_size_bytes=0, transport="copy_engine", example_inputs=_example_inputs(gm)
-    )
-    targets, sizes = _gather_targets(gm)
-    ok = _agree((targets, sizes))
-    say(f"UNEVEN_TRANSPORT rows={rows} agree={ok} targets={targets} sizes={sizes}")
-    return ok
-
-
-def _check_nccl_bucket_cap(mesh, rows: int, *, n: int, cols: int, cap: int, say) -> bool:
-    """The byte cap must cut buckets in the same place on every rank.
-
-    Runs on the DEFAULT transport, where the uneven weight is bucketed rather than
-    excluded, so the cap is the only thing deciding membership.
-    """
-    from magi_compiler.passes.fsdp_overlap import lower_and_bucket_full_graph
-
-    gm = _build_graph(mesh, [rows] * n, cols)
-    lower_and_bucket_full_graph(gm, "coalesced", bucket_size_bytes=cap, transport="nccl")
-    _targets, sizes = _gather_targets(gm)
-    ok = _agree(sizes)
-    say(f"UNEVEN_NCCL_BUCKETS rows={rows} agree={ok} sizes={sizes}")
+    _pipeline(gm, transport="copy_engine")
+    targets = _gather_targets(gm)
+    ok = _agree(targets)
+    say(f"UNEVEN_TRANSPORT rows={rows} agree={ok} targets={targets}")
     return ok
 
 
@@ -210,24 +193,17 @@ def _check_binding(mesh, *, even_rows: int, uneven_rows: int, cols: int, say) ->
 def _check_mixed(mesh, *, even_rows: int, uneven_rows: int, cols: int, say) -> bool:
     """Even and uneven weights in one copy-engine graph must split by transport.
 
-    Interleaved so a program-order bucket would mix them: the even pair stays on
-    the copy engine as one coalesced launch, the uneven pair stays on NCCL as
-    another.  All ranks must report the same split.
+    Interleaved: the even pair goes to the copy engine, the uneven pair stays on
+    NCCL.  All ranks must report the same split.
     """
-    from magi_compiler.passes.fsdp_overlap import lower_and_bucket_full_graph
     from magi_compiler.symm_mem import reset_registry
 
     reset_registry()
     gm = _build_graph(mesh, [even_rows, uneven_rows, even_rows, uneven_rows], cols)
-    lower_and_bucket_full_graph(
-        gm, "coalesced", bucket_size_bytes=0, transport="copy_engine", example_inputs=_example_inputs(gm)
-    )
-    targets, sizes = _gather_targets(gm)
-    targets = dict(sorted(targets.items()))
-    sizes = sorted(sizes)
-    expected = ({"ce_coalesced": 1, "nccl_coalesced": 1}, [("ce_coalesced", 2), ("nccl_coalesced", 2)])
-    ok = _agree((targets, sizes)) and (targets, sizes) == expected
-    say(f"UNEVEN_MIXED agree={ok} targets={targets} sizes={sizes}")
+    _pipeline(gm, transport="copy_engine")
+    targets = _gather_targets(gm)
+    ok = _agree(targets) and targets == {"ce": 2, "nccl": 2}
+    say(f"UNEVEN_MIXED agree={ok} targets={targets}")
     return ok
 
 
@@ -235,7 +211,6 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--n-weights", type=int, default=4)
     ap.add_argument("--cols", type=int, default=256)
-    ap.add_argument("--cap-bytes", type=int, default=2048, help="bucket byte cap that splits ranks if accounted locally")
     args = ap.parse_args()
 
     rank = int(os.environ.get("RANK", "0"))
@@ -255,7 +230,6 @@ def main() -> None:
 
     ok = _check_transport(mesh, even_rows, n=args.n_weights, cols=args.cols, say=say)
     ok &= _check_transport(mesh, uneven_rows, n=args.n_weights, cols=args.cols, say=say)
-    ok &= _check_nccl_bucket_cap(mesh, uneven_rows, n=args.n_weights, cols=args.cols, cap=args.cap_bytes, say=say)
     ok &= _check_binding(mesh, even_rows=even_rows, uneven_rows=uneven_rows, cols=args.cols, say=say)
     ok &= _check_mixed(mesh, even_rows=even_rows, uneven_rows=uneven_rows, cols=args.cols, say=say)
 
