@@ -29,21 +29,33 @@ this suite exists to catch.
 import pytest
 import torch
 
-from magi_compiler.passes.overlap import memory, scheduler
+from magi_compiler.passes.overlap import CostView, SnodeGraph, memory, scheduler
 from magi_compiler.passes.weight_offload.schedule import h2d_reorder, load_plan
 from magi_compiler.passes.weight_offload.schedule.h2d_reorder import H2dLoadReorder
 
 _MIB = 1 << 20
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="promotion moves real bytes")
+
+
+@pytest.fixture
+def clean_host_weights():
+    from magi_compiler.passes.weight_offload import host_weights
+
+    host_weights.reset()
+    try:
+        yield
+    finally:
+        host_weights.reset()
 
 
 def _park(tensor: torch.Tensor, name: str = "") -> int:
     """Put ``tensor`` in the host pool the production way: reserve, fill, empty, adopt."""
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
 
-    host = host_pool.reserve(tuple(tensor.shape), tensor.dtype, name=name)
+    host = host_weights.reserve(tuple(tensor.shape), tensor.dtype, name=name)
     host.copy_(tensor.detach())
     tensor.untyped_storage().resize_(0)
-    return host_pool.adopt(host, tensor, name=name)
+    return host_weights.adopt(host, tensor, name=name)
 
 
 class _Dep:
@@ -155,52 +167,44 @@ def _reorder(
     return [s.name for s in p(order)]
 
 
-def test_load_is_hoisted_until_the_compute_covers_the_transfer():
-    # 10 MiB at 10 GB/s is ~1.05ms; one 2ms kernel is more than enough, so the
-    # load should stop just in front of it rather than walking to the top.
-    order = [
-        _compute("c0", 2e6),
-        _compute("c1", 2e6),
-        _load("ld", 10),
-        _wait("w", "ld"),
-        _compute("gather_user", 1e6, deps=["w"]),
-    ]
-    assert _reorder(order) == ["c0", "ld", "c1", "w", "gather_user"]
-
-
-def test_load_walks_further_when_one_kernel_is_not_enough():
-    order = [
-        _compute("c0", 2e5),
-        _compute("c1", 2e5),
-        _compute("c2", 2e5),
-        _load("ld", 10),  # ~1.05ms needs all three 0.2ms kernels and still is not covered
-        _wait("w", "ld"),
-        _compute("user", 1e6, deps=["w"]),
-    ]
-    assert _reorder(order) == ["ld", "c0", "c1", "c2", "w", "user"]
+@pytest.mark.parametrize(
+    "compute_ns,expected",
+    [
+        pytest.param([2e6, 2e6], ["c0", "ld", "c1", "w", "user"], id="nearest-kernel-covers-transfer"),
+        pytest.param([2e5] * 3, ["ld", "c0", "c1", "c2", "w", "user"], id="all-compute-still-insufficient"),
+    ],
+)
+def test_load_hoists_only_as_far_as_the_transfer_needs(compute_ns, expected):
+    """10 MiB at 10 GB/s needs about 1.05 ms of preceding compute."""
+    order = [_compute(f"c{i}", cost) for i, cost in enumerate(compute_ns)]
+    order += [_load("ld", 10), _wait("w", "ld"), _compute("user", 1e6, deps=["w"])]
+    assert _reorder(order) == expected
 
 
 def test_two_loads_do_not_spend_the_same_compute():
-    """One PCIe stream means the loads are serialized against each other, so the
-    compute that hides one is gone as far as the other is concerned."""
+    """Each transfer fits a 1 ms window alone, but their serial sum does not."""
     order = [
         _compute("c0", 1e6),
-        _compute("c1", 1e6),
-        _load("ld0", 5),  # ~0.52ms
+        _load("ld0", 6),
         _wait("w0", "ld0"),
-        # No dep on w0: last_user is w0, so the live ranges stay adjacent
-        # ([ld0, w0] / [ld1, ...]) and this test only checks compute claiming.
-        _compute("mid", 1e6),
-        _load("ld1", 5),
+        _load("ld1", 6),
         _wait("w1", "ld1"),
-        _compute("user", 1e6, deps=["w1"]),
+        _compute("user", 1e6, deps=["w0", "w1"]),
     ]
-    out = _reorder(order)
-    # ld1 claims mid, so ld0 has to fall back to c1 -- not share mid.
-    assert out.index("ld1") < out.index("mid")
-    assert out.index("ld0") < out.index("c1")
-    # Closed [ld0, last_user]: last_user must be strictly before the next load.
-    assert out.index("ld0") < out.index("w0") < out.index("ld1")
+    graph = SnodeGraph(order)
+    p = H2dLoadReorder(bandwidth_bytes_per_ns=10.0, window_margin_ns=0.0, max_inflight_bytes=12 * _MIB)
+    plans = p._plan(graph)
+    prefix = CostView(lambda s: s.cost).prefix(order)
+    p._schedule(plans, order, graph.index_of, prefix)
+
+    assert len(plans) == 2
+    assert [plan.need for plan in plans] == pytest.approx([629145.6, 629145.6])
+    assert plans[0].exposed == 0
+    assert plans[1].exposed == pytest.approx(258291.2), "the shared bus cannot hide 1.258 ms in 1 ms"
+    assert not any(plan.budget_bound for plan in plans), "both buffers fit; the shortage is on the bus"
+
+    out = _reorder(order, max_inflight_bytes=12 * _MIB)
+    assert out == ["ld0", "ld1", "c0", "w0", "w1", "user"]
 
 
 def test_load_never_crosses_its_own_producer():
@@ -267,72 +271,67 @@ def _serialized_loads(slots, *, mib=10):
     return order
 
 
-def test_the_default_budget_is_what_the_unhoisted_order_already_needs():
-    """An unasked-for budget makes the peak no worse, and spends all of that.
+@pytest.mark.parametrize(
+    "configured_mib,expected_mib",
+    [
+        pytest.param(0, 24, id="default-adds-one-load"),
+        pytest.param(8, 16, id="below-unhoisted-floor"),
+        pytest.param(20, 20, id="explicit-budget"),
+    ],
+)
+def test_inflight_budget_preserves_the_unhoisted_floor(configured_mib, expected_mib):
+    """Two 8 MiB weights share their last user, so even unhoisted they need 16 MiB.
 
-    Both loads here are still read at ``user``, so even unhoisted -- each against
-    its own wait, the shortest live range it can have -- their bytes are live
-    together.  16 MiB is therefore the floor of this problem, not a hoist's fault,
-    and declining to use it would leave two transfers exposed to save memory that
-    is spent either way.  Both stay hidden; the bus/live-range split then places
-    them as late as that hide allows, so the live ranges stay short.
+    The default adds one largest load; an explicit budget is floored at 16 MiB.
+    All three budgets let both transfers use the nearest sufficient kernel.
     """
-    out = _reorder(_two_conflicting_loads())
+    order = _two_conflicting_loads()
+    p = H2dLoadReorder(bandwidth_bytes_per_ns=10.0, max_inflight_bytes=configured_mib * _MIB)
+    assert p._inflight_budget(p._plan(SnodeGraph(order))) == expected_mib * _MIB
+
+    out = _reorder(order, max_inflight_bytes=configured_mib * _MIB)
     assert out.index("ld0") < out.index("w0") and out.index("ld1") < out.index("w1")
-    assert out.index("ld1") < out.index("w0"), "the overlap phase 1 already pays for"
-    # Shortest hide: both fit behind c2 rather than being chain-pushed into c0.
-    assert out.index("c1") < out.index("ld0") <= out.index("ld1") < out.index("c2")
+    assert out.index("ld1") < out.index("w0"), "the original order already needs both buffers together"
+    assert out.index("c1") < out.index("ld0") < out.index("ld1") < out.index("c2")
 
 
-def test_the_inflight_budget_is_what_lets_two_loads_share_a_window():
-    """What widening the budget buys, and the only thing that can buy it.
-
-    Unhoisted these two never coexist, so one load is the floor and ld1 has to
-    stay against its wait, fully exposed, however much compute sits upstream.
-    16 MiB puts both of them under the same three kernels: 8 MiB more at the peak
-    for a transfer that stops costing anything.
-    """
-    tight = _reorder(_two_loads_one_window(), max_inflight_bytes=8 * _MIB)
-    assert tight.index("ld1") + 1 == tight.index("w1"), "one load of budget leaves ld1 where it was"
-
-    wide = _reorder(_two_loads_one_window(), max_inflight_bytes=16 * _MIB)
-    assert wide.index("ld0") < wide.index("w0") and wide.index("ld1") < wide.index("w1")
-    assert wide.index("ld1") < wide.index("w0"), "the overlap is the point, not an accident"
-    assert wide.index("c1") < wide.index("ld0") <= wide.index("ld1") < wide.index("c2")
-
-
-def test_the_inflight_budget_counts_bytes_not_loads():
-    """15 MiB does not hold two 8 MiB loads.
-
-    A budget counting loads would allow the second hoist and hand back a schedule
-    needing 16 MiB, which is a budget that does not bound anything.
-    """
-    out = _reorder(_two_loads_one_window(), max_inflight_bytes=15 * _MIB)
-    assert out.index("ld1") + 1 == out.index("w1")
+@pytest.mark.parametrize(
+    "budget_mib,can_overlap",
+    [
+        pytest.param(8, False, id="one-buffer"),
+        pytest.param(15, False, id="just-too-small"),
+        pytest.param(16, True, id="two-buffers"),
+    ],
+)
+def test_inflight_bytes_determine_whether_loads_share_a_window(budget_mib, can_overlap):
+    """Two 8 MiB buffers can share a compute window only when both fit."""
+    out = _reorder(_two_loads_one_window(), max_inflight_bytes=budget_mib * _MIB)
+    assert out.index("ld0") < out.index("w0") and out.index("ld1") < out.index("w1")
+    if can_overlap:
+        assert out.index("ld1") < out.index("w0")
+        assert out.index("c1") < out.index("ld0") < out.index("ld1") < out.index("c2")
+    else:
+        assert out.index("ld1") + 1 == out.index("w1"), "the second load must remain against its wait"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="promotion moves real bytes")
-def test_an_empty_residency_budget_keeps_nothing_on_the_device():
-    """The default, and the reason it is the default.
+@requires_cuda
+@pytest.mark.usefixtures("clean_host_weights")
+@pytest.mark.parametrize(
+    "resident_mib,expected_resident", [pytest.param(0, False, id="disabled"), pytest.param(64, True, id="enabled")]
+)
+def test_residency_budget_applies_even_to_fully_hideable_loads(resident_mib, expected_resident):
+    """Zero budget keeps offload enabled; ample budget removes even hidden PCIe traffic."""
+    from magi_compiler.passes.weight_offload import host_weights
 
-    Handing a weight back is the one decision this pass makes that costs device
-    memory for the whole graph rather than for a window, so it happens only when
-    asked for.  Doing it by default is how a 50 GiB budget ended up as 46 GiB of
-    permanently resident weight with one bucket of overlap left over.
-    """
-    from magi_compiler.passes.weight_offload import host_pool
-
-    host_pool.reset()
-    try:
-        shards = [torch.randn(8 * _MIB // 2, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
-        slots = [_park(s) for s in shards]
-        _reorder(_two_conflicting_loads(slots))
-        assert not any(host_pool.is_resident(s) for s in slots)
-    finally:
-        host_pool.reset()
+    shards = [torch.randn(8 * _MIB // 2, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+    slots = [_park(s) for s in shards]
+    _reorder(_two_conflicting_loads(slots), max_resident_bytes=resident_mib * _MIB)
+    assert [host_weights.is_resident(slot) for slot in slots] == [expected_resident] * 2
+    assert host_weights.resident_bytes() == (16 * _MIB if expected_resident else 0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="promotion moves real bytes")
+@requires_cuda
+@pytest.mark.usefixtures("clean_host_weights")
 def test_the_residency_budget_buys_out_the_transfer_nothing_can_hide():
     """The lever that changes how much traffic the bus carries at all.
 
@@ -343,70 +342,36 @@ def test_the_residency_budget_buys_out_the_transfer_nothing_can_hide():
     Residency is the only thing that helps: the bytes go back on the device and
     the transfer stops happening.
     """
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
 
     def run(resident):
         # Fresh shards each time: adopt empties their storage, so a tensor can
         # only be parked once.
-        host_pool.reset()
+        host_weights.reset()
         shards = [torch.randn(10 * _MIB // 2, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
         slots = [_park(s) for s in shards]
         out = _reorder(_serialized_loads(slots), max_resident_bytes=resident, max_inflight_bytes=20 * _MIB)
-        return out, [host_pool.is_resident(s) for s in slots]
+        return out, [host_weights.is_resident(s) for s in slots]
 
-    try:
-        out, resident = run(0)
-        assert not any(resident), "an empty budget buys nothing"
-        assert out.index("ld0") < out.index("c0"), "the earlier deadline claims the only window"
-        assert out.index("ld1") + 1 == out.index("w1"), "the one that loses it is not hoisted for nothing"
+    out, resident = run(0)
+    assert not any(resident), "an empty budget buys nothing"
+    assert out.index("ld0") < out.index("c0"), "the earlier deadline claims the only window"
+    assert out.index("ld1") + 1 == out.index("w1"), "the one that loses it is not hoisted for nothing"
 
-        out, resident = run(10 * _MIB)
-        assert resident == [True, False], "the budget takes one of the two off the bus"
-    finally:
-        host_pool.reset()
+    out, resident = run(10 * _MIB)
+    assert resident == [True, False], "the budget takes one of the two off the bus"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="promotion moves real bytes")
+@requires_cuda
+@pytest.mark.usefixtures("clean_host_weights")
 def test_the_residency_budget_is_a_ceiling_not_a_target():
-    """Three loads worth buying out and room for one.
+    """Three 10 MiB weights compete for a 10 MiB budget: restore exactly one."""
+    from magi_compiler.passes.weight_offload import host_weights
 
-    Spending past the budget is what OOM'd 400B, and stopping early would leave
-    exposure the caller has already paid memory for.
-    """
-    from magi_compiler.passes.weight_offload import host_pool
-
-    host_pool.reset()
-    try:
-        shards = [torch.randn(10 * _MIB // 2, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
-        slots = [_park(s) for s in shards]
-        _reorder(_serialized_loads(slots), max_resident_bytes=10 * _MIB, max_inflight_bytes=40 * _MIB)
-        assert host_pool.resident_bytes() == 10 * _MIB
-    finally:
-        host_pool.reset()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="promotion moves real bytes")
-def test_residency_is_spent_even_where_the_sweep_hides_everything():
-    """A hidden transfer is still a transfer, and it happens every step.
-
-    The sweep hides both loads here, so neither purchase shortens the *modelled*
-    schedule -- and for a while that was reason enough not to make either one
-    resident.  400B showed what that costs: exposure modelled at zero, 45 GiB of
-    the residency budget left unspent, the full weight set crossing PCIe every
-    step, and a step 35% slower than the run that had spent it.  The model prices
-    one bus at a nominal bandwidth; what the budget is actually for is making
-    bytes stop crossing it.
-    """
-    from magi_compiler.passes.weight_offload import host_pool
-
-    host_pool.reset()
-    try:
-        shards = [torch.randn(8 * _MIB // 2, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
-        slots = [_park(s) for s in shards]
-        _reorder(_two_conflicting_loads(slots), max_resident_bytes=64 * _MIB)
-        assert all(host_pool.is_resident(s) for s in slots), "room for both, so both come off the bus"
-    finally:
-        host_pool.reset()
+    shards = [torch.randn(10 * _MIB // 2, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    slots = [_park(s) for s in shards]
+    _reorder(_serialized_loads(slots), max_resident_bytes=10 * _MIB, max_inflight_bytes=40 * _MIB)
+    assert host_weights.resident_bytes() == 10 * _MIB
 
 
 def _layered_graph(slots, *, layers=6, big_mib=8, small_mib=4, compute_ns=1e6):
@@ -427,7 +392,8 @@ def _layered_graph(slots, *, layers=6, big_mib=8, small_mib=4, compute_ns=1e6):
     return order
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="promotion moves real bytes")
+@requires_cuda
+@pytest.mark.usefixtures("clean_host_weights")
 def test_residency_closes_each_windows_own_deficit():
     """Best fit, block by block: the 4 MiB weight covers a 3.4 MiB overrun.
 
@@ -436,23 +402,20 @@ def test_residency_closes_each_windows_own_deficit():
     the budget short for a later block.  With the budget set to exactly what the
     target density costs, only the best-fit choice fits at all.
     """
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
 
-    host_pool.reset()
-    try:
-        slots, sizes = [], [8, 4] * 6
-        for mib in sizes:
-            slots.append(_park(torch.randn(mib * _MIB // 2, device="cuda", dtype=torch.bfloat16)))
-        _reorder(_layered_graph(slots), max_device_weight_bytes=(24 + 16) * _MIB)
+    slots, sizes = [], [8, 4] * 6
+    for mib in sizes:
+        slots.append(_park(torch.randn(mib * _MIB // 2, device="cuda", dtype=torch.bfloat16)))
+    _reorder(_layered_graph(slots), max_device_weight_bytes=(24 + 16) * _MIB)
 
-        resident = {i for i, s in enumerate(slots) if host_pool.is_resident(s)}
-        assert resident == {1, 3, 5, 7, 9, 11}, "every block gives back its own smaller weight"
-        assert host_pool.resident_bytes() == 24 * _MIB
-    finally:
-        host_pool.reset()
+    resident = {i for i, s in enumerate(slots) if host_weights.is_resident(s)}
+    assert resident == {1, 3, 5, 7, 9, 11}, "every block gives back its own smaller weight"
+    assert host_weights.resident_bytes() == 24 * _MIB
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="promotion moves real bytes")
+@requires_cuda
+@pytest.mark.usefixtures("clean_host_weights")
 def test_residency_is_spread_across_the_graph_not_stacked_at_the_front():
     """The budget is spent where the graph is over-subscribed, which is everywhere.
 
@@ -461,75 +424,35 @@ def test_residency_is_spread_across_the_graph_not_stacked_at_the_front():
     step time follows, because a load can only be hoisted so far before the
     in-flight budget stops it.
     """
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
 
-    host_pool.reset()
-    try:
-        slots = []
-        for mib in [8, 4] * 6:
-            slots.append(_park(torch.randn(mib * _MIB // 2, device="cuda", dtype=torch.bfloat16)))
-        _reorder(_layered_graph(slots), max_device_weight_bytes=64 * _MIB)
+    slots = []
+    for mib in [8, 4] * 6:
+        slots.append(_park(torch.randn(mib * _MIB // 2, device="cuda", dtype=torch.bfloat16)))
+    _reorder(_layered_graph(slots), max_device_weight_bytes=64 * _MIB)
 
-        blocks_touched = {i // 2 for i, s in enumerate(slots) if host_pool.is_resident(s)}
-        assert len(blocks_touched) >= 5, f"residency only reached blocks {sorted(blocks_touched)}"
-    finally:
-        host_pool.reset()
+    blocks_touched = {i // 2 for i, s in enumerate(slots) if host_weights.is_resident(s)}
+    assert len(blocks_touched) >= 5, f"residency only reached blocks {sorted(blocks_touched)}"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="promotion moves real bytes")
-def test_device_weight_budget_bounds_residency_plus_inflight():
+@requires_cuda
+@pytest.mark.usefixtures("clean_host_weights")
+def test_device_weight_budget_reserves_inflight_room_before_residency():
     """One budget, split by the pass: residency never eats the in-flight floor."""
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
 
-    host_pool.reset()
-    try:
-        slots = []
-        for mib in [8, 4] * 6:
-            slots.append(_park(torch.randn(mib * _MIB // 2, device="cuda", dtype=torch.bfloat16)))
-        _reorder(_layered_graph(slots), max_device_weight_bytes=30 * _MIB)
+    slots = []
+    for mib in [8, 4] * 6:
+        slots.append(_park(torch.randn(mib * _MIB // 2, device="cuda", dtype=torch.bfloat16)))
+    _reorder(_layered_graph(slots), max_device_weight_bytes=30 * _MIB)
 
-        # 2 x the largest bucket is reserved for in-flight before residency is
-        # handed anything, so a 30 MiB budget can buy at most 14 MiB back.
-        assert 0 < host_pool.resident_bytes() <= 14 * _MIB
-    finally:
-        host_pool.reset()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="promotion moves real bytes")
-def test_loads_far_enough_apart_both_survive():
-    """The rule only fires on an actual overlap.
-
-    With ld0's last user (``mid0``) well upstream of where ld1 lands, the two
-    loads are never live together and both stay offloaded -- the rule must not
-    cost residency it does not have to.
-    """
-    from magi_compiler.passes.weight_offload import host_pool
-
-    host_pool.reset()
-    try:
-        shards = [torch.randn(2 * _MIB // 2, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
-        s0, s1 = _park(shards[0]), _park(shards[1])
-        order = [
-            _compute("c0", 5e6),
-            _load("ld0", 2, slots=[s0]),
-            _wait("w0", "ld0"),
-            _compute("mid0", 5e6, deps=["w0"]),
-            _compute("mid1", 5e6),
-            _load("ld1", 2, slots=[s1]),
-            _wait("w1", "ld1"),
-            _compute("user", 1e6, deps=["w1"]),
-        ]
-        _reorder(order)
-        assert not host_pool.is_resident(s0)
-        assert not host_pool.is_resident(s1)
-    finally:
-        host_pool.reset()
+    # 2 x the largest bucket is reserved for in-flight before residency is
+    # handed anything, so a 30 MiB budget can buy at most 14 MiB back.
+    assert 0 < host_weights.resident_bytes() <= 14 * _MIB
 
 
 def test_last_user_is_the_consumer_not_the_wait():
     """The wait is only the floor; last_user is whoever still reads the bytes."""
-    from magi_compiler.passes.overlap import SnodeGraph
-
     order = [_compute("c0", 5e6), _load("ld", 4), _wait("w", "ld"), _compute("matmul", 1e6, deps=["w"])]
     graph = SnodeGraph(order)
     plans = H2dLoadReorder(bandwidth_bytes_per_ns=10.0, window_margin_ns=0.0, cost_fn=lambda s: s.cost)._plan(graph)
@@ -546,7 +469,7 @@ def test_load_without_a_wait_is_left_alone():
 
 
 def test_bandwidth_sets_the_window_size():
-    """A tenfold faster bus needs a tenfold smaller window, so the same load stops
+    """A faster bus needs a smaller transfer window, so the same load stops
     at a nearer kernel.  This is the check that a GB/s-vs-bytes/ns slip fails."""
 
     def build():
@@ -592,34 +515,21 @@ def test_wait_is_found_through_the_multioutput_unpack():
     assert out.index("mo") == out.index("ld") + 1
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="promotion moves real bytes")
 def test_live_ranges_never_overlap_however_tight_the_chain():
-    """What a one-load budget buys, asserted directly on the emitted order.
+    """A one-buffer budget keeps all four closed live ranges disjoint.
 
-    Whatever the pass decides to hoist, no two loads may be live at the same time
-    -- a load is live from where it runs until its last user.  These computes have
-    no dep on the wait, so last_user falls back to the wait.  Checking the
-    invariant beats checking how many loads got hoisted: the count depends on
-    where the sweep happens to land, the invariant is the contract.
+    No residency is requested, so synthetic loads need no host slots or CUDA.
+    Computes do not read the waits here; each live range ends at its wait.
     """
-    from magi_compiler.passes.weight_offload import host_pool
+    order = [_compute("c0", 9e6)]
+    for i in range(4):
+        order += [_load(f"ld{i}", 4), _wait(f"w{i}", f"ld{i}"), _compute(f"m{i}", 3e6)]
+    out = _reorder(order, max_inflight_bytes=4 * _MIB)
 
-    host_pool.reset()
-    try:
-        shards = [torch.randn(4 * _MIB // 2, device="cuda", dtype=torch.bfloat16) for _ in range(4)]
-        slots = [_park(s) for s in shards]
-        order = [_compute("c0", 9e6)]
-        for i, slot in enumerate(slots):
-            order += [_load(f"ld{i}", 4, slots=[slot]), _wait(f"w{i}", f"ld{i}"), _compute(f"m{i}", 3e6)]
-        out = _reorder(order, max_inflight_bytes=4 * _MIB)
-
-        live = [(out.index(f"ld{i}"), out.index(f"w{i}")) for i, slot in enumerate(slots) if not host_pool.is_resident(slot)]
-        live.sort()
-        for (s0, e0), (s1, e1) in zip(live, live[1:]):
-            assert e0 < s1, f"two shards live at once: [{s0},{e0}] and [{s1},{e1}]"
-        assert live, "the rule must not promote everything"
-    finally:
-        host_pool.reset()
+    live = sorted((out.index(f"ld{i}"), out.index(f"w{i}")) for i in range(4))
+    assert all(start < end for start, end in live)
+    for (s0, e0), (s1, e1) in zip(live, live[1:]):
+        assert e0 < s1, f"two buffers live at once: [{s0},{e0}] and [{s1},{e1}]"
 
 
 def test_the_budget_charges_for_the_last_user_not_the_last_wait():
@@ -652,7 +562,8 @@ def test_the_budget_charges_for_the_last_user_not_the_last_wait():
     assert wide.index("ld1") < wide.index("mid"), "given room for both, ld1 hides behind mid"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="promotion moves real bytes")
+@requires_cuda
+@pytest.mark.usefixtures("clean_host_weights")
 def test_a_lone_unhideable_load_is_bought_out_only_when_asked():
     """No compute upstream at all, so no budget makes this one overlap.
 
@@ -660,23 +571,20 @@ def test_a_lone_unhideable_load_is_bought_out_only_when_asked():
     is the only answer -- but it is still device memory for the whole graph, so
     it waits for a budget to be handed one.
     """
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
 
     def run(resident):
-        host_pool.reset()
+        host_weights.reset()
         shard = torch.randn(2 * _MIB // 2, device="cuda", dtype=torch.bfloat16)
         slot = _park(shard)
         order = [_load("ld", 2, slots=[slot]), _wait("w", "ld"), _compute("user", 1e6, deps=["w"])]
         _reorder(order, max_resident_bytes=resident)
-        return host_pool.is_resident(slot), shard
+        return host_weights.is_resident(slot), shard
 
-    try:
-        resident, shard = run(0)
-        assert not resident and shard.untyped_storage().nbytes() == 0, "it should still be offloaded"
-        resident, _ = run(2 * _MIB)
-        assert resident, "given the budget, the transfer stops happening"
-    finally:
-        host_pool.reset()
+    resident, shard = run(0)
+    assert not resident and shard.untyped_storage().nbytes() == 0, "it should still be offloaded"
+    resident, _ = run(2 * _MIB)
+    assert resident, "given the budget, the transfer stops happening"
 
 
 def _equal_boundary_order():
@@ -692,30 +600,19 @@ def _equal_boundary_order():
     ]
 
 
-def test_equal_last_user_and_next_start_counts_as_an_overlap():
-    """Closed-interval equality: last_user == next start is an overlap.
+@pytest.mark.parametrize(
+    "budget_mib,expected",
+    [
+        pytest.param(4, ["ld0", "c0", "w0", "user0", "ld1", "w1", "user1"], id="one-buffer"),
+        pytest.param(8, ["ld0", "c0", "w0", "ld1", "user0", "w1", "user1"], id="two-buffers"),
+    ],
+)
+def test_equal_boundary_overlap_requires_room_for_both_buffers(budget_mib, expected):
+    """A load inserted before the previous buffer's last user makes both live.
 
-    Rebuild inserts the later load *before* its target, so a target equal to the
-    earlier load's last_user has both buffers alive while that node runs.  Under
-    a one-load budget ld1 must therefore stop short of ``user0`` -- reading the
-    boundary as free is how the emitted order ends up needing twice the peak the
-    pass reported.
+    The shared boundary is legal when the budget pays for both 4 MiB buffers.
     """
-    out = _reorder(_equal_boundary_order(), max_inflight_bytes=4 * _MIB)
-    assert out == ["ld0", "c0", "w0", "user0", "ld1", "w1", "user1"]
-    assert out.index("user0") < out.index("ld1"), "ld1 may not come alive where user0 reads ld0"
-
-
-def test_equal_boundary_is_an_overlap_the_budget_can_afford():
-    """The flip side: the equality is a byte count, not an illegality.
-
-    Two loads of budget pay for the one node where both buffers are alive, and
-    both transfers then hide -- so the boundary has to be priced rather than
-    forbidden.
-    """
-    out = _reorder(_equal_boundary_order(), max_inflight_bytes=8 * _MIB)
-    assert out.index("ld0") < out.index("c0"), "ld0 hides behind c0 now"
-    assert out.index("ld1") < out.index("user0"), "and ld1 reaches the window past it"
+    assert _reorder(_equal_boundary_order(), max_inflight_bytes=budget_mib * _MIB) == expected
 
 
 def test_adjacent_closed_ranges_both_stay_offloaded():
@@ -859,14 +756,9 @@ def test_a_load_window_is_sized_from_its_unpack():
 
 
 def test_a_late_small_load_is_not_dragged_to_the_front_of_the_graph():
-    """The gaga4 400B failure mode, in miniature.
+    """A late small transfer must stay near its deadline after earlier large loads.
 
-    Big transfers ahead of it leave the bus busy through the middle of the graph.
-    Scored by exposure alone the only index that looks fully hidden is the gap at
-    the top, so the small load used to be emitted there and then hold memory for
-    the length of the graph -- 4% of the bytes for 37% of the in-flight peak, on
-    the real model.  Its deadline is last, so it belongs last.
-    """
+    Moving it to the front would hold its buffer across unrelated compute."""
     order = [_compute("c0", 6e5)]
     for i in range(3):
         order += [_load(f"big{i}", 4, slots=()), _wait(f"wb{i}", f"big{i}"), _compute(f"ub{i}", 6e5, deps=[f"wb{i}"])]
@@ -882,15 +774,9 @@ def test_a_late_small_load_is_not_dragged_to_the_front_of_the_graph():
 
 
 def test_large_transfer_keeps_the_window_under_inflight_pressure():
-    """The 400B mid-graph failure mode, on a toy graph.
+    """The early large transfer uses the long kernel; the late small one stays local.
 
-    A small late load that only needs a sliver of compute used to be chain-pushed
-    a thousand nodes upstream by ``window_end``, pin an in-flight byte for the
-    whole middle of the graph, and leave the large early transfer stuck against
-    its wait with the bus idle under a fat compute kernel.  Largest-need-first
-    plus a bus timeline that does not move live ranges puts the 1920-class load
-    under the kernel and keeps the small one's live range short.
-    """
+    Hoisting the small load across the large one needlessly extends its lifetime."""
     # 20 MiB at 10 GB/s ~ 2.1ms; 2 MiB ~ 0.21ms.  One 5ms kernel hides either.
     order = [
         _compute("moe", 5e6),

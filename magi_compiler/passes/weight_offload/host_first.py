@@ -58,7 +58,7 @@ import torch.nn as nn
 
 from magi_compiler.utils import magi_logger
 
-from .runtime import host_pool
+from .runtime import host_weights
 
 _TO_EMPTY = "Module.to_empty.<locals>.<lambda>"
 """Qualname of the callable ``nn.Module.to_empty`` hands to ``_apply``.
@@ -354,7 +354,7 @@ def patch_materialize(instance: nn.Module, conf) -> None:
             host = hosts.get(id(t))
             if host is None:
                 payload = _payload(t)
-                host = host_pool.reserve(payload.shape, payload.dtype, name=name)
+                host = host_weights.reserve(payload.shape, payload.dtype, name=name)
                 hosts[id(t)] = host
                 parked.append(host.numel() * host.element_size())
             return _rebuild(t, host) if _is_dtensor(t) else host
@@ -423,7 +423,7 @@ def handoff(module: nn.Module) -> int:
         # After, not before: registration is what decides which tensor object
         # the graph will be traced against, and the slot is keyed on it.
         device_tensor = installed._local_tensor if _is_dtensor(installed) else installed
-        host_pool.adopt(host, device_tensor, name=_pretty(names[0]))
+        host_weights.adopt(host, device_tensor, name=_pretty(names[0]))
         nbytes += host.numel() * host.element_size()
 
     setattr(module, _PENDING_ATTR, False)

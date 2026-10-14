@@ -106,9 +106,6 @@ peak and the allocator churn that goes with it.
 
 from __future__ import annotations
 
-import logging
-from collections import defaultdict
-
 from torch._inductor.scheduler import BaseSchedulerNode
 from torch._inductor.utils import contains_wait
 
@@ -184,7 +181,7 @@ class H2dLoadReorder(OverlapPass):
 
     def report(self, graph: SnodeGraph, cost: CostView, plans: list[LoadPlan], committed: bool, ctx: dict) -> None:
         if committed:
-            self._report(plans, ctx["targets"], graph.index_of, ctx["given_back"], ctx["budget"], len(graph), ctx["prefix"])
+            self._report(plans, ctx["targets"], graph.index_of, ctx["given_back"], ctx["budget"], ctx["prefix"])
 
     # -- planning ---------------------------------------------------------
     @staticmethod
@@ -427,7 +424,7 @@ class H2dLoadReorder(OverlapPass):
     # -- committing --------------------------------------------------------
     @staticmethod
     def _promote(plans) -> int:
-        from ..runtime import host_pool
+        from ..runtime import host_weights
 
         slots: list[int] = []
         for p in plans:
@@ -437,10 +434,10 @@ class H2dLoadReorder(OverlapPass):
                 p.inactive = False
                 continue
             slots.extend(p.slots)
-        return host_pool.make_resident_many(slots)
+        return host_weights.make_resident_many(slots)
 
     # -- reporting --------------------------------------------------------
-    def _report(self, plans, targets, index_of, given_back, budget, n_snodes, prefix) -> None:
+    def _report(self, plans, targets, index_of, given_back, budget, prefix) -> None:
         resident = [p for p in plans if p.inactive]
         exposed = sum(p.exposed for p in plans)
         by_budget = sum(p.exposed for p in plans if p.budget_bound)
@@ -473,7 +470,6 @@ class H2dLoadReorder(OverlapPass):
             exposed / 1e6,
             f", {by_budget / 1e6:.1f}ms of it because the in-flight budget and not the bus ran out" if by_budget > 0 else "",
         )
-        self._log_density(plans, prefix)
         if inflight > budget:
             magi_logger.warning(
                 "h2d load reorder: %.1f MiB of load buffers are live at once, over the %.0f MiB "
@@ -481,89 +477,6 @@ class H2dLoadReorder(OverlapPass):
                 "live ranges disagree, so treat the peak this pass reports as unreliable",
                 inflight / 2**20,
                 budget / 2**20,
-            )
-        self._log_placement(plans, targets, index_of, n_snodes)
-
-    def _log_density(self, plans, prefix) -> None:
-        """How full the bus is over every prefix of the graph, after residency.
-
-        Measured on prefixes, not on the gap between neighbouring deadlines: a
-        load can be hoisted anywhere upstream, so what has to hold is that the
-        bytes due by each deadline fit the compute available by then.  Per-gap
-        densities read as noise for exactly that reason -- two loads four snodes
-        apart show one empty window and one impossible one, and nothing is wrong.
-
-        A max above 1.0 is a schedule that does not exist: that prefix has more
-        transfer than compute and the excess is exposed wherever it is placed.
-        """
-        if not logging.getLogger("magi_compiler").isEnabledFor(logging.DEBUG):
-            return
-        by_wait: dict[int, int] = defaultdict(int)
-        for p in plans:
-            if not p.inactive:
-                by_wait[p.deadline] += p.nbytes
-        ratios = []
-        cumulative = 0
-        for wait in sorted(by_wait):
-            cumulative += by_wait[wait]
-            compute = prefix[min(wait, len(prefix) - 1)]
-            if compute > 0:
-                ratios.append(cumulative / self.bandwidth_bytes_per_ns / compute)
-        if not ratios:
-            return
-        magi_logger.debug(
-            "h2d load reorder: bus occupancy over %d prefix(es): first %.2f, median %.2f, worst "
-            "%.2f at prefix %d/%d (1.0 means the transfers due by then exactly fill the compute "
-            "available by then, and above 1.0 cannot be hidden at any placement)",
-            len(ratios),
-            ratios[0],
-            sorted(ratios)[len(ratios) // 2],
-            max(ratios),
-            ratios.index(max(ratios)) + 1,
-            len(ratios),
-        )
-
-    @staticmethod
-    def _weights_of(plan) -> str:
-        from ..runtime import host_pool
-
-        names = [host_pool.name_of(s) for s in plan.slots]
-        names = [n for n in names if n] or ["?"]
-        return ", ".join(names[:3]) + (f", +{len(names) - 3} more" if len(names) > 3 else "")
-
-    def _log_placement(self, plans, targets, index_of, n_snodes) -> None:
-        if not logging.getLogger("magi_compiler").isEnabledFor(logging.DEBUG):
-            return
-        magi_logger.debug(
-            "h2d load placement (%d loads over %d snodes; 'at' is where the load ended up, "
-            "'last_user' the last snode that still reads its bytes, 'floor' the dep floor and the "
-            "in-flight floor):",
-            len(plans),
-            n_snodes,
-        )
-        for p in sorted(plans, key=lambda p: index_of[p.anchor]):
-            if p.inactive:
-                verdict = f"RESIDENT: {p.need / 1e6:.1f}ms off the bus"
-            elif p.exposed <= 0:
-                verdict = "hidden"
-            elif p.budget_bound:
-                verdict = f"EXPOSED {p.exposed / 1e6:.1f}ms (in-flight budget)"
-            else:
-                verdict = f"EXPOSED {p.exposed / 1e6:.1f}ms (bus/compute)"
-            at = targets.get(p.anchor, index_of[p.anchor])
-            magi_logger.debug(
-                "  %-10s %2d slot(s) %7.1f MiB  at %5d (from %5d, floor %5d/%5d)  last_user %5d  " "need %6.1fms  %-38s  %s",
-                p.anchor.get_name(),
-                len(p.slots),
-                p.nbytes / 2**20,
-                at,
-                index_of[p.anchor],
-                p.lower,
-                p.budget_floor,
-                p.last_user,
-                p.need / 1e6,
-                verdict,
-                self._weights_of(p),
             )
 
     def _log_shortfall(self, total, hideable, resident, exposed) -> None:

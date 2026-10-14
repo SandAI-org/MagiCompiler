@@ -94,14 +94,14 @@ def parked_slot(local: Any, min_bytes: int) -> tuple[int | None, str | None]:
     A weight reaches the pool only through host-first materialization.  Collect
     never copies a resident shard off the device.
     """
-    from ..runtime import host_pool
+    from ..runtime import host_weights
 
     if not isinstance(local, torch.Tensor):
         return None, "graph input is not a tensor"
-    slot = host_pool.slot_of(local)
+    slot = host_weights.slot_of(local)
     if slot is None:
         return None, "weight was not materialized in host memory"
-    if host_pool.slot_bytes(slot) < min_bytes:
+    if host_weights.slot_bytes(slot) < min_bytes:
         return None, "weight is below the size floor"
     return slot, None
 
@@ -119,7 +119,7 @@ class PlainParamSource(WeightSource):
     def collect(
         self, graph: fx.GraphModule, placeholder_examples: Mapping[str, Any], min_bytes: int
     ) -> tuple[list[OffloadCandidate], Counter]:
-        from ..runtime import host_pool
+        from ..runtime import host_weights
 
         candidates: list[OffloadCandidate] = []
         skipped: Counter = Counter()
@@ -148,7 +148,7 @@ class PlainParamSource(WeightSource):
             # is nothing to dedupe -- the shard was adopted once.
             candidates.append(
                 OffloadCandidate(
-                    holder=node, local=live, name=param_name(node), nbytes=host_pool.slot_bytes(slot), tag=None, slot=slot
+                    holder=node, local=live, name=param_name(node), nbytes=host_weights.slot_bytes(slot), tag=None, slot=slot
                 )
             )
         return candidates, skipped
@@ -252,7 +252,7 @@ class FsdpShardSource(WeightSource):
     ) -> tuple[list[OffloadCandidate], Counter]:
         from magi_compiler.passes.fsdp_overlap.node_meta import is_weight_ag
 
-        from ..runtime import host_pool
+        from ..runtime import host_weights
 
         candidates: list[OffloadCandidate] = []
         skipped: Counter = Counter()
@@ -297,7 +297,7 @@ class FsdpShardSource(WeightSource):
                     holder=holder,
                     local=local,
                     name=param_name(holder.args[0]),
-                    nbytes=host_pool.slot_bytes(slot),
+                    nbytes=host_weights.slot_bytes(slot),
                     tag=node,
                     slot=slot,
                     group=mesh_group(param),
@@ -325,7 +325,7 @@ class FsdpShardSource(WeightSource):
         gather and freed, while these ARE the weight the matmul reads and live to
         its last consumer.
         """
-        from ..runtime import host_pool
+        from ..runtime import host_weights
 
         for node in graph.graph.nodes:
             if node in seen or not _is_local_extraction(node) or not node.users:
@@ -347,7 +347,7 @@ class FsdpShardSource(WeightSource):
                     holder=node,
                     local=local,
                     name=param_name(src),
-                    nbytes=host_pool.slot_bytes(slot),
+                    nbytes=host_weights.slot_bytes(slot),
                     # No gather to tag: bucketing keeps offloaded gathers apart
                     # from resident ones, and this weight has neither.
                     tag=None,

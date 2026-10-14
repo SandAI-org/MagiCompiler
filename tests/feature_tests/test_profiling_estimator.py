@@ -512,7 +512,7 @@ import shutil  # noqa: E402
 import subprocess  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-_COLL_HELPER = Path(__file__).parent / "fsdp_overlap_helper" / "estimator_collective_helper.py"
+_COLL_HELPER = Path(__file__).parent / "profiling_helper" / "estimator_collective_helper.py"
 
 
 @requires_cuda

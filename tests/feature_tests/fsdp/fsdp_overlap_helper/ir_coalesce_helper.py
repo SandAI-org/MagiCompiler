@@ -176,7 +176,6 @@ def main() -> None:
     ap.add_argument("--hidden", type=int, default=512)
     ap.add_argument("--n-layers", type=int, default=4)
     ap.add_argument("--cost-mode", default="analytical", choices=["analytical", "profile_sync"])
-    ap.add_argument("--memory-probe", action="store_true")
     ap.add_argument("--diverge", action="store_true", help="non-zero ranks plan one bucket fewer")
     ap.add_argument("--mismatch", action="store_true", help="rank 1 compiles a structurally different graph")
     args = ap.parse_args()
@@ -212,7 +211,6 @@ def main() -> None:
         cfg.fsdp_config.bucket_mode = "none" if args.pair > 0 else "auto"
         cfg.fsdp_config.bucket_size_mib = args.bucket_size_mib
         cfg.fsdp_config.cost_mode = args.cost_mode
-        cfg.fsdp_config.memory_probe = args.memory_probe
         return cfg
 
     compiled = magi_compile(model, config_patch=_patch, dynamic_arg_dims={"x": 0})

@@ -12,13 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pinned host storage for weight shards the compiled graph loads on demand.
+"""Slot table of the weight shards the compiled graph loads from host on demand.
 
-One slab per dtype holds many shards: ``cudaHostAlloc`` is a driver round trip
-that also pauses every other stream, and a sharded model has thousands of
-weights.  Pinning is what makes the load asynchronous at all -- a pageable source
-forces ``cudaMemcpyAsync`` to stage through a driver bounce buffer synchronously,
-which would leave nothing for the reorder pass to overlap.
+The bytes live in a pinned :class:`~magi_compiler.host_mem.HostMemPool`; this
+module decides which shard each region holds and whether the device copy is
+back.  Pinned, because a paged source would make every load synchronous and
+leave nothing for the reorder pass to overlap.
 
 A shard is addressed by an integer ``slot``, not by a pointer.  Adopt pairs a
 filled host buffer with a storage-free CUDA stand-in; the stand-in's address is
@@ -34,7 +33,7 @@ straight into a pinned reservation, and the shard never occupies a device byte.
 That is what keeps the device high-water mark at the resident set instead of
 the whole model.
 
-The process holds one :class:`HostPool`.  ``magi::h2d_load`` reads it at
+The process holds one :class:`HostWeightStore`.  ``magi::h2d_load`` reads it at
 runtime by the slot integers baked into the graph.
 """
 
@@ -45,25 +44,14 @@ from typing import Sequence
 
 import torch
 
+from magi_compiler.host_mem import HostMemPool
 from magi_compiler.utils import magi_logger
 
 from .bandwidth import PROBE_BYTES, measure_h2d_bandwidth, probe_world
 
-_SLAB_BYTES = 1 << 30
-"""Cap on one pinned slab (1 GiB).
-
-Pinned memory is not swappable, so a slab is a hard reservation of host RAM; a
-smaller cap bounds the over-allocation of the last, partly used slab.  A shard
-larger than this gets a slab of its own.
-"""
-
-_ALIGN_BYTES = 512
-"""Every shard starts on a multiple of this many bytes: the alignment the DMA
-engine wants for peak host-to-device throughput."""
-
 
 @dataclass(frozen=True)
-class HostShard:
+class HostWeight:
     """One shard parked in host memory, plus the tensor it came out of.
 
     ``device_tensor`` is kept so :func:`restore_all` can put the shard back
@@ -76,8 +64,8 @@ class HostShard:
     name: str = ""  # the parameter this shard came from, for the placement logs
 
 
-class HostPool:
-    """Pinned-host slab allocator + slot table for one process.
+class HostWeightStore:
+    """Slot table + residency state for one process's host-offloaded weights.
 
     Adopt is idempotent on tensor identity: a second compile of the same
     stand-in must reuse the slot the first one minted.  ``_resident`` and the
@@ -85,11 +73,10 @@ class HostPool:
     ``make_resident`` always update both.
     """
 
-    def __init__(self) -> None:
-        self._slots: list[HostShard] = []
-        self._slabs: list[torch.Tensor] = []
-        self._slab_used: dict[int, int] = {}
-        # ``id(local shard) -> slot``.  The pool holds a reference to each
+    def __init__(self, pool: HostMemPool | None = None) -> None:
+        self._pool = pool if pool is not None else HostMemPool(pinned=True)
+        self._slots: list[HostWeight] = []
+        # ``id(local shard) -> slot``.  The store holds a reference to each
         # shard, so the object stays alive and its id stays unique even after
         # its CUDA storage is gone.
         self._by_tensor: dict[int, int] = {}
@@ -100,58 +87,25 @@ class HostPool:
     def reset(self) -> None:
         """Drop every slot, slab and cached probe.  Tests only."""
         self._slots.clear()
-        self._slabs.clear()
-        self._slab_used.clear()
+        self._pool.reset()
         self._resident.clear()
         self._claimed.clear()
         self._by_tensor.clear()
         self._bandwidth_bytes_per_ns = None
 
-    def _slab_for(self, dtype: torch.dtype, numel: int) -> torch.Tensor:
-        """A pinned region of ``numel`` elements, bump-allocated out of a slab.
-
-        Returns a *view* into the slab.  Views keep the slab alive, so the slab
-        list is only there to make the reservation explicit and resettable.
-        """
-        align = max(1, _ALIGN_BYTES // dtype.itemsize)
-        want = (numel + align - 1) // align * align
-
-        for slab in self._slabs:
-            if slab.dtype is not dtype:
-                continue
-            used = self._slab_used[id(slab)]
-            if used + want <= slab.numel():
-                self._slab_used[id(slab)] = used + want
-                return slab[used : used + numel]
-
-        slab_numel = max(want, _SLAB_BYTES // dtype.itemsize)
-        try:
-            slab = torch.empty(slab_numel, dtype=dtype, device="cpu", pin_memory=True)
-        except RuntimeError as exc:  # pinning failed -- pageable still works, just synchronously
-            magi_logger.warning(
-                "host offload: could not pin a %.1f MiB slab (%s); falling back to pageable host memory, "
-                "which makes the load synchronous and unhideable",
-                slab_numel * dtype.itemsize / 2**20,
-                exc,
-            )
-            slab = torch.empty(slab_numel, dtype=dtype, device="cpu")
-        self._slabs.append(slab)
-        self._slab_used[id(slab)] = want
-        return slab[:numel]
-
     def _register(self, host: torch.Tensor, device_tensor: torch.Tensor, nbytes: int, name: str) -> int:
         slot = len(self._slots)
-        self._slots.append(HostShard(host=host, device_tensor=device_tensor, nbytes=nbytes, name=name))
+        self._slots.append(HostWeight(host=host, device_tensor=device_tensor, nbytes=nbytes, name=name))
         self._by_tensor[id(device_tensor)] = slot
         return slot
 
-    def _entry(self, slot: int) -> HostShard:
+    def _entry(self, slot: int) -> HostWeight:
         try:
             return self._slots[slot]
         except IndexError:
             raise RuntimeError(
                 f"magi::h2d_load got slot {slot} but only {len(self._slots)} shard(s) are bound. "
-                "The compiled graph outlived the host pool it was built against -- a cached "
+                "The compiled graph outlived the host weight store it was built against -- a cached "
                 "artifact replayed in a fresh process, or reset() between compile and run."
             ) from None
 
@@ -163,13 +117,11 @@ class HostPool:
         host buffer with the device tensor that stands in for it in the graph,
         and that tensor does not exist until :meth:`adopt`.
         """
-        numel = 1
-        for d in shape:
-            numel *= int(d)
+        host = self._pool.alloc(shape, dtype)
         magi_logger.debug(
-            "host offload: reserved %.1f MiB of pinned host memory for %s", numel * dtype.itemsize / 2**20, name
+            "host offload: reserved %.1f MiB of pinned host memory for %s", host.numel() * host.element_size() / 2**20, name
         )
-        return self._slab_for(dtype, numel).view(tuple(int(d) for d in shape))
+        return host
 
     def adopt(self, host: torch.Tensor, device_tensor: torch.Tensor, name: str = "") -> int:
         """Pair a filled host buffer with a storage-free device tensor.  Returns its slot.
@@ -352,90 +304,90 @@ class HostPool:
         return self._bandwidth_bytes_per_ns
 
 
-# Process-wide pool.  ``magi::h2d_load`` looks slots up here at runtime; a
+# Process-wide store.  ``magi::h2d_load`` looks slots up here at runtime; a
 # per-backend instance would desync from the integers already in the graph.
-_POOL = HostPool()
+_STORE = HostWeightStore()
 
 
-def default_pool() -> HostPool:
-    return _POOL
+def default_store() -> HostWeightStore:
+    return _STORE
 
 
 def reserve(shape: Sequence[int], dtype: torch.dtype, name: str = "") -> torch.Tensor:
-    return _POOL.reserve(shape, dtype, name)
+    return _STORE.reserve(shape, dtype, name)
 
 
 def adopt(host: torch.Tensor, device_tensor: torch.Tensor, name: str = "") -> int:
-    return _POOL.adopt(host, device_tensor, name)
+    return _STORE.adopt(host, device_tensor, name)
 
 
 def slot_of(local: torch.Tensor) -> int | None:
-    return _POOL.slot_of(local)
+    return _STORE.slot_of(local)
 
 
 def find_slot(name: str, shape: Sequence[int], dtype: str) -> int | None:
-    return _POOL.find_slot(name, shape, dtype)
+    return _STORE.find_slot(name, shape, dtype)
 
 
 def name_of(slot: int) -> str:
-    return _POOL.name_of(slot)
+    return _STORE.name_of(slot)
 
 
 def get(slot: int) -> torch.Tensor:
-    return _POOL.get(slot)
+    return _STORE.get(slot)
 
 
 def source(slot: int) -> torch.Tensor:
-    return _POOL.source(slot)
+    return _STORE.source(slot)
 
 
 def make_resident(slot: int) -> int:
-    return _POOL.make_resident(slot)
+    return _STORE.make_resident(slot)
 
 
 def make_resident_many(slots: Sequence[int]) -> int:
-    return _POOL.make_resident_many(slots)
+    return _STORE.make_resident_many(slots)
 
 
 def is_resident(slot: int) -> bool:
-    return _POOL.is_resident(slot)
+    return _STORE.is_resident(slot)
 
 
 def mark_claimed(slot: int) -> None:
-    _POOL.mark_claimed(slot)
+    _STORE.mark_claimed(slot)
 
 
 def restore_unclaimed() -> list[str]:
-    return _POOL.restore_unclaimed()
+    return _STORE.restore_unclaimed()
 
 
 def slot_bytes(slot: int) -> int:
-    return _POOL.slot_bytes(slot)
+    return _STORE.slot_bytes(slot)
 
 
 def resident_bytes() -> int:
-    return _POOL.resident_bytes()
+    return _STORE.resident_bytes()
 
 
 def bound_bytes() -> int:
-    return _POOL.bound_bytes()
+    return _STORE.bound_bytes()
 
 
 def total_bound_bytes() -> int:
-    return _POOL.total_bound_bytes()
+    return _STORE.total_bound_bytes()
 
 
 def num_bound() -> int:
-    return _POOL.num_bound()
+    return _STORE.num_bound()
 
 
 def restore_all() -> None:
-    _POOL.restore_all()
+    _STORE.restore_all()
 
 
 def reset() -> None:
-    _POOL.reset()
+    _STORE.reset()
 
 
 def h2d_bandwidth_bytes_per_ns(override_gbps: float = 0.0) -> float:
-    return _POOL.h2d_bandwidth_bytes_per_ns(override_gbps)
+    return _STORE.h2d_bandwidth_bytes_per_ns(override_gbps)

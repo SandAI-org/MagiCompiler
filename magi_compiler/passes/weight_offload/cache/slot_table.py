@@ -38,7 +38,7 @@ def collect_host_slot_table(module: nn.Module) -> dict[int, dict[str, Any]]:
     submods, not on the root.
     """
     from ..node_meta import host_slot
-    from ..runtime import host_pool
+    from ..runtime import host_weights
 
     table: dict[int, dict[str, Any]] = {}
     for _, child in module.named_modules():
@@ -49,13 +49,13 @@ def collect_host_slot_table(module: nn.Module) -> dict[int, dict[str, Any]]:
             slot = host_slot(node)
             if slot is None or slot in table:
                 continue
-            host = host_pool.get(slot)
+            host = host_weights.get(slot)
             table[int(slot)] = {
-                "name": host_pool.name_of(slot),
+                "name": host_weights.name_of(slot),
                 "shape": tuple(int(d) for d in host.shape),
                 "dtype": str(host.dtype),
-                "nbytes": int(host_pool.slot_bytes(slot)),
-                "resident": bool(host_pool.is_resident(slot)),
+                "nbytes": int(host_weights.slot_bytes(slot)),
+                "resident": bool(host_weights.is_resident(slot)),
             }
     return table
 
@@ -95,6 +95,6 @@ def refresh_resident_flags(table: Mapping[int, Mapping[str, Any]]) -> dict[int, 
     collected.  The sidecar must record that final set so a cache hit can
     replay it.
     """
-    from ..runtime import host_pool
+    from ..runtime import host_weights
 
-    return {int(slot): {**dict(info), "resident": bool(host_pool.is_resident(int(slot)))} for slot, info in table.items()}
+    return {int(slot): {**dict(info), "resident": bool(host_weights.is_resident(int(slot)))} for slot, info in table.items()}

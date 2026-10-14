@@ -36,7 +36,7 @@ import torch._C._distributed_c10d as _c10d
 
 from magi_compiler.cuda.event_work import EventWork
 
-from . import host_pool
+from . import host_weights
 from .slot_remap import resolve_slot
 
 _LIB = torch.library.Library("magi", "FRAGMENT")
@@ -55,13 +55,13 @@ def h2d_stream() -> torch.cuda.Stream:
 
 
 def _check_shard(shard: torch.Tensor, slot: int) -> None:
-    host = host_pool.source(slot)
+    host = host_weights.source(slot)
     if tuple(shard.shape) != tuple(host.shape) or shard.dtype != host.dtype:
         raise RuntimeError(
-            f"magi::h2d_load slot {slot} ({host_pool.name_of(slot)!r}) is "
+            f"magi::h2d_load slot {slot} ({host_weights.name_of(slot)!r}) is "
             f"{tuple(host.shape)} {host.dtype}, but the graph asked for "
             f"{tuple(shard.shape)} {shard.dtype}. The compiled artifact's slot "
-            "ids do not match this process's host pool."
+            "ids do not match this process's host weight store."
         )
 
 
@@ -71,14 +71,14 @@ def _h2d_load(shard: torch.Tensor, slot: int) -> torch.Tensor:
     # any other part of the op, the graph or the schedule having to know.
     slot = resolve_slot(slot)
     _check_shard(shard, slot)
-    host = host_pool.source(slot)
+    host = host_weights.source(slot)
     # Allocated on the COMPUTE stream, deliberately: the caching allocator ties a
     # block to the stream it was allocated on, and this buffer is consumed by
     # compute.  ``record_stream`` below is what tells it the load stream wrote
     # it, so a freed block is not handed out before the copy lands.
     out = torch.empty(host.shape, dtype=host.dtype, device=shard.device)
 
-    if host_pool.is_resident(slot):
+    if host_weights.is_resident(slot):
         # Nothing to hide and nothing to wait for: the shard is already on the
         # device, so the transfer is a short D2D hop rather than a trip across
         # PCIe.  Doing it inline on the compute stream skips two cross-stream

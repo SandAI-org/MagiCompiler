@@ -26,7 +26,7 @@ storage-free CUDA stand-in survives as an Inductor graph input: the graph still
 carries it, for its shape and for the data edge from the parameter, but there
 are no bytes behind it until ``magi::h2d_load`` puts some there.
 
-Run: torchrun --nproc_per_node=N .../offload_e2e_helper.py [--bucket-mode ...]
+Run: torchrun --nproc_per_node=N tests/feature_tests/offload/h2d_helper/offload_e2e_helper.py [--bucket-mode ...]
 
 Markers printed on rank 0 (grepped by the test):
   OFFLOAD_CONFIG world=<n> bucket_mode=<m> host_first=True
@@ -110,12 +110,11 @@ def main() -> None:
     # where the lowering pass cannot see it.  Anything else leaves the
     # redistribute in the top-level graph, which is what this chain needs.
     ap.add_argument("--ac-mode", default="full")
-    # The two budgets the placement pass spends: how much weight may go back on
-    # the device permanently, and how much may be live in load buffers at once.
-    # 0 / 0 is the smallest footprint a schedule can have -- nothing resident,
-    # one load in flight -- and therefore the slowest.
-    ap.add_argument("--max-resident-mib", type=int, default=0)
-    ap.add_argument("--max-inflight-mib", type=int, default=0)
+    # The weight the placement pass may keep on the device, split between weights
+    # handed back permanently and load buffers in flight.  0 is the smallest
+    # footprint a schedule can have -- nothing resident, one load in flight -- and
+    # therefore the slowest.
+    ap.add_argument("--max-device-weight-mib", type=int, default=0)
     # Accepted for older invocations; host-first is the only materialization path.
     ap.add_argument("--host-first", action="store_true")
     # 0 = probe the bus. A test comparing two runs has to pin it: the probe is a
@@ -155,8 +154,7 @@ def main() -> None:
         cfg.fsdp_config.cost_mode = args.cost_mode
         cfg.offload_config.graph_weight_offload = True
         cfg.offload_config.offload_min_shard_mib = args.min_shard_mib
-        cfg.offload_config.offload_max_resident_mib = args.max_resident_mib
-        cfg.offload_config.offload_max_inflight_mib = args.max_inflight_mib
+        cfg.offload_config.offload_max_device_weight_mib = args.max_device_weight_mib
         cfg.offload_config.offload_h2d_bandwidth_gbps = args.h2d_gbps
         return cfg
 
@@ -186,15 +184,15 @@ def main() -> None:
         out = compiled(x)
         torch.cuda.synchronize()
 
-    from magi_compiler.passes.weight_offload import host_pool
+    from magi_compiler.passes.weight_offload import host_weights
 
     if rank == 0:
         print(
-            f"OFFLOAD_FREED mib={host_pool.bound_bytes() / 2**20:.2f} shards={host_pool.num_bound()} "
-            f"promoted_mib={host_pool.resident_bytes() / 2**20:.2f}",
+            f"OFFLOAD_FREED mib={host_weights.bound_bytes() / 2**20:.2f} shards={host_weights.num_bound()} "
+            f"promoted_mib={host_weights.resident_bytes() / 2**20:.2f}",
             flush=True,
         )
-        if host_pool.num_bound() == 0:
+        if host_weights.num_bound() == 0:
             # Offload tags what the redistribute lowering exposed, so zero shards
             # means the lowering found nothing -- which is a property of the
             # installed SimpleFSDP, not of this run.  Say so explicitly: a numeric

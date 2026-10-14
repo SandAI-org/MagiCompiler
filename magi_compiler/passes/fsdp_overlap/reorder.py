@@ -25,11 +25,9 @@ at the LATEST position whose downstream compute still hides the collective::
 Not enough upstream compute -> as-early-as-legal (never worse than raise_comms).
 
 What is FSDP-specific lives here: which snodes a gather drags along, and the
-cross-rank agreement a collective needs.  Placement is one of the shared
-strategies (``placement``): ``index_sweep`` claims compute a snode at a time and
-carries a long kernel's remainder to the next gather by hand; ``alap`` schedules
-the one transfer stream on the compute time axis, as the load reorder does.
-Rebuild and validation are ``OverlapPass``'s.
+cross-rank agreement a collective needs.  Placement is the shared
+``alap_schedule``, which runs the one transfer stream on the compute time axis
+as the load reorder does.  Rebuild and validation are ``OverlapPass``'s.
 
 Handles both lowering forms: plain all_gather (1 launch / 1 wait) and coalesced
 (1 packed launch + N MultiOutput members moved together as one block + N waits).
@@ -50,7 +48,6 @@ from magi_compiler.passes.overlap import (
     TransferTask,
     alap_schedule,
     enforce_monotone,
-    index_sweep,
     rank_sync,
 )
 from magi_compiler.passes.snode_utils import (
@@ -66,8 +63,6 @@ from magi_compiler.utils import magi_logger
 
 _AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
 
-_PLACEMENTS = ("index_sweep", "alap")
-
 
 class FsdpOverlapReorder(OverlapPass):
     """Callable reorder pass."""
@@ -79,12 +74,8 @@ class FsdpOverlapReorder(OverlapPass):
         comm_overlap_window_margin_ns: float = DEFAULT_WINDOW_MARGIN_NS,
         cost_fn=None,
         comm_overlap_window_scale: float = 1.0,
-        placement: str = "index_sweep",
     ) -> None:
         super().__init__(cost_fn)
-        if placement not in _PLACEMENTS:
-            raise ValueError(f"FsdpOverlapReorder: placement must be one of {_PLACEMENTS}, got {placement!r}")
-        self.placement = placement
         self.comm_overlap_window_margin_ns = comm_overlap_window_margin_ns
         # need = comm * scale + margin: collectives are measured in isolation but
         # run concurrent with the compute that hides them.
@@ -125,7 +116,6 @@ class FsdpOverlapReorder(OverlapPass):
                     deadline=index_of[launch] + 1,
                     need=comm * self.comm_overlap_window_scale + self.comm_overlap_window_margin_ns,
                     last_user=fc_idx,
-                    meta={"fc_idx": fc_idx, "comm": comm},
                 )
             )
         return tasks
@@ -136,16 +126,8 @@ class FsdpOverlapReorder(OverlapPass):
         moving = {m for t in tasks for m in t.group}
         full = cost
         cost = CostView(lambda s: 0.0 if s in moving else full(s))
-        if self.placement == "alap":
-            # No in-flight byte budget on gathers, and a gather issued late behind
-            # a stalled wait idles the stream: issue from the deadline chain alone.
-            alap_schedule(tasks, cost.prefix(graph.order), graph.index_of, float("inf"), follow_resource=False)
-            for task in tasks:
-                self._log_alap_placement(task, graph)
-        else:
-            index_sweep(tasks, graph.order, cost)
-            for task in reversed(tasks):
-                self._log_placement(task, graph)
+        # No in-flight byte budget on gathers.
+        alap_schedule(tasks, cost.prefix(graph.order), graph.index_of, float("inf"))
         if ctx["world"] > 1 and ctx["mode"] != "pinned":
             rank_sync.consensus_slot_targets(
                 ctx["launches"], {t.anchor: t for t in tasks}, ctx["skel_idx"], graph.index_of, ctx["sync_group"], ctx["world"]
@@ -282,61 +264,3 @@ class FsdpOverlapReorder(OverlapPass):
                 fc = min(uses)
                 best = fc if best is None else min(best, fc)
         return best
-
-    # -- reporting --------------------------------------------------------
-    @staticmethod
-    def _log_placement(task: TransferTask, graph: SnodeGraph) -> None:
-        """Per-gather placement decision, the record that answers "why didn't
-        this gather move earlier":
-
-          cur       = original program index of the launch
-          target    = where it was placed (== cur means NOT moved)
-          lower     = earliest LEGAL index (real-dep floor) it could move to
-          fc_idx    = first real consumer (the wait's user)
-          comm      = the gather's runtime it needs to hide
-          carry_in  = capacity inherited from the later gather's boundary node
-                      (target==cur with a large carry_in means it was already
-                      covered and did not have to move at all); 0 when this
-                      gather already sat upstream of that boundary node
-          carry_idx = boundary node this gather leaves its own remainder in
-          acc_upstream = carry_in plus the compute found in [target, cur]
-          verdict   = hidden (acc>=need) | COMPUTE-LIMITED (ran out of upstream
-                      compute before covering comm -- i.e. hit `lower` or the
-                      previous gather's placement first)
-        """
-        meta = task.meta
-        magi_logger.debug(
-            "FSDP overlap placement: launch %s(%s) cur=%d -> target=%d fc=%d lower=%d | "
-            "comm=%.1fus carry_in=%.1fus carry_idx=%d acc_upstream=%.1fus need=%.1fus %s",
-            task.anchor.get_name(),
-            getattr(leaf_collective_node(task.anchor), "op_overload", "?"),
-            graph.index_of[task.anchor],
-            task.target,
-            meta["fc_idx"],
-            task.lower,
-            meta["comm"] / 1e3,
-            meta["carry_in"] / 1e3,
-            meta["carry_idx"],
-            meta["acc"] / 1e3,
-            task.need / 1e3,
-            "hidden" if meta["acc"] >= task.need else "COMPUTE-LIMITED",
-        )
-
-    @staticmethod
-    def _log_alap_placement(task: TransferTask, graph: SnodeGraph) -> None:
-        """Same record for ``placement='alap'``: exposed is the part of the gather
-        the stream could not finish before the launch's own position."""
-        magi_logger.debug(
-            "FSDP overlap placement (alap): launch %s(%s) cur=%d -> target=%d fc=%d lower=%d | "
-            "comm=%.1fus need=%.1fus exposed=%.1fus %s",
-            task.anchor.get_name(),
-            getattr(leaf_collective_node(task.anchor), "op_overload", "?"),
-            graph.index_of[task.anchor],
-            task.target,
-            task.meta["fc_idx"],
-            task.lower,
-            task.meta["comm"] / 1e3,
-            task.need / 1e3,
-            task.exposed / 1e3,
-            "hidden" if task.exposed <= 0 else "COMPUTE-LIMITED",
-        )

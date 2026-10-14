@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from torch._inductor.scheduler import BaseSchedulerNode
 
@@ -40,6 +40,4 @@ class TransferTask:
     target: int | None = None  # where the scheduler placed the anchor
     exposed: float = 0.0  # ns the placement could not hide
     inactive: bool = False  # left in place and off the resource
-    budget_floor: int = 0  # earliest index the in-flight budget left open
     budget_bound: bool = False  # the in-flight budget, not the resource, is what stopped it
-    meta: dict = field(default_factory=dict)  # pass-specific diagnostics

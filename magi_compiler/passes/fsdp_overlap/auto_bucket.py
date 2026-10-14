@@ -75,7 +75,7 @@ from dataclasses import dataclass
 import torch.distributed as dist
 from torch._inductor.scheduler import BaseSchedulerNode
 
-from magi_compiler.passes.overlap import DEFAULT_WINDOW_MARGIN_NS, CostView, SnodeGraph, rank_sync
+from magi_compiler.passes.overlap import CostView, SnodeGraph, rank_sync
 from magi_compiler.passes.overlap.cost import default_cost_fn
 from magi_compiler.passes.weight_offload.node_meta import is_host_offloaded
 from magi_compiler.utils import magi_logger
@@ -146,9 +146,6 @@ class PlanParams:
     beta_ns_per_byte: float
     overhead_ratio: float = DEFAULT_OVERHEAD_RATIOS["nccl"]
     max_local_bytes: int = 0  # ``bucket_size_mib``: local-shard bytes per bucket, 0 = no cap
-    # The placement model's (``bucket_eval``) window terms, as the reorder applies them.
-    scale: float = 1.0
-    margin_ns: float = DEFAULT_WINDOW_MARGIN_NS
 
     @property
     def target_bytes(self) -> float:
@@ -226,28 +223,13 @@ class FsdpAutoBucket:
 
     name = "FSDP auto bucket"
 
-    def __init__(
-        self,
-        cost_fn=None,
-        max_bucket_bytes: int = 0,
-        overhead_ratio: float | None = None,
-        launch_overhead_ns: float = DEFAULT_LAUNCH_OVERHEAD_NS,
-        comm_overlap_window_scale: float = 1.0,
-        comm_overlap_window_margin_ns: float = DEFAULT_WINDOW_MARGIN_NS,
-        memory_probe: bool = False,
-    ) -> None:
+    def __init__(self, cost_fn=None, max_bucket_bytes: int = 0, overhead_ratio: float | None = None) -> None:
         if overhead_ratio is not None and not 0.0 < overhead_ratio < 1.0:
             raise ValueError(f"FsdpAutoBucket: overhead_ratio must be in (0, 1), got {overhead_ratio}")
         self._cost_fn = cost_fn if cost_fn is not None else default_cost_fn()
         self.max_bucket_bytes = int(max_bucket_bytes)
         # None: per transport, from DEFAULT_OVERHEAD_RATIOS.
         self.overhead_ratio = None if overhead_ratio is None else float(overhead_ratio)
-        # The fixed cost assumed when every measured gather has one size, so the
-        # fit cannot separate it from the per-byte cost.
-        self.launch_overhead_ns = float(launch_overhead_ns)
-        self.comm_overlap_window_scale = float(comm_overlap_window_scale)
-        self.comm_overlap_window_margin_ns = float(comm_overlap_window_margin_ns)
-        self.memory_probe = bool(memory_probe)
 
     def __deepcopy__(self, memo):
         # Through memo, so this copy and the profile pass's copy share one table.
@@ -298,12 +280,6 @@ class FsdpAutoBucket:
         if not buckets:
             self._report(report, 0)
             return snodes
-
-        if self.memory_probe:
-            try:
-                magi_logger.info("%s", self._model_report(order, cands, buckets, cost, report["params"]))
-            except Exception as exc:  # noqa: BLE001 - a diagnostic never fails a compile
-                magi_logger.warning("%s: model report failed (%s)", self.name, exc)
 
         for members in buckets:
             out_bytes = sum(gather_info(m).shard_bytes * gather_info(m).world for m in members)
@@ -395,14 +371,12 @@ class FsdpAutoBucket:
         out = {}
         for key, pts in points.items():
             kind = key[0]
-            alpha, beta = fit_alpha_beta(pts, alpha_guess_ns=self.launch_overhead_ns)
+            alpha, beta = fit_alpha_beta(pts)
             out[key] = PlanParams(
                 alpha_ns=alpha,
                 beta_ns_per_byte=beta,
                 overhead_ratio=self.overhead_ratio if self.overhead_ratio is not None else DEFAULT_OVERHEAD_RATIOS[kind],
                 max_local_bytes=self.max_bucket_bytes,
-                scale=self.comm_overlap_window_scale,
-                margin_ns=self.comm_overlap_window_margin_ns,
             )
         return out
 
@@ -555,49 +529,6 @@ class FsdpAutoBucket:
             if sim is None:
                 return None
         return sim if SnodeGraph(order).validate(sim) else None
-
-    def _model_report(
-        self, order, cands, buckets, cost: CostView, params_by_group: dict[tuple[str, str, int], PlanParams]
-    ) -> str:
-        """What the exact placement model predicts for no buckets and for ``buckets``, on this order."""
-        from .bucket_eval import peak_with, place
-        from .memory_probe import GiB, memory_timeline
-
-        graph = SnodeGraph(order)
-        prefix = cost.prefix(order)
-        base = memory_timeline(order).curve
-        bucket_of = {s: i for i, b in enumerate(buckets) for s in b}
-        singles, planned = [], []
-        for run in self._runs(cands):
-            pairs = [(s, m) for s in run if (m := self._member(s, graph, cost)) is not None]
-            if not pairs:
-                continue
-            members = [m for _, m in pairs]
-            params = params_by_group[self._fit_key(gather_info(run[0]))]
-            segs: list[tuple[int, int]] = []
-            for i, (s, _) in enumerate(pairs):
-                b = bucket_of.get(s)
-                if segs and b is not None and bucket_of.get(pairs[segs[-1][0]][0]) == b:
-                    segs[-1] = (segs[-1][0], i + 1)
-                else:
-                    segs.append((i, i + 1))
-            one = [(i, i + 1) for i in range(len(members))]
-            singles.append((members, one, place(members, one, prefix, params)))
-            planned.append((members, segs, place(members, segs, prefix, params)))
-
-        def line(runs) -> str:
-            peak, step, extra = peak_with(base, runs)
-            exposed = sum(p.exposed_ns for _, _, p in runs) / 1e6
-            launches = sum(len(segs) for _, segs, _ in runs)
-            return (
-                f"{launches} launch(es), exposed {exposed:.2f} ms, peak {peak / GiB:.2f} GiB at step {step} "
-                f"(+{extra / GiB:.2f} GiB of early allocation there)"
-            )
-
-        return (
-            f"{self.name} model: base peak {max(base, default=0) / GiB:.2f} GiB; "
-            f"unbucketed -> {line(singles)}; plan -> {line(planned)}"
-        )
 
     # -- after the merge ----------------------------------------------------------
     def _record(self, packed, unpacks, out_bytes: int, params: PlanParams) -> None:

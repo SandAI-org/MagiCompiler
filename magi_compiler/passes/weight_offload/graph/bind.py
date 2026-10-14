@@ -220,7 +220,7 @@ def _splice_load(graph: fx.GraphModule, holder: fx.Node, slot: int, order) -> in
     The load has to sit above every reader, so whatever the graph does to the
     weight still runs on the device; the reorder pass is what places it properly.
     """
-    from ..runtime import host_pool
+    from ..runtime import host_weights
     from ..runtime.h2d_op import H2D_LOAD
 
     readers = list(holder.users)
@@ -236,5 +236,5 @@ def _splice_load(graph: fx.GraphModule, holder: fx.Node, slot: int, order) -> in
     # Everything that read the (now storage-free) weight reads the loaded copy
     # instead -- except the load itself, which still needs it.
     holder.replace_all_uses_with(wait, delete_user_cb=lambda user: user is not load)
-    host_pool.mark_claimed(slot)
+    host_weights.mark_claimed(slot)
     return 1
