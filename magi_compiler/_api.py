@@ -157,7 +157,24 @@ def _run_orchestration(state: MagiCompileState, args, kwargs):
             state._ensure_compiled()
 
             if state.compile_config.aot:
-                state.aot_compile(*args, **kwargs)
+                try:
+                    state.aot_compile(*args, **kwargs)
+                except RuntimeError as e:
+                    # SimpleFSDP/DTensor aot_compile_fullgraph is unsupported; VAE still uses MAGI_COMPILE_AOT=1.
+                    if isinstance(e, torch.cuda.OutOfMemoryError):
+                        raise
+                    magi_logger.warning(
+                        "AOT compile failed (%s: %s), falling back to JIT path for %s",
+                        type(e).__name__,
+                        e,
+                        state.original_code_for_hook,
+                    )
+                    state.compile_config = state.compile_config.model_copy(update={"aot": False})
+                    state.compiled_entry = None
+                    torch._dynamo.reset()
+                    state._ensure_compiled()
+                    with state._jit_capture_compiled_bytecode():
+                        return state.compiled_entry(*args, **kwargs)
             else:
                 with state._jit_capture_compiled_bytecode():
                     return state.compiled_entry(*args, **kwargs)

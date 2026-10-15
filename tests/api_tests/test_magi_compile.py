@@ -552,7 +552,7 @@ class TestPerformanceImprovementConsistency:
         class SimpleModel(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.dim = 128
+                self.dim = 1024
                 self.layers = nn.ModuleList([nn.Linear(self.dim, self.dim) for _ in range(4)])
                 self.norms = nn.ModuleList([nn.LayerNorm(self.dim) for _ in range(4)])
 
@@ -567,8 +567,8 @@ class TestPerformanceImprovementConsistency:
                 return x
 
         device = torch.device("cuda:0")
-        seq_len = 256
-        test_input = torch.randn(seq_len, 128, device=device)
+        seq_len = 512
+        test_input = torch.randn(seq_len, 1024, device=device)
 
         native = SimpleModel().to(device).eval()
 
@@ -632,16 +632,16 @@ class TestPerformanceImprovementConsistency:
             def forward(self, x: torch.Tensor) -> torch.Tensor:
                 return super().forward(x)
 
-        non_module_native = NonModulePerf(128)
+        non_module_native = NonModulePerf(1024)
 
-        non_module_cls = CompiledNonModulePerf(128)
+        non_module_cls = CompiledNonModulePerf(1024)
         non_module_cls.copy_from(non_module_native)
 
-        non_module_inst_obj = NonModulePerf(128)
+        non_module_inst_obj = NonModulePerf(1024)
         non_module_inst_obj.copy_from(non_module_native)
         non_module_inst = magi_compile(non_module_inst_obj, dynamic_arg_dims={"x": 0})
 
-        non_module_mtd_obj = NonModulePerf(128)
+        non_module_mtd_obj = NonModulePerf(1024)
         non_module_mtd_obj.copy_from(non_module_native)
         non_module_mtd_obj.step = magi_compile(non_module_mtd_obj.step, dynamic_arg_dims={"x": 0})
 
