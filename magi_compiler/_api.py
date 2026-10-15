@@ -159,9 +159,10 @@ def _run_orchestration(state: MagiCompileState, args, kwargs):
             if state.compile_config.aot:
                 try:
                     state.aot_compile(*args, **kwargs)
-                except Exception as e:
-                    # AOT still cannot compile SimpleFSDP/DTensor graphs (undefined local in
-                    # aot_compile_fullgraph). Keep MAGI_COMPILE_AOT=1 process-wide for VAE.
+                except RuntimeError as e:
+                    # SimpleFSDP/DTensor aot_compile_fullgraph is unsupported; VAE still uses MAGI_COMPILE_AOT=1.
+                    if isinstance(e, torch.cuda.OutOfMemoryError):
+                        raise
                     magi_logger.warning(
                         "AOT compile failed (%s: %s), falling back to JIT path for %s",
                         type(e).__name__,
