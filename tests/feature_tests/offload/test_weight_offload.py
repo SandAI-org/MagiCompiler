@@ -374,6 +374,27 @@ def test_make_resident_many_restores_values_and_is_idempotent():
 
 
 @requires_cuda
+def test_release_resident_many_falls_back_to_host_and_can_be_promoted_again():
+    """A released slot must stop reading its freed device copy, and promotion must restore it."""
+    from magi_compiler.passes.weight_offload import host_weights
+
+    shard = torch.randn(32, 16, device="cuda")
+    expected = shard.clone()
+    slot = _park(shard)
+    host_weights.make_resident(slot)
+
+    assert host_weights.release_resident_many([slot]) == expected.numel() * expected.element_size()
+    assert shard.untyped_storage().nbytes() == 0
+    assert not host_weights.is_resident(slot), "h2d_load would D2D-copy from freed storage"
+    assert host_weights.source(slot).device.type == "cpu"
+    assert host_weights.release_resident_many([slot]) == 0
+
+    host_weights.make_resident_many([slot])
+    assert host_weights.is_resident(slot)
+    torch.testing.assert_close(shard, expected)
+
+
+@requires_cuda
 def test_bandwidth_probe_is_plausible_and_reset_clears_its_cache():
     from magi_compiler.passes.weight_offload import host_weights
 
@@ -1003,6 +1024,85 @@ def test_ordinary_device_moves_are_left_alone(dist_1rank):
     local = _raw(root.inner.big)._local_tensor
     assert local.dtype is torch.float32, "the cast must have happened"
     assert local.data_ptr() != before, "and produced its own storage rather than another reservation"
+
+
+@requires_cuda
+def test_device_moves_of_a_sharded_module_change_residency_not_tensors(dist_1rank):
+    """torch's ``_apply`` swaps every DTensor parameter, which a traced module refuses.
+
+    A move of a module with parked shards must complete the handoff and leave the
+    stand-ins where the graph expects them instead.
+    """
+    root = _shard_on_meta(dist_1rank, rows=256, cols=64)
+    _patched(root.inner)
+    root.to_empty(device=torch.device("cuda"))
+
+    root.inner.to("cpu")
+
+    local = _raw(root.inner.big)._local_tensor
+    assert local.device.type == "cuda" and local.untyped_storage().nbytes() == 0
+
+
+@requires_cuda
+def test_a_host_built_module_parks_on_its_first_move_and_moves_the_rest_with_torch():
+    """An unsharded model built and loaded on the host never calls ``to_empty``.
+
+    Its first move to CUDA must park the offloadable weights instead of moving them,
+    while small weights and buffers still follow every move, both ways. That move
+    may come under inference mode; placement still promotes the stand-ins outside it.
+    """
+    from magi_compiler.passes.weight_offload import host_weights
+
+    module = _patched(_Compiled(rows=256, cols=64), min_shard_mib=0.01)  # big: 64 KiB, small: 64 B
+    module.register_buffer("scale", torch.ones(4))
+    expected = module.big.weight.detach().clone()
+
+    with torch.inference_mode():
+        module.to("cuda")
+    slot = host_weights.slot_of(module.big.weight)
+    assert slot is not None and module.big.weight.untyped_storage().nbytes() == 0
+    torch.testing.assert_close(host_weights.get(slot), expected)
+    assert module.small.weight.device.type == "cuda" and module.scale.device.type == "cuda"
+
+    host_weights.make_resident(slot)
+    module.to("cpu")
+    assert not host_weights.is_resident(slot) and module.big.weight.device.type == "cuda"
+    assert module.small.weight.device.type == "cpu" and module.scale.device.type == "cpu"
+
+    module.to("cuda")
+    assert host_weights.is_resident(slot) and module.small.weight.device.type == "cuda"
+    torch.testing.assert_close(module.big.weight.detach().cpu(), expected)
+
+
+@requires_cuda
+def test_device_moves_free_and_repromote_only_this_instances_promoted_shards():
+    """To the host frees this instance's promoted copies; back promotes exactly those.
+
+    The pool is shared by every compiled model in the process, so another instance's
+    residency must not move, and a shard the graph loads must stay in host memory.
+    """
+    from magi_compiler.passes.weight_offload import host_weights
+
+    def build():
+        with torch.device("meta"):
+            module = _Compiled(rows=256, cols=64)
+        _patched(module)
+        module.to_empty(device=torch.device("cuda"))
+        return module.to("cuda")
+
+    a, b = build(), build()
+    hot_a, cold_a, hot_b = (host_weights.slot_of(w) for w in (a.big.weight, a.small.weight, b.big.weight))
+    expected = host_weights.get(hot_a).clone()
+    host_weights.make_resident_many([hot_a, hot_b])
+
+    a.to("cpu")
+    assert a.big.weight.untyped_storage().nbytes() == 0 and not host_weights.is_resident(hot_a)
+    assert host_weights.is_resident(hot_b), "another model's residency must not move"
+
+    a.to("cuda")
+    assert host_weights.is_resident(hot_a)
+    assert not host_weights.is_resident(cold_a)
+    torch.testing.assert_close(a.big.weight.detach().cpu(), expected)
 
 
 @requires_cuda

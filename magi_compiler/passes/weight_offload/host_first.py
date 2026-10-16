@@ -23,19 +23,32 @@ stand-ins before Dynamo traces and registers their host buffers by tensor identi
 Tied weights share one reservation and slot, with every registration updated.
 Weights tied outside the compiled subtree stay resident if already materialized;
 ones reclaimed by a later external ``_apply`` are reported at handoff.
+
+An unsharded module built and loaded on the host never calls ``to_empty``. Its
+first move to CUDA parks the same weights instead: their bytes are copied into the
+pool once and handed off, and they never go to the device.
+
+Once an instance has parked weights, any ``_apply`` that is a pure device move
+(``.to(device)``, ``.cuda()``, ``.cpu()``, or a caller's own function with the same
+effect) completes the handoff and changes the residency of those weights; see
+``residency``. The function never sees a stand-in. Its other tensors move through
+the class's ``_apply``, except in a DTensor module: torch's would swap the traced
+shards, so their sharding owner moves them in place.
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from magi_compiler.utils import magi_logger
 
+from . import residency
 from .runtime import host_weights
 
 _TO_EMPTY = "Module.to_empty.<locals>.<lambda>"
-"""Only intercept ``to_empty``; other ``_apply`` uses must preserve device/dtype behavior."""
+"""Only ``to_empty`` materializes; dtype casts and other ``_apply`` uses keep torch behavior."""
 
 _PENDING_ATTR = "_magi_host_first_pending"
 """Set on an instance whose weights are waiting in host memory for their handoff."""
@@ -44,22 +57,18 @@ _PARKED_ATTR = "_magi_host_first_parked"
 """Names ``patch_materialize`` put in host memory, so the handoff can tell a
 weight it was never given from one that was taken back out from under it."""
 
+_SETTLED_ATTR = "_magi_host_first_settled"
+"""Set once ``to_empty`` or the first move to CUDA decided what to park, even nothing."""
 
-def _payload(param) -> torch.Tensor:
+
+def _payload(param: torch.Tensor) -> torch.Tensor:
     """The tensor whose bytes we park: a DTensor's local shard, or the Parameter itself."""
-    local = getattr(param, "_local_tensor", None)
-    return local if local is not None else param
-
-
-def _is_dtensor(param: object) -> bool:
-    return getattr(param, "_local_tensor", None) is not None
+    return param._local_tensor if isinstance(param, DTensor) else param
 
 
 def _is_offloadable(param: object) -> bool:
     """Must agree with the weight sources: plain Parameters or single Shard(0)/Replicate DTensors.
     ``restore_unclaimed`` restores parked weights that no graph loads."""
-    from torch.distributed.tensor import DTensor, Replicate, Shard
-
     if isinstance(param, DTensor):
         placements = param.placements
         if len(placements) != 1:
@@ -75,10 +84,9 @@ def _pretty(name: str) -> str:
     return ".".join(parts) or name
 
 
-def _rebuild(param, local: torch.Tensor):
+def _rebuild(param: DTensor, local: torch.Tensor) -> DTensor:
     """Preserve DTensor metadata without moving ``local`` to the mesh device.
     ``DTensor.from_local`` would copy a host reservation onto CUDA."""
-    from torch.distributed.tensor import DTensor
     from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 
     meta = param._spec.tensor_meta
@@ -113,8 +121,8 @@ def _parked_params(module: nn.Module) -> list[tuple[list[str], nn.Parameter]]:
     all names are needed if handoff falls back to re-registration."""
     groups: dict[int, tuple[list[str], nn.Parameter]] = {}
     for name, param in module.named_parameters(recurse=True, remove_duplicate=False):
-        if _is_dtensor(param):
-            parked = param._local_tensor.device.type == "cpu" and param._spec.mesh.device_type != "cpu"
+        if isinstance(param, DTensor):
+            parked = param._local_tensor.device.type == "cpu" and param.device_mesh.device_type != "cpu"
         else:
             parked = param.device.type == "cpu"
         if parked:
@@ -143,6 +151,97 @@ def _warn_about_reclaimed(module: nn.Module, parked: list[tuple[list[str], nn.Pa
         )
 
 
+def _move_target(fn) -> torch.device | None:
+    """Where ``fn`` moves a tensor between host and CUDA, or None if it does not or also casts it.
+    Judged by effect, not name, so a caller's own move function is recognized too."""
+    try:
+        probe = torch.empty(0)
+        moved = fn(probe)
+        if not isinstance(moved, torch.Tensor) or moved.dtype != probe.dtype:
+            return None
+        if moved.is_cuda:
+            return moved.device
+        moved_back = fn(torch.empty(0, device="cuda"))
+    except Exception:  # noqa: BLE001 - a function that cannot take a probe is not a device move
+        return None
+    return moved_back.device if moved_back.dtype == probe.dtype and moved_back.device.type == "cpu" else None
+
+
+def _manages_device_moves(instance: nn.Module) -> bool:
+    return getattr(instance, _PENDING_ATTR, False) or residency.has_slots(instance)
+
+
+def _is_sharded(module: nn.Module) -> bool:
+    return any(isinstance(p, DTensor) for p in module.parameters())
+
+
+def _built_on_host(module: nn.Module) -> bool:
+    """Unsharded, fully materialized, with weights on the host: never went through ``to_empty``."""
+    params = list(module.parameters())
+    if any(isinstance(p, DTensor) or p.is_meta for p in params):
+        return False
+    return any(p.device.type == "cpu" for p in params)
+
+
+def _leaving_parked(fn):
+    """``fn`` for everything but the stand-ins, whose placement is the pool's."""
+
+    def apply(t):
+        return t if host_weights.slot_of(t) is not None else fn(t)
+
+    return apply
+
+
+# A move may arrive under inference mode, and placement later writes these stand-ins outside it.
+@torch.inference_mode(False)
+def _hand_over(module: nn.Module, parked: list[tuple[list[str], nn.Parameter, torch.Tensor]]) -> int:
+    """Swap each weight for a storage-free CUDA stand-in and adopt its filled host buffer.
+    Returns the bytes handed over. Stand-in construction temporarily allocates one full shard."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    nbytes = 0
+    slots = []
+    for names, param, host in parked:
+        stand_in = torch.empty(host.shape, dtype=host.dtype, device=device)
+        stand_in.untyped_storage().resize_(0)
+        new_data = _rebuild(param, stand_in) if isinstance(param, DTensor) else stand_in
+        installed = _replace_param(module, names, param, new_data)
+        # After, not before: registration is what decides which tensor object
+        # the graph will be traced against, and the slot is keyed on it.
+        device_tensor = _payload(installed)
+        slots.append(host_weights.adopt(host, device_tensor, name=_pretty(names[0])))
+        nbytes += host.numel() * host.element_size()
+    residency.record_slots(module, slots)
+    return nbytes
+
+
+@torch.inference_mode(False)
+def _park_host_built(module: nn.Module, min_bytes: int) -> int:
+    """Copy a host-built module's offloadable weights into the pool and hand them over.
+    Returns the number parked; the rest keep their normal placement."""
+    groups: dict[int, tuple[list[str], nn.Parameter]] = {}
+    for name, param in module.named_parameters(remove_duplicate=False):
+        if param.device.type != "cpu" or param.numel() * param.element_size() < min_bytes:
+            continue
+        if param.is_contiguous():
+            groups.setdefault(id(param), ([], param))[0].append(name)
+    parked = []
+    for names, param in groups.values():
+        host = host_weights.reserve(param.shape, param.dtype, name=_pretty(names[0]))
+        host.copy_(param.detach())
+        parked.append((names, param, host))
+    if not parked:
+        return 0
+    nbytes = _hand_over(module, parked)
+    magi_logger.info(
+        "host offload: %s copied %d host-built weight(s) (%.1f MiB) into the host pool on its first move to the "
+        "device; they load in the graph instead of moving",
+        type(module).__name__,
+        len(parked),
+        nbytes / 2**20,
+    )
+    return len(parked)
+
+
 def patch_materialize(instance: nn.Module, conf) -> None:
     """Redirect CUDA ``to_empty`` for this compiled instance's offloadable weights.
 
@@ -150,19 +249,34 @@ def patch_materialize(instance: nn.Module, conf) -> None:
     if getattr(instance, "_magi_host_first_installed", False):
         return
     min_bytes = int(conf.offload_config.offload_min_shard_mib * 1024 * 1024)
-    # The class's, not the instance's: taking it back off the instance would find
-    # this wrapper and recurse.
-    orig_apply = type(instance)._apply
+
+    def orig_apply(self, fn, recurse):
+        # The class's, looked up per call: the instance's is this wrapper, and a
+        # sharding owner may swap the class after compile-time patching.
+        return type(self)._apply(self, fn, recurse=recurse)
 
     def _host_first_apply(self, fn, recurse=True):
-        if getattr(fn, "__qualname__", "") != _TO_EMPTY:
+        if getattr(fn, "__qualname__", "") == _TO_EMPTY:
+            return _materialize_on_host(self, fn, recurse)
+        target = _move_target(fn)
+        if target is not None and target.type == "cuda" and not getattr(self, _SETTLED_ATTR, False):
+            setattr(self, _SETTLED_ATTR, True)
+            if _built_on_host(self):
+                _park_host_built(self, min_bytes)
+        if target is None or not _manages_device_moves(self):
             return orig_apply(self, fn, recurse=recurse)
+        handoff_if_pending(self)
+        residency.move(self, to_host=target.type == "cpu")
+        return self if _is_sharded(self) else orig_apply(self, _leaving_parked(fn), recurse=recurse)
+
+    def _materialize_on_host(self, fn, recurse):
         try:
             target = fn(torch.empty(0, device="meta")).device
         except Exception:  # noqa: BLE001 - an unreadable target is simply not ours to redirect
             return orig_apply(self, fn, recurse=recurse)
         if target.type != "cuda":
             return orig_apply(self, fn, recurse=recurse)
+        setattr(self, _SETTLED_ATTR, True)
 
         # Resolve candidates before _apply starts swapping parameter objects.
         chosen = {}
@@ -226,7 +340,7 @@ def patch_materialize(instance: nn.Module, conf) -> None:
                 host = host_weights.reserve(payload.shape, payload.dtype, name=name)
                 hosts[id(t)] = host
                 parked.append(host.numel() * host.element_size())
-            return _rebuild(t, host) if _is_dtensor(t) else host
+            return _rebuild(t, host) if isinstance(t, DTensor) else host
 
         result = orig_apply(self, materialize, recurse=recurse)
         setattr(self, _PENDING_ATTR, True)
@@ -257,30 +371,16 @@ def handoff(module: nn.Module) -> int:
     """Install storage-free CUDA stand-ins and return the number of weights handed off.
 
     Run after checkpoint loading and weight post-processing, but before Dynamo
-    traces devices. Stand-in construction temporarily allocates one full shard."""
+    traces devices."""
     parked = _parked_params(module)
     _warn_about_reclaimed(module, parked)
     if not parked:
         setattr(module, _PENDING_ATTR, False)
+        residency.record_slots(module, ())
         return 0
 
-    device = torch.device("cuda", torch.cuda.current_device())
-    nbytes = 0
-    for names, param in parked:
-        # Detach plain Parameters before swap_tensors replaces their host payload.
-        host = _payload(param)
-        if host is param:
-            host = param.detach()
-        stand_in = torch.empty(host.shape, dtype=host.dtype, device=device)
-        stand_in.untyped_storage().resize_(0)
-        new_data = _rebuild(param, stand_in) if _is_dtensor(param) else stand_in
-        installed = _replace_param(module, names, param, new_data)
-        # After, not before: registration is what decides which tensor object
-        # the graph will be traced against, and the slot is keyed on it.
-        device_tensor = installed._local_tensor if _is_dtensor(installed) else installed
-        host_weights.adopt(host, device_tensor, name=_pretty(names[0]))
-        nbytes += host.numel() * host.element_size()
-
+    # Detach plain Parameters before swap_tensors replaces their host payload.
+    nbytes = _hand_over(module, [(names, param, _payload(param).detach()) for names, param in parked])
     setattr(module, _PENDING_ATTR, False)
     magi_logger.info(
         "host offload: handed %d weight(s) (%.1f MiB) over to the host pool; %s enters compilation with "

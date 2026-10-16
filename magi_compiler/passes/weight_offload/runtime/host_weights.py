@@ -70,7 +70,7 @@ class HostWeightStore:
     Adopt is idempotent on tensor identity: a second compile of the same
     stand-in must reuse the slot the first one minted.  ``_resident`` and the
     device tensor's storage are the same question -- ``restore_all`` /
-    ``make_resident`` always update both.
+    ``make_resident`` / ``release_resident_many`` always update both.
     """
 
     def __init__(self, pool: HostMemPool | None = None) -> None:
@@ -200,6 +200,24 @@ class HostWeightStore:
             nbytes += entry.nbytes
         if copied:
             torch.cuda.synchronize()
+        return nbytes
+
+    def release_resident_many(self, slots: Sequence[int]) -> int:
+        """Free the device copy of every listed promoted shard.  Returns the bytes freed.
+
+        The inverse of :meth:`make_resident_many`, for a caller that parks a whole
+        model between uses.  The host copy stays, so a released slot loads over
+        H2D again and ``make_resident_many`` brings the device copy back.  The
+        caller must have synchronized every stream still reading these shards.
+        """
+        nbytes = 0
+        for slot in slots:
+            if slot not in self._resident:
+                continue
+            entry = self._entry(slot)
+            entry.device_tensor.untyped_storage().resize_(0)
+            self._resident.discard(slot)
+            nbytes += entry.nbytes
         return nbytes
 
     def is_resident(self, slot: int) -> bool:
@@ -332,6 +350,10 @@ def make_resident(slot: int) -> int:
 
 def make_resident_many(slots: Sequence[int]) -> int:
     return _STORE.make_resident_many(slots)
+
+
+def release_resident_many(slots: Sequence[int]) -> int:
+    return _STORE.release_resident_many(slots)
 
 
 def is_resident(slot: int) -> bool:
