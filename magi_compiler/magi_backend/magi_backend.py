@@ -302,7 +302,8 @@ def fix_graph_device_placement(module: torch.nn.Module):
                 node.update_kwarg('device', target_device)
                 needs_recompile = True
 
-        if node.op == 'call_method' and node.target == 'to':
+        # torch_musa wraps Tensor.to, so on MUSA Dynamo records the wrapped method as orig_to.
+        if node.op == 'call_method' and node.target in ('to', 'orig_to'):
             new_args = list(node.args)
             changed = False
             for i, arg in enumerate(new_args):
