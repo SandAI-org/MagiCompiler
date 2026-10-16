@@ -87,8 +87,8 @@ class OffloadScheduler(abc.ABC):
         self.weight_sizes = weight_sizes
 
         self.kept_weights: Set[str] = set()
-        self.rt = accelerator_module()
-        self.device = accelerator_type()
+        self.device_module = accelerator_module()
+        self.device_type = accelerator_type()
 
     @abc.abstractmethod
     def schedule_kept_weights(self, profile_data: Dict[str, float]):
@@ -192,7 +192,7 @@ class BaseScheduler(OffloadScheduler):
 
         weight_names = self.submod_weights_map.get(target_node.name, [])
 
-        with self.rt.stream(h2d_stream):
+        with self.device_module.stream(h2d_stream):
             for w_name in weight_names:
                 if w_name in self.kept_weights:
                     continue
@@ -203,10 +203,10 @@ class BaseScheduler(OffloadScheduler):
 
                 if is_next_iter:
                     if w_name in buffers:
-                        submod_0_next_iter_weights[w_node] = buffers[w_name].to(self.device, non_blocking=True)
+                        submod_0_next_iter_weights[w_node] = buffers[w_name].to(self.device_type, non_blocking=True)
 
                 elif w_node in env and hasattr(env[w_node], 'device') and env[w_node].device.type == "cpu":
-                    env[w_node] = env[w_node].to(self.device, non_blocking=True)
+                    env[w_node] = env[w_node].to(self.device_type, non_blocking=True)
 
 
 @SchedulerFactory.register("COST_EFFECTIVE")
@@ -273,9 +273,9 @@ class HeuristicScheduler(BaseScheduler):
         # prefetch schedule: { trigger_node_name : target_submod_index }
         # when execute the trigger_node_name, prefetch the target_submod_index
         self.prefetch_schedule = collections.defaultdict()
-        self.submod_load_events: Dict[str, torch.cuda.Event] = collections.defaultdict(self.rt.Event)
+        self.submod_load_events: Dict[str, torch.cuda.Event] = collections.defaultdict(self.device_module.Event)
         for i in range(len(self.submod_nodes)):
-            self.submod_load_events[self.submod_nodes[i].name] = self.rt.Event()
+            self.submod_load_events[self.submod_nodes[i].name] = self.device_module.Event()
 
     def schedule_kept_weights(self, profile_data: Dict[str, Any]):
         """
@@ -446,7 +446,7 @@ class HeuristicScheduler(BaseScheduler):
         if h2d_idx is None:
             return
 
-        compute_complete_event = self.rt.Event()
+        compute_complete_event = self.device_module.Event()
         compute_complete_event.record(compute_stream)
         h2d_stream.wait_event(compute_complete_event)
 
@@ -455,7 +455,7 @@ class HeuristicScheduler(BaseScheduler):
 
         weight_names = self.submod_weights_map.get(h2d_node.name, [])
 
-        with self.rt.stream(h2d_stream):
+        with self.device_module.stream(h2d_stream):
             for w_name in weight_names:
                 if w_name in self.kept_weights:
                     continue
@@ -463,8 +463,8 @@ class HeuristicScheduler(BaseScheduler):
                 w_node = self.name_node_map.get(w_name)
 
                 if w_node in env and hasattr(env[w_node], 'device') and env[w_node].device.type == "cpu":
-                    env[w_node] = env[w_node].to(self.device, non_blocking=True)
+                    env[w_node] = env[w_node].to(self.device_type, non_blocking=True)
                 elif is_last_step and w_name in buffers:
-                    submod_0_next_iter_weights[w_node] = buffers[w_name].to(self.device, non_blocking=True)
+                    submod_0_next_iter_weights[w_node] = buffers[w_name].to(self.device_type, non_blocking=True)
 
             self.submod_load_events[h2d_node.name].record(h2d_stream)

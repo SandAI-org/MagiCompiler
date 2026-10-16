@@ -18,6 +18,8 @@ import os
 
 import torch
 
+from magi_compiler.utils.device import accelerator_type
+
 _cudart = None
 _musart = None
 
@@ -57,11 +59,14 @@ def pin_memory_in_place(tensor: torch.Tensor):
     """
     if tensor.device.type != "cpu":
         return tensor
-    if (lib := init_cudart()) is not None:
-        host_register = lib.cudaHostRegister
-    elif (lib := init_musart()) is not None:
-        host_register = lib.musaHostRegister
+    # Pick by accelerator, not by which library loads: a MUSA host may also ship libcudart.
+    if accelerator_type() == "musa":
+        lib = init_musart()
+        host_register = lib.musaHostRegister if lib is not None else None
     else:
+        lib = init_cudart()
+        host_register = lib.cudaHostRegister if lib is not None else None
+    if host_register is None:
         return tensor
 
     ptr = tensor.data_ptr()
