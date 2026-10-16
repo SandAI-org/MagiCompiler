@@ -66,32 +66,18 @@ def _check_shard(shard: torch.Tensor, slot: int) -> None:
 
 
 def _h2d_load(shard: torch.Tensor, slot: int) -> torch.Tensor:
-    # ``source``, not ``get``: a slot the placement pass promoted back onto the
-    # device copies from there instead, which turns this into a D2D copy without
-    # any other part of the op, the graph or the schedule having to know.
+    # Resident slots copy from the device; other slots copy from pinned host storage.
     slot = resolve_slot(slot)
     _check_shard(shard, slot)
     host = host_weights.source(slot)
-    # Allocated on the COMPUTE stream, deliberately: the caching allocator ties a
-    # block to the stream it was allocated on, and this buffer is consumed by
-    # compute.  ``record_stream`` below is what tells it the load stream wrote
-    # it, so a freed block is not handed out before the copy lands.
+    # Allocate on the consuming compute stream;
+    # record_stream below prevents reuse while the H2D stream is still writing.
     out = torch.empty(host.shape, dtype=host.dtype, device=shard.device)
 
     if host_weights.is_resident(slot):
-        # Nothing to hide and nothing to wait for: the shard is already on the
-        # device, so the transfer is a short D2D hop rather than a trip across
-        # PCIe.  Doing it inline on the compute stream skips two cross-stream
-        # synchronizations, the event and its Work registration -- all of which
-        # exist to overlap a transfer that no longer happens.  The
-        # ``wait_tensor`` downstream then finds no Work and is a no-op.
-        #
-        # The buffer is still a real copy, and that is not an oversight: a
-        # promoted slot's source IS the shard the graph handed us, so returning
-        # it would make this op's output alias a graph input.  Inductor does not
-        # allocate a fallback kernel's output but does put it in the reuse pool,
-        # so the next same-sized allocation would take over the parameter's
-        # storage and the following kernel would write into the weight.
+        # D2D runs on the compute stream without a Work; wait_tensor is then a no-op.
+        # Keep a separate output: Inductor may reuse a fallback output's storage,
+        # so aliasing the parameter would let a later kernel overwrite its weights.
         out.copy_(host)
         return out
 

@@ -12,33 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tag already-parked weights, and load them back inside the graph.
+"""Bind parked weights, then insert their graph-side loads.
 
-Weights reach the host pool only through host-first materialization
-(``reserve`` + ``adopt``).  Two steps, deliberately separate:
-
-``bind_weights_to_host``
-    asks the source which parked weights the graph should load, intersects
-    the pick with peers in each shard group (per-candidate, not WORLD-wide
-    all-or-nothing), and tags the graph.  Nothing about the graph's shape
-    changes, and no bytes move -- a failure here is a no-op.
-
-``insert_h2d_loads``
-    splices ``magi::h2d_load`` + ``wait_tensor`` in behind each tagged weight,
-    one load per weight.  The load goes ABOVE every reader of that weight, so
-    anything the graph did to it -- a dtype cast, an uneven-shard pad -- still
-    runs on the device: casting on the host would both burn CPU and, for a
-    fp32-master/bf16-forward weight, double the bytes crossing PCIe.
-
-    Loads are not merged.  A submission costs ~25us of CPU on top of the copy,
-    which from ~4 MiB up is under the transfer time it rides along with, and
-    the size floor keeps smaller weights resident; on gaga4 400B per-weight
-    loads ran within noise of loads merged to the all-gather buckets.  A merged
-    load would also hold its whole group in flight from the first member's
-    deadline to the last member's read.
-
-What a weight *is* belongs to the source (see ``weight_source.py``); everything
-here is written once and works for a sharded model and a plain one alike.
+``bind_weights_to_host`` intersects candidates within each shard group;
+it tags the graph without moving bytes. Unsharded parameters need no cross-rank vote.
+``insert_h2d_loads`` inserts one load/wait pair per tagged holder before all readers.
+The load preserves the stored dtype; existing casts and padding run on the device.
+Different holders of a shared weight still need their own loads.
+Weight discovery is delegated to ``WeightSource`` for plain and FSDP models.
 """
 
 from __future__ import annotations

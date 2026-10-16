@@ -57,10 +57,8 @@ def boundary_gelu(x: torch.Tensor) -> torch.Tensor:
 
 
 class Block(nn.Module):
-    """One transformer-ish block: two Linears with an opaque extern op between them.
-    Multiple blocks give the graph many Shard(0) weight all-gathers interleaved with
-    compute -- so the bucketing pass coalesces them whole-graph and the reorder pass
-    has real compute to hide gathers behind."""
+    """Two linear layers separated by an opaque extern op.
+    Repeated blocks provide interleaved gathers and compute for bucketing and overlap."""
 
     def __init__(self, hidden: int):
         super().__init__()

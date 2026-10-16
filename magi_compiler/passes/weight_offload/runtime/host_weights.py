@@ -12,29 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Slot table of the weight shards the compiled graph loads from host on demand.
+"""Process-wide host-weight slots and device residency state.
 
-The bytes live in a pinned :class:`~magi_compiler.host_mem.HostMemPool`; this
-module decides which shard each region holds and whether the device copy is
-back.  Pinned, because a paged source would make every load synchronous and
-leave nothing for the reorder pass to overlap.
+Pinned buffers support asynchronous H2D copies. ``reserve`` supplies storage;
+``adopt`` pairs a filled host buffer with a storage-free CUDA stand-in by identity.
+Host-first handoff temporarily allocates one full CUDA shard before freeing its storage.
 
-A shard is addressed by an integer ``slot``, not by a pointer.  Adopt pairs a
-filled host buffer with a storage-free CUDA stand-in; the stand-in's address is
-not a usable key, so the slot rides along in the graph instead.
-
-Slots are minted in this process at adopt time (0, 1, 2, …).  A cached
-kernel bakes those integers, so a later process remaps them through
-``slot_remap.using_slot_remap`` (see the ``host_slots.py`` sidecar next to
-the piecewise cache) rather than compiling the loads again.
-
-The only way in is ``reserve`` + ``adopt``: the loader reads the checkpoint
-straight into a pinned reservation, and the shard never occupies a device byte.
-That is what keeps the device high-water mark at the resident set instead of
-the whole model.
-
-The process holds one :class:`HostWeightStore`.  ``magi::h2d_load`` reads it at
-runtime by the slot integers baked into the graph.
+Compiled loads carry process-local slot integers rather than storage pointers.
+Cached artifacts remap these integers through ``using_slot_remap`` and ``host_slots.py``.
+Promotion restores a slot's device copy without discarding its host buffer.
 """
 
 from __future__ import annotations
@@ -110,13 +96,8 @@ class HostWeightStore:
             ) from None
 
     def reserve(self, shape: Sequence[int], dtype: torch.dtype, name: str = "") -> torch.Tensor:
-        """Pinned host storage for a shard that has no device copy yet.
-
-        A checkpoint can be read straight into the reservation, so the shard
-        never occupies a device byte.  There is no slot yet: a slot pairs a
-        host buffer with the device tensor that stands in for it in the graph,
-        and that tensor does not exist until :meth:`adopt`.
-        """
+        """Reserve pinned host storage that a checkpoint loader can fill directly.
+        No slot is created until ``adopt`` pairs it with a CUDA stand-in."""
         host = self._pool.alloc(shape, dtype)
         magi_logger.debug(
             "host offload: reserved %.1f MiB of pinned host memory for %s", host.numel() * host.element_size() / 2**20, name
@@ -158,12 +139,7 @@ class HostWeightStore:
         return self._entry(slot).host
 
     def source(self, slot: int) -> torch.Tensor:
-        """Where a load should copy this shard from.
-
-        The device copy for a promoted slot, the host copy otherwise.  The load
-        reads this instead of ``get`` so promotion needs no second code path:
-        same op, same stream, same event, just a much shorter wire.
-        """
+        """Return the device copy for a resident slot, otherwise the pinned host copy."""
         entry = self._entry(slot)
         return entry.device_tensor if slot in self._resident else entry.host
 
@@ -172,17 +148,8 @@ class HostWeightStore:
         return self.make_resident_many([slot])
 
     def make_resident_many(self, slots: Sequence[int]) -> int:
-        """Put every listed shard back on the device.  One sync for the whole batch.
-
-        Called from the placement pass for loads whose transfer no amount of
-        hoisting could hide.  Such a load is pure exposed latency: it stalls
-        the compute stream in front of its own all-gather and delays the
-        launch, so paying its bytes in device memory buys back more than it
-        costs.
-
-        Per-slot ``cuda.synchronize`` used to serialize this: a model that
-        hands back dozens of weights paid a host round-trip for each one.
-        """
+        """Restore listed shards, synchronizing once if any copies were submitted.
+        Return newly resident bytes; already resident slots contribute zero."""
         nbytes = 0
         copied = False
         for slot in slots:
@@ -228,16 +195,8 @@ class HostWeightStore:
         self._claimed.add(slot)
 
     def restore_unclaimed(self) -> list[str]:
-        """Hand back every parked shard no graph loads.  Returns what was restored.
-
-        The fail-safe for the whole offload path.  A shard is parked on the
-        strength of a prediction -- that the graph will turn out to contain an
-        all-gather reading it -- and a prediction that misses leaves a kernel
-        reading freed storage, which surfaces as an illegal access with nothing
-        pointing back here.  Restoring costs device memory and nothing else:
-        the shard's graph, if one ever appears, still loads it, just
-        device-to-device.
-        """
+        """Restore unclaimed, nonresident slots before graph execution; return their names.
+        This prevents readers without an inserted load from accessing empty storage."""
         pending = [slot for slot in range(len(self._slots)) if slot not in self._claimed and slot not in self._resident]
         if not pending:
             return []
@@ -263,38 +222,15 @@ class HostWeightStore:
         return len(self._slots)
 
     def restore_all(self) -> None:
-        """Put every bound shard back on the device.
-
-        Escape hatch for teardown and for running an offloaded model through
-        an un-offloaded code path.  Marks every slot resident so ``source``
-        and the device storage agree afterwards -- leaving them unmarked made
-        the next ``h2d_load`` copy from host while the bytes were already on
-        the device.
-        """
+        """Restore all slots for teardown or execution outside the offloaded graph.
+        Mark them resident so later loads read their device copies."""
         self.make_resident_many(range(len(self._slots)))
 
     def h2d_bandwidth_bytes_per_ns(self, override_gbps: float = 0.0) -> float:
-        """Measured host-to-device bandwidth, in bytes per nanosecond.
+        """Return H2D bandwidth in bytes/ns, using an override or a process-cached probe.
 
-        Measured once per process and reused: the reorder pass sizes thousands
-        of loads, and re-timing each one would cost more than the placement it
-        informs while telling us nothing new -- a pinned DMA of a contiguous
-        shard is the same transfer at every size above the fixed overhead.
-
-        The probe runs on every rank AT ONCE, which is the whole point.
-        Measured alone, one H100 reads pinned host memory at ~55 GB/s; measured
-        with its seven neighbours doing the same, it gets ~27 GB/s, because
-        what runs out is host memory bandwidth (~207 GB/s aggregate), not the
-        PCIe link.  Calibrating in isolation hands the placement pass a number
-        that is twice the truth, and it then sizes every overlap window at
-        half the transfer it has to hide -- which does not fail, it just
-        quietly stops hiding things.
-
-        The result is deliberately NOT reduced across ranks.  Load placement
-        moves no collective, so ranks are free to disagree (see
-        ``H2dLoadReorder``), and a rank on a slower root complex should hoist
-        further, not adopt a peer's number.
-        """
+        The probe aligns ranks to measure shared host-bandwidth contention.
+        Results remain rank-local because H2D placement moves no collectives."""
         if override_gbps > 0:
             # 1 GB/s == 1e9 bytes / 1e9 ns == 1 byte/ns, so the units coincide.
             return override_gbps

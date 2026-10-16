@@ -334,14 +334,7 @@ def test_adopt_refuses_a_device_tensor_that_still_holds_bytes():
 
 @requires_cuda
 def test_unclaimed_shards_are_handed_back_to_the_device():
-    """The fail-safe: a parked shard nothing loads is a kernel reading freed storage.
-
-    Parking is decided from a weight's placements while the model is built;
-    whether a graph loads it is only known once the lowering has run. Everything
-    that falls in that gap has to come back, and everything that does not must
-    be left alone -- putting a loaded shard back is a silent regression to no
-    offload at all.
-    """
+    """Restore parked weights without graph loads while leaving claimed weights offloaded."""
     from magi_compiler.passes.weight_offload import host_weights
 
     loaded = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
@@ -537,12 +530,7 @@ def test_bind_and_insert_puts_the_load_between_the_shard_and_the_gather(dist_1ra
 
 @requires_cuda
 def test_load_sits_above_the_dtype_cast(dist_1rank):
-    """The cast must run on the device, after the load.
-
-    Casting on the host would burn CPU and, for a fp32-master / bf16-forward
-    weight, double the bytes crossing PCIe -- the transfer this whole pass exists
-    to hide.
-    """
+    """Load the stored dtype before applying the graph's device-side cast."""
     from magi_compiler.passes.fsdp_overlap import FsdpShardSource
     from magi_compiler.passes.weight_offload import bind_weights_to_host, insert_h2d_loads
     from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
@@ -562,14 +550,7 @@ def test_load_sits_above_the_dtype_cast(dist_1rank):
 
 @requires_cuda
 def test_second_graph_over_the_same_parameters_still_gets_its_loads(dist_1rank):
-    """A model compiled for several shapes produces several graphs over ONE set
-    of parameters.
-
-    The shard was adopted once; every later graph still has to load it back.
-    Treating "already adopted" as "nothing to do" leaves the second graph
-    all-gathering an empty stand-in -- which surfaces as an illegal memory
-    access inside NCCL, on every rank, with nothing pointing back here.
-    """
+    """Every graph over the same parameters must insert loads while reusing adopted slots."""
     from magi_compiler.passes.fsdp_overlap import FsdpShardSource
     from magi_compiler.passes.weight_offload import bind_weights_to_host, insert_h2d_loads
     from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
@@ -618,14 +599,7 @@ def _twice_gathered_weight_graph(mesh, rows=8, cols=4):
 
 @requires_cuda
 def test_a_weight_two_gathers_read_gets_a_load_for_each(dist_1rank):
-    """The shard is adopted once; loading is per gather.
-
-    Each gather reaches the shard through its own ``to_local``, and the splice
-    only repoints the readers of the holder it was handed. Treating the second
-    one as a duplicate of the first leaves it gathering the empty stand-in --
-    an illegal access inside NCCL, on every rank, with nothing pointing back
-    here.
-    """
+    """Distinct to_local holders of one shard must each load the shared host slot."""
     from magi_compiler.passes.fsdp_overlap import FsdpShardSource
     from magi_compiler.passes.weight_offload import bind_weights_to_host, host_weights, insert_h2d_loads
     from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
@@ -659,13 +633,8 @@ def prim_to_local(x):
 
 
 def _replicated_weight_graph(mesh, rows=9, cols=64):
-    """A weight SimpleFSDP replicated instead of sharding, as the lowering leaves it.
-
-    ``rows`` is deliberately indivisible: athena replicates a ``Shard(0)`` whose
-    dim0 does not divide its mesh. Lowering only rewrites sharded gathers, so the
-    prim redistribute/to_local pair stays in the graph and there is no all-gather
-    to key off.
-    """
+    """A replicated DTensor whose prim redistribute/to_local pair survives lowering.
+    Offload must discover its weight holder without an all-gather to key off."""
     from torch.distributed.tensor import Replicate, distribute_tensor
 
     from magi_compiler.passes.fsdp_overlap import lower_prim_redistribute_to_collectives
@@ -1008,12 +977,7 @@ def test_a_shard_below_the_floor_is_materialized_on_the_device(dist_1rank):
 
 @requires_cuda
 def test_ordinary_device_moves_are_left_alone(dist_1rank):
-    """``_apply`` is how a module does everything to its tensors.
-
-    Only ``to_empty`` means "this model has no storage yet"; a dtype cast or a
-    device move is a request to put bytes somewhere, and quietly redirecting one
-    into host memory would be a very confusing way to lose a model.
-    """
+    """A dtype cast after host-first materialization must not reserve another host buffer."""
     root = _shard_on_meta(dist_1rank, rows=256, cols=64)
     _patched(root.inner)
 
@@ -1107,13 +1071,8 @@ def test_device_moves_free_and_repromote_only_this_instances_promoted_shards():
 
 @requires_cuda
 def test_host_first_materializes_hands_off_and_binds_the_compiled_subtree(dist_1rank):
-    """What the graph is traced against, and what the loader wrote into.
-
-    Between them sits the one moment this can be done: after the checkpoint and
-    the post-load hooks, before Dynamo. The bytes must survive it, the parameter
-    must come out on CUDA so the graph lowers to CUDA kernels, and the pool must
-    be able to find the slot from the tensor the graph will carry.
-    """
+    """Handoff must preserve loaded bytes and register CUDA stand-ins before tracing.
+    Binding must resolve the slots through the parameters installed on the module."""
     from magi_compiler.passes.fsdp_overlap import FsdpShardSource
     from magi_compiler.passes.weight_offload import bind_weights_to_host, host_weights, insert_h2d_loads
     from magi_compiler.passes.weight_offload.host_first import handoff_if_pending
@@ -1214,14 +1173,8 @@ def test_handoff_preserves_a_weight_shared_with_the_eager_subtree(dist_1rank, ea
 
 @requires_cuda
 def test_storage_freed_shard_survives_a_real_inductor_compile(dist_1rank):
-    """The premise the whole design rests on.
-
-    The graph keeps carrying the shard -- for its shape, and for the data edge
-    back to the parameter -- but there are no bytes behind it until the load puts
-    some there.  Nothing downstream of Dynamo is supposed to have an opinion
-    about that; Inductor's input handling (guards, ``assert_size_stride``, memory
-    planning) is where it would go wrong if anything did.
-    """
+    """An empty CUDA stand-in must survive Inductor input handling and repeated execution.
+    Each load returns a separate filled buffer; it does not fill the stand-in."""
     from magi_compiler.passes.snode_utils import is_compute
     from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
     from magi_compiler.passes.weight_offload.schedule.h2d_snode import is_h2d_load

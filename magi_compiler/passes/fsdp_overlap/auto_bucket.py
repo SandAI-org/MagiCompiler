@@ -12,57 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Weight all-gather bucketing sized to amortize the launch, inside the Inductor scheduler.
+"""Scheduler-stage weight all-gather bucketing, before ``FsdpOverlapReorder``.
 
-``bucket_mode="auto"`` is the only weight-gather bucketing there is.  This pass
-runs right after ``SnodeCostProfile`` and before ``FsdpOverlapReorder``, so it
-sees the fused graph with every gather priced, and the reorder then places the
-buckets it built.  NCCL and copy-engine gathers are bucketed alike, never into
-one bucket together (see ``ir_coalesce``).
+Fit ``T(S) = alpha + beta * S`` per transport and process group.
+The gathered-byte target is ``alpha * (1 - ratio) / (ratio * beta)``.
+Gathers at or above the target stay single and separate runs of smaller gathers.
+Merge smaller gathers up to the target, allowing at most twice the target;
+also respect producer/wait ordering and the configured local-byte cap.
+A final bucket below half the target may fold into its predecessor if it fits.
 
-The rule.  A gather of ``S`` gathered bytes costs ``T(S) = alpha + beta * S`` on
-its stream, fitted to the measured single gathers.  Merging only ever saves the
-fixed ``alpha``; what it costs is memory, because every member after the first
-is allocated at the bucket's launch instead of at its own.  So a gather is
-merged only while its launch is a large share of its time::
+NCCL and copy-engine gathers never share a bucket.
+An eight-rank calibration sets default launch-cost ratios to 0.1 and 0.5, respectively.
 
-    alpha / T(S) <= ratio   <=>   S >= S_target = alpha * (1 - ratio) / (ratio * beta)
-
-A gather of ``S_target`` or more amortizes its own launch and goes alone; it
-also ends the bucket being filled, so a bucket never spans one.  The smaller
-ones are merged in program order, while the bucket is under ``S_target`` and
-stays under ``2 * S_target`` (and ``bucket_size_mib`` of local bytes, when
-set): that bounds what a bucket can allocate early to about one target's worth
-of small weights.  A merge also stops at the first member whose shard is not
-ready before the bucket's earliest wait, and a last bucket under half the
-target folds into the one before it when that fits.
-
-``alpha``/``beta`` are fitted per transport and process group, and ``ratio`` is
-chosen per transport: a copy-engine gather pays a much larger fixed cost per
-launch and a much smaller one per byte than an NCCL one, so one ratio gives it a
-target several times the NCCL one; and a group's per-byte cost depends on how
-many ranks it gathers from.
-Unless set, ``ratio`` is 0.1 for NCCL and 0.5 for the copy engine -- the values
-at which gaga4 400B ran level with the old fixed 512 MiB buckets on each
-transport, without allocating more gathered weight early.
-
-Every rank must build the same buckets, or the collective sequence diverges.
-The collective skeletons are compared first (``rank_sync.negotiate_mode`` must
-answer ``slot``), but the costs are not: most snodes are priced on
-each rank from its own measurements, so the fitted ``alpha``/``beta`` can differ
-slightly.  So every rank plans, and every rank then takes rank 0's plan, checks
-it is legal on its own order, and touches the IR only once every rank has said
-yes.  A rank with fewer than two gathers still joins that comparison: the
-candidate count is rank-local, and returning before the exchange leaves the
-other ranks blocked in it.  Every rank leaves the gathers unbucketed only after
-the exchange says so.
-
-Matching collective skeletons align candidate ``j`` across ranks even when
-rank-private compute differs.  A bucket's launch depends on local producers, so two
-ranks can put it on opposite sides of a CP / EP collective.  So each rank also
-reports the order its skeleton takes after the merges, and the plan is applied
-only where that order is the same everywhere.  ``pinned`` has no skeleton to
-compare against and is left unbucketed.
+Every rank joins mode negotiation, including ranks with fewer than two candidates.
+Only matching collective skeletons (``slot`` mode) allow bucketing.
+All ranks adopt rank 0's plan and validate it against their local dependencies;
+IR changes require unanimous legality and matching post-merge collective order.
+Local plans separate host-offloaded and resident gathers;
+an adopted plan may mix them on another rank.
 """
 
 from __future__ import annotations

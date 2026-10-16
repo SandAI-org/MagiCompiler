@@ -243,9 +243,11 @@ def _park_host_built(module: nn.Module, min_bytes: int) -> int:
 
 
 def patch_materialize(instance: nn.Module, conf) -> None:
-    """Redirect CUDA ``to_empty`` for this compiled instance's offloadable weights.
+    """Install per-instance host-first materialization and residency-aware device moves.
 
-    Other instances and other ``_apply`` operations retain their normal behavior."""
+    Redirect eligible CUDA ``to_empty`` allocations to pinned host memory.
+    A host-built plain module parks eligible weights on its first CUDA move.
+    Later device moves release or restore promoted slots; dtype casts are delegated."""
     if getattr(instance, "_magi_host_first_installed", False):
         return
     min_bytes = int(conf.offload_config.offload_min_shard_mib * 1024 * 1024)
