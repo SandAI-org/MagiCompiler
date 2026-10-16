@@ -42,3 +42,29 @@ def device_capability(device: int = 0) -> Tuple[int, int]:
 def device_capability_major(device: int = 0) -> int:
     """Convenience wrapper: just the major-capability int (0 if no CUDA)."""
     return device_capability(device)[0]
+
+
+def accelerator_module():
+    """``torch.cuda`` on NVIDIA GPUs, the out-of-tree backend module (e.g. ``torch_musa``) elsewhere."""
+    import torch as _torch
+
+    return _torch.get_device_module()
+
+
+def accelerator_type() -> str:
+    """Device type of the current accelerator, e.g. ``"cuda"`` or ``"musa"``."""
+    import torch as _torch
+
+    acc = _torch.accelerator.current_accelerator()
+    return acc.type if acc is not None else "cuda"
+
+
+def is_host_scalar(val) -> bool:
+    """0-dim CPU tensor, e.g. a Python float lifted by Dynamo.
+
+    Device kernels accept these as-is, and they must stay on the host: a fake one moved to the device loses
+    its constant value, so a later ``.item()`` becomes data-dependent.
+    """
+    import torch as _torch
+
+    return isinstance(val, _torch.Tensor) and val.dim() == 0 and val.device.type == "cpu"

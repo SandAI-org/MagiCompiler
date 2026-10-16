@@ -264,5 +264,41 @@ def test_cpu_offload_different_decoration_styles(device, mlp_config):
         # assert model_mtd.mlp.up_proj.weight.device.type == "cpu"
 
 
+@magi_register_custom_op("athena::scale_by", infer_output_meta_fn=["x"])
+def scale_by(x: torch.Tensor, scale: float) -> torch.Tensor:
+    return x * scale
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
+def test_cpu_offload_float_attribute(device, mlp_config):
+    """
+    A float module attribute is lifted by Dynamo into a 0-dim CPU tensor input and read back with .item()
+    for the custom op; the offload path must keep it on the host.
+    """
+    with set_cpu_offload(True):
+
+        @magi_compile(dynamic_arg_dims={"x": 0})
+        class ScaledMLP(torch.nn.Module):
+            def __init__(self, config: MLPConfig):
+                super().__init__()
+                self.scale = 0.5
+                self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False, dtype=config.params_dtype)
+                self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False, dtype=config.params_dtype)
+
+            def forward(self, x):
+                return self.down_proj(scale_by(F.silu(self.up_proj(x)), self.scale))
+
+        model = TransformerWrapper(mlp_config, mlp_cls=ScaledMLP)
+        model.cuda()
+        assert model.mlp.up_proj.weight.device.type == "cpu"
+
+        with torch.no_grad():
+            for num_tokens in (4, 8, 16):
+                x = torch.randn(num_tokens, mlp_config.hidden_size, device=device, dtype=mlp_config.params_dtype)
+                up, down = model.mlp.up_proj.weight.to(device), model.mlp.down_proj.weight.to(device)
+                expected = model.attention_proj(my_attention(*[F.linear(F.silu(F.linear(x, up)) * 0.5, down)] * 3))
+                torch.testing.assert_close(model(x), expected, rtol=2e-2, atol=2e-2)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
