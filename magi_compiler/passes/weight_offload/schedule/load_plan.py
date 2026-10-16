@@ -25,7 +25,7 @@ from ...snode_utils import is_multi_output
 
 
 def snode_bytes(snode: BaseSchedulerNode) -> int:
-    node = getattr(snode, "node", None)
+    node = snode.node
     try:
         numel = 1
         for d in node.get_size():

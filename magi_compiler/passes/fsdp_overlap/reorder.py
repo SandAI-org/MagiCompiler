@@ -160,7 +160,7 @@ class FsdpOverlapReorder(OverlapPass):
         group = [launch]
         node = leaf_collective_node(launch)
         produced = set(launch.get_buffer_names())
-        if node is not None and (getattr(node, "op_overload", None) is _AG_COALESCED or is_ce_ag_coalesced(node)):
+        if node is not None and (node.op_overload is _AG_COALESCED or is_ce_ag_coalesced(node)):
             for s in order:
                 if is_multi_output(s) and any((not _is_fake_dep(d)) and d.name in produced for d in s.unmet_dependencies):
                     group.append(s)

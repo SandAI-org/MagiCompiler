@@ -41,6 +41,7 @@ import re
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch._inductor import ir
 from torch.distributed.device_mesh import init_device_mesh
 
 from magi_compiler import magi_compile
@@ -137,7 +138,7 @@ def _install(pair: int, diverge: bool = False) -> None:
         before = sum(1 for s in snodes if auto_bucket.gather_info(s) is not None)
         out = orig_call(self, snodes)
         after = sum(1 for s in out if auto_bucket.gather_info(s) is not None)
-        n_packed = sum(1 for s in out if getattr(getattr(s, "node", None), "op_overload", None) is _AG_COALESCED)
+        n_packed = sum(1 for s in out if isinstance(s.node, ir.ExternKernel) and s.node.op_overload is _AG_COALESCED)
         _STATS["buckets"] += n_packed
         _STATS["members"] += before - after
         return out

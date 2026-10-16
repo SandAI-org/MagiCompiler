@@ -90,7 +90,11 @@ def test_collect_and_refresh_read_the_live_pool():
     g.output((node,))
     gm = fx.GraphModule(nn.Module(), g)
 
-    table = collect_host_slot_table(gm)
+    root = nn.Module()
+    root.graph = object()  # An unrelated attribute must not hide the nested FX graph.
+    root.add_module("compiled", gm)
+    table = collect_host_slot_table(root)
+    assert table == collect_host_slot_table(gm)
     assert set(table) == {slot}
     assert table[slot]["name"] == "layers.0.w"
     assert table[slot]["shape"] == (16, 8)
