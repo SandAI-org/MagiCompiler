@@ -14,8 +14,12 @@
 
 import hashlib
 import os
+from collections.abc import Sequence
 from functools import reduce
 from typing import Any, List, Union
+
+import torch.fx as fx
+from torch.distributed.tensor import DTensor
 
 HASH_LENGTH = 10
 
@@ -50,6 +54,14 @@ def compute_code_hash_with_content(file_contents: dict[str, str]) -> str:
             continue
         hash_content.append(content)
     return compute_hash("\n".join(hash_content))
+
+
+def compute_graph_hash(graph: fx.GraphModule, example_inputs: Sequence[Any]) -> str:
+    # graph.code and Tensor/scalar types both change across TensorifyScalarRestartAnalysis.
+    # DTensor placements do not appear in traced source files.
+    return compute_hash(
+        [f"DTensor({x.dtype}, {x.placements}, {tuple(x.device_mesh.shape)})" for x in example_inputs if isinstance(x, DTensor)]
+    )
 
 
 def compute_code_hash(files: set[str]) -> str:
