@@ -35,6 +35,7 @@ import bisect
 
 import torch
 import torch.distributed as dist
+from torch._inductor import ir
 from torch._inductor.scheduler import BaseSchedulerNode
 
 from magi_compiler.utils import magi_logger
@@ -44,8 +45,9 @@ from ..snode_utils import is_weight_gather, issues_transfer, leaf_collective_nod
 
 def _collective_kind_key(snode: BaseSchedulerNode) -> tuple:
     """Coarse, rank-comparable identity of one NCCL-issuing snode."""
-    node = leaf_collective_node(snode) or getattr(snode, "node", None)
-    op = getattr(node, "op_overload", None) or getattr(node, "python_kernel_name", None) or type(node).__name__
+    node = leaf_collective_node(snode) or snode.node
+    op = (node.op_overload or node.python_kernel_name) if isinstance(node, ir.ExternKernel) else None
+    op = op or type(node).__name__
     dims: tuple = ()
     try:
         dims = tuple("?" if getattr(d, "free_symbols", None) else int(d) for d in node.get_size())

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+import torch.fx as fx
 import torch.nn as nn
 
 
@@ -42,10 +43,9 @@ def collect_host_slot_table(module: nn.Module) -> dict[int, dict[str, Any]]:
 
     table: dict[int, dict[str, Any]] = {}
     for _, child in module.named_modules():
-        graph = getattr(child, "graph", None)
-        if graph is None:
+        if not isinstance(child, fx.GraphModule):
             continue
-        for node in graph.nodes:
+        for node in child.graph.nodes:
             slot = host_slot(node)
             if slot is None or slot in table:
                 continue

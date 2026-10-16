@@ -302,12 +302,12 @@ class FsdpAutoBucket:
         its activation gathers left alone.
         """
         plain = [s for s in order if gather_info(s) is not None]
-        tagged = [s for s in plain if any(is_weight_ag(o) for o in getattr(s.node, "origins", ()) or ())]
+        tagged = [s for s in plain if any(is_weight_ag(o) for o in s.node.origins or ())]
         return tagged if tagged else plain
 
     @staticmethod
     def _kind(snode: BaseSchedulerNode, info: GatherInfo) -> tuple:
-        offloaded = any(is_host_offloaded(o) for o in getattr(snode.node, "origins", ()) or ())
+        offloaded = any(is_host_offloaded(o) for o in snode.node.origins or ())
         return (info.kind, info.dtype, offloaded)
 
     def _runs(self, cands: list[BaseSchedulerNode]) -> list[list[BaseSchedulerNode]]:
@@ -376,7 +376,7 @@ class FsdpAutoBucket:
             out[key] = PlanParams(
                 alpha_ns=alpha,
                 beta_ns_per_byte=beta,
-                overhead_ratio=self.overhead_ratio if self.overhead_ratio is not None else DEFAULT_OVERHEAD_RATIOS[kind],
+                overhead_ratio=(self.overhead_ratio if self.overhead_ratio is not None else DEFAULT_OVERHEAD_RATIOS[kind]),
                 max_local_bytes=self.max_bucket_bytes,
             )
         return out

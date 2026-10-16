@@ -22,8 +22,10 @@ collective double-spends the same microseconds on two different transfers.
 
 from __future__ import annotations
 
+from torch._inductor import ir
 from torch._inductor.scheduler import BaseSchedulerNode
 
+from ...snode_utils import iter_ir_nodes
 from ..runtime.h2d_op import H2D_LOAD
 
 H2D_OPS = (H2D_LOAD,)
@@ -37,13 +39,7 @@ def is_h2d_load(snode: BaseSchedulerNode) -> bool:
     NCCL work, and putting it there would make two ranks that merely offload
     different weights look like two structurally different graphs.
     """
-    node = getattr(snode, "node", None)
-    if getattr(node, "op_overload", None) in H2D_OPS:
-        return True
-    for child in getattr(snode, "snodes", []) or []:
-        if getattr(getattr(child, "node", None), "op_overload", None) in H2D_OPS:
-            return True
-    return False
+    return any(isinstance(node, ir.ExternKernel) and node.op_overload in H2D_OPS for node in iter_ir_nodes(snode))
 
 
 def slots_of(snode: BaseSchedulerNode) -> list[int]:
@@ -52,8 +48,10 @@ def slots_of(snode: BaseSchedulerNode) -> list[int]:
     Inductor flattens a custom op's non-tensor arguments into ``constant_args``,
     and the load op takes exactly one such argument -- the slot.
     """
-    node = getattr(snode, "node", None)
+    node = snode.node
+    if not isinstance(node, ir.ExternKernel):
+        return []
     try:
-        return [int(a) for a in getattr(node, "constant_args", ())]
+        return [int(a) for a in node.constant_args]
     except (TypeError, ValueError):  # not an int arg: not a shape this pass knows
         return []

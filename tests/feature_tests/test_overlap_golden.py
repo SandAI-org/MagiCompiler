@@ -119,7 +119,7 @@ def _gather(name, deps, cost, coalesced=False):
 def _load(name, mib, deps=(), slots=()):
     from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
-    return _Snode(name, _ir(_Compute, op=H2D_LOAD, numel=mib * _MIB // 2, slots=slots), deps)
+    return _Snode(name, _ir(ir.FallbackKernel, op=H2D_LOAD, numel=mib * _MIB // 2, slots=slots), deps)
 
 
 # -- graph builders -----------------------------------------------------------

@@ -55,6 +55,7 @@ os.environ.setdefault("TORCH_SYMM_MEM_DISABLE_MULTICAST", "1")
 import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
 import torch.nn as nn  # noqa: E402
+from torch._inductor import ir  # noqa: E402
 from torch.distributed.device_mesh import init_device_mesh  # noqa: E402
 
 from magi_compiler import magi_compile  # noqa: E402
@@ -196,7 +197,7 @@ def main() -> None:
         nonlocal n_ce_buckets
         out = orig_bucket(self, snodes)
         n_ce_buckets += sum(
-            1 for s in out if getattr(getattr(s, "node", None), "op_overload", None) is CE_ALL_GATHER_COALESCED
+            1 for s in out if isinstance(s.node, ir.ExternKernel) and s.node.op_overload is CE_ALL_GATHER_COALESCED
         )
         return out
 

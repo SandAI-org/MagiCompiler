@@ -20,6 +20,7 @@ import math
 import torch
 import torch.distributed as dist
 import torch.fx as fx
+from torch.distributed.tensor import DTensor, Shard
 
 from magi_compiler.utils import magi_logger
 
@@ -72,10 +73,10 @@ def _input_is_weight(node: fx.Node) -> bool:
     return any(t in name for t in ("parameter", "parameters", "weight", "bias"))
 
 
-def _dtensor_meta(node: fx.Node):
+def _dtensor_meta(node: fx.Node) -> DTensor | None:
     """Return the DTensor example_value carried on a node, or None."""
     ev = node.meta.get("example_value")
-    return ev if getattr(ev, "_spec", None) is not None else None
+    return ev if isinstance(ev, DTensor) else None
 
 
 def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
@@ -134,7 +135,7 @@ def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
 
         spec = in_dt._spec
         placement = spec.placements[0] if len(spec.placements) == 1 else None
-        if placement is None or not getattr(placement, "is_shard", lambda: False)() or placement.dim != 0:
+        if not isinstance(placement, Shard) or placement.dim != 0:
             # Only single-mesh Shard(0) is supported; leave others on the prim path.
             skipped += 1
             continue

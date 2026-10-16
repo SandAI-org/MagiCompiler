@@ -28,6 +28,7 @@ this suite exists to catch.
 
 import pytest
 import torch
+from torch._inductor import ir
 
 from magi_compiler.passes.overlap import CostView, SnodeGraph, memory, scheduler
 from magi_compiler.passes.weight_offload.schedule import h2d_reorder, load_plan
@@ -63,24 +64,14 @@ class _Dep:
         self.name = name
 
 
-class _IR:
-    def __init__(self, op_overload, numel, dtype=torch.bfloat16, slots=()):
-        self.op_overload = op_overload
-        self._numel = numel
-        self._dtype = dtype
-        # Inductor flattens a custom op's non-tensor args here; for the load ops
-        # that is exactly the host-pool slot(s).
-        self.constant_args = tuple(slots)
-
-    def get_size(self):
-        return [self._numel]
-
-    def get_dtype(self):
-        return self._dtype
-
-
-class MultiOutput(_IR):
-    """Named to match Inductor's unpack node: the pass recognizes it by class name."""
+def _make_ir(op_overload, numel, dtype=torch.bfloat16, slots=()):
+    node = object.__new__(ir.FallbackKernel)
+    node.op_overload = op_overload
+    node.layout = ir.FixedLayout(device=torch.device("cpu"), dtype=dtype, size=[numel])
+    # Inductor flattens a custom op's non-tensor args here; for the load ops
+    # that is exactly the host-pool slot(s).
+    node.constant_args = tuple(slots)
+    return node
 
 
 class _Snode:
@@ -95,8 +86,12 @@ class _Snode:
         self.kind = kind
         self.cost = cost
         self.unmet_dependencies = [_Dep(d) for d in deps]
-        cls = MultiOutput if kind == "unpack" else _IR
-        self.node = cls(H2D_LOAD if kind == "load" else "fake.op", numel, slots=slots)
+        if kind == "unpack":
+            # Scheduling only needs the layout; construction normally registers with V.graph.
+            self.node = object.__new__(ir.MultiOutput)
+            self.node.layout = ir.FixedLayout(device=torch.device("cpu"), dtype=torch.bfloat16, size=[numel])
+        else:
+            self.node = _make_ir(H2D_LOAD if kind == "load" else "fake.op", numel, slots=slots)
 
     def get_name(self):
         return self.name
