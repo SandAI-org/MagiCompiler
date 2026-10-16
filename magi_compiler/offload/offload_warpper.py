@@ -23,6 +23,7 @@ from torch.fx.node import map_arg
 from magi_compiler.config import CompileConfig
 from magi_compiler.offload.profiler import OffloadProfiler
 from magi_compiler.offload.scheduler import OffloadRuntimeContext, SchedulerFactory
+from magi_compiler.utils.device import accelerator_module, accelerator_type
 from magi_compiler.utils.nvtx import add_nvtx_event
 
 from ..magi_depyf.timeline import observe_lifecycle
@@ -33,8 +34,10 @@ class OffloadExecutor:
         self.graph_module = graph_module
         self.compile_config = compile_config
 
-        self.compute_stream = torch.cuda.current_stream()
-        self.h2d_stream = torch.cuda.Stream()
+        self.rt = accelerator_module()
+        self.device = accelerator_type()
+        self.compute_stream = self.rt.current_stream()
+        self.h2d_stream = self.rt.Stream()
 
         self.warmup = True
         self.second_call = False
@@ -106,14 +109,14 @@ class OffloadExecutor:
             # case 1: input tensor
             if not is_weight:
                 if isinstance(arg_val, torch.Tensor):
-                    arg_val = arg_val.to("cuda", non_blocking=False)
+                    arg_val = arg_val.to(self.device, non_blocking=False)
                 env[node] = arg_val
                 continue
 
             # case 2: kept weight
             if self.scheduler.is_kept(node.name):
                 if node.name not in self.persistent_weights:
-                    t = arg_val.to("cuda", non_blocking=False) if arg_val.device.type == "cpu" else arg_val
+                    t = arg_val.to(self.device, non_blocking=False) if arg_val.device.type == "cpu" else arg_val
                     self.persistent_weights[node.name] = t
                 env[node] = self.persistent_weights[node.name]
                 continue
@@ -122,7 +125,7 @@ class OffloadExecutor:
             if submod_0 in node.users:
                 if self.warmup and arg_val.device.type == "cpu":
                     self.buffers[node.name] = arg_val
-                    arg_val = arg_val.to("cuda", non_blocking=False)
+                    arg_val = arg_val.to(self.device, non_blocking=False)
                 elif not self.warmup:
                     if node in self.submod_0_weight_handoff:
                         arg_val = self.submod_0_weight_handoff[node]
@@ -166,7 +169,7 @@ class OffloadExecutor:
                     self.profiler.start_compute_profile(node.name, self.compute_stream)
 
                 with add_nvtx_event(node.name):
-                    with torch.cuda.stream(self.compute_stream):
+                    with self.rt.stream(self.compute_stream):
                         s_args = map_arg(node.args, lambda n: env[n])
                         s_kwargs = map_arg(node.kwargs, lambda n: env[n])
                         env[node] = getattr(self.graph_module, node.target)(*s_args, **s_kwargs)
@@ -183,7 +186,7 @@ class OffloadExecutor:
                     parent_node, idx = node.args
                     env[node] = env[parent_node][idx]
                 else:
-                    with torch.cuda.stream(self.compute_stream):
+                    with self.rt.stream(self.compute_stream):
                         f_args = map_arg(node.args, lambda n: env[n])
                         f_kwargs = map_arg(node.kwargs, lambda n: env[n])
                         env[node] = node.target(*f_args, **f_kwargs)
@@ -204,7 +207,7 @@ class OffloadExecutor:
                 if current_user_counts[input_node] == 0:
                     if input_node in env:
                         tensor_obj = env[input_node]
-                        if isinstance(tensor_obj, torch.Tensor) and tensor_obj.is_cuda:
+                        if isinstance(tensor_obj, torch.Tensor) and tensor_obj.device.type != "cpu":
                             tensor_obj.record_stream(self.compute_stream)
                         del env[input_node]
         return None

@@ -35,6 +35,7 @@ from magi_compiler.magi_depyf.timeline import observe_lifecycle, observe_lifecyc
 from magi_compiler.offload.offload_warpper import OffloadWrapper
 from magi_compiler.passes import CustomJointGraphPartitionFn, FullGraphPassManager, PostGradPassManager, pass_context
 from magi_compiler.utils import compilation_counter, compute_code_hash, compute_hash, magi_logger
+from magi_compiler.utils.device import accelerator_module, accelerator_type
 from magi_compiler.utils.visualize import save_fx_graph_visualization
 
 from ._cache_data_cls import CacheEntry, CacheHandle
@@ -271,7 +272,7 @@ def _device_is_cpu(val) -> bool:
     return isinstance(val, str) and val == 'cpu'
 
 
-def _recursive_to_device(val, target_device: int):
+def _recursive_to_device(val, target_device: torch.device):
     """Recursively move tensor-like *val* (or nested list/tuple) to *target_device*."""
     if isinstance(val, (list, tuple)):
         items = [_recursive_to_device(v, target_device) for v in val]
@@ -285,7 +286,7 @@ def _recursive_to_device(val, target_device: int):
 
 
 def fix_graph_device_placement(module: torch.nn.Module):
-    """Rewrite CPU device refs and example_values to CUDA in an FX graph."""
+    """Rewrite CPU device refs and example_values to the accelerator in an FX graph."""
     for _, child in module.named_children():
         fix_graph_device_placement(child)
 
@@ -293,12 +294,12 @@ def fix_graph_device_placement(module: torch.nn.Module):
         return
 
     needs_recompile = False
-    target_device = torch.cuda.current_device()
+    target_device = torch.device(accelerator_type(), accelerator_module().current_device())
 
     for node in module.graph.nodes:
         if node.op == 'call_function' and 'device' in node.kwargs:
             if _device_is_cpu(node.kwargs['device']):
-                node.update_kwarg('device', torch.device('cuda', target_device))
+                node.update_kwarg('device', target_device)
                 needs_recompile = True
 
         if node.op == 'call_method' and node.target == 'to':
@@ -306,13 +307,13 @@ def fix_graph_device_placement(module: torch.nn.Module):
             changed = False
             for i, arg in enumerate(new_args):
                 if _device_is_cpu(arg):
-                    new_args[i] = torch.device('cuda', target_device)
+                    new_args[i] = target_device
                     changed = True
             if changed:
                 node.args = tuple(new_args)
                 needs_recompile = True
             if 'device' in node.kwargs and _device_is_cpu(node.kwargs['device']):
-                node.update_kwarg('device', torch.device('cuda', target_device))
+                node.update_kwarg('device', target_device)
                 needs_recompile = True
 
     cpu_fix_count = 0
@@ -327,7 +328,7 @@ def fix_graph_device_placement(module: torch.nn.Module):
             cpu_fix_count += 1
 
     if needs_recompile:
-        magi_logger.info('[fix_device] fixed %d CPU example_values to cuda:%s', cpu_fix_count, target_device)
+        magi_logger.info('[fix_device] fixed %d CPU example_values to %s', cpu_fix_count, target_device)
         module.recompile()
 
 
@@ -365,7 +366,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
             fix_graph_device_placement(self.module)
             for i, arg in enumerate(fake_args):
                 if isinstance(arg, torch.Tensor):
-                    fake_args[i] = arg.cuda()
+                    fake_args[i] = arg.to(accelerator_type())
 
         with self.fake_mode, enable_python_dispatcher():
             return super().run(*fake_args)

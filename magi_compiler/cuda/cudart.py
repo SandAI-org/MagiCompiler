@@ -19,6 +19,7 @@ import os
 import torch
 
 _cudart = None
+_musart = None
 
 
 def init_cudart():
@@ -40,23 +41,36 @@ def init_cudart():
     return None
 
 
+def init_musart():
+    global _musart
+    if _musart is None:
+        try:
+            _musart = ctypes.CDLL("libmusart.so")
+        except OSError:
+            pass
+    return _musart
+
+
 def pin_memory_in_place(tensor: torch.Tensor):
     """
-    Pin memory in-place using cudaHostRegister.
+    Pin memory in-place using cudaHostRegister (musaHostRegister on MUSA).
     """
-    if tensor.is_cuda:
+    if tensor.device.type != "cpu":
         return tensor
-    cudart = init_cudart()
-    if cudart is None:
+    if (lib := init_cudart()) is not None:
+        host_register = lib.cudaHostRegister
+    elif (lib := init_musart()) is not None:
+        host_register = lib.musaHostRegister
+    else:
         return tensor
 
     ptr = tensor.data_ptr()
     size = tensor.numel() * tensor.element_size()
-    res = cudart.cudaHostRegister(ctypes.c_void_p(ptr), ctypes.c_size_t(size), 0)
+    res = host_register(ctypes.c_void_p(ptr), ctypes.c_size_t(size), 0)
 
     # 0: success, 712: already registered
     # https://www.autodesk.com/support/technical/article/caas/sfdcarticles/sfdcarticles/GPU-and-CUDA-call-failed-error-messages-with-Arnold-5-3-5-and-Maya-2024.html
     if res == 0 or res == 712:
         return tensor
     else:
-        raise RuntimeError(f"cudaHostRegister failed with error code {res}")
+        raise RuntimeError(f"{host_register.__name__} failed with error code {res}")
