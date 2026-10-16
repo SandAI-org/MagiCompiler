@@ -23,7 +23,7 @@ from torch.fx.node import map_arg
 from magi_compiler.config import CompileConfig
 from magi_compiler.offload.profiler import OffloadProfiler
 from magi_compiler.offload.scheduler import OffloadRuntimeContext, SchedulerFactory
-from magi_compiler.utils.device import accelerator_module, accelerator_type
+from magi_compiler.utils.device import accelerator_module, accelerator_type, is_host_scalar
 from magi_compiler.utils.nvtx import add_nvtx_event
 
 from ..magi_depyf.timeline import observe_lifecycle
@@ -108,7 +108,7 @@ class OffloadExecutor:
 
             # case 1: input tensor
             if not is_weight:
-                if isinstance(arg_val, torch.Tensor):
+                if isinstance(arg_val, torch.Tensor) and not is_host_scalar(arg_val):
                     arg_val = arg_val.to(self.device, non_blocking=False)
                 env[node] = arg_val
                 continue

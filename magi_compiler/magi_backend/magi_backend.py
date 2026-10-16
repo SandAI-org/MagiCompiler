@@ -35,7 +35,7 @@ from magi_compiler.magi_depyf.timeline import observe_lifecycle, observe_lifecyc
 from magi_compiler.offload.offload_warpper import OffloadWrapper
 from magi_compiler.passes import CustomJointGraphPartitionFn, FullGraphPassManager, PostGradPassManager, pass_context
 from magi_compiler.utils import compilation_counter, compute_code_hash, compute_graph_hash, compute_hash, magi_logger
-from magi_compiler.utils.device import accelerator_module, accelerator_type
+from magi_compiler.utils.device import accelerator_module, accelerator_type, is_host_scalar
 from magi_compiler.utils.visualize import save_fx_graph_visualization
 
 from ._cache_data_cls import CacheEntry, CacheHandle
@@ -277,7 +277,7 @@ def _recursive_to_device(val, target_device: torch.device):
     if isinstance(val, (list, tuple)):
         items = [_recursive_to_device(v, target_device) for v in val]
         return type(val)(items) if any(n is not o for n, o in zip(items, val)) else val
-    if hasattr(val, 'device') and str(val.device) == 'cpu':
+    if hasattr(val, 'device') and str(val.device) == 'cpu' and not is_host_scalar(val):
         new_val = val.to(target_device)
         if isinstance(val, torch.nn.Parameter):
             new_val = torch.nn.Parameter(new_val, requires_grad=val.requires_grad)
@@ -365,7 +365,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         if self.compile_config.offload_config.model_cpu_offload:
             fix_graph_device_placement(self.module)
             for i, arg in enumerate(fake_args):
-                if isinstance(arg, torch.Tensor):
+                if isinstance(arg, torch.Tensor) and not is_host_scalar(arg):
                     fake_args[i] = arg.to(accelerator_type())
 
         with self.fake_mode, enable_python_dispatcher():
