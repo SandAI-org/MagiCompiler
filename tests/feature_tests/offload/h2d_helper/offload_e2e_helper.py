@@ -17,14 +17,13 @@
 Chain under test (magi_backend._apply_weight_pipeline with
 ``offload_config.graph_weight_offload``)::
 
-    lowering -> tag parked slots -> bucketing -> h2d_load insertion
-           -> FsdpOverlapReorder (phase 1) -> H2dLoadReorder (phase 2)
+    FX: lowering -> tag parked slots -> h2d_load insertion
+    Scheduler: SnodeCostProfile -> FsdpAutoBucket (when enabled)
+               -> FsdpOverlapReorder -> H2dLoadReorder
 
-Weights are built on meta, materialized through the patched ``to_empty`` into
-pinned host memory, and filled there.  The load-bearing question is whether a
-storage-free CUDA stand-in survives as an Inductor graph input: the graph still
-carries it, for its shape and for the data edge from the parameter, but there
-are no bytes behind it until ``magi::h2d_load`` puts some there.
+Weights are built on meta and loaded into pinned host memory.
+Storage-free CUDA stand-ins carry metadata and dependencies through Inductor;
+``magi::h2d_load`` returns separate filled buffers without filling the stand-ins.
 
 Run: torchrun --nproc_per_node=N tests/feature_tests/offload/h2d_helper/offload_e2e_helper.py [--bucket-mode ...]
 
@@ -110,10 +109,7 @@ def main() -> None:
     # where the lowering pass cannot see it.  Anything else leaves the
     # redistribute in the top-level graph, which is what this chain needs.
     ap.add_argument("--ac-mode", default="full")
-    # The weight the placement pass may keep on the device, split between weights
-    # handed back permanently and load buffers in flight.  0 is the smallest
-    # footprint a schedule can have -- nothing resident, one load in flight -- and
-    # therefore the slowest.
+    # Zero disables residency; in-flight room is the unhoisted peak plus one largest load.
     ap.add_argument("--max-device-weight-mib", type=int, default=0)
     # Accepted for older invocations; host-first is the only materialization path.
     ap.add_argument("--host-first", action="store_true")

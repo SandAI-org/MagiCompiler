@@ -12,20 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Reorder pass #0: price the graph once, for every reorder pass after it.
+"""Price compute and collectives once before the overlap reorder passes.
 
-The FSDP all-gather reorder and the weight-load reorder both size their overlap
-windows from snode runtimes, and on several ranks those runtimes are only
-trustworthy after a rank-lockstep re-measurement.  That measurement is not a
-side effect of either pass: ``SnodeCostProfile`` runs first in
-``reorder_for_compute_comm_overlap_passes``, prices the graph, and records one
-number per snode in a ``SnodeCostTable`` that the later passes take as their
-``cost_fn``.  Inductor chains the passes over the same snode objects
-(``order = p(order)``), so a table keyed by snode stays valid down the chain.
-
-Priced: compute and collectives.  Not priced: a weight load, which
-``H2dLoadReorder`` prices from its bytes and the bus bandwidth, and a wait, which
-takes no time of its own.
+``SnodeCostProfile`` fills a shared ``SnodeCostTable`` keyed by scheduler nodes.
+With synchronized profiling, rank-lockstep measurement precedes table writes.
+Downstream passes that create nodes must price them separately.
+Waits take no time here; ``H2dLoadReorder`` prices loads from bytes and bandwidth.
 """
 
 from __future__ import annotations
@@ -63,18 +55,10 @@ def _is_priced(snode: BaseSchedulerNode) -> bool:
 
 
 class SnodeCostTable:
-    """snode -> ns for the compile in flight.  Callable, so it is a ``cost_fn``.
+    """Callable snode-to-nanoseconds table, weakly keyed to release finished graphs.
 
-    Weakly keyed: the table lives in the pass list across compiles and must not
-    keep a finished compile's scheduler graph alive.
-
-    A miss falls back to Inductor's analytical estimate, except for a weight
-    load, which this table never prices.  Waits are never recorded either, so
-    missing them is expected; missing a compute or collective snode is not --
-    either the profile pass is not ahead of the reader, or a pass between them
-    built new snodes -- and is warned about, since the reader then sizes its
-    windows from the roofline without saying so.
-    """
+    Missing compute or collective entries warn and use Inductor's analytical estimate.
+    Loads are unpriced; missing waits are expected and do not warn."""
 
     def __init__(self) -> None:
         self._ns: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()

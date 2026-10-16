@@ -12,40 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Coalesce weight all-gathers after fusion, inside the Inductor scheduler.
+"""Coalesce weight all-gathers after fusion while preserving buffer names.
 
-By the time the reorder passes run, every weight gather is an out-of-place
-``_CollectiveKernel`` whose operation name and buffer name are what the rest of
-the graph refers to: its ``_WaitKernel`` mutates that buffer, and the kernels
-that read the gathered weight -- many of them already fused into one Triton
-body -- name it in their loop bodies.  Renaming any of that after fusion is not
-practical, so a bucket keeps every name it can:
+Fused readers and waits refer to existing names;
+each replacement unpack retains its member's names and SchedulerBuffer users:
 
-    before:  ag_i = all_gather(in_i)              (op_i / buf_i, one per member)
-    after:   packed = all_gather_coalesced([in_0 .. in_k])      (new names)
-             buf_i  = packed[i]                   (MultiOutput, takes op_i / buf_i)
+    NCCL: ag_i = all_gather(in_i) -> packed = all_gather_coalesced(inputs)
+                                   ag_i = packed[i]
+    CE:   k_i = ce_all_gather(in_i); buf_i = k_i[0]
+          -> packed = ce_all_gather_coalesced(inputs); buf_i = packed[i]
 
-Only the producer of ``buf_i`` changes; its waits and readers are untouched.
+NCCL members become MultiOutputs; CE members reuse their existing unpack names.
+Replacement IR nodes take the old slots in V.graph.buffers / operations.
+CE launches remain in those lists, unscheduled, to prevent name reuse.
 
-A copy-engine gather (``magi::ce_all_gather``) is a custom op, so it lowers to a
-``FallbackKernel`` whose result reaches its readers through a ``MultiOutput``:
-the gathered bytes, the waits and the readers all hang off the unpack.  There
-the unpack's names are the ones kept, and the launch is simply no longer scheduled::
-
-    before:  k_i = ce_all_gather(in_i); buf_i = k_i[0]     (one pair per member)
-    after:   packed = ce_all_gather_coalesced([in_0 .. in_k])
-             buf_i  = packed[i]                   (MultiOutput, takes buf_i's names)
-The swap follows what ``Scheduler.finalize_multi_template_buffers`` does for a
-template choice: the new IR node takes the old names and the old slots in
-``V.graph.buffers`` / ``V.graph.operations``, and the new scheduler node takes
-over the old one's ``SchedulerBuffer`` users.
-
-Memory-planning info is the one piece of state that has to be rebuilt rather
-than patched.  Inductor estimates peak memory around every reorder pass over the
-list object it passed IN, and again in the wrapper over the final order; both
-walk each buffer's ``mpi_buffer.succ_nodes`` and fail on a successor that is not
-in the list.  So the pass that coalesces must write its result back into that
-same list and then call ``refresh_memory_planning`` once, after its last merge.
+Inductor checks memory around each reorder pass using the list passed in.
+The caller must update that list in place after its last merge;
+``refresh_memory_planning`` then aligns buffer successor lists with the schedule.
 """
 
 from __future__ import annotations

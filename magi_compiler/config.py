@@ -44,7 +44,6 @@ class CompileMode(Enum):
 class CudaGraphMode(Enum):
     """
     Constants for the cudagraph mode in CompileConfig.
-    Different from the CUDAGraphMode for llm, PIECEWISE and FULL modes are enough for diffusion models.
 
     NONE: No cudagraph is used.
     PIECEWISE: Cudagraph is used for piecewise compilation.
@@ -210,20 +209,14 @@ class OffloadConfig(BaseModel):
     graph_weight_offload: bool = Field(
         False,
         description=(
-            "Compile-time CPU offload of SimpleFSDP weight shards, scheduled at snode granularity. "
-            "Requires compile_mode=MAGI_COMPILE: host-first parks selected weights as empty CUDA "
-            "stand-ins and only the Magi backend inserts magi::h2d_load; TORCH_COMPILE and NONE "
-            "skip that rewrite and would leave the stand-in empty. "
-            "Parks each selected local shard in pinned host memory and loads it back inside the graph "
-            "with magi::h2d_load, placed far enough upstream for compute to hide the transfer before "
-            "its all-gather launches. offload_max_device_weight_mib bounds the weight bytes on the "
-            "device, which the placement pass splits between weights handed back permanently and "
-            "load buffers in flight. Works with SimpleFSDP (transport='nccl') and with unsharded "
-            "nn.Parameter models. Mutually exclusive with model_cpu_offload (the runtime-wrapper "
-            "path) because the two offload the same bytes through different mechanisms. "
-            "When this is on, a meta-built model's to_empty hands back pinned host memory and the "
-            "checkpoint loads into it directly, so the weights enter the host pool without occupying "
-            "a device byte."
+            "Compile-time CPU weight offload for SimpleFSDP (transport='nccl') and unsharded nn.Parameter models. "
+            "Requires compile_mode=MAGI_COMPILE and cudagraph_mode=NONE; "
+            "mutually exclusive with model_cpu_offload. "
+            "Host-first materialization loads checkpoints into pinned memory; "
+            "handoff temporarily allocates one CUDA shard. "
+            "A host-built unsharded model parks eligible weights on its first CUDA move. "
+            "The graph loads separate device buffers with magi::h2d_load and schedules transfers to overlap compute. "
+            "See offload_max_device_weight_mib for the residency and in-flight scheduling budget."
         ),
     )
     offload_min_shard_mib: float = Field(
@@ -239,14 +232,12 @@ class OffloadConfig(BaseModel):
         0,
         ge=0,
         description=(
-            "Budget per GPU for the weight MiB on the device, which the placement pass splits between "
-            "residency and in-flight load buffers: the smallest in-flight budget that still hides every "
-            "transfer, and all the rest to residency. A resident weight pays no PCIe at all, so "
-            "residency decides how much traffic the bus carries: with T MiB of offloadable weight, a "
-            "bandwidth of B MiB/ms and C ms of compute per step, no schedule is compute-bound unless "
-            "(T - resident) / B <= C. In-flight room decides how far upstream a load may be hoisted. "
-            "0 = nothing resident, and in-flight room for one load on top of what the unhoisted order "
-            "already needs."
+            "Per-GPU scheduling budget in MiB, split between residency and in-flight H2D buffers. "
+            "The split aims to reduce exposed transfers. "
+            "The in-flight budget cannot fall below the unhoisted live-buffer peak, even if that exceeds this value. "
+            "Not a total device-memory cap: resident loads still allocate D2D outputs outside the in-flight budget, "
+            "and other graph buffers are not included. "
+            "0 = no residency, with in-flight room for the unhoisted peak plus one largest load."
         ),
     )
     offload_h2d_bandwidth_gbps: float = Field(
@@ -285,7 +276,7 @@ class FSDPConfig(BaseModel):
         ),
     )
     bucket_size_mib: int = Field(
-        0, ge=0, description="bucket_mode='auto': hard cap on a bucket's accumulated local-shard MiB (0 = none)."
+        0, ge=0, description="bucket_mode='auto': merged local-shard MiB cap (0 = none); a single gather may exceed it."
     )
     auto_bucket_overhead_ratio: float | None = Field(
         None,
@@ -298,10 +289,6 @@ class FSDPConfig(BaseModel):
             "with their program-order neighbours until a bucket reaches that size, never past twice it. "
             "Smaller ratios merge more and allocate more gathered weight early. "
             "None (default) picks per transport: 0.1 for NCCL gathers and 0.5 for copy-engine gathers. "
-            "A copy-engine launch costs far more fixed time and far less per byte, so one ratio would give it "
-            "a target several times the NCCL one; on gaga4 400B (8 ranks) these defaults give targets of "
-            "~240 MiB (NCCL) and ~150 MiB (copy engine) and ran level with the old fixed 512 MiB buckets, "
-            "while 0.1 on the copy engine (~1.4 GiB) was ~3% slower and held ~2 GiB more. "
             "A value set here applies to both transports."
         ),
     )
@@ -510,7 +497,7 @@ def _get_parallel_topology() -> str:
     meta functions and must not share cached artifacts.
 
     Resolution order:
-    1. ``MAGI_COMPILE_TOPOLOGY_KEY`` env var (set by the host framework, e.g. athena)
+    1. ``MAGI_COMPILE_TOPOLOGY_KEY`` env var, supplied by the caller
     2. ``ws{world_size}`` when torch.distributed is initialized
     3. ``ws1`` (single-process default)
     """
@@ -525,9 +512,9 @@ def _get_parallel_topology() -> str:
 def model_rank_dir_name(model_idx: int, model_tag: str | None) -> str:
     """Directory name: ``model_{idx}[_{tag}]_rank_{rank}_{topology}``.
 
-    Topology encodes all parallel dimension sizes via PSM.topology_key().
-    Different topologies produce different tensor strides in custom-op meta
-    functions; without isolation, stale artifacts trigger stride-mismatch assertions.
+    Callers can encode parallel dimensions in ``MAGI_COMPILE_TOPOLOGY_KEY``;
+    otherwise only the distributed world size is used. Topologies that change
+    custom-op tensor strides must not share cached artifacts.
     """
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     topo = _get_parallel_topology()

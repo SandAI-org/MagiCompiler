@@ -70,29 +70,13 @@ def issue_index(prefix: list[float], t_start: float, lo: int, deadline: int, emi
 
 
 def alap_schedule(tasks: list[TransferTask], prefix: list[float], index_of: dict, budget: float) -> dict:
-    """Schedule the resource by deadline, then issue each task just in time.
+    """Place active transfers in deadline order on one serial resource.
 
-    Every active task is booked at its unhoisted position in the in-flight map
-    before anything moves, and released only when placed -- so the budget is a
-    promise.  Inactive tasks keep their position, take no resource slot and no
-    in-flight room: whatever they cost is charged elsewhere, and charging them
-    twice would let that squeeze the transfers still on the resource.
-
-    The active tasks are then list-scheduled in DEADLINE order, in two passes.
-    A backward pass (``latest_finish``) gives each the latest instant it may
-    finish without pushing the ones after it past their own deadlines; a
-    forward pass then runs the resource, giving each the latest slot that
-    respects both that limit and the resource still being busy.  Where the
-    resource is saturated the slots butt together and it never idles; where
-    there is slack a task simply starts late, which costs nothing and keeps its
-    buffer's live range short.  The snode a task is emitted at is the latest
-    one whose compute prefix still reaches its slot -- just in time, because
-    the transfer begins at that instant whatever index we choose and anything
-    earlier only holds memory for longer.
-
-    Fills ``target``, ``exposed`` and ``budget_bound`` on every task and
-    returns ``{anchor: target}`` for the active ones.
-    """
+    Reserve each active task's unhoisted live range before moving any task.
+    A backward pass computes latest finishes;
+    a forward pass places launches within dependency, bus and live-byte limits.
+    Inactive tasks stay put and use no bus time or in-flight budget.
+    Fill target, exposed and budget_bound; return active anchor-to-target indices."""
     live = InflightMap(budget)
     for task in tasks:
         if task.inactive:

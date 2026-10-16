@@ -183,23 +183,10 @@ class FsdpOverlapReorder(OverlapPass):
 
     @staticmethod
     def _prep_chain(group, graph: SnodeGraph) -> list[BaseSchedulerNode]:
-        """The UPSTREAM shard-prep snodes that have to travel with the launch.
-
-        A weight's path from placeholder to gather can hold an ``h2d_load``, its
-        wait, a dtype cast and an uneven-shard pad.  Every one of them is a real
-        buffer producer, so ``earliest_legal_index`` pins the launch just below
-        them: leaving them behind does not make the hoist illegal, it makes it
-        impossible.
-
-        Moving a producer earlier is always legal for its readers, so there is no
-        "all users inside the group" condition here -- the cost of a longer live
-        range is the in-flight budget's business, not correctness'.  The condition
-        that does matter is that a traveller reads nothing but graph inputs and
-        other travellers: a node that touches an activation would be compute we
-        are simultaneously counting as compute that hides this gather.  Anything
-        failing that is dropped, and ``earliest_legal_index`` then simply reports
-        a higher floor -- a shorter hoist, never a wrong one.
-        """
+        """Hoist shard prep with the gather when it reads only graph inputs or other prep.
+        Prep may include H2D loads/waits, casts and pads; real collectives stay out.
+        Excluded producers raise the gather's legal floor.
+        This pass imposes no byte budget on prep or gathered buffers."""
         buf_to_snode, index_of = graph.buf_to_snode, graph.index_of
         members = set(group)
         stack = list(group)
@@ -231,19 +218,9 @@ class FsdpOverlapReorder(OverlapPass):
     # -- consumer discovery ----------------------------------------------
     @staticmethod
     def _first_consumer_index(group, graph: SnodeGraph, cost: CostView) -> int | None:
-        """min over the launch's waits of the earliest real (non-transparent) consumer.
-
-        The waits are reached through any alias layer: a custom-op gather puts an
-        alias snode between the launch and its wait, and missing the wait silently
-        drops the gather from the placement plan altogether.  A wait that is itself
-        a group member is stepped over rather than reported: with host offload the
-        group contains the ``h2d_load`` and the wait that guards it, and that wait
-        sits UPSTREAM of the gather.  Stopping there would report the gather's own
-        launch as its first consumer -- a zero-width overlap window.
-
-        From each wait, a forward walk through transparent forwarders (cost~0
-        view / getitem / MultiOutput / split) finds the first genuine consumer.
-        """
+        """Find the earliest real consumer beyond the gather's waits and alias nodes.
+        Skip waits inside the moving group, including upstream H2D waits;
+        otherwise the gather itself would be mistaken for its first consumer."""
         members = set(group)
 
         def to_wait(u):

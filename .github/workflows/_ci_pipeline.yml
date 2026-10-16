@@ -179,7 +179,7 @@ jobs:
     # Shard split rationale (8 shards):
     #   perf           – GPU timing-sensitive, isolated for independent rerun
     #   api            – magi_compile API surface (compile / nested / custom-op / dynamic)
-    #   model          – model-level e2e: MLP train/infer, RMSNorm, Qwen inference
+    #   model          - end-to-end training and inference
     #   feature-fsdp   – FSDP overlap and H2D weight offload (torchrun subprocess tests)
     #   feature-cache  – cache invariant / topology / artifact management
     #   feature-pass   – inductor passes (CUTLASS EVT → separate ci:evt workflow)

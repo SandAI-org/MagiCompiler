@@ -126,7 +126,7 @@ def _load(name, mib, deps=(), slots=()):
 
 
 def _fsdp_graph(seed, *, form):
-    """A transformer-ish chain with one weight gather per layer, in phase-0 order.
+    """A repeated compute chain with one weight gather per layer, in phase-0 order.
 
     ``form``: ``plain`` (1 launch / 1 wait), ``coalesced`` (packed launch + N
     unpacks + N waits) or ``prep`` (an h2d load and a cast feeding the gather,

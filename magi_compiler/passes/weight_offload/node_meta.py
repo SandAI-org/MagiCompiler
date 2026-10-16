@@ -27,11 +27,8 @@ import torch.fx as fx
 # moved to.  Set by binding only.
 HOST_SLOT = "magi_host_offload_slot"
 
-# On a node downstream of an offloaded weight, so a later pass can keep
-# offloaded and resident work apart -- the scheduler-stage FSDP bucketing reads
-# this to avoid putting both kinds in one all-gather.  Mirrored under
-# ``meta["custom"]``, the one field AOT autograd's re-trace carries over, so it
-# can be read off an IR node's origins.
+# Local bucket planning separates gathers by this tag; rank 0's adopted plan may mix them.
+# Mirrored under ``meta["custom"]`` so AOT preserves it in scheduler-node origins.
 HOST_OFFLOADED = "magi_host_offloaded"
 
 
