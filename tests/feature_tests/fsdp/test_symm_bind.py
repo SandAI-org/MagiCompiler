@@ -384,10 +384,8 @@ def test_shards_below_the_size_floor_are_not_bound(mesh_1rank):
 # ---------------------------------------------------------------------------
 @requires_cuda
 def test_many_shards_share_few_windows(mesh_1rank):
-    """Windows are a capped driver resource -- roughly 128 per process, however
-    small.  A window per shard looks fine at this scale and dies at shard 92 of
-    gaga4's 808, in ``rendezvous``, with tens of GiB of the card still free.  So
-    the invariant worth holding is a count that does not track the shard count."""
+    """Compatible shards must share symmetric-memory windows;
+    one window per shard can exhaust driver resources before device memory."""
     from magi_compiler.symm_mem import registered_buffers
 
     params = [_param(mesh_1rank) for _ in range(16)]

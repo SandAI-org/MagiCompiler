@@ -117,13 +117,8 @@ def test_the_ratio_defaults_per_transport():
 
 
 def test_each_process_group_gets_its_own_fit(monkeypatch):
-    """A one-rank group's gather is a local copy; pooled with an eight-rank group's
-    gathers, its gigabyte points pull ``beta`` down for every gather.
-
-    The points are gaga4 400B at ep=8 (expert mesh one rank wide): pooled, they
-    fit 0.39 us/MiB and a 4.4 GiB target, so dense gathers were merged into buckets
-    priced at a seventh of what they took.
-    """
+    """Fit single-rank local copies separately from multi-rank gathers;
+    pooling their timings must not underprice collective transfers."""
     from magi_compiler.passes.fsdp_overlap import auto_bucket
     from magi_compiler.passes.fsdp_overlap.ir_coalesce import GatherInfo
     from magi_compiler.passes.overlap import CostView

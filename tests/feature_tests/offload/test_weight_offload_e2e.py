@@ -62,11 +62,7 @@ def _free_port() -> str:
 def _run(nproc: int, *extra: str) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env["MAGI_LOGGING_LEVEL"] = env.get("MAGI_LOGGING_LEVEL", "info")
-    # A cache root of its own per run. Two runs of this helper produce the same
-    # FX graph by design -- host-first changes where the weights live, not what
-    # the graph says -- so a shared cache has the second one replay the first
-    # one's artifact and skip the scheduler, which is where the placement pass
-    # and every log line these tests assert on live.
+    # Isolate the cache so replay cannot skip the scheduler and its asserted reports.
     with tempfile.TemporaryDirectory(prefix="magi_offload_e2e_") as cache_root:
         env["MAGI_COMPILE_CACHE_ROOT_DIR"] = cache_root
         return subprocess.run(
@@ -122,9 +118,8 @@ def test_both_reorder_phases_run():
 @requires_cuda
 @requires_torchrun
 def test_offload_with_scheduler_stage_buckets():
-    """``bucket_mode='auto'`` buckets during scheduling, after the loads exist;
-    the coalesced launch still has to wait for every member's own load, and
-    bucketing keeps offloaded and resident gathers apart."""
+    """Scheduler bucketing runs after load insertion and must preserve each load dependency.
+    Local plans separate offloaded and resident gathers; cross-rank adoption may mix them."""
     p = _run(2, "--bucket-mode", "auto", "--n-layers", "6")
     out = _check(p)
     assert "OFFLOAD_PASS" in p.stdout, out[-4000:]
@@ -152,14 +147,8 @@ def _inflight(out: str) -> tuple[float, float]:
 @requires_cuda
 @requires_torchrun
 def test_the_inflight_budget_is_never_exceeded():
-    """The promise the whole pass rests on, end to end.
-
-    With several 4 MiB buckets back to back the hoists would otherwise stack and
-    put most of the model back on the device.  Unasked, the budget is what phase
-    1's own unhoisted order already needs plus one bucket, and the emitted
-    schedule has to fit inside it -- overshooting reads as a working run until the
-    day the model is big enough to OOM on the difference.
-    """
+    """Without residency, hoisted loads must fit the default in-flight budget:
+    the unhoisted live-buffer peak plus one largest load."""
     p = _run(1, *_MULTI_LOAD_SHAPE)
     out = _check(p)
     peak, budget = _inflight(out)
@@ -170,12 +159,7 @@ def test_the_inflight_budget_is_never_exceeded():
 @requires_cuda
 @requires_torchrun
 def test_no_residency_budget_keeps_nothing_resident():
-    """The default, end to end.
-
-    Handing weights back costs device memory for the whole graph, so it happens
-    only when a budget asks for it -- doing it uninvited is how a run OOMs, and
-    the numerics have to come out right either way.
-    """
+    """Without a residency budget, weights must stay offloaded and outputs must match eager."""
     p = _run(1, *_MULTI_LOAD_SHAPE)
     out = _check(p)
     assert "OFFLOAD_PASS" in p.stdout, out[-4000:]
@@ -236,14 +220,8 @@ def test_host_first_never_puts_the_weights_on_the_device():
 @requires_cuda
 @requires_torchrun
 def test_host_first_weights_are_all_claimed_by_the_graph():
-    """Nothing may fall in the gap between "parked" and "loaded".
-
-    Parking happens while the model is built, from a weight's placements alone;
-    whether the graph actually loads it is only known once the lowering has run.
-    A weight in the gap has no bytes behind it, so the backend hands it back and
-    says so -- correct, but it means offload bought nothing for that weight, and
-    on this model it should never happen.
-    """
+    """All parked weights in this model must be claimed by graph loads.
+    Restoring an unclaimed weight is safe but would lose its offload saving."""
     p = _run(1, "--host-first")
     out = _check(p)
     assert "are not loaded by any compiled graph" not in out, out[-4000:]

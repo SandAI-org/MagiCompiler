@@ -41,7 +41,39 @@ import torch
 import torch.fx as fx
 from torch.distributed.tensor import DTensor
 
-from .fx_walk import is_prep, param_name, resolve, walk_back_to_holder
+# Producers we walk through when tracing a value back to the parameter behind it.
+_PREP_METHODS = {"to_local", "contiguous", "to", "view", "reshape"}
+_PREP_FUNCTIONS = ("constant_pad_nd", "_to_copy", "convert_element_type", "view", "reshape", "clone")
+
+
+def _is_prep(node: fx.Node) -> bool:
+    """A cheap reshaping producer that a weight's value may pass through."""
+    if node.op == "call_method":
+        return str(node.target) in _PREP_METHODS
+    if node.op == "call_function":
+        name = getattr(node.target, "__name__", "") or str(node.target)
+        return any(t in name for t in _PREP_FUNCTIONS)
+    return False
+
+
+def _param_name(node: fx.Node) -> str:
+    raw = str(node.target or node.name or "?")
+    parts = [p for p in raw.strip("_").split("_") if p and p not in ("L", "self", "modules", "parameters", "parameter")]
+    return ".".join(parts) or raw
+
+
+def _resolve(graph: fx.GraphModule, node: fx.Node, placeholder_examples: Mapping[str, Any]) -> Any:
+    """The live object a placeholder or get_attr stands for, or None."""
+    if node.op == "placeholder":
+        return placeholder_examples.get(node.name)
+    if node.op == "get_attr":
+        obj: Any = graph
+        for part in str(node.target).split("."):
+            obj = getattr(obj, part, None)
+            if obj is None:
+                return None
+        return obj
+    return None
 
 
 def mesh_group(param: object):
@@ -115,7 +147,7 @@ class PlainParamSource(WeightSource):
         for node in graph.graph.nodes:
             if node.op not in ("placeholder", "get_attr"):
                 continue
-            live = resolve(graph, node, placeholder_examples)
+            live = _resolve(graph=graph, node=node, placeholder_examples=placeholder_examples)
             if live is None:
                 continue
             if not isinstance(live, torch.nn.Parameter):
@@ -129,14 +161,10 @@ class PlainParamSource(WeightSource):
             if why is not None:
                 skipped[why] += 1
                 continue
-            # A tied weight reaches the graph as two placeholders, and each one
-            # needs its own load: the splice repoints the readers of the node it
-            # was given, so a second node left untagged would read the empty
-            # stand-in.  The nodes are distinct by construction here, so there
-            # is nothing to dedupe -- the shard was adopted once.
+            # Each placeholder needs a load, even when tied weights share one host slot.
             candidates.append(
                 OffloadCandidate(
-                    holder=node, local=live, name=param_name(node), nbytes=host_weights.slot_bytes(slot), tag=None, slot=slot
+                    holder=node, local=live, name=_param_name(node), nbytes=host_weights.slot_bytes(slot), tag=None, slot=slot
                 )
             )
         return candidates, skipped
@@ -152,6 +180,21 @@ def _is_to_local(node: fx.Node) -> bool:
     return isinstance(owner, fx.Node) and owner.op in ("placeholder", "get_attr")
 
 
+def _find_shard_holder(node: fx.Node) -> fx.Node | None:
+    q: deque[fx.Node] = deque([node])
+    seen: set[fx.Node] = set()
+    while q:
+        n = q.popleft()
+        if n in seen:
+            continue
+        seen.add(n)
+        if _is_to_local(n):
+            return n
+        if _is_prep(n):
+            q.extend(n.all_input_nodes)
+    return None
+
+
 def shard_holder(gather: fx.Node) -> fx.Node | None:
     """The ``to_local(placeholder|get_attr)`` whose output this gather consumes.
 
@@ -160,7 +203,7 @@ def shard_holder(gather: fx.Node) -> fx.Node | None:
     matching only the bare shape would silently skip exactly the biggest weights.
     """
     for inp in gather.all_input_nodes:
-        found = walk_back_to_holder(inp, _is_to_local)
+        found = _find_shard_holder(inp)
         if found is not None:
             return found
     return None
@@ -197,7 +240,7 @@ def _feeds_a_weight_gather(node: fx.Node) -> bool:
         if user.op == "call_function" and user.target is _ALL_GATHER:
             return True
         name = getattr(user.target, "__name__", "") or str(user.target)
-        if is_prep(user) or "h2d_load" in name or "wait_tensor" in name:
+        if _is_prep(user) or "h2d_load" in name or "wait_tensor" in name:
             q.extend(user.users)
     return False
 
@@ -223,17 +266,12 @@ def _weight_behind(to_local: fx.Node) -> fx.Node | None:
 
 @dataclass
 class FsdpShardSource(WeightSource):
-    """Weights of a SimpleFSDP model: the shards its weight all-gathers read.
+    """Find SimpleFSDP weight holders, including weights without an all-gather.
 
-    A shard's loaded bytes die at the all-gather that consumes them, which is why
-    the loads here are cheaper to schedule than a plain parameter's: the live
-    range is a handful of snodes rather than the rest of the layer.
-
-    ``collect`` meets the one-gather-per-weight form the lowering produces;
-    gathers are bucketed only later, during scheduling, where the offloaded tag
-    binding sets keeps a bucket single-kind.  Every weight gets a load of its
-    own; a bucket's launch waits for each member's load separately.
-    """
+    Gathered shards can die at the gather; ungathered weights live through their readers.
+    Each distinct holder needs a load, even when several holders share a host slot.
+    Local bucket planning separates offloaded and resident gathers;
+    rank 0's adopted plan may mix them on another rank."""
 
     def collect(
         self, graph: fx.GraphModule, placeholder_examples: Mapping[str, Any], min_bytes: int
@@ -255,27 +293,19 @@ class FsdpShardSource(WeightSource):
             if holder is None:
                 skipped["gather does not reach a to_local(parameter)"] += 1
                 continue
-            param = resolve(graph, holder.args[0], placeholder_examples)
+            param = _resolve(graph=graph, node=holder.args[0], placeholder_examples=placeholder_examples)
             if param is None:
                 skipped["graph input has no live parameter behind it"] += 1
                 continue
 
             local = param._local_tensor if isinstance(param, DTensor) else None
-            # A shard an earlier compile of this same model already adopted.  It
-            # is a candidate again, not a skip: every graph over these
-            # parameters needs its own load.  Skipping it leaves the second
-            # graph gathering an empty stand-in -- an illegal access, far from
-            # here and with nothing pointing back.
+            # Reuse the adopted slot; each compiled graph still needs its own load.
             slot, why = parked_slot(local, min_bytes)
             if why is not None:
                 skipped[why] += 1
                 continue
 
-            # By holder, not by shard.  A weight two all-gathers read has two
-            # holders, and each one needs its own load: the splice repoints the
-            # readers of the holder it was given, so a second holder left
-            # untagged would gather the empty stand-in.  The shard was adopted
-            # once.
+            # Deduplicate by holder: distinct holders need separate loads of a shared slot.
             if holder in seen:
                 skipped["gather shares a holder with an earlier weight"] += 1
                 continue
@@ -284,7 +314,7 @@ class FsdpShardSource(WeightSource):
                 OffloadCandidate(
                     holder=holder,
                     local=local,
-                    name=param_name(holder.args[0]),
+                    name=_param_name(holder.args[0]),
                     nbytes=host_weights.slot_bytes(slot),
                     tag=node,
                     slot=slot,
@@ -314,7 +344,7 @@ class FsdpShardSource(WeightSource):
             src = _weight_behind(node)
             if src is None or _feeds_a_weight_gather(node):
                 continue
-            param = resolve(graph, src, placeholder_examples)
+            param = _resolve(graph=graph, node=src, placeholder_examples=placeholder_examples)
             if not isinstance(param, DTensor):
                 continue
             local = param._local_tensor
@@ -327,10 +357,9 @@ class FsdpShardSource(WeightSource):
                 OffloadCandidate(
                     holder=node,
                     local=local,
-                    name=param_name(src),
+                    name=_param_name(src),
                     nbytes=host_weights.slot_bytes(slot),
-                    # No gather to tag: bucketing keeps offloaded gathers apart
-                    # from resident ones, and this weight has neither.
+                    # This holder feeds no weight gather to tag for bucket planning.
                     tag=None,
                     slot=slot,
                     group=mesh_group(param),

@@ -342,20 +342,12 @@ def test_residency_budget_applies_even_to_fully_hideable_loads(resident_mib, exp
 @requires_cuda
 @pytest.mark.usefixtures("clean_host_weights")
 def test_the_residency_budget_buys_out_the_transfer_nothing_can_hide():
-    """The lever that changes how much traffic the bus carries at all.
-
-    One compute window, two loads that both want it: whatever the in-flight
-    budget, one of them is exposed -- the graph is short of compute, not memory.
-    The window goes to the earlier deadline, and the load that loses it stays
-    against its own wait instead of being hoisted somewhere it gains nothing.
-    Residency is the only thing that helps: the bytes go back on the device and
-    the transfer stops happening.
-    """
+    """When two loads exceed one compute window, residency must remove exposed H2D work.
+    Without residency, the later load stays at its wait when hoisting cannot help."""
     from magi_compiler.passes.weight_offload import host_weights
 
     def run(resident):
-        # Fresh shards each time: adopt empties their storage, so a tensor can
-        # only be parked once.
+        # Use fresh tensors because _park releases their device storage.
         host_weights.reset()
         shards = [torch.randn(10 * _MIB // 2, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
         slots = [_park(s) for s in shards]
@@ -384,13 +376,8 @@ def test_the_residency_budget_is_a_ceiling_not_a_target():
 
 
 def _layered_graph(slots, *, layers=6, big_mib=8, small_mib=4, compute_ns=1e6):
-    """``layers`` identical blocks, each one compute kernel then two loads.
-
-    Sized so a block's transfers do not fit its compute: 12 MiB at 10 GB/s is
-    1.26ms against 1.0ms of compute, so every block runs a deficit and residency
-    is the only way to close it.  This is the shape of a real transformer under
-    weight offload, and the shape the placement sweep alone cannot fix.
-    """
+    """Repeated blocks with one compute kernel and two loads each.
+    At the defaults, 12 MiB at 10 GB/s exceeds 1 ms of compute and requires residency."""
     order = []
     for i in range(layers):
         order.append(_compute(f"c{i}", compute_ns))
@@ -404,13 +391,8 @@ def _layered_graph(slots, *, layers=6, big_mib=8, small_mib=4, compute_ns=1e6):
 @requires_cuda
 @pytest.mark.usefixtures("clean_host_weights")
 def test_residency_closes_each_windows_own_deficit():
-    """Best fit, block by block: the 4 MiB weight covers a 3.4 MiB overrun.
-
-    The 8 MiB one covers it too, and taking that instead is what a largest-first
-    fill does -- it overshoots by 4.6 MiB, leaves the block with bus to spare and
-    the budget short for a later block.  With the budget set to exactly what the
-    target density costs, only the best-fit choice fits at all.
-    """
+    """A 4 MiB promotion must cover a 3.4 MiB window deficit.
+    Promoting 8 MiB instead would exhaust the budget needed by later windows."""
     from magi_compiler.passes.weight_offload import host_weights
 
     slots, sizes = [], [8, 4] * 6
@@ -426,13 +408,7 @@ def test_residency_closes_each_windows_own_deficit():
 @requires_cuda
 @pytest.mark.usefixtures("clean_host_weights")
 def test_residency_is_spread_across_the_graph_not_stacked_at_the_front():
-    """The budget is spent where the graph is over-subscribed, which is everywhere.
-
-    Spending it on the largest weights globally would buy out the first blocks
-    and leave the last ones at their original density -- which is then what the
-    step time follows, because a load can only be hoisted so far before the
-    in-flight budget stops it.
-    """
+    """Distribute residency across overloaded windows rather than exhausting it at the front."""
     from magi_compiler.passes.weight_offload import host_weights
 
     slots = []
@@ -542,14 +518,8 @@ def test_live_ranges_never_overlap_however_tight_the_chain():
 
 
 def test_the_budget_charges_for_the_last_user_not_the_last_wait():
-    """ld0's wait is at index 3, but late0 still reads its bytes at index 5.
-
-    ld1 wants the window in front of ``mid``.  Charging ld0's live range to its
-    wait would leave index 4 free and let ld1 have it, with both buffers alive
-    across ``mid`` and ``late0`` -- twice the peak the budget was told to hold.
-    ``last_user`` blocks it, and doubling the budget then hands it over, which is
-    what shows the wait was never what stood in the way.
-    """
+    """Charge a load through its last reader, even after its wait.
+    The second load may share that interval only when both buffers fit the budget."""
 
     def build():
         return [
@@ -574,12 +544,7 @@ def test_the_budget_charges_for_the_last_user_not_the_last_wait():
 @requires_cuda
 @pytest.mark.usefixtures("clean_host_weights")
 def test_a_lone_unhideable_load_is_bought_out_only_when_asked():
-    """No compute upstream at all, so no budget makes this one overlap.
-
-    Loading a weight nothing can hide is pure cost every forward, and residency
-    is the only answer -- but it is still device memory for the whole graph, so
-    it waits for a budget to be handed one.
-    """
+    """A load with no preceding compute becomes resident only when given a residency budget."""
     from magi_compiler.passes.weight_offload import host_weights
 
     def run(resident):
@@ -706,12 +671,7 @@ def test_peak_counts_a_promoted_weight_twice_where_its_copy_runs():
 
 
 def test_inflight_occupancy_finds_the_earliest_fitting_start():
-    """The one question the sweep asks per load, answered on a byte budget.
-
-    A range that fits alongside what is already live may start at the top of the
-    graph; one that does not has to start past whatever is in its way, which is
-    what turns a byte budget into a placement floor.
-    """
+    """Find the earliest launch whose closed live range fits the remaining byte budget."""
     live = memory.InflightMap(budget=10)
     live.add(4, 8, 6)  # 6 bytes live over the closed range [4, 8]
 
