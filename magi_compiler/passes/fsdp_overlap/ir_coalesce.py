@@ -61,7 +61,7 @@ from torch._inductor.utils import contains_wait
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
-from ..snode_utils import ce_ag_ops
+from ..snode_utils import ce_ag_ops, iter_ir_nodes
 
 _AG = torch.ops._c10d_functional.all_gather_into_tensor.default
 _AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
@@ -84,13 +84,12 @@ def gather_info(snode: BaseSchedulerNode) -> GatherInfo | None:
     Coalesced gathers and anything grouped are not candidates: this module only
     knows how to merge the one-weight form.
     """
-    node = getattr(snode, "node", None)
-    op = getattr(node, "op_overload", None)
-    if isinstance(node, ir._CollectiveKernel) and op is _AG:
+    node = snode.node
+    if isinstance(node, ir._CollectiveKernel) and node.op_overload is _AG:
         if not isinstance(node.layout, ir.Layout):
             return None
         kind = "nccl"
-    elif isinstance(node, ir.FallbackKernel) and op is not None and op is ce_ag_ops()[0]:
+    elif isinstance(node, ir.FallbackKernel) and node.op_overload is not None and node.op_overload is ce_ag_ops()[0]:
         kind = "ce"
     else:
         return None
@@ -118,8 +117,7 @@ def _unpacks_of(snode: BaseSchedulerNode, order: list[BaseSchedulerNode]) -> lis
     return [
         s
         for s in order
-        if isinstance(getattr(s, "node", None), ir.MultiOutput)
-        and any((not _is_fake_dep(d)) and d.name in names for d in s.unmet_dependencies)
+        if isinstance(s.node, ir.MultiOutput) and any((not _is_fake_dep(d)) and d.name in names for d in s.unmet_dependencies)
     ]
 
 
@@ -295,14 +293,12 @@ def _repoint_inputs(snodes, old: ir.Buffer, new: ir.Buffer) -> None:
     find the volatile read -- with the replaced node's class.
     """
     for s in snodes:
-        for sub in getattr(s, "snodes", None) or (s,):
-            node = getattr(sub, "node", None)
-            inputs = getattr(node, "inputs", None)
-            if not isinstance(node, ir.ExternKernel) or not inputs:
+        for node in iter_ir_nodes(s):
+            if not isinstance(node, ir.ExternKernel):
                 continue
-            for j, inp in enumerate(inputs):
+            for j, inp in enumerate(node.inputs):
                 if inp is old:
-                    inputs[j] = new
+                    node.inputs[j] = new
                 elif isinstance(inp, ir.ReinterpretView) and inp.data is old:
                     inp.data = new
                 elif isinstance(inp, ir.StorageBox) and inp.data is old:

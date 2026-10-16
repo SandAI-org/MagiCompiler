@@ -52,6 +52,7 @@ import dataclasses
 from typing import Any, Optional
 
 import torch
+from torch._inductor import ir
 from torch._inductor.runtime.benchmarking import benchmarker
 from torch._inductor.scheduler import BaseSchedulerNode, ExternKernelSchedulerNode, FusedSchedulerNode
 from torch._inductor.utils import contains_collective, contains_wait
@@ -102,7 +103,7 @@ class ProfileEntry:
     reuse_count: int = 0  # how many later snodes reused this entry
 
 
-def _fx_node_of(node) -> Optional[torch.fx.Node]:
+def _fx_node_of(node: ir.Operation | None) -> Optional[torch.fx.Node]:
     """The fx node an IR node was lowered from.
 
     ``origin_node`` is left unset by several ExternKernel subclasses -- notably
@@ -113,10 +114,10 @@ def _fx_node_of(node) -> Optional[torch.fx.Node]:
     """
     if node is None:
         return None
-    origin = node.get_origin_node() if hasattr(node, "get_origin_node") else None
+    origin = node.get_origin_node()
     if origin is not None:
         return origin
-    fx_node = getattr(node, "fx_node", None)
+    fx_node = node.fx_node if isinstance(node, ir.ExternKernel) else None
     return fx_node if isinstance(fx_node, torch.fx.Node) else None
 
 
@@ -167,13 +168,13 @@ def _triton_kernel_name(fx_node: torch.fx.Node) -> Optional[str]:
 def _snode_label(snode: BaseSchedulerNode, max_shapes: int = 3) -> str:
     """Human-readable identity for the profile table: op target + first few input
     shapes (for logs only; the cache key is ``_structural_key``)."""
-    node = getattr(snode, "node", None)
+    node = snode.node
     origin = _fx_node_of(node)
     target = _fx_target_name(origin, node)
     target = target.split("(")[0].split(" ")[-1][-40:]
     shapes = []
     if origin is not None:
-        for ev in _iter_tensor_metas((*origin.args, *getattr(origin, "kwargs", {}).values())):
+        for ev in _iter_tensor_metas((*origin.args, *origin.kwargs.values())):
             shapes.append("x".join(str(x) for x in _static(ev.shape)))
             if len(shapes) >= max_shapes:
                 break
@@ -186,7 +187,7 @@ def _is_multi_output_unpack(snode: BaseSchedulerNode) -> bool:
     would return the parent's full runtime."""
     from torch._inductor.ir import MultiOutput
 
-    return type(getattr(snode, "node", None)) is MultiOutput
+    return type(snode.node) is MultiOutput
 
 
 def _structural_key(snode: BaseSchedulerNode) -> tuple | None:
@@ -195,7 +196,7 @@ def _structural_key(snode: BaseSchedulerNode) -> tuple | None:
     when we can't build a stable key (then we don't cache)."""
     parts: list[Any] = []
     for n in snode.get_nodes():
-        node = getattr(n, "node", None)
+        node = n.node
         if node is None:
             return None
         origin = _fx_node_of(node)
@@ -319,11 +320,11 @@ def _extern_replay_fn(snode: ExternKernelSchedulerNode):
 
 def _argument_bytes(snode: BaseSchedulerNode) -> int:
     """Bytes in this kernel's tensor arguments, from the fx node's metas."""
-    origin = _fx_node_of(getattr(snode, "node", None))
+    origin = _fx_node_of(snode.node)
     if origin is None:
         return 0
     nbytes = 0
-    for ev in _iter_tensor_metas((*origin.args, *getattr(origin, "kwargs", {}).values())):
+    for ev in _iter_tensor_metas((*origin.args, *origin.kwargs.values())):
         numel = 1
         for s in _static(ev.shape):
             numel *= s[1] if isinstance(s, tuple) else s
@@ -427,9 +428,9 @@ def _extern_has_internal_collective(snode: BaseSchedulerNode) -> bool:
     """Ops registered via ``register_materialize_inputs`` are treated as
     issuing an internal collective and must be measured with fixed iterations
     under a barrier."""
-    node = getattr(snode, "node", None)
-    origin = node.get_origin_node() if (node is not None and hasattr(node, "get_origin_node")) else None
-    target = getattr(origin, "target", None) if origin is not None else None
+    node = snode.node
+    origin = node.get_origin_node() if node is not None else None
+    target = origin.target if origin is not None else None
     return op_has_internal_collective(_op_name(target)) if target is not None else False
 
 
@@ -439,25 +440,20 @@ _AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.defa
 _WAIT = torch.ops._c10d_functional.wait_tensor.default
 
 
-def _leaf_collective(snode: BaseSchedulerNode):
+def _leaf_collective(snode: BaseSchedulerNode) -> ir.ExternKernel | None:
     """The underlying _CollectiveKernel IR node (unwraps GroupedSchedulerNode)."""
     from torch._inductor.utils import is_collective
 
-    node = getattr(snode, "node", None)
-    if node is not None and is_collective(node):
-        return node
-    for child in getattr(snode, "snodes", []) or []:
-        cn = getattr(child, "node", None)
-        if cn is not None and is_collective(cn):
-            return cn
-    return None
+    from magi_compiler.passes.snode_utils import iter_ir_nodes
+
+    return next((node for node in iter_ir_nodes(snode) if is_collective(node)), None)
 
 
-def _collective_spec(node):
+def _collective_spec(node: ir.ExternKernel):
     """(op_overload, group_name, group_size, [(shape, dtype, device), ...]) for a
     collective IR node, or None if it isn't a benchmarkable all-gather."""
     # TODO: support more graph collectives than AG / AG_COALESCED.
-    op = getattr(node, "op_overload", None)
+    op = node.op_overload
     if op not in (_AG, _AG_COALESCED):
         return None
     group_name = node.constant_args[-1]  # (..., group_size, group_name)
@@ -471,7 +467,7 @@ def _collective_spec(node):
     return op, group_name, group_size, specs
 
 
-def _leaf_ce_ag(snode: BaseSchedulerNode):
+def _leaf_ce_ag(snode: BaseSchedulerNode) -> ir.ExternKernel | None:
     """The copy-engine gather IR node inside ``snode``, or None.
 
     It is an ordinary FallbackKernel, not a ``_CollectiveKernel``, so none of
@@ -479,12 +475,9 @@ def _leaf_ce_ag(snode: BaseSchedulerNode):
     """
     # Imported per call, like ``_is_h2d_load``: a module-level import would close
     # the ``magi_compiler.passes`` import cycle.
-    from magi_compiler.passes.snode_utils import is_ce_ag_ir
+    from magi_compiler.passes.snode_utils import is_ce_ag_ir, iter_ir_nodes
 
-    for n in (getattr(snode, "node", None), *(getattr(c, "node", None) for c in getattr(snode, "snodes", []) or [])):
-        if n is not None and is_ce_ag_ir(n):
-            return n
-    return None
+    return next((node for node in iter_ir_nodes(snode) if is_ce_ag_ir(node)), None)
 
 
 def _is_ce_ag_coalesced_ir(node) -> bool:
@@ -493,9 +486,9 @@ def _is_ce_ag_coalesced_ir(node) -> bool:
     return is_ce_ag_coalesced(node)
 
 
-def _ce_ag_spec(node):
+def _ce_ag_spec(node: ir.ExternKernel):
     """(shapes, dtype, group_size, group_name). Use ``constant_args``; ``get_origin_node()`` is unset and would cost 0."""
-    args = getattr(node, "constant_args", None)
+    args = node.constant_args
     if not args or len(args) < 2:
         return None
     group_size, group_name = args[-2:]

@@ -260,7 +260,7 @@ class FsdpShardSource(WeightSource):
                 skipped["graph input has no live parameter behind it"] += 1
                 continue
 
-            local = getattr(param, "_local_tensor", None)
+            local = param._local_tensor if isinstance(param, DTensor) else None
             # A shard an earlier compile of this same model already adopted.  It
             # is a candidate again, not a skip: every graph over these
             # parameters needs its own load.  Skipping it leaves the second
@@ -315,9 +315,9 @@ class FsdpShardSource(WeightSource):
             if src is None or _feeds_a_weight_gather(node):
                 continue
             param = resolve(graph, src, placeholder_examples)
-            local = getattr(param, "_local_tensor", None)
-            if local is None:
+            if not isinstance(param, DTensor):
                 continue
+            local = param._local_tensor
             slot, why = parked_slot(local, min_bytes)
             if why is not None:
                 skipped[why] += 1

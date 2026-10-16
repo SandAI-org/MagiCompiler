@@ -26,17 +26,13 @@ import gc
 import pickle
 
 import pytest
+from torch._inductor import ir
 
 from magi_compiler.passes import snode_cost, snode_utils
 from magi_compiler.passes.snode_cost import SnodeCostProfile, SnodeCostTable
 from magi_compiler.profiling import ProfilingRuntimeEstimator
 from magi_compiler.profiling import runtime_estimator as re_mod
 from magi_compiler.profiling.runtime_estimator import ProfileEntry
-
-
-class _IR:
-    def __init__(self, op_overload):
-        self.op_overload = op_overload
 
 
 class _Snode:
@@ -47,7 +43,8 @@ class _Snode:
 
         self.name = name
         self.kind = kind
-        self.node = _IR(H2D_LOAD if kind == "load" else "fake.op")
+        self.node = object.__new__(ir.FallbackKernel)
+        self.node.op_overload = H2D_LOAD if kind == "load" else "fake.op"
 
     def get_name(self):
         return self.name

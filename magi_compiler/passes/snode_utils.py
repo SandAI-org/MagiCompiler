@@ -22,12 +22,13 @@ happen.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from functools import lru_cache
 
 import torch
+from torch._inductor import ir
 from torch._inductor.comms import _is_fake_dep
-from torch._inductor.ir import MultiOutput
-from torch._inductor.scheduler import BaseSchedulerNode
+from torch._inductor.scheduler import BaseSchedulerNode, FusedSchedulerNode, GroupedSchedulerNode
 from torch._inductor.utils import contains_collective, contains_wait, is_collective
 
 from magi_compiler.utils import magi_logger
@@ -45,33 +46,31 @@ def ce_ag_ops() -> tuple:
         return None, None
 
 
-def is_ce_ag_ir(node) -> bool:
+def iter_ir_nodes(snode: BaseSchedulerNode) -> Iterator[ir.Operation]:
+    # Keep one-level traversal even for ForeachKernelSchedulerNode, whose get_nodes() flattens further.
+    children = snode.snodes if isinstance(snode, (GroupedSchedulerNode, FusedSchedulerNode)) else (snode,)
+    for child in children:
+        if child.node is not None:
+            yield child.node
+
+
+def is_ce_ag_ir(node: ir.Operation | None) -> bool:
     """``magi::ce_all_gather`` lowers to an ordinary FallbackKernel, so Inductor's
     ``is_collective`` does not recognize it."""
-    op = getattr(node, "op_overload", None)
-    return op is not None and op in ce_ag_ops()
+    return isinstance(node, ir.ExternKernel) and node.op_overload is not None and node.op_overload in ce_ag_ops()
 
 
-def is_ce_ag_coalesced(node) -> bool:
-    op = getattr(node, "op_overload", None)
-    return op is not None and op is ce_ag_ops()[1]
+def is_ce_ag_coalesced(node: ir.Operation | None) -> bool:
+    return isinstance(node, ir.ExternKernel) and node.op_overload is not None and node.op_overload is ce_ag_ops()[1]
 
 
-def is_gather_ir(node) -> bool:
+def is_gather_ir(node: ir.Operation | None) -> bool:
     return node is not None and (is_collective(node) or is_ce_ag_ir(node))
 
 
-def leaf_collective_node(snode: BaseSchedulerNode):
+def leaf_collective_node(snode: BaseSchedulerNode) -> ir.ExternKernel | None:
     """The underlying collective IR node for a (possibly grouped) snode, or None."""
-    node = getattr(snode, "node", None)
-    if is_gather_ir(node):
-        return node
-    # GroupedSchedulerNode: find the collective child.
-    for child in getattr(snode, "snodes", []) or []:
-        cn = getattr(child, "node", None)
-        if is_gather_ir(cn):
-            return cn
-    return None
+    return next((node for node in iter_ir_nodes(snode) if is_gather_ir(node)), None)
 
 
 def issues_transfer(snode: BaseSchedulerNode) -> bool:
@@ -88,7 +87,7 @@ _NCCL_WEIGHT_AG_OPS = (
 def is_weight_gather(snode: BaseSchedulerNode) -> bool:
     """An FSDP weight all-gather launch, over NCCL or the copy engine."""
     node = leaf_collective_node(snode)
-    op = getattr(node, "op_overload", None) if node is not None else None
+    op = node.op_overload if node is not None else None
     return op is not None and (op in _NCCL_WEIGHT_AG_OPS or op in ce_ag_ops())
 
 
@@ -105,13 +104,8 @@ def is_compute(snode: BaseSchedulerNode) -> bool:
 
 
 def is_multi_output(snode: BaseSchedulerNode) -> bool:
-    """A custom op's result reaches its readers through one of these, not directly.
-
-    Matched by class name rather than ``isinstance``: Inductor has exactly one
-    class by this name, and the name lets a scheduler-level test stand one in
-    without building a real IR node.
-    """
-    return type(getattr(snode, "node", None)).__name__ == MultiOutput.__name__
+    """A custom op's result reaches its readers through one of these, not directly."""
+    return isinstance(snode.node, ir.MultiOutput)
 
 
 def earliest_legal_index(group, index_of, buf_to_snode) -> int:
