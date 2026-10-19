@@ -28,6 +28,7 @@ import torch
 import torch.fx as fx
 from torch._dispatch.python import enable_python_dispatcher
 from torch._guards import detect_fake_mode
+from torch.distributed.tensor import DTensor
 
 import magi_compiler.utils.envs as envs
 from magi_compiler.config import CompileConfig, CompileMode, CudaGraphMode, inductor_compile_config_hash, magi_cache_dump_path
@@ -662,8 +663,8 @@ class MagiBackend:
         self.local_magi_cache_path.mkdir(parents=True, exist_ok=True)
         self.compiler_manager.initialize_cache(self.local_magi_cache_path)
 
-    def _reclaim_unloaded_weights(self) -> None:
-        """Restore parked weights that no compiled graph loads.
+    def _reclaim_unloaded_weights(self, example_inputs) -> None:
+        """Restore parked weights this graph reads but does not load.
 
         After the offload rewrite, before any execution — including the interpreter
         that compiles submodules on the example inputs. A parked shard with no load
@@ -672,16 +673,18 @@ class MagiBackend:
         Usually empty. Non-empty when ``host_first`` parked a weight from its
         placement but lowering never emitted an all-gather that reads it.
         """
-        from magi_compiler.passes.weight_offload import host_weights
-
+        # The graph's own inputs only: the pool also holds every other compiled
+        # model's weights, which stay unclaimed until that model compiles.
+        locals_ = (ex._local_tensor if isinstance(ex, DTensor) else ex for ex in example_inputs or ())
+        slots = [slot for t in locals_ if isinstance(t, torch.Tensor) and (slot := host_weights.slot_of(t)) is not None]
         # Delta, not the pool total: the placement pass also promotes shards, and
         # ``make_resident_many`` only adds, so the difference is this call.
         before = host_weights.resident_bytes()
-        restored = host_weights.restore_unclaimed()
+        restored = host_weights.restore_unclaimed(slots)
         if not restored:
             return
         magi_logger.warning(
-            "host offload: %d parked weight(s) are not loaded by any compiled graph and have been put "
+            "host offload: %d parked weight(s) are read by this graph without a load and have been put "
             "back on the device (%.1f MiB); offload is simply not helping for these. Weights: %s",
             len(restored),
             (host_weights.resident_bytes() - before) / 2**20,
@@ -749,7 +752,7 @@ class MagiBackend:
             # Before the interpreter, which runs the graph on the example inputs
             # to drive per-submodule compilation -- a parked weight with no load
             # would be read there, not at the first real forward.
-            self._reclaim_unloaded_weights()
+            self._reclaim_unloaded_weights(example_inputs)
             self.compiler_manager.bind_offload_cache(graph)
 
     def _configure_overlap_passes(self, *, loads_inserted: bool, auto_bucket: bool = False) -> None:
