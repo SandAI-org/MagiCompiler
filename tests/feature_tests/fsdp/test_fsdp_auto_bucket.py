@@ -87,7 +87,7 @@ def _members(out_mib, *, world: int = 8):
     """One gather per entry (gathered MiB), each at ``3k`` with its wait at
     ``3k+1`` and its reader at ``3k+2``."""
     return [
-        Member(idx=3 * k, lo=0, wait=3 * k + 1, deadline=3 * k + 2, local_bytes=int(o * MiB) // world, out_bytes=int(o * MiB))
+        Member(idx=3 * k, lo=0, wait=3 * k + 1, local_bytes=int(o * MiB) // world, out_bytes=int(o * MiB))
         for k, o in enumerate(out_mib)
     ]
 
@@ -176,7 +176,7 @@ def test_a_bucket_never_spans_a_wait_its_launch_cannot_precede():
     """Member 3's shard is produced after member 2's wait: no single launch can
     follow the one and precede the other, so the bucket breaks there."""
     members = _members([4] * 6)
-    members[3] = Member(idx=9, lo=8, wait=10, deadline=11, local_bytes=MiB // 2, out_bytes=4 * MiB)
+    members[3] = Member(idx=9, lo=8, wait=10, local_bytes=MiB // 2, out_bytes=4 * MiB)
     segs = plan_segments(members, _params())
     assert segs == [(0, 3), (3, 6)]
     for s, e in segs:

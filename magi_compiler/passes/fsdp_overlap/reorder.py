@@ -164,16 +164,9 @@ class FsdpOverlapReorder(OverlapPass):
             for s in order:
                 if is_multi_output(s) and any((not _is_fake_dep(d)) and d.name in produced for d in s.unmet_dependencies):
                     group.append(s)
-            if is_ce_ag_coalesced(node):
-                for s in order:
-                    if s is launch or s in group or contains_wait(s) or not cost.is_transparent(s):
-                        continue
-                    deps = [d for d in s.unmet_dependencies if not _is_fake_dep(d)]
-                    if deps and all(d.name in produced for d in deps):
-                        group.append(s)
-        elif is_ce_ag_ir(node):
+        if is_ce_ag_ir(node):
             for s in order:
-                if s is launch or contains_wait(s) or not cost.is_transparent(s):
+                if s in group or contains_wait(s) or not cost.is_transparent(s):
                     continue
                 deps = [d for d in s.unmet_dependencies if not _is_fake_dep(d)]
                 if deps and all(d.name in produced for d in deps):

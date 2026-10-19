@@ -113,19 +113,6 @@ def _waits_of(snode: BaseSchedulerNode, order: list[BaseSchedulerNode]) -> list[
     ]
 
 
-def _producer_index(snode, index_of, buf_to_snode, skip) -> int:
-    """1 + index of the latest real producer ``snode`` reads, ignoring ``skip``."""
-    lo = 0
-    for d in snode.unmet_dependencies:
-        if _is_fake_dep(d):
-            continue
-        prod = buf_to_snode.get(d.name)
-        if prod is None or prod in skip:
-            continue
-        lo = max(lo, index_of[prod] + 1)
-    return lo
-
-
 @dataclass
 class Placement:
     """Where a bucket's launch goes, and which shard prep has to move up to it."""
@@ -149,11 +136,11 @@ def coalesce_placement(order: list[BaseSchedulerNode], members: list[BaseSchedul
     from .reorder import FsdpOverlapReorder
 
     graph = SnodeGraph(order)
-    index_of, buf_to_snode = graph.index_of, graph.buf_to_snode
+    index_of = graph.index_of
     prep = FsdpOverlapReorder._prep_chain(list(members), graph)
     moving = set(members) | set(prep) | {u for m in members for u in _unpacks_of(m, order)}
     at = min(index_of[m] for m in members)
-    at = max([at] + [_producer_index(s, index_of, buf_to_snode, moving) for s in moving])
+    at = max(at, graph.earliest_legal_index(moving))
     waits = [w for m in members for w in _waits_of(m, order)]
     if len(waits) < len(members) or at > min(index_of[w] for w in waits):
         return None
@@ -176,8 +163,9 @@ def _explain_placement(order: list[BaseSchedulerNode], members: list[BaseSchedul
         parts.append(
             f"{m.get_name()}@{index_of[m]} unpacks={[index_of[u] for u in unpacks]} waits={[index_of[w] for w in waits]}"
         )
-    latest = max(moving, key=lambda s: _producer_index(s, index_of, buf_to_snode, moving))
-    floor = _producer_index(latest, index_of, buf_to_snode, moving)
+    floors = {s: graph.earliest_legal_index(group=[s], skip=moving) for s in moving}
+    latest = max(moving, key=floors.__getitem__)
+    floor = floors[latest]
     culprit = [
         f"{buf_to_snode[d.name].get_name()}@{index_of[buf_to_snode[d.name]]}"
         for d in latest.unmet_dependencies

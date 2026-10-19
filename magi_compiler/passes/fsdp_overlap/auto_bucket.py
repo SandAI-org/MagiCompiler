@@ -64,7 +64,6 @@ class Member:
     idx: int  # the launch's own index
     lo: int  # earliest index a launch reading its shard could take
     wait: int  # index of its first wait: a merged launch must come before it
-    deadline: int  # first real consumer
     local_bytes: int  # bytes this rank contributes
     out_bytes: int  # bytes the gather produces
 
@@ -300,23 +299,17 @@ class FsdpAutoBucket:
         return out
 
     # -- planning -------------------------------------------------------------
-    def _member(self, snode, graph: SnodeGraph, cost: CostView) -> Member | None:
+    def _member(self, snode, graph: SnodeGraph) -> Member | None:
         info = gather_info(snode)
         prep = FsdpOverlapReorder._prep_chain([snode], graph)
         moving = {snode, *prep}
-        lo = max(ir_coalesce._producer_index(s, graph.index_of, graph.buf_to_snode, moving) for s in moving)
+        lo = graph.earliest_legal_index(moving)
         waits = ir_coalesce._waits_of(snode, graph.order)
         if not waits:
             return None
         wait = min(graph.index_of[w] for w in waits)
-        deadline = FsdpOverlapReorder._first_consumer_index([snode, *prep], graph, cost)
         return Member(
-            idx=graph.index_of[snode],
-            lo=lo,
-            wait=wait,
-            deadline=wait if deadline is None else deadline,
-            local_bytes=info.shard_bytes,
-            out_bytes=info.shard_bytes * info.world,
+            idx=graph.index_of[snode], lo=lo, wait=wait, local_bytes=info.shard_bytes, out_bytes=info.shard_bytes * info.world
         )
 
     @staticmethod
@@ -352,12 +345,12 @@ class FsdpAutoBucket:
         graph = SnodeGraph(order)
         params_by_group = self._params_by_group(cands, cost)
         buckets: list[list[BaseSchedulerNode]] = []
-        report = {"n": len(cands), "solo": 0, "share_before": 0.0, "share_after": 0.0, "launches": 0, "sizes": []}
+        report = {"n": len(cands), "solo": 0, "share_before": 0.0, "share_after": 0.0, "sizes": []}
         stream_ns = launch_ns_before = launch_ns_after = 0.0
         for run in self._runs(cands):
             params = params_by_group[self._fit_key(gather_info(run[0]))]
             alpha, beta = params.alpha_ns, params.beta_ns_per_byte
-            pairs = [(s, self._member(s, graph, cost)) for s in run]
+            pairs = [(s, self._member(snode=s, graph=graph)) for s in run]
             usable = [(s, m) for s, m in pairs if m is not None]
             if len(usable) < 2:
                 continue

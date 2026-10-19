@@ -264,6 +264,26 @@ def _weight_behind(to_local: fx.Node) -> fx.Node | None:
     return src if any(t in text for t in ("parameter", "parameters", "weight", "bias")) else None
 
 
+def _shard_candidate(*, holder, source, param, min_bytes, skipped, tag=None) -> OffloadCandidate | None:
+    from ..runtime import host_weights
+
+    local = param._local_tensor if isinstance(param, DTensor) else None
+    # Reuse the adopted slot; each compiled graph still needs its own load.
+    slot, why = parked_slot(local=local, min_bytes=min_bytes)
+    if why is not None:
+        skipped[why] += 1
+        return None
+    return OffloadCandidate(
+        holder=holder,
+        local=local,
+        name=_param_name(source),
+        nbytes=host_weights.slot_bytes(slot),
+        tag=tag,
+        slot=slot,
+        group=mesh_group(param),
+    )
+
+
 @dataclass
 class FsdpShardSource(WeightSource):
     """Find SimpleFSDP weight holders, including weights without an all-gather.
@@ -277,8 +297,6 @@ class FsdpShardSource(WeightSource):
         self, graph: fx.GraphModule, placeholder_examples: Mapping[str, Any], min_bytes: int
     ) -> tuple[list[OffloadCandidate], Counter]:
         from magi_compiler.passes.fsdp_overlap.node_meta import is_weight_ag
-
-        from ..runtime import host_weights
 
         candidates: list[OffloadCandidate] = []
         skipped: Counter = Counter()
@@ -298,29 +316,16 @@ class FsdpShardSource(WeightSource):
                 skipped["graph input has no live parameter behind it"] += 1
                 continue
 
-            local = param._local_tensor if isinstance(param, DTensor) else None
-            # Reuse the adopted slot; each compiled graph still needs its own load.
-            slot, why = parked_slot(local, min_bytes)
-            if why is not None:
-                skipped[why] += 1
-                continue
-
             # Deduplicate by holder: distinct holders need separate loads of a shared slot.
             if holder in seen:
                 skipped["gather shares a holder with an earlier weight"] += 1
                 continue
-            seen.add(holder)
-            candidates.append(
-                OffloadCandidate(
-                    holder=holder,
-                    local=local,
-                    name=_param_name(holder.args[0]),
-                    nbytes=host_weights.slot_bytes(slot),
-                    tag=node,
-                    slot=slot,
-                    group=mesh_group(param),
-                )
+            candidate = _shard_candidate(
+                holder=holder, source=holder.args[0], param=param, min_bytes=min_bytes, skipped=skipped, tag=node
             )
+            if candidate is not None:
+                seen.add(holder)
+                candidates.append(candidate)
 
         self._collect_ungathered(graph, placeholder_examples, min_bytes, candidates, skipped, seen)
         return candidates, skipped
@@ -336,8 +341,6 @@ class FsdpShardSource(WeightSource):
         Each rank holds the full tensor, and it stays live until its last matmul
         consumer rather than being freed at a gather.
         """
-        from ..runtime import host_weights
-
         for node in graph.graph.nodes:
             if node in seen or not _is_local_extraction(node) or not node.users:
                 continue
@@ -347,21 +350,8 @@ class FsdpShardSource(WeightSource):
             param = _resolve(graph=graph, node=src, placeholder_examples=placeholder_examples)
             if not isinstance(param, DTensor):
                 continue
-            local = param._local_tensor
-            slot, why = parked_slot(local, min_bytes)
-            if why is not None:
-                skipped[why] += 1
-                continue
-            seen.add(node)
-            candidates.append(
-                OffloadCandidate(
-                    holder=node,
-                    local=local,
-                    name=_param_name(src),
-                    nbytes=host_weights.slot_bytes(slot),
-                    # This holder feeds no weight gather to tag for bucket planning.
-                    tag=None,
-                    slot=slot,
-                    group=mesh_group(param),
-                )
-            )
+            # This holder feeds no weight gather to tag for bucket planning.
+            candidate = _shard_candidate(holder=node, source=src, param=param, min_bytes=min_bytes, skipped=skipped)
+            if candidate is not None:
+                seen.add(node)
+                candidates.append(candidate)
