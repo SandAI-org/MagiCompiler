@@ -17,9 +17,8 @@
 Fit ``T(S) = alpha + beta * S`` per transport and process group.
 The gathered-byte target is ``alpha * (1 - ratio) / (ratio * beta)``.
 Gathers at or above the target stay single and separate runs of smaller gathers.
-Merge smaller gathers up to the target, allowing at most twice the target;
+Merge smaller gathers until a bucket reaches the target, so it stays below twice the target;
 also respect producer/wait ordering and the configured local-byte cap.
-A final bucket below half the target may fold into its predecessor if it fits.
 
 NCCL and copy-engine gathers never share a bucket.
 An eight-rank calibration sets default launch-cost ratios to 0.1 and 0.5, respectively.
@@ -36,6 +35,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import logging
 from dataclasses import dataclass
 
 import torch.distributed as dist
@@ -43,6 +43,7 @@ from torch._inductor.scheduler import BaseSchedulerNode
 
 from magi_compiler.passes.overlap import CostView, SnodeGraph, rank_sync
 from magi_compiler.passes.overlap.cost import default_cost_fn
+from magi_compiler.passes.snode_cost import SnodeCostTable
 from magi_compiler.passes.weight_offload.node_meta import is_host_offloaded
 from magi_compiler.utils import magi_logger
 
@@ -116,16 +117,11 @@ class PlanParams:
     def target_bytes(self) -> float:
         return amortizing_bytes(self.alpha_ns, self.beta_ns_per_byte, self.overhead_ratio)
 
-    @property
-    def cap_bytes(self) -> float:
-        return 2.0 * self.target_bytes
-
 
 def plan_segments(members: list[Member], params: PlanParams) -> list[tuple[int, int]]:
     """Contiguous ``[start, end)`` segments covering ``members`` (see the module docstring)."""
-    target, cap = params.target_bytes, params.cap_bytes
+    target = params.target_bytes
     segs: list[tuple[int, int]] = []
-    small: list[bool] = []  # per segment: a bucket of small gathers (may absorb a tail)
     start = None
     out = local = 0
     lo = wait = 0
@@ -133,18 +129,15 @@ def plan_segments(members: list[Member], params: PlanParams) -> list[tuple[int, 
     def close(end: int) -> None:
         if start is not None:
             segs.append((start, end))
-            small.append(True)
 
     for i, m in enumerate(members):
         if m.out_bytes >= target:
             close(i)
             start = None
             segs.append((i, i + 1))
-            small.append(False)
             continue
         if start is not None:
-            fits = out < target and out + m.out_bytes <= cap
-            fits = fits and (params.max_local_bytes <= 0 or local + m.local_bytes <= params.max_local_bytes)
+            fits = out < target and (params.max_local_bytes <= 0 or local + m.local_bytes <= params.max_local_bytes)
             if fits and max(members[start].idx, lo, m.lo) <= min(wait, m.wait):
                 out += m.out_bytes
                 local += m.local_bytes
@@ -153,33 +146,7 @@ def plan_segments(members: list[Member], params: PlanParams) -> list[tuple[int, 
             close(i)
         start, out, local, lo, wait = i, m.out_bytes, m.local_bytes, m.lo, m.wait
     close(len(members))
-    return _fold_tails(members, segs, small, params)
-
-
-def _fold_tails(members: list[Member], segs, small, params: PlanParams) -> list[tuple[int, int]]:
-    """Fold a small last bucket of each run of small gathers into the bucket before it, when that fits."""
-    out: list[tuple[int, int]] = []
-    out_small: list[bool] = []
-    for k, (seg, is_small) in enumerate(zip(segs, small)):
-        last_of_run = is_small and (k + 1 == len(segs) or not small[k + 1])
-        if last_of_run and out and out_small[-1] and out[-1][1] == seg[0]:
-            tail = members[seg[0] : seg[1]]
-            merged = members[out[-1][0] : seg[1]]
-            tail_bytes = sum(m.out_bytes for m in tail)
-            merged_bytes = sum(m.out_bytes for m in merged)
-            merged_local = sum(m.local_bytes for m in merged)
-            legal = max(merged[0].idx, max(m.lo for m in merged)) <= min(m.wait for m in merged)
-            if (
-                tail_bytes < 0.5 * params.target_bytes
-                and merged_bytes <= params.cap_bytes
-                and (params.max_local_bytes <= 0 or merged_local <= params.max_local_bytes)
-                and legal
-            ):
-                out[-1] = (out[-1][0], seg[1])
-                continue
-        out.append(seg)
-        out_small.append(is_small)
-    return out
+    return segs
 
 
 # -- the pass -----------------------------------------------------------------
@@ -229,33 +196,29 @@ class FsdpAutoBucket:
         if len(cands) < 2:
             return snodes
 
-        ok, buckets, report = True, [], {}
+        ok, buckets, params_by_group = True, [], {}
         try:
             if not ir_coalesce.ir_coalesce_supported():
                 raise RuntimeError("this torch lacks the Inductor internals scheduler-level coalescing needs")
-            buckets, report = self._plan(order, cands, cost)
+            buckets, params_by_group = self._plan(order, cands, cost)
         except Exception as exc:  # noqa: BLE001
             magi_logger.warning("%s: planning failed (%s); leaving every weight gather unbucketed", self.name, exc, rank="all")
             ok, buckets = False, []
-        adopted = self._adopt(ok=ok, buckets=buckets, order=order, cands=cands, group=group, world=world, skeleton=skeleton)
-        if adopted is None:
+        buckets = self._adopt(ok=ok, buckets=buckets, order=order, cands=cands, group=group, world=world, skeleton=skeleton)
+        if buckets is None:
             return snodes
-        if adopted is not buckets:
-            buckets = adopted
-            report["sizes"] = [sum(gather_info(s).shard_bytes for s in b) for b in buckets]
-            report["members"] = sum(len(b) for b in buckets)
         if not buckets:
-            self._report(report, 0)
+            self._report(params_by_group, buckets, n_cands=len(cands))
             return snodes
 
         for members in buckets:
             out_bytes = sum(gather_info(m).shard_bytes * gather_info(m).world for m in members)
-            params = report["params"][self._fit_key(gather_info(members[0]))]
+            params = params_by_group[self._fit_key(gather_info(members[0]))]
             order, packed, unpacks = ir_coalesce.coalesce_all_gathers(order, members)
             self._record(packed, unpacks, out_bytes, params)
         snodes[:] = order
         ir_coalesce.refresh_memory_planning(snodes)
-        self._report(report, len(buckets))
+        self._report(params_by_group, buckets, n_cands=len(cands))
         return snodes
 
     # -- candidates -----------------------------------------------------------
@@ -345,25 +308,15 @@ class FsdpAutoBucket:
         graph = SnodeGraph(order)
         params_by_group = self._params_by_group(cands, cost)
         buckets: list[list[BaseSchedulerNode]] = []
-        report = {"n": len(cands), "solo": 0, "share_before": 0.0, "share_after": 0.0, "sizes": []}
-        stream_ns = launch_ns_before = launch_ns_after = 0.0
         for run in self._runs(cands):
             params = params_by_group[self._fit_key(gather_info(run[0]))]
-            alpha, beta = params.alpha_ns, params.beta_ns_per_byte
             pairs = [(s, self._member(snode=s, graph=graph)) for s in run]
             usable = [(s, m) for s, m in pairs if m is not None]
             if len(usable) < 2:
                 continue
             snodes_, members = [s for s, _ in usable], [m for _, m in usable]
             segs = plan_segments(members, params)
-            report["solo"] += sum(1 for m in members if m.out_bytes >= params.target_bytes)
-            stream_ns += sum(alpha + beta * m.out_bytes for m in members)
-            launch_ns_before += alpha * len(members)
-            launch_ns_after += alpha * len(segs)
             buckets.extend(snodes_[s:e] for s, e in segs if e - s >= 2)
-        if stream_ns > 0:
-            report["share_before"] = launch_ns_before / stream_ns
-            report["share_after"] = launch_ns_after / (stream_ns - launch_ns_before + launch_ns_after)
 
         # Merge in sequence on a stand-in order: each merge moves shard prep,
         # and the next merge must still be legal after it.
@@ -376,15 +329,11 @@ class FsdpAutoBucket:
             kept.append(members)
         if not graph.validate(sim):
             raise RuntimeError("the merged order is not topological")
-        report["sizes"] = [sum(gather_info(s).shard_bytes for s in b) for b in kept]
-        report["members"] = sum(len(b) for b in kept)
-        report["params"] = params_by_group
-        return kept, report
+        return kept, params_by_group
 
     def _adopt(self, ok: bool, buckets, order, cands, group, world: int, skeleton):
         """Rank 0's buckets, as this rank's snodes, once every rank has found them legal; None to leave the graph alone.
 
-        Returns ``buckets`` itself when this rank's own plan is the one adopted.
         Every rank must also merge into the same collective order (see the module docstring).
         """
         if world <= 1:
@@ -411,16 +360,8 @@ class FsdpAutoBucket:
                 self.name,
             )
             return None
-        lead = peers[0][1]
-        distinct = len({hashlib.sha256(repr(p[1]).encode()).hexdigest() for p in peers})
-        if distinct > 1:
-            magi_logger.info(
-                "%s: ranks planned %d distinct bucket plans from their own measured costs; every rank takes rank 0's",
-                self.name,
-                distinct,
-            )
         try:
-            adopted = buckets if lead == mine else [[cands[i] for i in b] for b in lead]
+            adopted = [[cands[i] for i in b] for b in peers[0][1]]
             merged = self._merged(order, adopted)
             legal = merged is not None
         except Exception:  # noqa: BLE001 - an unmappable plan is simply not legal here
@@ -488,41 +429,33 @@ class FsdpAutoBucket:
     # -- after the merge ----------------------------------------------------------
     def _record(self, packed, unpacks, out_bytes: int, params: PlanParams) -> None:
         """Price the new snodes, so the table does not report them as misses."""
-        record = getattr(self._cost_fn, "record", None)
-        if record is None:
+        if not isinstance(self._cost_fn, SnodeCostTable):
             return
-        record(packed, params.alpha_ns + params.beta_ns_per_byte * out_bytes)
+        self._cost_fn.record(packed, params.alpha_ns + params.beta_ns_per_byte * out_bytes)
         for u in unpacks:
-            record(u, 0.0)
+            self._cost_fn.record(u, 0.0)
 
-    def _report(self, report: dict, n_buckets: int) -> None:
-        if not report or "params" not in report:
-            return
-        fits = ", ".join(
-            f"{kind} ws={world} group {group}: alpha={p.alpha_ns / 1e3:.1f}us "
-            f"beta={p.beta_ns_per_byte * 2**20 / 1e3:.3f}us/MiB, ratio {p.overhead_ratio:.2f} -> "
-            f"target {p.target_bytes / 2**20:.1f} MiB gathered (cap {p.cap_bytes / 2**20:.1f})"
-            for (kind, group, world), p in sorted(report["params"].items())
-        )
-        sizes = sorted(report.get("sizes") or [0])
+    def _report(self, params_by_group: dict, buckets: list[list[BaseSchedulerNode]], n_cands: int) -> None:
+        sizes = sorted(sum(gather_info(s).shard_bytes for s in b) for b in buckets) or [0]
         mib = [x / 2**20 for x in sizes]
-        n = report.get("n", 0)
-        launches = n - report.get("members", 0) + n_buckets
+        launches = n_cands - sum(len(b) for b in buckets) + len(buckets)
         magi_logger.info(
-            "%s: %d bucket(s) from %d weight gather(s) (%d merged, %d large enough to go alone); "
-            "%d -> %d launch(es); %s; "
-            "bucket local MiB min/median/max %.1f/%.1f/%.1f; launch share of stream time %.1f%% -> %.1f%%",
+            "%s: %d bucket(s) from %d weight gather(s); %d -> %d launch(es); "
+            "bucket local MiB min/median/max %.1f/%.1f/%.1f",
             self.name,
-            n_buckets,
-            n,
-            report.get("members", 0),
-            report.get("solo", 0),
-            n,
+            len(buckets),
+            n_cands,
+            n_cands,
             launches,
-            fits,
             mib[0],
             mib[len(mib) // 2],
             mib[-1],
-            100.0 * report.get("share_before", 0.0),
-            100.0 * report.get("share_after", 0.0),
         )
+        if logging.getLogger("magi_compiler").isEnabledFor(logging.DEBUG):
+            fits = ", ".join(
+                f"{kind} ws={world} group {group}: alpha={p.alpha_ns / 1e3:.1f}us "
+                f"beta={p.beta_ns_per_byte * 2**20 / 1e3:.3f}us/MiB, ratio={p.overhead_ratio:.2f}, "
+                f"target={p.target_bytes / 2**20:.1f} MiB gathered"
+                for (kind, group, world), p in sorted(params_by_group.items())
+            )
+            magi_logger.debug("%s: %s", self.name, fits)

@@ -160,7 +160,7 @@ def bind_weights_to_host(
 
     sizes = sorted(c.nbytes for c in plan)
     magi_logger.info(
-        "host offload: %d weight(s) served from host memory (%.1f MiB never allocated on device); "
+        "host offload: %d weight(s) bound to host slots, %.1f MiB; "
         "sizes %.1f / %.1f / %.1f MiB (min/median/max, floor %.1f); %s",
         len(plan),
         sum(c.nbytes for c in plan) / 2**20,

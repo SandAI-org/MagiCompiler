@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from torch._inductor import ir
@@ -45,6 +46,9 @@ from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
 from ..snode_utils import ce_ag_ops, iter_ir_nodes
+
+if TYPE_CHECKING:
+    from ..overlap import SnodeGraph
 
 _AG = torch.ops._c10d_functional.all_gather_into_tensor.default
 _AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
@@ -113,6 +117,19 @@ def _waits_of(snode: BaseSchedulerNode, order: list[BaseSchedulerNode]) -> list[
     ]
 
 
+def _launch_group(
+    order: list[BaseSchedulerNode], members: list[BaseSchedulerNode]
+) -> tuple[SnodeGraph, list[BaseSchedulerNode], set[BaseSchedulerNode]]:
+    """``(graph, prep, moving)``: the members' shard prep, and every snode that moves with their packed launch."""
+    from ..overlap import SnodeGraph
+    from .reorder import FsdpOverlapReorder
+
+    graph = SnodeGraph(order)
+    prep = FsdpOverlapReorder._prep_chain(list(members), graph)
+    moving = set(members) | set(prep) | {u for m in members for u in _unpacks_of(m, order)}
+    return graph, prep, moving
+
+
 @dataclass
 class Placement:
     """Where a bucket's launch goes, and which shard prep has to move up to it."""
@@ -132,13 +149,8 @@ def coalesce_placement(order: list[BaseSchedulerNode], members: list[BaseSchedul
     pass moves with a gather.  Prep that already runs above the launch stays
     put: moving a producer down could put it under one of its other readers.
     """
-    from ..overlap import SnodeGraph
-    from .reorder import FsdpOverlapReorder
-
-    graph = SnodeGraph(order)
+    graph, prep, moving = _launch_group(order, members)
     index_of = graph.index_of
-    prep = FsdpOverlapReorder._prep_chain(list(members), graph)
-    moving = set(members) | set(prep) | {u for m in members for u in _unpacks_of(m, order)}
     at = min(index_of[m] for m in members)
     at = max(at, graph.earliest_legal_index(moving))
     waits = [w for m in members for w in _waits_of(m, order)]
@@ -149,13 +161,8 @@ def coalesce_placement(order: list[BaseSchedulerNode], members: list[BaseSchedul
 
 def _explain_placement(order: list[BaseSchedulerNode], members: list[BaseSchedulerNode]) -> str:
     """Why ``coalesce_placement`` found no index: each member's position, its waits, and the latest producer."""
-    from ..overlap import SnodeGraph
-    from .reorder import FsdpOverlapReorder
-
-    graph = SnodeGraph(order)
+    graph, _, moving = _launch_group(order, members)
     index_of, buf_to_snode = graph.index_of, graph.buf_to_snode
-    prep = FsdpOverlapReorder._prep_chain(list(members), graph)
-    moving = set(members) | set(prep) | {u for m in members for u in _unpacks_of(m, order)}
     parts = []
     for m in members:
         unpacks = _unpacks_of(m, order)
@@ -250,10 +257,9 @@ def _replace_ir(orig: ir.Buffer, new: ir.Buffer) -> None:
     graph.operations[graph.operations.index(orig)] = new
     graph.name_to_op[orig_op] = new
 
-    unaligned = getattr(graph, "unaligned_buffers", None)
-    if unaligned is not None and new_buf in unaligned:
-        unaligned.discard(new_buf)
-        unaligned.add(orig_buf)
+    if new_buf in graph.unaligned_buffers:
+        graph.unaligned_buffers.discard(new_buf)
+        graph.unaligned_buffers.add(orig_buf)
 
 
 def _repoint_inputs(snodes, old: ir.Buffer, new: ir.Buffer) -> None:

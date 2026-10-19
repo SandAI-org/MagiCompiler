@@ -12,25 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Latest-safe-launch FSDP all-gather / compute overlap reorder pass.
+"""Schedule FSDP gathers and shard preparation with shared ALAP placement.
 
-Installed in ``reorder_for_compute_comm_overlap_passes`` in place of
-``raise_comms``/``sink_waits``, right after ``SnodeCostProfile``, whose
-``SnodeCostTable`` is this pass's ``cost_fn``; runs on the whole Inductor graph
-(``disable_graph_split=True``).  For each FSDP weight all-gather launch, place it
-at the LATEST position whose downstream compute still hides the collective::
-
-    sum(compute runtime between launch and first-consumer) >= comm * scale + margin
-
-Not enough upstream compute -> as-early-as-legal (never worse than raise_comms).
-
-What is FSDP-specific lives here: which snodes a gather drags along, and the
-cross-rank agreement a collective needs.  Placement is the shared
-``alap_schedule``, which runs the one transfer stream on the compute time axis
-as the load reorder does.  Rebuild and validation are ``OverlapPass``'s.
-
-Handles both lowering forms: plain all_gather (1 launch / 1 wait) and coalesced
-(1 packed launch + N MultiOutput members moved together as one block + N waits).
+Runs after cost profiling and optional bucketing on the unsplit graph.
+Each task uses the original launch's next boundary as its deadline and
+``comm * scale + margin`` as its transfer window; gathers are never delayed.
+Single and coalesced gathers share dependency validation and rank agreement.
 """
 
 from __future__ import annotations

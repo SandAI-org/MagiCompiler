@@ -12,23 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""What counts as an offloadable weight, and where its load goes.
+"""Discover plain and FSDP weights as OffloadCandidates for binding and scheduling.
 
-``PlainParamSource`` and ``FsdpShardSource`` are the two answers.  Everything
-downstream -- binding, splicing the load in, placing it during scheduling -- is
-written once against ``OffloadCandidate``.
-
-Two differences are worth naming because they change the arithmetic downstream,
-not just the lookup:
-
-* **What dies, and when.**  Under FSDP the loaded bytes are a shard that an
-  all-gather consumes into a fresh buffer, so the load's output dies almost
-  immediately.  Without FSDP the loaded bytes *are* the weight the matmul reads,
-  so they live until the last consumer -- a much longer range for the same
-  placement.
-* **How much moves.**  A shard is 1/world_size of a weight.  Offloading a plain
-  parameter moves the whole thing, so the same model costs world_size times the
-  PCIe traffic.
+Gathered weights load local shards whose outputs live through their consumers,
+typically the gather. Plain and replicated weights load full local copies that
+remain live through computation. Payload size and lifetime drive H2D placement.
 """
 
 from __future__ import annotations
@@ -128,13 +116,7 @@ def parked_slot(local: Any, min_bytes: int) -> tuple[int | None, str | None]:
 
 @dataclass
 class PlainParamSource(WeightSource):
-    """Weights of a model that is NOT sharded: lifted parameter placeholders.
-
-    Without FSDP there is no redistribute to lower and no all-gather to key off,
-    so a weight is just a graph input that happens to be a ``Parameter``.  The
-    load goes directly in front of its first reader, and its bytes stay live
-    until the last one -- there is no gather to hand them off to.
-    """
+    """Discover registered Parameters behind placeholders and get_attr nodes."""
 
     def collect(
         self, graph: fx.GraphModule, placeholder_examples: Mapping[str, Any], min_bytes: int
@@ -196,12 +178,7 @@ def _find_shard_holder(node: fx.Node) -> fx.Node | None:
 
 
 def shard_holder(gather: fx.Node) -> fx.Node | None:
-    """The ``to_local(placeholder|get_attr)`` whose output this gather consumes.
-
-    Walks the prep chain rather than looking only at ``args[0]``: a weight with a
-    ``forward_dtype`` or an uneven shard has a cast and/or a pad in between, and
-    matching only the bare shape would silently skip exactly the biggest weights.
-    """
+    """Find the parameter's to_local through preparation, including dtype casts and shard padding."""
     for inp in gather.all_input_nodes:
         found = _find_shard_holder(inp)
         if found is not None:
@@ -210,26 +187,14 @@ def shard_holder(gather: fx.Node) -> fx.Node | None:
 
 
 def _is_local_extraction(node: fx.Node) -> bool:
-    """A ``to_local``, in either shape SimpleFSDP's parametrization leaves behind.
-
-    The lowering rewrites the ``Shard(0)`` ones into ``to_local`` + all-gather;
-    what still carries the ``prim_to_local`` form after it has run is a weight it
-    declined to lower.
-    """
+    """Recognize both lowered to_local methods and unlowered prim_to_local calls."""
     return (node.op == "call_function" and getattr(node.target, "__name__", None) == "prim_to_local") or (
         node.op == "call_method" and node.target == "to_local"
     )
 
 
 def _feeds_a_weight_gather(node: fx.Node) -> bool:
-    """True if an all-gather consumes this node, through the usual prep chain.
-
-    The forward mirror of ``shard_holder``, and the thing that makes "has no
-    gather" a property of the graph rather than of what an earlier sweep
-    happened to record.  ``h2d_load`` and ``wait_tensor`` are walked through for
-    the same reason the backward walk does it: once a load has been spliced in,
-    a walk that stops at it stops one node short of the gather it is looking for.
-    """
+    """Find a downstream gather through preparation, H2D loads, and waits."""
     q: deque[fx.Node] = deque(node.users)
     seen: set[fx.Node] = set()
     while q:
@@ -332,15 +297,7 @@ class FsdpShardSource(WeightSource):
 
     @staticmethod
     def _collect_ungathered(graph, placeholder_examples, min_bytes, candidates, skipped, seen) -> None:
-        """Weights SimpleFSDP replicates, so they have no all-gather to key off.
-
-        A ``Shard(0)`` whose dim0 does not divide its mesh is stored replicated.
-        NCCL agreement is the collective sequence; rank-private compute may differ.
-        Lowering only rewrites sharded gathers, so these stay on the prim path.
-
-        Each rank holds the full tensor, and it stays live until its last matmul
-        consumer rather than being freed at a gather.
-        """
+        """Collect weight holders without downstream gathers, including replicated weights."""
         for node in graph.graph.nodes:
             if node in seen or not _is_local_extraction(node) or not node.users:
                 continue

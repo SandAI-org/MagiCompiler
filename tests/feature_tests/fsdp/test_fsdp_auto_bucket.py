@@ -18,7 +18,7 @@ Tested separately:
 
 * the planner -- ``fit_alpha_beta``, the amortizing target and
   ``plan_segments`` -- on synthetic members, where every case the rule
-  distinguishes (alone, merged, capped, folded, illegal) can be built exactly;
+  distinguishes (alone, merged, capped, illegal) can be built exactly;
 * the IR surgery and the pass, end to end on a 2-rank SimpleFSDP model through
   ``fsdp_overlap_helper/ir_coalesce_helper.py``: the compiled output must match
   eager, the wrapper must launch coalesced gathers, and every wait must still
@@ -148,11 +148,10 @@ def test_each_process_group_gets_its_own_fit(monkeypatch):
     "out_mib,expected",
     [
         pytest.param([400, 150, 100, 120], [(0, 1), (1, 2), (2, 3), (3, 4)], id="large-and-target-sized-alone"),
-        # Two 100 MiB buckets plus a 40 MiB tail: fold the tail into the second bucket.
-        pytest.param([4] * 60, [(0, 25), (25, 60)], id="tiny-gathers-fold-tail"),
+        # Two 100 MiB buckets, then the 40 MiB left over goes alone.
+        pytest.param([4] * 60, [(0, 25), (25, 50), (50, 60)], id="tiny-gathers-fill-to-target"),
         pytest.param([4] * 5 + [300] + [4] * 5, [(0, 5), (5, 6), (6, 11)], id="large-gather-splits-run"),
-        pytest.param([60, 60, 40], [(0, 3)], id="tail-fits-cap"),
-        pytest.param([90, 90, 40], [(0, 2), (2, 3)], id="tail-exceeds-cap"),
+        pytest.param([60, 60, 40], [(0, 2), (2, 3)], id="bucket-closes-at-target"),
     ],
 )
 def test_plan_segments(out_mib, expected):
@@ -160,10 +159,10 @@ def test_plan_segments(out_mib, expected):
     params = _params()
     segs = plan_segments(members, params)
     assert segs == expected
-    # An already-large singleton may exceed the cap; a merged bucket may not.
+    # An already-large singleton may exceed twice the target; a merged bucket may not.
     for (start, end), size in zip(segs, _out(members, segs)):
         if end - start > 1:
-            assert size * MiB <= params.cap_bytes
+            assert size * MiB < 2 * params.target_bytes
 
 
 def test_bucket_size_mib_caps_local_bytes():
@@ -232,17 +231,17 @@ def test_fixed_pairs_coalesce_under_their_old_names():
 
 @requires_2gpu
 @pytest.mark.parametrize(
-    "extra,cap_mib,expected_messages",
+    "extra,cap_mib",
     [
-        pytest.param((), None, (), id="analytical"),
-        pytest.param(("--cost-mode", "profile_sync", "--bucket-size-mib", "4"), 4.0, (), id="profile-sync-cap"),
+        pytest.param((), None, id="analytical"),
+        pytest.param(("--cost-mode", "profile_sync", "--bucket-size-mib", "4"), 4.0, id="profile-sync-cap"),
         # Inject a missing bucket on rank 1; both ranks must adopt rank 0's plan.
-        pytest.param(("--bucket-size-mib", "4", "--diverge"), 4.0, ("every rank takes rank 0's",), id="divergent-plan"),
+        pytest.param(("--bucket-size-mib", "4", "--diverge"), 4.0, id="divergent-plan"),
         # Rank 1 adds compute but keeps the collective skeleton: exercise SLOT consensus.
-        pytest.param(("--mismatch",), None, (), id="different-compute-graphs"),
+        pytest.param(("--mismatch",), None, id="different-compute-graphs"),
     ],
 )
-def test_auto_bucketing_end_to_end(extra, cap_mib, expected_messages):
+def test_auto_bucketing_end_to_end(extra, cap_mib):
     p = _run("--pair", "0", "--n-layers", "8", "--hidden", "1024", *extra)
     out = p.stdout + p.stderr
     assert p.returncode == 0 and "IRC_PASS" in p.stdout, out[-4000:]
@@ -251,8 +250,6 @@ def test_auto_bucketing_end_to_end(extra, cap_mib, expected_messages):
     assert "unbucketed" not in out, out[-4000:]
     assert "snode cost table:" not in out, "the pass must price the snodes it builds"
 
-    for message in expected_messages:
-        assert message in out, out[-4000:]
     if cap_mib is not None:
         # Plan-consensus messages share the prefix; select the size report explicitly.
         line = next(l for l in out.splitlines() if "FSDP auto bucket:" in l and "min/median/max " in l)

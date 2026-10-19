@@ -12,28 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Materialize offloaded weights in pinned host memory before checkpoint loading.
+"""Park eligible weights in pinned memory on meta to_empty or the first CPU-to-CUDA move.
 
-A per-instance ``_apply`` hook redirects CUDA ``to_empty`` only for contiguous,
-meta-backed weights supported by the weight sources. Other weights keep their
-normal placement. DTensor mesh, placements and global shape are preserved.
-
-After loading and weight post-processing, ``handoff`` installs storage-free CUDA
-stand-ins before Dynamo traces and registers their host buffers by tensor identity.
-Tied weights share one reservation and slot, with every registration updated.
-Weights tied outside the compiled subtree stay resident if already materialized;
-ones reclaimed by a later external ``_apply`` are reported at handoff.
-
-An unsharded module built and loaded on the host never calls ``to_empty``. Its
-first move to CUDA parks the same weights instead: their bytes are copied into the
-pool once and handed off, and they never go to the device.
-
-Once an instance has parked weights, any ``_apply`` that is a pure device move
-(``.to(device)``, ``.cuda()``, ``.cpu()``, or a caller's own function with the same
-effect) completes the handoff and changes the residency of those weights; see
-``residency``. The function never sees a stand-in. Its other tensors move through
-the class's ``_apply``, except in a DTensor module: torch's would swap the traced
-shards, so their sharding owner moves them in place.
+After initialization, handoff installs storage-free CUDA stand-ins before tracing;
+it temporarily allocates one local shard. Tied registrations share a reservation
+and slot. Externally materialized weights stay resident; reclaimed weights are reported.
+Device moves update residency without replacing traced stand-ins. Other tensors
+use the class's _apply; DTensor movement stays with the sharding owner.
 """
 
 from __future__ import annotations
@@ -142,9 +127,7 @@ def _warn_about_reclaimed(module: nn.Module, parked: list[tuple[list[str], nn.Pa
     missing = [name for name in expected if name not in found]
     if missing:
         magi_logger.warning(
-            "host offload: %d weight(s) materialized in host memory are back on the device before the "
-            "handoff and will not be offloaded (%s); the usual cause is a weight tied to a module outside "
-            "%s, whose own to_empty re-materialized the shared Parameter",
+            "host offload: %d weight(s) reclaimed before handoff (%s); offload skipped, check ties outside %s",
             len(missing),
             ", ".join(missing[:8]) + (" ..." if len(missing) > 8 else ""),
             type(module).__name__,
@@ -233,8 +216,7 @@ def _park_host_built(module: nn.Module, min_bytes: int) -> int:
         return 0
     nbytes = _hand_over(module, parked)
     magi_logger.info(
-        "host offload: %s copied %d host-built weight(s) (%.1f MiB) into the host pool on its first move to the "
-        "device; they load in the graph instead of moving",
+        "host offload: %s parked %d CPU weight(s), %.1f MiB, on first CUDA move",
         type(module).__name__,
         len(parked),
         nbytes / 2**20,
@@ -258,17 +240,26 @@ def patch_materialize(instance: nn.Module, conf) -> None:
         return type(self)._apply(self, fn, recurse=recurse)
 
     def _host_first_apply(self, fn, recurse=True):
+        # Meta-built (e.g. SimpleFSDP): to_empty(cuda) puts eligible weights in the pool, handoff pending.
         if getattr(fn, "__qualname__", "") == _TO_EMPTY:
             return _materialize_on_host(self, fn, recurse)
+        # None unless fn is a pure host<->CUDA move: dtype casts and other conversions get None.
         target = _move_target(fn)
+        # Decided once per instance. Weights on the host at the first CUDA move are parked: built on
+        # the host, or built on CUDA and moved to the host first. Weights already on CUDA never are.
         if target is not None and target.type == "cuda" and not getattr(self, _SETTLED_ATTR, False):
             setattr(self, _SETTLED_ATTR, True)
             if _built_on_host(self):
                 _park_host_built(self, min_bytes)
+        # Plain torch: not a device move, or no handoff is pending and none ever ran; e.g. a move to
+        # the host before the first CUDA move, or a module already on CUDA at that move.
         if target is None or not _manages_device_moves(self):
             return orig_apply(self, fn, recurse=recurse)
+        # A device move of a module that owns host slots: hand off first if to_empty left it pending.
         handoff_if_pending(self)
         residency.move(self, to_host=target.type == "cpu")
+        # Sharded: the sharding owner moves its DTensors in place, so nothing else moves here.
+        # Unsharded: the remaining tensors move normally, the stand-ins stay where the pool put them.
         return self if _is_sharded(self) else orig_apply(self, _leaving_parked(fn), recurse=recurse)
 
     def _materialize_on_host(self, fn, recurse):
@@ -305,9 +296,7 @@ def patch_materialize(instance: nn.Module, conf) -> None:
 
         if strided:
             magi_logger.warning(
-                "host offload: %d weight(s) of %s have a non-contiguous layout and stay on the device (%s); a "
-                "host reservation is a flat pinned span, so offloading one would quietly make it contiguous "
-                "while to_empty preserves the stride",
+                "host offload: %d non-contiguous weight(s) of %s stay on device to preserve layout (%s)",
                 len(strided),
                 type(self).__name__,
                 ", ".join(strided[:8]) + (" ..." if len(strided) > 8 else ""),
@@ -315,11 +304,7 @@ def patch_materialize(instance: nn.Module, conf) -> None:
 
         if shared:
             magi_logger.warning(
-                "host offload: %d weight(s) of %s already have storage and stay on the device (%s); host-first "
-                "only redirects a weight it materializes itself, so one arriving with storage was either not "
-                "built on meta or is shared with a module outside the compiled subtree whose to_empty reached "
-                "it first -- and that one must keep its bytes, because the graph that would load them back is "
-                "not the graph that reads it",
+                "host offload: %d already-materialized weight(s) of %s stay on device for possible external readers (%s)",
                 len(shared),
                 type(self).__name__,
                 ", ".join(shared[:8]) + (" ..." if len(shared) > 8 else ""),
@@ -348,8 +333,7 @@ def patch_materialize(instance: nn.Module, conf) -> None:
         setattr(self, _PENDING_ATTR, True)
         setattr(self, _PARKED_ATTR, list(chosen.values()))
         magi_logger.info(
-            "host offload: %s materialized %d weight(s) (%.1f MiB) in pinned host memory instead of on %s; "
-            "the checkpoint loads straight into them and no device byte is spent until the graph asks",
+            "host offload: %s materialized %d weight(s), %.1f MiB, in pinned host memory for %s",
             type(self).__name__,
             len(parked),
             sum(parked) / 2**20,
@@ -385,8 +369,7 @@ def handoff(module: nn.Module) -> int:
     nbytes = _hand_over(module, [(names, param, _payload(param).detach()) for names, param in parked])
     setattr(module, _PENDING_ATTR, False)
     magi_logger.info(
-        "host offload: handed %d weight(s) (%.1f MiB) over to the host pool; %s enters compilation with "
-        "no weight storage on the device",
+        "host offload: handed off %d weight(s), %.1f MiB, for %s; their CUDA stand-ins have no storage",
         len(parked),
         nbytes / 2**20,
         type(module).__name__,

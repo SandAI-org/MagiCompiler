@@ -109,15 +109,11 @@ def is_multi_output(snode: BaseSchedulerNode) -> bool:
 
 
 def earliest_legal_index(group, index_of, buf_to_snode, *, skip=()) -> int:
-    """1 + max index of any REAL (non-fake buffer) producer the group needs.
+    """First boundary after external producers, excluding group and skip members.
 
-    Deliberately NOT ``snode.ancestors``: that set is polluted by the fake
-    ``WeakDep`` edges Inductor inserts between collectives for comm-stream
-    serialization.  Weight gathers read independent param shards -- there is no
-    real gather->gather dependency -- so counting the WeakDep would pin the
-    launch right after the previous collective and forbid the very hoist the
-    reorder passes exist for.  A gather's only real producer is its weight-shard
-    placeholder (+ to_local/pad/cast chain), so real ``lower`` is ~0."""
+    Ignore fake dependencies: ancestors include advisory collective-order edges
+    that would prevent legal hoisting. Only real data dependencies constrain it.
+    """
     group_set = set(group) | set(skip)
     lo = 0
     for s in group:
@@ -132,13 +128,9 @@ def earliest_legal_index(group, index_of, buf_to_snode, *, skip=()) -> int:
 
 
 def validate_topological_order(new_order, buf_to_snode) -> bool:
-    """Valid topological order w.r.t. REAL data deps: every node's non-fake
-    buffer producers precede it (the driver does not repair the order, so a
-    violation would silently miscompile).  Checking direct producers per node
-    is a complete validation of the real-dep DAG.  ``snode.ancestors`` is NOT
-    used -- it includes the fake WeakDep edges the passes intentionally cross
-    (see ``earliest_legal_index``); an ancestors check would false-reject
-    every legal hoist.  WeakDep is advisory, not a correctness constraint."""
+    """Check real producers precede their readers; Inductor does not repair the order.
+    Use the same dependency rules as earliest_legal_index, excluding fused self-edges.
+    """
     pos = {s: i for i, s in enumerate(new_order)}
     for s in new_order:
         sp = pos[s]

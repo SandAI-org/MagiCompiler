@@ -98,14 +98,8 @@ class SnodeCostTable:
         # Once per compile at WARNING: a pass that bypassed the profile misses on
         # every snode it reads.
         log = magi_logger.warning if self._misses == 1 else magi_logger.debug
-        log(
-            "snode cost table: %s was not priced by SnodeCostProfile, using Inductor's analytical "
-            "%.1fus instead. Install SnodeCostProfile ahead of every pass that reads this table, and "
-            "make sure no pass between them creates snodes (later misses in this compile log at DEBUG)",
-            snode.get_name(),
-            ns / 1e3,
-            rank="all",
-        )
+        hint = " Check profile ordering and pricing of new nodes." if self._misses == 1 else ""
+        log("snode cost table: unpriced node=%s; analytical fallback=%.1fus%s", snode.get_name(), ns / 1e3, hint, rank="all")
 
     # Inductor deepcopies the pass list into the fx-graph cache key and pickles
     # the copy; snodes hold FakeTensors, so neither may carry the entries.

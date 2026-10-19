@@ -664,106 +664,82 @@ class MagiBackend:
         self.compiler_manager.initialize_cache(self.local_magi_cache_path)
 
     def _reclaim_unloaded_weights(self, example_inputs) -> None:
-        """Restore parked weights this graph reads but does not load.
-
-        After the offload rewrite, before any execution — including the interpreter
-        that compiles submodules on the example inputs. A parked shard with no load
-        has no device bytes, and the fault is an illegal access inside a kernel.
-
-        Usually empty. Non-empty when ``host_first`` parked a weight from its
-        placement but lowering never emitted an all-gather that reads it.
-        """
-        # The graph's own inputs only: the pool also holds every other compiled
-        # model's weights, which stay unclaimed until that model compiles.
+        """Restore this graph's parked weights that the offload rewrite left without loads."""
+        # Other models' slots must stay parked until their own graphs compile.
         locals_ = (ex._local_tensor if isinstance(ex, DTensor) else ex for ex in example_inputs or ())
         slots = [slot for t in locals_ if isinstance(t, torch.Tensor) and (slot := host_weights.slot_of(t)) is not None]
-        # Delta, not the pool total: the placement pass also promotes shards, and
-        # ``make_resident_many`` only adds, so the difference is this call.
+        # Exclude bytes made resident by other calls or passes.
         before = host_weights.resident_bytes()
         restored = host_weights.restore_unclaimed(slots)
         if not restored:
             return
         magi_logger.warning(
-            "host offload: %d parked weight(s) are read by this graph without a load and have been put "
-            "back on the device (%.1f MiB); offload is simply not helping for these. Weights: %s",
+            "host offload: restored %d weight(s) without graph loads, %.1f MiB; weights: %s",
             len(restored),
             (host_weights.resident_bytes() - before) / 2**20,
             ", ".join(restored[:8]) + (f", +{len(restored) - 8} more" if len(restored) > 8 else ""),
         )
 
-    @observe_lifecycle("weight_pipeline")
-    def _apply_weight_pipeline(self, graph: fx.GraphModule, example_inputs) -> None:
+    def _validate_weight_pipeline(self) -> None:
         fsdp_cfg = self.compile_config.fsdp_config
         offload_cfg = self.compile_config.offload_config
-        enable_fsdp = fsdp_cfg.enable_fsdp
-        copy_engine = enable_fsdp and fsdp_cfg.transport == "copy_engine"
-        if enable_fsdp:
+        if fsdp_cfg.enable_fsdp:
             assert self.compile_config.disable_graph_split, "fsdp_config.enable_fsdp requires disable_graph_split=True"
             assert (
                 self.compile_config.cudagraph_mode == CudaGraphMode.NONE
             ), "fsdp_config.enable_fsdp requires cudagraph_mode=NONE"
         if offload_cfg.graph_weight_offload:
-            assert not offload_cfg.model_cpu_offload, (
-                "offload_config.graph_weight_offload and offload_config.model_cpu_offload both offload "
-                "the model's weights, through a compile-time graph rewrite and a runtime wrapper "
-                "respectively; enable exactly one"
-            )
+            assert (
+                not offload_cfg.model_cpu_offload
+            ), "offload_config.graph_weight_offload and offload_config.model_cpu_offload are mutually exclusive"
             assert self.compile_config.cudagraph_mode == CudaGraphMode.NONE, (
-                "offload_config.graph_weight_offload requires cudagraph_mode=NONE: magi::h2d_load runs "
-                "on a stream of its own and publishes a CUDA event, neither of which graph capture records"
+                "offload_config.graph_weight_offload requires cudagraph_mode=NONE: "
+                "magi::h2d_load uses a separate stream and CUDA events"
             )
-            assert not (enable_fsdp and fsdp_cfg.transport == "copy_engine"), (
-                "offload_config.graph_weight_offload requires fsdp_config.transport='nccl': a "
-                "copy-engine gather reads its peers' device-resident shards, which offloading frees"
+            assert not (fsdp_cfg.enable_fsdp and fsdp_cfg.transport == "copy_engine"), (
+                "offload_config.graph_weight_offload requires fsdp_config.transport='nccl': "
+                "copy-engine gathers require device-resident peer shards"
             )
 
-        bucket_mode = fsdp_cfg.bucket_mode if enable_fsdp else "none"
-        source = FsdpShardSource() if enable_fsdp else PlainParamSource()
+    @observe_lifecycle("weight_pipeline")
+    def _apply_weight_pipeline(self, graph: fx.GraphModule, example_inputs) -> None:
+        self._validate_weight_pipeline()
+        fsdp_cfg = self.compile_config.fsdp_config
+        offload_cfg = self.compile_config.offload_config
 
-        if enable_fsdp:
+        if fsdp_cfg.enable_fsdp:
             lowered = lower_prim_redistribute_to_collectives(graph)
             magi_logger.info("Whole-graph FSDP lowering: %d weight redistribute -> collectives", lowered)
+            magi_logger.info("FSDP fullgraph overlap: transport=%s bucket_mode=%s", fsdp_cfg.transport, fsdp_cfg.bucket_mode)
 
-        # The bind slot, which the copy engine and host offload contend for and
-        # never share: a copy-engine gather reads its peers' device-resident
-        # shards, and offloading is the act of freeing those.
         bound = 0
-        if copy_engine:
-            bind_weights_for_copy_engine(graph, example_inputs, int(fsdp_cfg.symm_min_shard_mib) * 1024 * 1024)
+        if fsdp_cfg.enable_fsdp and fsdp_cfg.transport == "copy_engine":
+            bind_weights_for_copy_engine(
+                graph=graph, example_inputs=example_inputs, min_shard_bytes=int(fsdp_cfg.symm_min_shard_mib) * 1024 * 1024
+            )
+            rewrite_weight_ag_to_copy_engine(graph)
         elif offload_cfg.graph_weight_offload:
             bound = bind_weights_to_host(
-                graph, example_inputs, source, min_bytes=int(offload_cfg.offload_min_shard_mib * 1024 * 1024)
+                graph=graph,
+                example_inputs=example_inputs,
+                source=FsdpShardSource() if fsdp_cfg.enable_fsdp else PlainParamSource(),
+                min_bytes=int(offload_cfg.offload_min_shard_mib * 1024 * 1024),
             )
+            if bound:
+                insert_h2d_loads(graph)
 
-        if enable_fsdp:
-            # Weight gathers stay one per weight here; bucket_mode='auto' merges
-            # them during scheduling (FsdpAutoBucket), once their costs are known.
-            magi_logger.info("FSDP fullgraph overlap: transport=%s bucket_mode=%s", fsdp_cfg.transport, bucket_mode)
-
-        if bound:
-            insert_h2d_loads(graph)
-
-        if copy_engine:
-            rewrite_weight_ag_to_copy_engine(graph)
-
-        self._configure_overlap_passes(loads_inserted=bool(bound), auto_bucket=bucket_mode == "auto")
+        self._configure_overlap_passes(
+            loads_inserted=bool(bound), auto_bucket=fsdp_cfg.enable_fsdp and fsdp_cfg.bucket_mode == "auto"
+        )
 
         if offload_cfg.graph_weight_offload:
-            # Before the interpreter, which runs the graph on the example inputs
-            # to drive per-submodule compilation -- a parked weight with no load
-            # would be read there, not at the first real forward.
+            # The compilation interpreter runs next and must not read storage-free weights.
             self._reclaim_unloaded_weights(example_inputs)
             self.compiler_manager.bind_offload_cache(graph)
 
     def _configure_overlap_passes(self, *, loads_inserted: bool, auto_bucket: bool = False) -> None:
-        """Install the Inductor scheduler passes the weight rewrite needs.
-
-        ``SnodeCostProfile`` prices the graph once into ``SnodeCostTable``
-        (rank-synchronized unless ``fsdp_config.cost_mode`` is ``analytical``).
-        FSDP replaces Inductor's ``raise_comms`` / ``sink_waits`` with
-        latest-safe-launch reorder; offload alone appends to those defaults.
-        Replacing them only pays off when weight all-gathers dominate the
-        schedule, and otherwise drops overlap for other collectives (CP / EP).
+        """Share one cost table across profiling, optional bucketing, and overlap passes.
+        FSDP replaces the default reorders; offload alone preserves them for CP/EP overlap.
         """
         fsdp_cfg = self.compile_config.fsdp_config
         if not (fsdp_cfg.enable_fsdp or loads_inserted):
@@ -775,8 +751,7 @@ class MagiBackend:
         passes: list = [SnodeCostProfile(costs, estimator)]
 
         if fsdp_cfg.enable_fsdp and auto_bucket:
-            # Right behind the profile: it writes its result back into the list
-            # Inductor passed in (see ir_coalesce), and prices the snodes it builds.
+            # Bucketing needs profiled costs and prices the nodes it creates.
             passes.append(
                 FsdpAutoBucket(
                     cost_fn=costs,
