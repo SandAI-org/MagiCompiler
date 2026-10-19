@@ -50,8 +50,8 @@ class SnodeGraph:
     def __len__(self) -> int:
         return len(self.order)
 
-    def earliest_legal_index(self, group: Iterable[BaseSchedulerNode]) -> int:
-        return earliest_legal_index(group, self.index_of, self.buf_to_snode)
+    def earliest_legal_index(self, group: Iterable[BaseSchedulerNode], *, skip: Iterable[BaseSchedulerNode] = ()) -> int:
+        return earliest_legal_index(group=group, index_of=self.index_of, buf_to_snode=self.buf_to_snode, skip=skip)
 
     def validate(self, new_order: list[BaseSchedulerNode]) -> bool:
         return validate_topological_order(new_order, self.buf_to_snode)

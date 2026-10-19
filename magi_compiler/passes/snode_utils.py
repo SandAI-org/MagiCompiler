@@ -108,7 +108,7 @@ def is_multi_output(snode: BaseSchedulerNode) -> bool:
     return isinstance(snode.node, ir.MultiOutput)
 
 
-def earliest_legal_index(group, index_of, buf_to_snode) -> int:
+def earliest_legal_index(group, index_of, buf_to_snode, *, skip=()) -> int:
     """1 + max index of any REAL (non-fake buffer) producer the group needs.
 
     Deliberately NOT ``snode.ancestors``: that set is polluted by the fake
@@ -118,7 +118,7 @@ def earliest_legal_index(group, index_of, buf_to_snode) -> int:
     launch right after the previous collective and forbid the very hoist the
     reorder passes exist for.  A gather's only real producer is its weight-shard
     placeholder (+ to_local/pad/cast chain), so real ``lower`` is ~0."""
-    group_set = set(group)
+    group_set = set(group) | set(skip)
     lo = 0
     for s in group:
         for d in s.unmet_dependencies:  # buffer names
