@@ -94,14 +94,14 @@ class H2dLoadReorder(OverlapPass):
     def place(self, graph: SnodeGraph, cost: CostView, plans: list[LoadPlan], ctx: dict) -> None:
         prefix = cost.prefix(graph.order)
         targets, budget = self._schedule(plans, graph.order, graph.index_of, prefix)
-        ctx.update(prefix=prefix, targets=targets, budget=budget)
+        ctx.update(targets=targets, budget=budget)
 
     def on_commit(self, graph: SnodeGraph, plans: list[LoadPlan], ctx: dict) -> None:
         ctx["given_back"] = self._promote(plans)
 
     def report(self, graph: SnodeGraph, cost: CostView, plans: list[LoadPlan], committed: bool, ctx: dict) -> None:
         if committed:
-            self._report(plans, ctx["targets"], graph.index_of, ctx["given_back"], ctx["budget"], ctx["prefix"])
+            self._report(plans, ctx["targets"], graph.index_of, ctx["given_back"], ctx["budget"])
 
     # -- planning ---------------------------------------------------------
     @staticmethod
@@ -154,9 +154,7 @@ class H2dLoadReorder(OverlapPass):
             return floor + max((p.nbytes for p in plans), default=0)
         if self.max_inflight_bytes < floor:
             magi_logger.warning(
-                "h2d load reorder: the %.1f MiB in-flight budget is under the %.1f MiB that phase 1's "
-                "own unhoisted order already needs, so it is raised to that -- weights are still "
-                "being read past where the next load has to start, and no placement changes it",
+                "h2d load reorder: in-flight budget raised from %.1f to %.1f MiB (unhoisted peak)",
                 self.max_inflight_bytes / 2**20,
                 floor / 2**20,
             )
@@ -179,9 +177,7 @@ class H2dLoadReorder(OverlapPass):
         device = self.max_device_weight_bytes
         if floor >= device:
             magi_logger.warning(
-                "h2d load reorder: the %.0f MiB device-weight budget is under the %.1f MiB of load "
-                "buffers phase 1's own unhoisted order already needs, so nothing is left for "
-                "residency and the bus carries every byte",
+                "h2d load reorder: device-weight budget %.0f MiB <= unhoisted peak %.1f MiB; residency disabled",
                 device / 2**20,
                 floor / 2**20,
             )
@@ -289,64 +285,43 @@ class H2dLoadReorder(OverlapPass):
         return host_weights.make_resident_many(slots)
 
     # -- reporting --------------------------------------------------------
-    def _report(self, plans, targets, index_of, given_back, budget, prefix) -> None:
+    def _report(self, plans, targets, index_of, given_back, budget) -> None:
         resident = [p for p in plans if p.inactive]
         exposed = sum(p.exposed for p in plans)
         by_budget = sum(p.exposed for p in plans if p.budget_bound)
         inflight = inflight_peak(plans, live_starts(plans, targets, index_of))
         moved = sum(1 for load, target in targets.items() if target != index_of[load])
         on_bus = sum(p.nbytes for p in plans if not p.inactive)
-        total = sum(p.nbytes for p in plans)
-        hideable = self._hideable_bytes(plans, prefix)
-        compute_ns = hideable / self.bus_utilization / self.bandwidth_bytes_per_ns
         magi_logger.info(
-            "h2d load reorder: %.0fms of compute at %.1f GB/s can overlap %.1f MiB of the %.1f MiB "
-            "offloaded (%.0f%% bus utilization assumed), so %.1f MiB had to become resident; it did "
-            "over %d weight(s), leaving %.1f MiB on the bus, %.1fms of transfer. Hoisted %d/%d "
-            "load(s); in-flight peak %.1f MiB of the %.0f MiB budget; %.1f MiB of weight on the "
-            "device at peak; %.1fms still exposed%s",
-            compute_ns / 1e6,
-            self.bandwidth_bytes_per_ns,
-            hideable / 2**20,
-            total / 2**20,
-            self.bus_utilization * 100,
+            "h2d load reorder: promoted %.1f MiB; resident loads=%d; bus=%.1f MiB at %.1f GB/s; "
+            "Hoisted %d/%d load(s); in-flight peak %.1f MiB of the %.0f MiB budget; "
+            "device-weight peak=%.1f MiB; exposed=%.1fms (budget-bound=%.1fms)",
             given_back / 2**20,
             len(resident),
             on_bus / 2**20,
-            on_bus / self.bandwidth_bytes_per_ns / 1e6,
+            self.bandwidth_bytes_per_ns,
             moved,
             len(plans),
             inflight / 2**20,
             budget / 2**20,
             device_peak(plans, targets, index_of) / 2**20,
             exposed / 1e6,
-            f", {by_budget / 1e6:.1f}ms of it because the in-flight budget and not the bus ran out" if by_budget > 0 else "",
+            by_budget / 1e6,
         )
         if inflight > budget:
             magi_logger.warning(
-                "h2d load reorder: %.1f MiB of load buffers are live at once, over the %.0f MiB "
-                "budget the sweep was supposed to hold -- the in-flight accounting and the emitted "
-                "live ranges disagree, so treat the peak this pass reports as unreliable",
+                "h2d load reorder: in-flight peak %.1f MiB exceeds budget %.0f MiB; memory accounting mismatch",
                 inflight / 2**20,
                 budget / 2**20,
             )
 
     def _log_shortfall(self, total, hideable, resident, exposed) -> None:
-        """Say so when the step simply has no compute for the bytes left on the bus."""
+        """Warn when estimated compute coverage cannot hide the remaining transfers."""
         unavoidable = total - resident - hideable
         if unavoidable <= 0 or exposed <= 0:
             return
         magi_logger.warning(
-            "h2d load reorder: %.1f MiB of weight is offloaded and %.1f MiB of it is resident, "
-            "leaving %.1f MiB on the bus, but %.0f ms of compute at %.1f GB/s can only overlap "
-            "%.1f MiB of it -- %.1f MiB (%.1fms) is exposed wherever the loads are placed, and only "
-            "more residency removes it",
-            total / 2**20,
-            resident / 2**20,
-            (total - resident) / 2**20,
-            hideable / self.bus_utilization / self.bandwidth_bytes_per_ns / 1e6,
-            self.bandwidth_bytes_per_ns,
-            hideable / 2**20,
+            "h2d load reorder: estimated transfer coverage deficit=%.1f MiB (%.1fms); consider more residency",
             unavoidable / 2**20,
             unavoidable / self.bandwidth_bytes_per_ns / 1e6,
         )

@@ -157,10 +157,9 @@ def consensus_slot_targets(
         slot_hi = skel_idx[q] if q < len(skel_idx) else index_of[anchor]
         task.target = min(max(target, slot_lo), max(slot_hi, slot_lo))
         magi_logger.debug(
-            who + " slot consensus: launch cur=%d slot=%d/%d (mine=%s) target %d -> %d [%d, %d]",
+            who + " slot consensus: launch=%d slot=%d mine=%s target=%d->%d bounds=[%d,%d]",
             index_of[anchor],
             q,
-            slot_of(index_of[anchor]),
             mine[j],
             target,
             task.target,

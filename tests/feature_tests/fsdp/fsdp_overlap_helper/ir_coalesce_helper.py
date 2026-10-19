@@ -149,8 +149,8 @@ def _install(pair: int, diverge: bool = False) -> None:
         orig_plan = auto_bucket.FsdpAutoBucket._plan
 
         def diverged(self, order, cands, cost):
-            buckets, report = orig_plan(self, order, cands, cost)
-            return buckets[:-1], report
+            buckets, params_by_group = orig_plan(self, order, cands, cost)
+            return buckets[:-1], params_by_group
 
         auto_bucket.FsdpAutoBucket._plan = diverged
 

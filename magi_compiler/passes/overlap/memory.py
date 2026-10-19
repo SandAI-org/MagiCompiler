@@ -87,15 +87,8 @@ def peak_with(tasks, starts, permanent_anchors) -> int:
 
 
 def device_peak(tasks, targets, index_of) -> int:
-    """Transfer bytes on the device at the worst point in the graph.
-
-    Every buffer is counted where it comes alive, inactive ones included, and an
-    inactive task's bytes are charged again for the whole graph: for a weight
-    made resident, residency removes the PCIe crossing, not the copy, so
-    ``h2d_load`` still allocates an output and its bytes are on the device twice
-    while that buffer lives.  The in-flight *budget* deliberately does not
-    charge for those (see ``alap_schedule``); this is the memory report, where
-    it would be a lie not to.
+    """Peak transfer storage, including resident weights and their separate D2D outputs.
+    Unlike the H2D in-flight budget, this report counts resident output lifetimes too.
     """
     starts = {t.anchor: targets.get(t.anchor, index_of[t.anchor]) for t in tasks}
     return peak_with(tasks, starts, {t.anchor for t in tasks if t.inactive})

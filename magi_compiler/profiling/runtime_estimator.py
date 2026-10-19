@@ -333,25 +333,14 @@ def _argument_bytes(snode: BaseSchedulerNode) -> int:
 
 
 _DRAM_FLOOR_SLACK = 0.5
-"""How far under the DRAM floor a measurement may land before we distrust it.
-
-Not 1.0: a kernel can legitimately beat the floor by reading an argument it only
-partially touches, or out of L2.  Half the floor is well outside that, and the
-replay failures this catches come in two orders of magnitude low.
+"""Heuristic warning threshold, allowing headroom for partial reads and L2 hits.
+Observed replay failures were about 100x low; this is not a strict timing bound.
 """
 
 
 def _warn_if_implausible(snode: BaseSchedulerNode, ns: float) -> None:
-    """Flag a measurement too fast to have read the kernel's own arguments.
-
-    Not a cost model -- a plausibility check.  A replay landing far under the
-    time it takes to merely stream its operands did not do the kernel's work:
-    the usual cause is an argument whose VALUES drive the work (expert offsets,
-    tile counts, sequence bounds) arriving zero-filled from the generic realize,
-    which makes the kernel exit without touching its operands.  Worth the check
-    because the failure mode is otherwise invisible -- a kernel that does nothing
-    measures as free, and every pass reading the cost table then treats a real
-    kernel as a gap it can hoist transfers across.
+    """Warn on suspicious replay timing without changing the estimate.
+    Value-dependent work may need materialize_inputs to avoid benchmarking an early exit.
     """
     from torch._inductor.utils import get_gpu_dram_gbps
 
@@ -361,11 +350,8 @@ def _warn_if_implausible(snode: BaseSchedulerNode, ns: float) -> None:
     if floor_ns <= 0.0 or ns >= floor_ns * _DRAM_FLOOR_SLACK:
         return
     magi_logger.warning(
-        "profiling: %s measured %.1fus, but its arguments are %.0f MiB and take %.1fus to even read "
-        "at %.0f GB/s -- the replay is not doing the kernel's work, so this op is priced at near "
-        "zero and every pass reading the cost table will treat it as a gap. When an argument's "
-        "VALUES are what drive the work, give the op a materialize_inputs hook, or draw the custom-"
-        "op boundary around whatever produces those values so the replay produces them too",
+        "profiling: %s suspicious replay %.1fus; arguments=%.0f MiB, DRAM estimate=%.1fus at %.0f GB/s. "
+        "Check value-dependent inputs and materialize_inputs.",
         _snode_label(snode),
         ns / 1e3,
         nbytes / 2**20,

@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Recognizing a weight load among scheduler nodes.
-
-Lives on its own because two passes need it and neither owns it: the load
-reorder has to find the loads it places, and the all-gather reorder has to know
-a load is NOT compute -- counting a PCIe transfer as compute that hides a
-collective double-spends the same microseconds on two different transfers.
-"""
+"""Recognize H2D loads, which provide no compute window for hiding transfers."""
 
 from __future__ import annotations
 
@@ -32,13 +26,7 @@ H2D_OPS = (H2D_LOAD,)
 
 
 def is_h2d_load(snode: BaseSchedulerNode) -> bool:
-    """``magi::h2d_load`` lowers to an ordinary FallbackKernel, so nothing in
-    Inductor marks it as a transfer.
-
-    It is deliberately NOT part of any collective skeleton -- a load issues no
-    NCCL work, and putting it there would make two ranks that merely offload
-    different weights look like two structurally different graphs.
-    """
+    """Recognize the fallback op; rank-private H2D loads stay outside the collective skeleton."""
     return any(isinstance(node, ir.ExternKernel) and node.op_overload in H2D_OPS for node in iter_ir_nodes(snode))
 
 
