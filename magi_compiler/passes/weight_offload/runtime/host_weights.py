@@ -194,10 +194,11 @@ class HostWeightStore:
         """Record that a graph now carries a load for this slot."""
         self._claimed.add(slot)
 
-    def restore_unclaimed(self) -> list[str]:
-        """Restore unclaimed, nonresident slots before graph execution; return their names.
-        This prevents readers without an inserted load from accessing empty storage."""
-        pending = [slot for slot in range(len(self._slots)) if slot not in self._claimed and slot not in self._resident]
+    def restore_unclaimed(self, slots: Sequence[int]) -> list[str]:
+        """Restore the unclaimed, nonresident ``slots`` before graph execution; return their names.
+        This prevents readers without an inserted load from accessing empty storage. Only the
+        compiling graph's slots: another model's are unclaimed until its own compile binds them."""
+        pending = [slot for slot in dict.fromkeys(slots) if slot not in self._claimed and slot not in self._resident]
         if not pending:
             return []
         self.make_resident_many(pending)
@@ -300,8 +301,8 @@ def mark_claimed(slot: int) -> None:
     _STORE.mark_claimed(slot)
 
 
-def restore_unclaimed() -> list[str]:
-    return _STORE.restore_unclaimed()
+def restore_unclaimed(slots: Sequence[int]) -> list[str]:
+    return _STORE.restore_unclaimed(slots)
 
 
 def slot_bytes(slot: int) -> int:

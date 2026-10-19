@@ -334,21 +334,28 @@ def test_adopt_refuses_a_device_tensor_that_still_holds_bytes():
 
 @requires_cuda
 def test_unclaimed_shards_are_handed_back_to_the_device():
-    """Restore parked weights without graph loads while leaving claimed weights offloaded."""
+    """Restore the graph's parked weights without loads, leaving claimed ones offloaded.
+
+    The pool also holds models that have not compiled yet; their weights are unclaimed
+    only because their graph does not exist, and must not land on the device.
+    """
     from magi_compiler.passes.weight_offload import host_weights
 
     loaded = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
     orphan = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
+    other_model = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
     expected = orphan.clone()
     loaded_slot = _park(loaded, name="kept")
     orphan_slot = _park(orphan, name="orphan")
+    other_slot = _park(other_model, name="other model")
     host_weights.mark_claimed(loaded_slot)
 
-    assert host_weights.restore_unclaimed() == ["orphan"]
+    assert host_weights.restore_unclaimed([loaded_slot, orphan_slot]) == ["orphan"]
     assert not host_weights.is_resident(loaded_slot), "a shard the graph loads must stay in host memory"
     assert host_weights.is_resident(orphan_slot)
+    assert not host_weights.is_resident(other_slot), "another model's weight is not this graph's to restore"
     torch.testing.assert_close(orphan, expected)
-    assert host_weights.restore_unclaimed() == [], "already-restored shards must not be reported twice"
+    assert host_weights.restore_unclaimed([orphan_slot]) == [], "already-restored shards must not be reported twice"
 
 
 @requires_cuda
