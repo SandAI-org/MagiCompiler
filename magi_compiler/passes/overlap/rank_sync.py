@@ -18,6 +18,8 @@ A pass that moves NCCL-issuing snodes must emit the same collective sequence on
 every rank, or the ranks deadlock.  Costs are rank-local measurements and
 per-rank graphs can differ in compute, so agreement is negotiated, not assumed:
 
+* ``any_rank`` ORs a local "anything to place" check, so a rank with nothing
+  of its own still joins the collectives its peers enter;
 * ``negotiate_mode`` picks how much freedom the ranks can share
   (slot / pinned / abort);
 * ``consensus_slot_targets`` puts each transfer in the same skeleton slot
@@ -110,18 +112,24 @@ def negotiate_mode(anchors, skel_kinds, costs_ok: bool = True, who: str = "FSDP 
     return "pinned", group, world
 
 
-def agree(ok: bool, sync_group, world: int, who: str = "FSDP overlap") -> bool:
+def agree(ok: bool, sync_group, world: int) -> bool:
     """Reduce a local yes/no into a rank-identical one (AND over ranks)."""
     if world <= 1:
         return ok
+    t = torch.tensor([1 if ok else 0], dtype=torch.int32)
+    dist.all_reduce(t, op=dist.ReduceOp.MIN, group=sync_group)
+    return bool(t.item())
 
-    try:
-        t = torch.tensor([1 if ok else 0], dtype=torch.int32)
-        dist.all_reduce(t, op=dist.ReduceOp.MIN, group=sync_group)
-        return bool(t.item())
-    except Exception as exc:  # noqa: BLE001
-        magi_logger.warning(who + " reorder: cross-rank agreement failed (%s); leaving graph unchanged", exc)
-        return False
+
+def any_rank(flag: bool) -> bool:
+    """OR a local flag over the placement sync group, so every rank takes the same branch into a collective."""
+    if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() <= 1:
+        return flag
+    from magi_compiler.profiling.runtime_estimator import _get_cost_sync_group
+
+    t = torch.tensor([int(flag)], dtype=torch.int32)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX, group=_get_cost_sync_group())
+    return bool(t.item())
 
 
 def consensus_slot_targets(

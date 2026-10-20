@@ -70,7 +70,9 @@ class FsdpOverlapReorder(OverlapPass):
 
     # -- OverlapPass hooks ------------------------------------------------
     def wants(self, order: list[BaseSchedulerNode]) -> bool:
-        return any(is_weight_gather(s) for s in order)
+        # plan() negotiates with a collective, so a rank without a weight gather
+        # of its own still enters it whenever a peer has one.
+        return rank_sync.any_rank(any(is_weight_gather(s) for s in order))
 
     def plan(self, graph: SnodeGraph, cost: CostView, ctx: dict) -> list[TransferTask] | None:
         order, index_of = graph.order, graph.index_of

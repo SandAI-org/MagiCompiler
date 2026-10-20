@@ -205,8 +205,8 @@ def test_align_still_enters_a_group_found_only_on_graph_inputs(monkeypatch):
     assert seen == [group]
 
 
-def test_align_failed_group_does_not_abort_the_others(monkeypatch):
-    """A collective failing on one mesh drops that mesh, not the whole plan."""
+def test_align_propagates_a_failed_group_collective(monkeypatch):
+    """A failed collective propagates: a rank that dropped the group and moved on would desync its peers."""
     from collections import Counter
 
     from magi_compiler.passes.weight_offload.graph import bind
@@ -229,10 +229,8 @@ def test_align_failed_group_does_not_abort_the_others(monkeypatch):
 
     monkeypatch.setattr(bind.dist, "all_gather_object", fake_all_gather_object)
 
-    skipped = Counter()
-    kept = bind._align_across_ranks(plan, {}, skipped)
-    assert [c.name for c in kept] == ["dense.w"]
-    assert skipped["process-group agreement failed"] == 1
+    with pytest.raises(RuntimeError, match="expert group is down"):
+        bind._align_across_ranks(plan, {}, Counter())
 
 
 # ---------------------------------------------------------------- host pool
@@ -405,6 +403,22 @@ def test_bandwidth_probe_is_plausible_and_reset_clears_its_cache():
     assert host_weights.default_store()._bandwidth_bytes_per_ns == bw
     host_weights.reset()
     assert host_weights.default_store()._bandwidth_bytes_per_ns is None
+
+
+def test_bandwidth_probe_enters_both_barriers_when_its_setup_fails(monkeypatch):
+    """A rank whose pinned allocation fails still meets its peers at both barriers."""
+    from magi_compiler.passes.weight_offload.runtime import bandwidth
+
+    barriers = []
+    monkeypatch.setattr(bandwidth.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(bandwidth, "_probe_barrier", lambda: barriers.append(True))
+
+    def failing_empty(*args, **kwargs):
+        raise RuntimeError("pinned allocation failed")
+
+    monkeypatch.setattr(bandwidth.torch, "empty", failing_empty)
+    assert bandwidth.measure_h2d_bandwidth() == bandwidth.FALLBACK_BYTES_PER_NS
+    assert len(barriers) == 2
 
 
 # ------------------------------------------------------------------- the op

@@ -92,16 +92,9 @@ def _align_across_ranks(
     for gid, pg in groups.items():
         cands = by_group[gid]
         keys = [_candidate_key(c) for c in cands]
-        try:
-            world = dist.get_world_size(pg)
-            gathered: list[Any] = [None] * world
-            dist.all_gather_object(gathered, keys, group=pg)
-        except Exception as exc:  # noqa: BLE001
-            magi_logger.warning(
-                "host offload: agreement on a %d-candidate process group failed (%s); dropping that group", len(cands), exc
-            )
-            skipped["process-group agreement failed"] += len(cands)
-            continue
+        world = dist.get_world_size(pg)
+        gathered: list[Any] = [None] * world
+        dist.all_gather_object(gathered, keys, group=pg)
         common = Counter(keys)
         for peer in gathered:
             common &= Counter(peer or [])
@@ -137,8 +130,8 @@ def bind_weights_to_host(
     """Tag already-parked weights on the graph so a later splice can load them.
 
     A weight reaches the pool only through host-first materialization.  This
-    step does not copy or free anything. Candidate disagreement or failed
-    agreement drops the affected candidates; mesh group lookup errors propagate.
+    step does not copy or free anything. Candidate disagreement drops the
+    affected candidates; mesh group lookup and collective errors propagate.
 
     Returns how many weights are now served from host memory.
     """

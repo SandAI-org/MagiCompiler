@@ -38,48 +38,63 @@ def probe_world() -> int:
     return dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
 
 
+PROBE_ITERS = 20
+"""Enough copies that the ranks stay overlapped for the whole timed window
+rather than straggling apart after the barrier."""
+
+
 def _probe_barrier() -> None:
     """Line every rank up on the probe, so it measures the contended bandwidth.
 
-    Best-effort: a failure here costs accuracy, not correctness, and must never
-    be the thing that hangs a compile.
+    Every rank reaches both barriers whatever its own probe did: one that
+    skipped a barrier would leave its peers waiting in it.
     """
     import torch.distributed as dist
 
     if dist.is_available() and dist.is_initialized():
-        try:
-            dist.barrier()
-        except Exception as exc:  # noqa: BLE001
-            magi_logger.warning("host offload: bandwidth probe barrier failed (%s); measuring unsynchronized", exc)
+        dist.barrier()
+
+
+def _probe_buffers() -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Pinned source and device destination with the driver's mapping warmed, or None if either fails."""
+    try:
+        src = torch.empty(PROBE_BYTES, dtype=torch.uint8, device="cpu", pin_memory=True)
+        dst = torch.empty(PROBE_BYTES, dtype=torch.uint8, device="cuda")
+        for _ in range(2):
+            dst.copy_(src, non_blocking=True)
+        torch.cuda.current_stream().synchronize()
+    except RuntimeError as exc:
+        magi_logger.warning(
+            "host offload: H2D bandwidth probe setup failed (%s); assuming %.1f GB/s", exc, FALLBACK_BYTES_PER_NS
+        )
+        return None
+    return src, dst
+
+
+def _timed_copies_ns(src: torch.Tensor, dst: torch.Tensor) -> float:
+    """Nanoseconds for ``PROBE_ITERS`` back-to-back copies, or 0.0 if a copy fails."""
+    stream = torch.cuda.current_stream()
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    try:
+        start.record(stream)
+        for _ in range(PROBE_ITERS):
+            dst.copy_(src, non_blocking=True)
+        end.record(stream)
+        stream.synchronize()
+    except RuntimeError as exc:
+        magi_logger.warning("host offload: H2D bandwidth probe failed (%s); assuming %.1f GB/s", exc, FALLBACK_BYTES_PER_NS)
+        return 0.0
+    return start.elapsed_time(end) * 1e6
 
 
 def measure_h2d_bandwidth() -> float:
     """Pinned H2D bandwidth in bytes per nanosecond, measured with every rank probing at once."""
     if not torch.cuda.is_available():
         return FALLBACK_BYTES_PER_NS
-    try:
-        src = torch.empty(PROBE_BYTES, dtype=torch.uint8, device="cpu", pin_memory=True)
-        dst = torch.empty(PROBE_BYTES, dtype=torch.uint8, device="cuda")
-        stream = torch.cuda.current_stream()
-        for _ in range(2):  # warm the driver's mapping before timing
-            dst.copy_(src, non_blocking=True)
-        stream.synchronize()
-
-        # Enough iterations that the ranks stay overlapped for the whole window
-        # rather than straggling apart after the barrier.
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        iters = 20
-        _probe_barrier()
-        start.record(stream)
-        for _ in range(iters):
-            dst.copy_(src, non_blocking=True)
-        end.record(stream)
-        stream.synchronize()
-        _probe_barrier()
-        elapsed_ns = start.elapsed_time(end) * 1e6
-        if elapsed_ns <= 0:
-            return FALLBACK_BYTES_PER_NS
-        return PROBE_BYTES * iters / elapsed_ns
-    except RuntimeError as exc:  # noqa: BLE001
-        magi_logger.warning("host offload: H2D bandwidth probe failed (%s); assuming %.1f GB/s", exc, FALLBACK_BYTES_PER_NS)
+    buffers = _probe_buffers()
+    _probe_barrier()
+    elapsed_ns = _timed_copies_ns(*buffers) if buffers is not None else 0.0
+    _probe_barrier()
+    if elapsed_ns <= 0:
         return FALLBACK_BYTES_PER_NS
+    return PROBE_BYTES * PROBE_ITERS / elapsed_ns

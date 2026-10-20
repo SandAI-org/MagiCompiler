@@ -341,11 +341,7 @@ class FsdpAutoBucket:
         pos = {s: i for i, s in enumerate(cands)}
         mine = [[pos[s] for s in b] for b in buckets] if ok else None
         peers: list = [None] * world
-        try:
-            dist.all_gather_object(peers, (ok, mine, self._signature(cands)), group=group)
-        except Exception as exc:  # noqa: BLE001
-            magi_logger.warning("%s: cross-rank plan exchange failed (%s); leaving gathers unbucketed", self.name, exc)
-            return None
+        dist.all_gather_object(peers, (ok, mine, self._signature(cands)), group=group)
         if not all(p[0] for p in peers):
             magi_logger.warning(
                 "%s: planning failed on rank(s) %s; leaving every weight gather unbucketed",
@@ -372,11 +368,7 @@ class FsdpAutoBucket:
     def _commit(self, legal: bool, skeleton_order: str | None, group, world: int) -> bool:
         """Rank-identical go / no-go: every rank found the plan legal and merges into one collective order."""
         peers: list = [None] * world
-        try:
-            dist.all_gather_object(peers, (bool(legal), skeleton_order), group=group)
-        except Exception as exc:  # noqa: BLE001
-            magi_logger.warning("%s: cross-rank agreement failed (%s); leaving gathers unbucketed", self.name, exc)
-            return False
+        dist.all_gather_object(peers, (bool(legal), skeleton_order), group=group)
         if not all(p[0] for p in peers):
             magi_logger.warning(
                 "%s: rank 0's bucket plan is not legal on rank(s) %s; leaving every weight gather unbucketed",

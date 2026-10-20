@@ -26,12 +26,11 @@ import copy
 import logging
 import weakref
 
-import torch
-import torch.distributed as dist
 from torch._inductor.scheduler import BaseSchedulerNode
 
 from magi_compiler.utils import magi_logger
 
+from .overlap import rank_sync
 from .snode_utils import is_compute, is_weight_gather, issues_transfer
 from .weight_offload.schedule.h2d_snode import is_h2d_load
 
@@ -43,10 +42,6 @@ def _analytical(snode: BaseSchedulerNode) -> float:
         return max(0.0, float(estimate_op_runtime(snode)))
     except Exception:  # noqa: BLE001
         return 0.0
-
-
-def _multi_rank() -> bool:
-    return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
 
 
 def _is_priced(snode: BaseSchedulerNode) -> bool:
@@ -179,13 +174,7 @@ class SnodeCostProfile:
         needs the COMPUTE around it priced -- the load itself never is.
         """
         local = any(is_weight_gather(s) or is_h2d_load(s) for s in snodes)
-        if not (self._syncs and _multi_rank()):
-            return local
-        from magi_compiler.profiling.runtime_estimator import _get_cost_sync_group
-
-        t = torch.tensor([int(local)], dtype=torch.int32)
-        dist.all_reduce(t, op=dist.ReduceOp.MAX, group=_get_cost_sync_group())
-        return bool(t.item())
+        return rank_sync.any_rank(local) if self._syncs else local
 
     def _warm(self, priced) -> bool:
         try:
