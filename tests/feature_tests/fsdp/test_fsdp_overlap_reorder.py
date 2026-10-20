@@ -29,6 +29,7 @@ import pytest
 import torch
 
 _HELPER = Path(__file__).parent / "fsdp_overlap_helper" / "reorder_helper.py"
+_RANK_HELPER = Path(__file__).parent / "fsdp_overlap_helper" / "reorder_rank_helper.py"
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 requires_torchrun = pytest.mark.skipif(shutil.which("torchrun") is None, reason="requires torchrun")
@@ -44,6 +45,25 @@ def _run(nproc: int, *extra: str, port: str = "29631") -> subprocess.CompletedPr
         text=True,
         timeout=600,
     )
+
+
+@requires_torchrun
+def test_reorder_negotiates_on_a_rank_without_weight_gathers():
+    """Two gloo ranks, only one with a weight gather: both join the negotiation and abort, neither hangs."""
+    root = str(Path(__file__).resolve().parents[3])
+    env = os.environ.copy()
+    env["PYTHONPATH"] = root if not env.get("PYTHONPATH") else root + os.pathsep + env["PYTHONPATH"]
+    env["MAGI_LOGGING_LEVEL"] = env.get("MAGI_LOGGING_LEVEL", "info")
+    p = subprocess.run(
+        ["torchrun", "--nproc_per_node=2", "--master_port=29637", str(_RANK_HELPER)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    out = p.stdout + p.stderr
+    assert p.returncode == 0, f"helper failed:\n{out[-3000:]}"
+    assert "REORDER_RANK_PASS" in p.stdout, out[-3000:]
 
 
 @requires_cuda
