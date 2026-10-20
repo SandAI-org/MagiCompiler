@@ -29,6 +29,8 @@ their existing position and are charged to residency, not in-flight storage.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 from torch._inductor.scheduler import BaseSchedulerNode
 
 from magi_compiler.utils import magi_logger
@@ -38,20 +40,32 @@ from ...overlap import (
     CostView,
     OverlapPass,
     SnodeGraph,
+    TransferTask,
     alap_schedule,
     device_peak,
     inflight_peak,
     live_starts,
     unhoisted_index,
 )
-from .h2d_snode import is_h2d_load, slot_of
-from .load_plan import LoadPlan, load_bytes
+from .h2d_snode import is_h2d_load, load_bytes, slot_of
 
 _MAX_SPLIT_ROUNDS = 5
 """Times ``_schedule`` may grow the in-flight budget out of the residency one."""
 
 _DENSITY_SEARCH_ROUNDS = 8
 """Bisection steps for the target bus density; 8 lands within 0.4% of it."""
+
+
+@dataclass(eq=False)
+class LoadPlan(TransferTask):
+    """One load's placement problem: how much transfer to hide, and where it may go.
+
+    ``anchor`` is the load, ``deadline`` its earliest wait (the hard upper
+    bound), and ``inactive`` means bought out of the offload plan: resident, so
+    the transfer is now device-to-device and off the bus.
+    """
+
+    slot: int = field(kw_only=True)  # host-pool slot this load pulls
 
 
 class H2dLoadReorder(OverlapPass):

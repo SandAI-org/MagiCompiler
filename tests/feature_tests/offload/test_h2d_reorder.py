@@ -31,8 +31,7 @@ import torch
 from torch._inductor import ir
 
 from magi_compiler.passes.overlap import CostView, SnodeGraph, memory, scheduler
-from magi_compiler.passes.weight_offload.schedule import load_plan
-from magi_compiler.passes.weight_offload.schedule.h2d_reorder import H2dLoadReorder
+from magi_compiler.passes.weight_offload.schedule.h2d_reorder import H2dLoadReorder, LoadPlan
 
 _MIB = 1 << 20
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="promotion moves real bytes")
@@ -610,7 +609,7 @@ def test_adjacent_closed_ranges_both_stay_offloaded():
 
 def _plan_stub(name, *, deadline, last_user, nbytes, need=0.0, lower=0, inactive=False):
     """A ``LoadPlan`` carrying only the fields the memory and pricing helpers read."""
-    return load_plan.LoadPlan(
+    return LoadPlan(
         anchor=_Snode(name, "load"),
         group=[],
         slot=0,
