@@ -112,8 +112,11 @@ def test_the_ratio_defaults_per_transport():
     assert DEFAULT_OVERHEAD_RATIOS == {"nccl": 0.1, "ce": 0.5}
     assert FsdpAutoBucket(cost_fn=lambda s: 0.0).overhead_ratio is None
     assert FsdpAutoBucket(cost_fn=lambda s: 0.0, overhead_ratio=0.3).overhead_ratio == 0.3
+
+    from magi_compiler.config import FSDPConfig
+
     with pytest.raises(ValueError):
-        FsdpAutoBucket(cost_fn=lambda s: 0.0, overhead_ratio=1.5)
+        FSDPConfig(auto_bucket_overhead_ratio=1.5)
 
 
 def test_each_process_group_gets_its_own_fit(monkeypatch):
@@ -181,6 +184,84 @@ def test_a_bucket_never_spans_a_wait_its_launch_cannot_precede():
     for s, e in segs:
         seg = members[s:e]
         assert max(seg[0].idx, max(m.lo for m in seg)) <= min(m.wait for m in seg)
+
+
+# ------------------------------------------------- weight gathers and skeleton
+
+
+def _gather_snode(*, tagged: bool, dtype=torch.bfloat16):
+    """A single NCCL gather launch with just the surface the predicates read."""
+    from types import SimpleNamespace
+
+    from torch._inductor import ir
+
+    from magi_compiler.passes.fsdp_overlap.node_meta import WEIGHT_AG
+    from magi_compiler.passes.snode_utils import AG
+
+    node = object.__new__(ir._CollectiveKernel)
+    origin = SimpleNamespace(meta={"custom": {WEIGHT_AG: True}} if tagged else {})
+    for key, value in {"op_overload": AG, "origins": [origin], "get_size": lambda: [8, 8], "get_dtype": lambda: dtype}.items():
+        object.__setattr__(node, key, value)
+    return SimpleNamespace(snodes=None, node=node)
+
+
+def test_weight_gathers_are_the_tagged_ones_or_every_one_when_none_is():
+    from magi_compiler.passes.snode_utils import weight_gathers
+
+    weight, activation = _gather_snode(tagged=True), _gather_snode(tagged=False)
+    assert weight_gathers([activation, weight]) == [weight], "a tagged graph leaves its activation gathers alone"
+    other = _gather_snode(tagged=False)
+    assert weight_gathers([activation, other]) == [activation, other], "an untagged graph treats every gather as a weight"
+
+
+def test_collective_skeleton_tells_weight_gathers_and_dtypes_apart():
+    """Slot mode, which auto-bucket requires, compares these keys; rank 0's bucket
+    indices only name the same collectives on a peer whose keys match."""
+    from magi_compiler.passes.overlap.rank_sync import _collective_kind_key
+
+    bf16 = _gather_snode(tagged=True)
+    assert _collective_kind_key(bf16, True) == _collective_kind_key(_gather_snode(tagged=True), True)
+    assert _collective_kind_key(bf16, True) != _collective_kind_key(_gather_snode(tagged=True, dtype=torch.float32), True)
+    assert _collective_kind_key(bf16, True) != _collective_kind_key(bf16, False)
+
+
+# ------------------------------------------------- weight gathers and skeleton
+
+
+def _gather_snode(*, tagged: bool, dtype=torch.bfloat16):
+    """A single NCCL gather launch with just the surface the predicates read."""
+    from types import SimpleNamespace
+
+    from torch._inductor import ir
+
+    from magi_compiler.passes.fsdp_overlap.node_meta import WEIGHT_AG
+    from magi_compiler.passes.snode_utils import AG
+
+    node = object.__new__(ir._CollectiveKernel)
+    origin = SimpleNamespace(meta={"custom": {WEIGHT_AG: True}} if tagged else {})
+    for key, value in {"op_overload": AG, "origins": [origin], "get_size": lambda: [8, 8], "get_dtype": lambda: dtype}.items():
+        object.__setattr__(node, key, value)
+    return SimpleNamespace(snodes=None, node=node)
+
+
+def test_weight_gathers_are_the_tagged_ones_or_every_one_when_none_is():
+    from magi_compiler.passes.snode_utils import weight_gathers
+
+    weight, activation = _gather_snode(tagged=True), _gather_snode(tagged=False)
+    assert weight_gathers([activation, weight]) == [weight], "a tagged graph leaves its activation gathers alone"
+    other = _gather_snode(tagged=False)
+    assert weight_gathers([activation, other]) == [activation, other], "an untagged graph treats every gather as a weight"
+
+
+def test_collective_skeleton_tells_weight_gathers_and_dtypes_apart():
+    """Slot mode, which auto-bucket requires, compares these keys; rank 0's bucket
+    indices only name the same collectives on a peer whose keys match."""
+    from magi_compiler.passes.overlap.rank_sync import _collective_kind_key
+
+    bf16 = _gather_snode(tagged=True)
+    assert _collective_kind_key(bf16, True) == _collective_kind_key(_gather_snode(tagged=True), True)
+    assert _collective_kind_key(bf16, True) != _collective_kind_key(_gather_snode(tagged=True, dtype=torch.float32), True)
+    assert _collective_kind_key(bf16, True) != _collective_kind_key(bf16, False)
 
 
 # ---------------------------------------------------------------- end to end

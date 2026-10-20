@@ -263,10 +263,8 @@ def patch_materialize(instance: nn.Module, conf) -> None:
         return self if _is_sharded(self) else orig_apply(self, _leaving_parked(fn), recurse=recurse)
 
     def _materialize_on_host(self, fn, recurse):
-        try:
-            target = fn(torch.empty(0, device="meta")).device
-        except Exception:  # noqa: BLE001 - an unreadable target is simply not ours to redirect
-            return orig_apply(self, fn, recurse=recurse)
+        # fn is to_empty's own empty_like, recognized by qualname above.
+        target = fn(torch.empty(0, device="meta")).device
         if target.type != "cuda":
             return orig_apply(self, fn, recurse=recurse)
         setattr(self, _SETTLED_ATTR, True)

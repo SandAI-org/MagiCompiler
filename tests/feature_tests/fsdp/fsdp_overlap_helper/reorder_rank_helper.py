@@ -67,13 +67,14 @@ def _check_rank_without_gathers_negotiates() -> bool:
     seen: dict = {}
     real_negotiate = rank_sync.negotiate_mode
 
-    def negotiate(anchors, skel_kinds, costs_ok=True, who="FSDP overlap"):
-        mode, group, world = real_negotiate(anchors=anchors, skel_kinds=skel_kinds, costs_ok=costs_ok, who=who)
+    def negotiate(n_anchors, skel_kinds, costs_ok=True, who="FSDP overlap"):
+        mode, group, world = real_negotiate(n_anchors=n_anchors, skel_kinds=skel_kinds, costs_ok=costs_ok, who=who)
         seen["mode"] = mode
         return mode, group, world
 
     snodes = [_Snode("buf0", gather=rank == 0), _Snode("buf1", gather=False)]
-    with patch.object(reorder, "is_weight_gather", lambda s: s.gather), patch.object(rank_sync, "negotiate_mode", negotiate):
+    gathers = lambda order: [s for s in order if s.gather]  # noqa: E731
+    with patch.object(reorder, "weight_gathers", gathers), patch.object(rank_sync, "negotiate_mode", negotiate):
         out = reorder.FsdpOverlapReorder(cost_fn=lambda s: 0.0)(list(snodes))
 
     unchanged = out == snodes

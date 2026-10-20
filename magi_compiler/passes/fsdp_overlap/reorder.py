@@ -22,7 +22,6 @@ Single and coalesced gathers share dependency validation and rank agreement.
 
 from __future__ import annotations
 
-import torch
 from torch._inductor.comms import _is_fake_dep
 from torch._inductor.scheduler import BaseSchedulerNode
 from torch._inductor.utils import contains_wait
@@ -38,17 +37,13 @@ from magi_compiler.passes.overlap import (
     rank_sync,
 )
 from magi_compiler.passes.snode_utils import (
+    AG_COALESCED,
     is_ce_ag_coalesced,
     is_ce_ag_ir,
-    is_multi_output,
-    is_weight_gather,
-    issues_transfer,
     leaf_collective_node,
+    weight_gathers,
 )
-from magi_compiler.passes.weight_offload.schedule.h2d_snode import is_h2d_load
 from magi_compiler.utils import magi_logger
-
-_AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
 
 
 class FsdpOverlapReorder(OverlapPass):
@@ -72,13 +67,13 @@ class FsdpOverlapReorder(OverlapPass):
     def wants(self, order: list[BaseSchedulerNode]) -> bool:
         # plan() negotiates with a collective, so a rank without a weight gather
         # of its own still enters it whenever a peer has one.
-        return rank_sync.any_rank(any(is_weight_gather(s) for s in order))
+        return rank_sync.any_rank(bool(weight_gathers(order)))
 
     def plan(self, graph: SnodeGraph, cost: CostView, ctx: dict) -> list[TransferTask] | None:
         order, index_of = graph.order, graph.index_of
-        launches = [s for s in order if is_weight_gather(s)]  # program order
+        launches = weight_gathers(order)
         skel_idx, skel_kinds = rank_sync.collective_skeleton(order)
-        mode, sync_group, world = rank_sync.negotiate_mode(anchors=launches, skel_kinds=skel_kinds, costs_ok=cost.ok)
+        mode, sync_group, world = rank_sync.negotiate_mode(n_anchors=len(launches), skel_kinds=skel_kinds, costs_ok=cost.ok)
         ctx.update(launches=launches, skel_idx=skel_idx, mode=mode, sync_group=sync_group, world=world)
         if mode == "abort":
             return None
@@ -86,8 +81,7 @@ class FsdpOverlapReorder(OverlapPass):
         tasks: list[TransferTask] = []
         for launch in launches:
             group = self._launch_group(launch, graph, cost)
-            fc_idx = self._first_consumer_index(group, graph, cost)
-            if fc_idx is None:
+            if not self._has_real_consumer(group, graph, cost):
                 continue
             comm = cost(launch)
             lower = graph.earliest_legal_index(group)
@@ -104,7 +98,6 @@ class FsdpOverlapReorder(OverlapPass):
                     lower=lower,
                     deadline=index_of[launch] + 1,
                     need=comm * self.comm_overlap_window_scale + self.comm_overlap_window_margin_ns,
-                    last_user=fc_idx,
                 )
             )
         return tasks
@@ -143,66 +136,31 @@ class FsdpOverlapReorder(OverlapPass):
         Coalesced: packed collective + its MultiOutput members (they depend on the
         packed buffer and must stay immediately after it, before any wait).
         no-bucket: just the launch (the wait stays put).
-        Always plus the upstream shard prep (see _prep_chain).
+        Always plus the upstream shard prep (see ``SnodeGraph.prep_chain``).
         """
-        order = graph.order
         group = [launch]
         node = leaf_collective_node(launch)
-        produced = set(launch.get_buffer_names())
-        if node is not None and (node.op_overload is _AG_COALESCED or is_ce_ag_coalesced(node)):
-            for s in order:
-                if is_multi_output(s) and any((not _is_fake_dep(d)) and d.name in produced for d in s.unmet_dependencies):
-                    group.append(s)
+        if node is not None and (node.op_overload is AG_COALESCED or is_ce_ag_coalesced(node)):
+            group.extend(graph.unpacks_of(launch))
         if is_ce_ag_ir(node):
-            for s in order:
+            produced = set(launch.get_buffer_names())
+            readers = {u for name in produced for u in graph.users.get(name, ())}
+            for s in sorted(readers, key=graph.index_of.__getitem__):
                 if s in group or contains_wait(s) or not cost.is_transparent(s):
                     continue
-                deps = [d for d in s.unmet_dependencies if not _is_fake_dep(d)]
-                if deps and all(d.name in produced for d in deps):
+                if all(name in produced for name in (d.name for d in s.unmet_dependencies if not _is_fake_dep(d))):
                     group.append(s)
-        group.extend(self._prep_chain(group, graph))
+        group.extend(graph.prep_chain(group))
         return group
-
-    @staticmethod
-    def _prep_chain(group, graph: SnodeGraph) -> list[BaseSchedulerNode]:
-        """Hoist shard prep with the gather when it reads only graph inputs or other prep.
-        Prep may include H2D loads/waits, casts and pads; real collectives stay out.
-        Excluded producers raise the gather's legal floor.
-        This pass imposes no byte budget on prep or gathered buffers."""
-        buf_to_snode, index_of = graph.buf_to_snode, graph.index_of
-        members = set(group)
-        stack = list(group)
-        reached: set[BaseSchedulerNode] = set()
-        while stack:
-            for d in stack.pop().unmet_dependencies:
-                if _is_fake_dep(d):
-                    continue
-                prod = buf_to_snode.get(d.name)
-                if prod is None or prod in members or prod in reached:
-                    continue
-                if issues_transfer(prod) and not is_h2d_load(prod):
-                    continue  # a real collective is not prep; it has a plan of its own
-                reached.add(prod)
-                stack.append(prod)
-
-        # Program order, so every producer is classified before its consumers and
-        # one pass settles the cascade of a dropped node's dependents.
-        keep: set[BaseSchedulerNode] = set()
-        for s in sorted(reached, key=lambda n: index_of[n]):
-            if all(
-                buf_to_snode.get(d.name) in (None, s) or buf_to_snode.get(d.name) in keep
-                for d in s.unmet_dependencies
-                if not _is_fake_dep(d)
-            ):
-                keep.add(s)
-        return sorted(keep, key=lambda n: index_of[n])
 
     # -- consumer discovery ----------------------------------------------
     @staticmethod
-    def _first_consumer_index(group, graph: SnodeGraph, cost: CostView) -> int | None:
-        """Find the earliest real consumer beyond the gather's waits and alias nodes.
+    def _has_real_consumer(group, graph: SnodeGraph, cost: CostView) -> bool:
+        """Whether the gather's result reaches a real use beyond its waits and alias nodes.
         Skip waits inside the moving group, including upstream H2D waits;
-        otherwise the gather itself would be mistaken for its first consumer."""
+        otherwise the gather itself would be mistaken for its consumer.
+
+        Gathers carry no byte budget, so only whether a use exists matters, not where."""
         members = set(group)
 
         def to_wait(u):
@@ -214,12 +172,4 @@ class FsdpOverlapReorder(OverlapPass):
             return (None, True) if cost.is_transparent(u) else ("use", False)
 
         waits = [u for _, u in graph.walk_users(group, to_wait)]
-        if not waits:
-            return None
-        best = None
-        for w in waits:
-            uses = [graph.index_of[u] for _, u in graph.walk_users([w], to_use) if u in graph.index_of]
-            if uses:
-                fc = min(uses)
-                best = fc if best is None else min(best, fc)
-        return best
+        return any(graph.walk_users([w], to_use) for w in waits)

@@ -28,8 +28,6 @@ object (which Inductor deep-copies into its cache key).
 
 from __future__ import annotations
 
-import copy
-
 from torch._inductor.scheduler import BaseSchedulerNode
 
 from magi_compiler.utils import magi_logger
@@ -52,14 +50,6 @@ class OverlapPass:
         # snode -> ns.  Normally the SnodeCostTable filled by the SnodeCostProfile
         # pass ahead of this one; Inductor's estimate_op_runtime when run alone.
         self._cost_fn = cost_fn if cost_fn is not None else default_cost_fn()
-
-    def __deepcopy__(self, memo):
-        # Through memo, so this copy and the profile pass's copy share one table.
-        new = type(self).__new__(type(self))
-        memo[id(self)] = new
-        for key, value in self.__dict__.items():
-            new.__dict__[key] = copy.deepcopy(value, memo) if key == "_cost_fn" else value
-        return new
 
     # -- the template -------------------------------------------------------
     def __call__(self, snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:

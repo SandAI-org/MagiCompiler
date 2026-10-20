@@ -35,23 +35,16 @@ from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import torch
 from torch._inductor import ir
 from torch._inductor.comms import _is_fake_dep
 from torch._inductor.scheduler import BaseSchedulerNode, NodeUser
-from torch._inductor.utils import contains_wait
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
-from ..snode_utils import ce_ag_ops, iter_ir_nodes
-
-if TYPE_CHECKING:
-    from ..overlap import SnodeGraph
-
-_AG = torch.ops._c10d_functional.all_gather_into_tensor.default
-_AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
+from ..overlap import SnodeGraph
+from ..snode_utils import AG, AG_COALESCED, ce_ag_ops, ir_node_bytes, iter_ir_nodes
 
 
 @dataclass(frozen=True)
@@ -72,7 +65,7 @@ def gather_info(snode: BaseSchedulerNode) -> GatherInfo | None:
     knows how to merge the one-weight form.
     """
     node = snode.node
-    if isinstance(node, ir._CollectiveKernel) and node.op_overload is _AG:
+    if isinstance(node, ir._CollectiveKernel) and node.op_overload is AG:
         if not isinstance(node.layout, ir.Layout):
             return None
         kind = "nccl"
@@ -89,45 +82,19 @@ def gather_info(snode: BaseSchedulerNode) -> GatherInfo | None:
         return None
     inp = node.inputs[0]
     try:
-        numel = 1
-        for d in inp.get_size():
-            numel *= int(V.graph.sizevars.size_hint(d, fallback=0))
-        dtype = inp.get_dtype()
+        shard_bytes, dtype = ir_node_bytes(inp), inp.get_dtype()
     except Exception:  # noqa: BLE001
         return None
-    return GatherInfo(str(group_name), world, dtype, numel * dtype.itemsize, kind)
-
-
-def _unpacks_of(snode: BaseSchedulerNode, order: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
-    """The ``MultiOutput`` snodes a launch's result reaches its readers through (none for NCCL)."""
-    names = set(snode.get_buffer_names())
-    return [
-        s
-        for s in order
-        if isinstance(s.node, ir.MultiOutput) and any((not _is_fake_dep(d)) and d.name in names for d in s.unmet_dependencies)
-    ]
-
-
-def _waits_of(snode: BaseSchedulerNode, order: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
-    names = set(snode.get_buffer_names())
-    for u in _unpacks_of(snode, order):
-        names.update(u.get_buffer_names())
-    return [
-        s for s in order if contains_wait(s) and any((not _is_fake_dep(d)) and d.name in names for d in s.unmet_dependencies)
-    ]
+    return GatherInfo(str(group_name), world, dtype, shard_bytes, kind)
 
 
 def _launch_group(
-    order: list[BaseSchedulerNode], members: list[BaseSchedulerNode]
-) -> tuple[SnodeGraph, list[BaseSchedulerNode], set[BaseSchedulerNode]]:
-    """``(graph, prep, moving)``: the members' shard prep, and every snode that moves with their packed launch."""
-    from ..overlap import SnodeGraph
-    from .reorder import FsdpOverlapReorder
-
-    graph = SnodeGraph(order)
-    prep = FsdpOverlapReorder._prep_chain(list(members), graph)
-    moving = set(members) | set(prep) | {u for m in members for u in _unpacks_of(m, order)}
-    return graph, prep, moving
+    graph: SnodeGraph, members: list[BaseSchedulerNode]
+) -> tuple[list[BaseSchedulerNode], set[BaseSchedulerNode]]:
+    """``(prep, moving)``: the members' shard prep, and every snode that moves with their packed launch."""
+    prep = graph.prep_chain(members)
+    moving = set(members) | set(prep) | {u for m in members for u in graph.unpacks_of(m)}
+    return prep, moving
 
 
 @dataclass
@@ -139,6 +106,11 @@ class Placement:
 
 
 def coalesce_placement(order: list[BaseSchedulerNode], members: list[BaseSchedulerNode]) -> Placement | None:
+    """Where the packed launch of ``members`` can go, or None if nowhere (see ``_placement``)."""
+    return _placement(SnodeGraph(order), members)
+
+
+def _placement(graph: SnodeGraph, members: list[BaseSchedulerNode]) -> Placement | None:
     """Where the packed launch of ``members`` can go, or None if nowhere.
 
     The launch has to follow every member's input and precede every member's
@@ -149,24 +121,24 @@ def coalesce_placement(order: list[BaseSchedulerNode], members: list[BaseSchedul
     pass moves with a gather.  Prep that already runs above the launch stays
     put: moving a producer down could put it under one of its other readers.
     """
-    graph, prep, moving = _launch_group(order, members)
+    prep, moving = _launch_group(graph, members)
     index_of = graph.index_of
     at = min(index_of[m] for m in members)
     at = max(at, graph.earliest_legal_index(moving))
-    waits = [w for m in members for w in _waits_of(m, order)]
+    waits = [w for m in members for w in graph.waits_of(m)]
     if len(waits) < len(members) or at > min(index_of[w] for w in waits):
         return None
     return Placement(at=at, hoisted=[p for p in prep if index_of[p] >= at])
 
 
-def _explain_placement(order: list[BaseSchedulerNode], members: list[BaseSchedulerNode]) -> str:
-    """Why ``coalesce_placement`` found no index: each member's position, its waits, and the latest producer."""
-    graph, _, moving = _launch_group(order, members)
+def _explain_placement(graph: SnodeGraph, members: list[BaseSchedulerNode]) -> str:
+    """Why ``_placement`` found no index: each member's position, its waits, and the latest producer."""
+    _, moving = _launch_group(graph, members)
     index_of, buf_to_snode = graph.index_of, graph.buf_to_snode
     parts = []
     for m in members:
-        unpacks = _unpacks_of(m, order)
-        waits = _waits_of(m, order)
+        unpacks = graph.unpacks_of(m)
+        waits = graph.waits_of(m)
         parts.append(
             f"{m.get_name()}@{index_of[m]} unpacks={[index_of[u] for u in unpacks]} waits={[index_of[w] for w in waits]}"
         )
@@ -198,11 +170,12 @@ def simulate_coalesce(order: list[BaseSchedulerNode], members: list[BaseSchedule
     read, the unpacks produce what they produced -- so a planner can check a
     whole sequence of merges before touching any IR.
     """
-    members = sorted(members, key=order.index)
-    placement = coalesce_placement(order, members)
+    graph = SnodeGraph(order)
+    members = sorted(members, key=graph.index_of.__getitem__)
+    placement = _placement(graph, members)
     if placement is None:
         return None
-    unpacks = [u for m in members for u in _unpacks_of(m, order)]
+    unpacks = [u for m in members for u in graph.unpacks_of(m)]
     return _reordered(order, [*members, *unpacks], placement, [*members, *unpacks])
 
 
@@ -319,16 +292,17 @@ def coalesce_all_gathers(
     """
     if len(members) < 2:
         raise ValueError("a bucket needs at least two gathers")
-    members = sorted(members, key=order.index)
+    graph = SnodeGraph(order)
+    members = sorted(members, key=graph.index_of.__getitem__)
     infos = [gather_info(m) for m in members]
     if any(i is None for i in infos):
         raise ValueError("every member must be a single-weight all-gather")
     if len({(i.kind, i.group_name, i.world, i.dtype) for i in infos}) != 1:
         raise ValueError("members span more than one (kind, group, world, dtype)")
-    placement = coalesce_placement(order, members)
+    placement = _placement(graph, members)
     if placement is None:
         raise ValueError(
-            "no index follows every member's input and precedes every member's wait: " + _explain_placement(order, members)
+            "no index follows every member's input and precedes every member's wait: " + _explain_placement(graph, members)
         )
 
     ce = infos[0].kind == "ce"
@@ -339,14 +313,14 @@ def coalesce_all_gathers(
         # The names to keep are the unpacks': waits and readers hang off them.
         keep_snodes = []
         for m in members:
-            unpacks = _unpacks_of(m, order)
+            unpacks = graph.unpacks_of(m)
             if len(unpacks) != 1:
                 raise ValueError(f"copy-engine gather {m.get_name()} has {len(unpacks)} unpacks, expected one")
             keep_snodes.append(unpacks[0])
         op = ce_ag_ops()[1]
     else:
         keep_snodes = list(members)
-        op = _AG_COALESCED
+        op = AG_COALESCED
     olds = [k.node for k in keep_snodes]
 
     # ``process_kernel`` consults the FX node being lowered for unbacked-symbol

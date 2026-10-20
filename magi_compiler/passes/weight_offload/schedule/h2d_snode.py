@@ -22,24 +22,17 @@ from torch._inductor.scheduler import BaseSchedulerNode
 from ...snode_utils import iter_ir_nodes
 from ..runtime.h2d_op import H2D_LOAD
 
-H2D_OPS = (H2D_LOAD,)
-
 
 def is_h2d_load(snode: BaseSchedulerNode) -> bool:
     """Recognize the fallback op; rank-private H2D loads stay outside the collective skeleton."""
-    return any(isinstance(node, ir.ExternKernel) and node.op_overload in H2D_OPS for node in iter_ir_nodes(snode))
+    return any(isinstance(node, ir.ExternKernel) and node.op_overload is H2D_LOAD for node in iter_ir_nodes(snode))
 
 
-def slots_of(snode: BaseSchedulerNode) -> list[int]:
-    """The host-pool slots a load node pulls.
+def slot_of(load: BaseSchedulerNode) -> int:
+    """The host-pool slot a load pulls.
 
     Inductor flattens a custom op's non-tensor arguments into ``constant_args``,
-    and the load op takes exactly one such argument -- the slot.
+    and ``h2d_load(Tensor shard, int slot)`` has exactly one: the slot.
     """
-    node = snode.node
-    if not isinstance(node, ir.ExternKernel):
-        return []
-    try:
-        return [int(a) for a in node.constant_args]
-    except (TypeError, ValueError):  # not an int arg: not a shape this pass knows
-        return []
+    (slot,) = load.node.constant_args
+    return int(slot)

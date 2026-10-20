@@ -21,29 +21,18 @@ from dataclasses import dataclass, field
 from torch._inductor.scheduler import BaseSchedulerNode
 
 from ...overlap import TransferTask
-from ...snode_utils import is_multi_output
-
-
-def snode_bytes(snode: BaseSchedulerNode) -> int:
-    node = snode.node
-    try:
-        numel = 1
-        for d in node.get_size():
-            numel *= int(d)
-        return numel * node.get_dtype().itemsize
-    except Exception:  # noqa: BLE001 - an unsized node simply contributes nothing
-        return 0
+from ...snode_utils import ir_node_bytes, is_multi_output
 
 
 def load_bytes(group: list[BaseSchedulerNode]) -> int:
     """Bytes this load pulls across PCIe.
 
     Measured on the ``MultiOutput`` unpack rather than on the load itself: a
-    custom op lowers to a ``FallbackKernel`` whose own ``get_size`` describes no
-    tensor, so the load alone would size as zero.
+    custom op lowers to a ``FallbackKernel`` whose own layout describes no
+    tensor.
     """
     unpacks = [s for s in group if is_multi_output(s)]
-    return sum(snode_bytes(s) for s in (unpacks or group[:1]))
+    return sum(ir_node_bytes(s.node) for s in (unpacks or group[:1]))
 
 
 @dataclass(eq=False)
@@ -55,4 +44,4 @@ class LoadPlan(TransferTask):
     the transfer is now device-to-device and off the bus.
     """
 
-    slots: list[int] = field(default_factory=list)  # host-pool slots this load pulls
+    slot: int = field(kw_only=True)  # host-pool slot this load pulls

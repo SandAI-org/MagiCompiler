@@ -95,7 +95,7 @@ def _mode_ladder_selfcheck(rank: int) -> bool:
     ]
     ok = True
     for expected, n_ag, kinds, costs_ok in cases:
-        got = negotiate(anchors=[None] * n_ag, skel_kinds=kinds, costs_ok=costs_ok)[0]
+        got = negotiate(n_anchors=n_ag, skel_kinds=kinds, costs_ok=costs_ok)[0]
         ok = ok and got == expected
         print(f"REORDER_MODE_CASE rank={rank} expected={expected} got={got}", flush=True)
     return ok
@@ -204,7 +204,7 @@ def main() -> None:
 
     def spy(self, snodes):
         calls["n"] += 1
-        calls["gathers"] += sum(1 for s in snodes if snode_utils.is_weight_gather(s))
+        calls["gathers"] += sum(1 for s in snodes if snode_utils.is_all_gather_launch(s))
         out = orig_call(self, snodes)
         skeletons.append(rank_sync.collective_skeleton(out)[1])
         return out

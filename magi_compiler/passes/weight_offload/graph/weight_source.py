@@ -29,6 +29,8 @@ import torch
 import torch.fx as fx
 from torch.distributed.tensor import DTensor
 
+from ...snode_utils import AG
+
 # Producers we walk through when tracing a value back to the parameter behind it.
 _PREP_METHODS = {"to_local", "contiguous", "to", "view", "reshape"}
 _PREP_FUNCTIONS = ("constant_pad_nd", "_to_copy", "convert_element_type", "view", "reshape", "clone")
@@ -91,16 +93,17 @@ class WeightSource(Protocol):
     """How to find offloadable weights in one flavour of graph."""
 
     def collect(
-        self, graph: fx.GraphModule, placeholder_examples: Mapping[str, Any], min_bytes: int
+        self, graph: fx.GraphModule, placeholder_examples: Mapping[str, Any]
     ) -> tuple[list[OffloadCandidate], Counter]:
         """Every candidate, plus a tally of why the rest were passed over."""
 
 
-def parked_slot(local: Any, min_bytes: int) -> tuple[int | None, str | None]:
+def parked_slot(local: Any) -> tuple[int | None, str | None]:
     """The host-pool slot for ``local``, or ``(None, why)`` if it cannot be loaded.
 
-    A weight reaches the pool only through host-first materialization.  Collect
-    never copies a resident shard off the device.
+    A weight reaches the pool only through host-first materialization, which
+    already applied the size floor.  Collect never copies a resident shard off
+    the device.
     """
     from ..runtime import host_weights
 
@@ -109,8 +112,6 @@ def parked_slot(local: Any, min_bytes: int) -> tuple[int | None, str | None]:
     slot = host_weights.slot_of(local)
     if slot is None:
         return None, "weight was not materialized in host memory"
-    if host_weights.slot_bytes(slot) < min_bytes:
-        return None, "weight is below the size floor"
     return slot, None
 
 
@@ -119,7 +120,7 @@ class PlainParamSource(WeightSource):
     """Discover registered Parameters behind placeholders and get_attr nodes."""
 
     def collect(
-        self, graph: fx.GraphModule, placeholder_examples: Mapping[str, Any], min_bytes: int
+        self, graph: fx.GraphModule, placeholder_examples: Mapping[str, Any]
     ) -> tuple[list[OffloadCandidate], Counter]:
         from ..runtime import host_weights
 
@@ -139,7 +140,7 @@ class PlainParamSource(WeightSource):
             if not node.users:
                 continue
 
-            slot, why = parked_slot(live, min_bytes)
+            slot, why = parked_slot(live)
             if why is not None:
                 skipped[why] += 1
                 continue
@@ -150,9 +151,6 @@ class PlainParamSource(WeightSource):
                 )
             )
         return candidates, skipped
-
-
-_ALL_GATHER = torch.ops._c10d_functional.all_gather_into_tensor.default
 
 
 def _is_to_local(node: fx.Node) -> bool:
@@ -202,7 +200,7 @@ def _feeds_a_weight_gather(node: fx.Node) -> bool:
         if user in seen:
             continue
         seen.add(user)
-        if user.op == "call_function" and user.target is _ALL_GATHER:
+        if user.op == "call_function" and user.target is AG:
             return True
         name = getattr(user.target, "__name__", "") or str(user.target)
         if _is_prep(user) or "h2d_load" in name or "wait_tensor" in name:
@@ -229,12 +227,12 @@ def _weight_behind(to_local: fx.Node) -> fx.Node | None:
     return src if any(t in text for t in ("parameter", "parameters", "weight", "bias")) else None
 
 
-def _shard_candidate(*, holder, source, param, min_bytes, skipped, tag=None) -> OffloadCandidate | None:
+def _shard_candidate(*, holder, source, param, skipped, tag=None) -> OffloadCandidate | None:
     from ..runtime import host_weights
 
     local = param._local_tensor if isinstance(param, DTensor) else None
     # Reuse the adopted slot; each compiled graph still needs its own load.
-    slot, why = parked_slot(local=local, min_bytes=min_bytes)
+    slot, why = parked_slot(local=local)
     if why is not None:
         skipped[why] += 1
         return None
@@ -259,7 +257,7 @@ class FsdpShardSource(WeightSource):
     rank 0's adopted plan may mix them on another rank."""
 
     def collect(
-        self, graph: fx.GraphModule, placeholder_examples: Mapping[str, Any], min_bytes: int
+        self, graph: fx.GraphModule, placeholder_examples: Mapping[str, Any]
     ) -> tuple[list[OffloadCandidate], Counter]:
         from magi_compiler.passes.fsdp_overlap.node_meta import is_weight_ag
 
@@ -270,7 +268,7 @@ class FsdpShardSource(WeightSource):
         for node in graph.graph.nodes:
             if node.op != "call_function" or not is_weight_ag(node):
                 continue
-            if node.target is not _ALL_GATHER:
+            if node.target is not AG:
                 continue
             holder = shard_holder(node)
             if holder is None:
@@ -285,18 +283,16 @@ class FsdpShardSource(WeightSource):
             if holder in seen:
                 skipped["gather shares a holder with an earlier weight"] += 1
                 continue
-            candidate = _shard_candidate(
-                holder=holder, source=holder.args[0], param=param, min_bytes=min_bytes, skipped=skipped, tag=node
-            )
+            candidate = _shard_candidate(holder=holder, source=holder.args[0], param=param, skipped=skipped, tag=node)
             if candidate is not None:
                 seen.add(holder)
                 candidates.append(candidate)
 
-        self._collect_ungathered(graph, placeholder_examples, min_bytes, candidates, skipped, seen)
+        self._collect_ungathered(graph, placeholder_examples, candidates, skipped, seen)
         return candidates, skipped
 
     @staticmethod
-    def _collect_ungathered(graph, placeholder_examples, min_bytes, candidates, skipped, seen) -> None:
+    def _collect_ungathered(graph, placeholder_examples, candidates, skipped, seen) -> None:
         """Collect weight holders without downstream gathers, including replicated weights."""
         for node in graph.graph.nodes:
             if node in seen or not _is_local_extraction(node) or not node.users:
@@ -308,7 +304,7 @@ class FsdpShardSource(WeightSource):
             if not isinstance(param, DTensor):
                 continue
             # This holder feeds no weight gather to tag for bucket planning.
-            candidate = _shard_candidate(holder=node, source=src, param=param, min_bytes=min_bytes, skipped=skipped)
+            candidate = _shard_candidate(holder=node, source=src, param=param, skipped=skipped)
             if candidate is not None:
                 seen.add(node)
                 candidates.append(candidate)

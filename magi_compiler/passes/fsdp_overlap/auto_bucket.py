@@ -33,7 +33,6 @@ an adopted plan may mix them on another rank.
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import logging
 from dataclasses import dataclass
@@ -44,13 +43,12 @@ from torch._inductor.scheduler import BaseSchedulerNode
 from magi_compiler.passes.overlap import CostView, SnodeGraph, rank_sync
 from magi_compiler.passes.overlap.cost import default_cost_fn
 from magi_compiler.passes.snode_cost import SnodeCostTable
+from magi_compiler.passes.snode_utils import weight_gathers
 from magi_compiler.passes.weight_offload.node_meta import is_host_offloaded
 from magi_compiler.utils import magi_logger
 
 from . import ir_coalesce
 from .ir_coalesce import GatherInfo, gather_info
-from .node_meta import is_weight_ag
-from .reorder import FsdpOverlapReorder
 
 DEFAULT_LAUNCH_OVERHEAD_NS = 10_000.0
 DEFAULT_OVERHEAD_RATIOS = {"nccl": 0.1, "ce": 0.5}
@@ -156,20 +154,10 @@ class FsdpAutoBucket:
     name = "FSDP auto bucket"
 
     def __init__(self, cost_fn=None, max_bucket_bytes: int = 0, overhead_ratio: float | None = None) -> None:
-        if overhead_ratio is not None and not 0.0 < overhead_ratio < 1.0:
-            raise ValueError(f"FsdpAutoBucket: overhead_ratio must be in (0, 1), got {overhead_ratio}")
         self._cost_fn = cost_fn if cost_fn is not None else default_cost_fn()
         self.max_bucket_bytes = int(max_bucket_bytes)
-        # None: per transport, from DEFAULT_OVERHEAD_RATIOS.
+        # None: per transport, from DEFAULT_OVERHEAD_RATIOS.  FSDPConfig bounds it to (0, 1).
         self.overhead_ratio = None if overhead_ratio is None else float(overhead_ratio)
-
-    def __deepcopy__(self, memo):
-        # Through memo, so this copy and the profile pass's copy share one table.
-        new = type(self).__new__(type(self))
-        memo[id(self)] = new
-        for key, value in self.__dict__.items():
-            new.__dict__[key] = copy.deepcopy(value, memo) if key == "_cost_fn" else value
-        return new
 
     def __call__(self, snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         order = list(snodes)
@@ -183,7 +171,7 @@ class FsdpAutoBucket:
             # all_gather and blocks whichever ranks do enter it.
             skel_idx, skel_kinds = rank_sync.collective_skeleton(order)
             mode, group, world = rank_sync.negotiate_mode(
-                anchors=cands, skel_kinds=skel_kinds, costs_ok=cost.ok, who=self.name
+                n_anchors=len(cands), skel_kinds=skel_kinds, costs_ok=cost.ok, who=self.name
             )
             if mode != "slot":
                 magi_logger.warning(
@@ -196,14 +184,24 @@ class FsdpAutoBucket:
         if len(cands) < 2:
             return snodes
 
-        ok, buckets, params_by_group = True, [], {}
-        try:
-            if not ir_coalesce.ir_coalesce_supported():
-                raise RuntimeError("this torch lacks the Inductor internals scheduler-level coalescing needs")
-            buckets, params_by_group = self._plan(order, cands, cost)
-        except Exception as exc:  # noqa: BLE001
-            magi_logger.warning("%s: planning failed (%s); leaving every weight gather unbucketed", self.name, exc, rank="all")
-            ok, buckets = False, []
+        ok, buckets, params_by_group = ir_coalesce.ir_coalesce_supported(), [], {}
+        if not ok:
+            magi_logger.warning(
+                "%s: this torch lacks the Inductor internals scheduler-level coalescing needs; "
+                "leaving every weight gather unbucketed",
+                self.name,
+            )
+        else:
+            try:
+                buckets, params_by_group = self._plan(order, cands, cost)
+            except Exception as exc:  # noqa: BLE001
+                if world <= 1:
+                    raise
+                # Only to still enter _adopt's exchange, which every peer does.
+                magi_logger.warning(
+                    "%s: planning failed (%s); leaving every weight gather unbucketed", self.name, exc, rank="all"
+                )
+                ok = False
         buckets = self._adopt(ok=ok, buckets=buckets, order=order, cands=cands, group=group, world=world, skeleton=skeleton)
         if buckets is None:
             return snodes
@@ -224,15 +222,8 @@ class FsdpAutoBucket:
     # -- candidates -----------------------------------------------------------
     @staticmethod
     def _candidates(order: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
-        """Single-weight gathers (NCCL or copy engine) tagged as weight gathers; every one if none is tagged.
-
-        The untagged fallback matches ``FsdpOverlapReorder``, which treats every
-        gather as a weight gather; a graph whose lowering tags weights at all has
-        its activation gathers left alone.
-        """
-        plain = [s for s in order if gather_info(s) is not None]
-        tagged = [s for s in plain if any(is_weight_ag(o) for o in s.node.origins or ())]
-        return tagged if tagged else plain
+        """The weight gathers (see ``snode_utils.weight_gathers``) in the single-weight form this pass can merge."""
+        return [s for s in weight_gathers(order) if gather_info(s) is not None]
 
     @staticmethod
     def _kind(snode: BaseSchedulerNode, info: GatherInfo) -> tuple:
@@ -264,10 +255,8 @@ class FsdpAutoBucket:
     # -- planning -------------------------------------------------------------
     def _member(self, snode, graph: SnodeGraph) -> Member | None:
         info = gather_info(snode)
-        prep = FsdpOverlapReorder._prep_chain([snode], graph)
-        moving = {snode, *prep}
-        lo = graph.earliest_legal_index(moving)
-        waits = ir_coalesce._waits_of(snode, graph.order)
+        lo = graph.earliest_legal_index({snode, *graph.prep_chain([snode])})
+        waits = graph.waits_of(snode)
         if not waits:
             return None
         wait = min(graph.index_of[w] for w in waits)
@@ -340,8 +329,7 @@ class FsdpAutoBucket:
             return buckets if ok else None
         pos = {s: i for i, s in enumerate(cands)}
         mine = [[pos[s] for s in b] for b in buckets] if ok else None
-        peers: list = [None] * world
-        dist.all_gather_object(peers, (ok, mine, self._signature(cands)), group=group)
+        peers = rank_sync.exchange((ok, mine), group, world)
         if not all(p[0] for p in peers):
             magi_logger.warning(
                 "%s: planning failed on rank(s) %s; leaving every weight gather unbucketed",
@@ -349,13 +337,8 @@ class FsdpAutoBucket:
                 [r for r, p in enumerate(peers) if not p[0]],
             )
             return None
-        if any(p[2] != peers[0][2] for p in peers[1:]):
-            magi_logger.warning(
-                "%s: the ranks' weight gathers do not correspond one to one (transport, world or dtype "
-                "differ at the same position); leaving every weight gather unbucketed",
-                self.name,
-            )
-            return None
+        # Slot mode already matched the skeletons, weight-ness and dtype included,
+        # so rank 0's candidate indices name the same collectives here.
         try:
             adopted = [[cands[i] for i in b] for b in peers[0][1]]
             merged = self._merged(order, adopted)
@@ -367,8 +350,7 @@ class FsdpAutoBucket:
 
     def _commit(self, legal: bool, skeleton_order: str | None, group, world: int) -> bool:
         """Rank-identical go / no-go: every rank found the plan legal and merges into one collective order."""
-        peers: list = [None] * world
-        dist.all_gather_object(peers, (bool(legal), skeleton_order), group=group)
+        peers = rank_sync.exchange((bool(legal), skeleton_order), group, world)
         if not all(p[0] for p in peers):
             magi_logger.warning(
                 "%s: rank 0's bucket plan is not legal on rank(s) %s; leaving every weight gather unbucketed",
@@ -384,16 +366,6 @@ class FsdpAutoBucket:
             )
             return False
         return True
-
-    @staticmethod
-    def _signature(cands) -> list[tuple]:
-        """What has to match at each candidate position for rank 0's indices to mean the same collectives here.
-
-        The group name is left out: it can be rank-specific for one logical group.
-        So is host offload: a shard's load is rank-private, and a bucket mixing
-        offloaded and resident members is legal, only slower (see ``_runs``).
-        """
-        return [(info.kind, info.world, str(info.dtype)) for info in map(gather_info, cands)]
 
     @staticmethod
     def _skeleton_order(merged, skeleton) -> str:

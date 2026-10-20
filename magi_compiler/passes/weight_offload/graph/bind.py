@@ -124,9 +124,7 @@ def _describe(skipped: Counter) -> str:
     return "skipped: " + ", ".join(f"{n}x {why}" for why, n in skipped.most_common())
 
 
-def bind_weights_to_host(
-    graph: fx.GraphModule, example_inputs: Sequence[Any] | None, source: WeightSource, *, min_bytes: int = 0
-) -> int:
+def bind_weights_to_host(graph: fx.GraphModule, example_inputs: Sequence[Any] | None, source: WeightSource) -> int:
     """Tag already-parked weights on the graph so a later splice can load them.
 
     A weight reaches the pool only through host-first materialization.  This
@@ -138,7 +136,7 @@ def bind_weights_to_host(
     placeholders = graph.graph.find_nodes(op="placeholder")
     placeholder_examples: Mapping[str, Any] = dict(zip((n.name for n in placeholders), example_inputs or ()))
 
-    plan, skipped = source.collect(graph, placeholder_examples, min_bytes)
+    plan, skipped = source.collect(graph, placeholder_examples)
 
     # Before the empty check, so every rank still enters each of its groups.
     plan = _align_across_ranks(plan, placeholder_examples, skipped)
@@ -153,14 +151,12 @@ def bind_weights_to_host(
 
     sizes = sorted(c.nbytes for c in plan)
     magi_logger.info(
-        "host offload: %d weight(s) bound to host slots, %.1f MiB; "
-        "sizes %.1f / %.1f / %.1f MiB (min/median/max, floor %.1f); %s",
+        "host offload: %d weight(s) bound to host slots, %.1f MiB; " "sizes %.1f / %.1f / %.1f MiB (min/median/max); %s",
         len(plan),
         sum(c.nbytes for c in plan) / 2**20,
         sizes[0] / 2**20,
         sizes[len(sizes) // 2] / 2**20,
         sizes[-1] / 2**20,
-        min_bytes / 2**20,
         _describe(skipped),
     )
     return len(plan)

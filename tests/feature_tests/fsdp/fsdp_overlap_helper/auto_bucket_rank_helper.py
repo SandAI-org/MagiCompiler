@@ -19,9 +19,8 @@ collective skeletons. Both must negotiate abort and leave their schedules unchan
 an early return hangs the peer and is caught by the process-group timeout.
 
 Then both ranks exercise adoption of rank 0's bucket plan:
-* same: matching collective order and signatures -> applied;
+* same: matching collective order -> applied;
 * hop: rank 1 moves the bucket across another collective -> unbucketed;
-* signature: rank 1 has a different candidate dtype -> unbucketed;
 * same-plan-hop: both ranks planned the same buckets, but their merged orders differ -> unbucketed;
 * same-plan-illegal: rank 0's shared plan is illegal on rank 1 -> unbucketed.
 
@@ -90,10 +89,10 @@ def _check_candidate_negotiation() -> bool:
     seen: dict = {}
     real_negotiate = rank_sync.negotiate_mode
 
-    def negotiate(anchors, skel_kinds, costs_ok=True, who="FSDP overlap"):
-        mode, group, world = real_negotiate(anchors=anchors, skel_kinds=skel_kinds, costs_ok=costs_ok, who=who)
+    def negotiate(n_anchors, skel_kinds, costs_ok=True, who="FSDP overlap"):
+        mode, group, world = real_negotiate(n_anchors=n_anchors, skel_kinds=skel_kinds, costs_ok=costs_ok, who=who)
         seen["mode"] = mode
-        seen["n"] = len(anchors)
+        seen["n"] = n_anchors
         return mode, group, world
 
     with patch.object(FsdpAutoBucket, "_candidates", staticmethod(candidates)), patch.object(
@@ -113,24 +112,18 @@ def _check_slot_consensus() -> bool:
     g0, x, g1, g2 = (_SlotSnode(n) for n in ("g0", "x", "g1", "g2"))
     order, cands, skeleton = [g0, x, g1, g2], [g0, g1, g2], [g0, x, g1, g2]
     before_x, after_x = [g0, g1, x, g2], [x, g0, g1, g2]
-    sig = [("nccl", 2, "torch.bfloat16")] * 3
-    odd_sig = [sig[0], ("nccl", 2, "torch.float32"), sig[2]]
 
     cases = [
-        # (name, rank 1's merged order, rank 1's signature, same plan, expected)
-        ("same", before_x, sig, False, "applied"),
-        ("hop", after_x, sig, False, "unbucketed"),
-        ("signature", before_x, odd_sig, False, "unbucketed"),
-        ("same-plan-hop", after_x, sig, True, "unbucketed"),
-        ("same-plan-illegal", None, sig, True, "unbucketed"),
+        # (name, rank 1's merged order, same plan, expected)
+        ("same", before_x, False, "applied"),
+        ("hop", after_x, False, "unbucketed"),
+        ("same-plan-hop", after_x, True, "unbucketed"),
+        ("same-plan-illegal", None, True, "unbucketed"),
     ]
     ok = True
-    for name, odd_merged, odd_signature, same_plan, expected in cases:
+    for name, odd_merged, same_plan, expected in cases:
         merged = odd_merged if rank == 1 else before_x
-        signature = odd_signature if rank == 1 else sig
-        with patch.object(FsdpAutoBucket, "_merged", staticmethod(lambda order, buckets, m=merged: m)), patch.object(
-            FsdpAutoBucket, "_signature", staticmethod(lambda cands, s=signature: s)
-        ):
+        with patch.object(FsdpAutoBucket, "_merged", staticmethod(lambda order, buckets, m=merged: m)):
             p = FsdpAutoBucket(cost_fn=lambda s: 0.0)
             # Every rank adopts rank 0's plan, even when its own plan differs.
             buckets = [[g0, g1]] if rank == 0 or same_plan else []

@@ -44,7 +44,6 @@ from magi_compiler.passes.fsdp_overlap import (
 )
 from magi_compiler.passes.snode_cost import SnodeCostProfile, SnodeCostTable
 from magi_compiler.passes.weight_offload import (
-    CacheValidity,
     FsdpShardSource,
     H2dLoadReorder,
     OffloadCache,
@@ -193,13 +192,11 @@ class CompilerManager:
         """
         if self.disable_cache:
             return
-        if self.offload_cache.bind(graph) is CacheValidity.DROP:
+        reason = self.offload_cache.bind(graph)
+        if reason is not None:
             self.cache.clear()
             self._remaining_restart_skips = {}
             if self.compile_config.assert_cache_hit:
-                reason = self.offload_cache.miss_reason() or (
-                    "offload host_slots sidecar missing or does not match this process's bound weights"
-                )
                 raise RuntimeError(f"MAGI_COMPILE_ASSERT_CACHE_HIT: {reason}. Re-bake the compile cache.")
 
     @observe_lifecycle("compiler_manager_load")
@@ -262,12 +259,6 @@ class CompilerManager:
             return compiled_graph
 
         if self.compile_config.assert_cache_hit:
-            reason = self.offload_cache.miss_reason()
-            if reason:
-                raise RuntimeError(
-                    f"MAGI_COMPILE_ASSERT_CACHE_HIT: {reason} for runtime_shape={runtime_shape} "
-                    f"graph_index={graph_index}. Re-bake the compile cache."
-                )
             if cache_entry not in self.cache:
                 raise RuntimeError(
                     f"MAGI_COMPILE_ASSERT_CACHE_HIT: cache miss for runtime_shape={runtime_shape} "
@@ -708,8 +699,7 @@ class MagiBackend:
         offload_cfg = self.compile_config.offload_config
 
         if fsdp_cfg.enable_fsdp:
-            lowered = lower_prim_redistribute_to_collectives(graph)
-            magi_logger.info("Whole-graph FSDP lowering: %d weight redistribute -> collectives", lowered)
+            lower_prim_redistribute_to_collectives(graph)
             magi_logger.info("FSDP fullgraph overlap: transport=%s bucket_mode=%s", fsdp_cfg.transport, fsdp_cfg.bucket_mode)
 
         bound = 0
@@ -723,21 +713,18 @@ class MagiBackend:
                 graph=graph,
                 example_inputs=example_inputs,
                 source=FsdpShardSource() if fsdp_cfg.enable_fsdp else PlainParamSource(),
-                min_bytes=int(offload_cfg.offload_min_shard_mib * 1024 * 1024),
             )
             if bound:
                 insert_h2d_loads(graph)
 
-        self._configure_overlap_passes(
-            loads_inserted=bool(bound), auto_bucket=fsdp_cfg.enable_fsdp and fsdp_cfg.bucket_mode == "auto"
-        )
+        self._configure_overlap_passes(loads_inserted=bool(bound))
 
         if offload_cfg.graph_weight_offload:
             # The compilation interpreter runs next and must not read storage-free weights.
             self._reclaim_unloaded_weights(example_inputs)
             self.compiler_manager.bind_offload_cache(graph)
 
-    def _configure_overlap_passes(self, *, loads_inserted: bool, auto_bucket: bool = False) -> None:
+    def _configure_overlap_passes(self, *, loads_inserted: bool) -> None:
         """Share one cost table across profiling, optional bucketing, and overlap passes.
         FSDP replaces the default reorders; offload alone preserves them for CP/EP overlap.
         """
@@ -750,7 +737,7 @@ class MagiBackend:
         estimator = None if fsdp_cfg.cost_mode == "analytical" else ProfilingRuntimeEstimator(sync_across_ranks=True)
         passes: list = [SnodeCostProfile(costs, estimator)]
 
-        if fsdp_cfg.enable_fsdp and auto_bucket:
+        if fsdp_cfg.enable_fsdp and fsdp_cfg.bucket_mode == "auto":
             # Bucketing needs profiled costs and prices the nodes it creates.
             passes.append(
                 FsdpAutoBucket(

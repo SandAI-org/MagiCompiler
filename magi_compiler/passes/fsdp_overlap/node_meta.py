@@ -17,10 +17,10 @@
 ``node.meta`` is the only channel that survives bucketing, which rebuilds nodes.
 Keys live here so a typo cannot silently drop a weight back to NCCL.
 
-The weight-gather tag is also written under ``meta["custom"]``: AOT autograd
-re-traces the graph before Inductor lowers it, and copies only a fixed set of
-meta fields onto the nodes it builds (``custom`` among them).  That copy is what
-a scheduler pass finds in an IR node's ``origins``.
+The weight-gather tag lives under ``meta["custom"]``: AOT autograd re-traces
+the graph before Inductor lowers it, and copies only a fixed set of meta fields
+onto the nodes it builds (``custom`` among them).  That copy is what a scheduler
+pass finds in an IR node's ``origins``, and FX passes read the same field.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ CE_BOUND = "magi_ce_bound"
 
 def is_weight_ag(node: fx.Node) -> bool:
     """Also true on the nodes AOT autograd re-traced from a tagged gather."""
-    return bool(node.meta.get(WEIGHT_AG) or (node.meta.get("custom") or {}).get(WEIGHT_AG))
+    return bool((node.meta.get("custom") or {}).get(WEIGHT_AG))
 
 
 def is_uneven_shard(node: fx.Node) -> bool:
@@ -55,7 +55,6 @@ def mark_weight_ag(node: fx.Node, *, uneven: bool) -> None:
 
     ``uneven`` is keyword-only: omitting it would default to the unsafe answer.
     """
-    node.meta[WEIGHT_AG] = True
     node.meta["custom"] = {**(node.meta.get("custom") or {}), WEIGHT_AG: True}
     node.meta[UNEVEN_SHARD] = uneven
 

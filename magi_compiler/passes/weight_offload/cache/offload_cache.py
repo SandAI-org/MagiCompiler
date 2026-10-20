@@ -23,7 +23,6 @@ spaces under one sidecar.
 from __future__ import annotations
 
 import ast
-import enum
 import pprint
 from collections.abc import Callable
 from pathlib import Path
@@ -36,13 +35,6 @@ from magi_compiler.utils import magi_logger
 from .slot_table import collect_host_slot_table, match_host_slot_tables, refresh_resident_flags
 
 
-class CacheValidity(enum.Enum):
-    """Whether the piecewise compile indices may be reused after ``bind``."""
-
-    KEEP = "keep"
-    DROP = "drop"
-
-
 class OffloadCache:
     """Host-slot sidecar: match, remap, replay residents, wrap a loaded graph.
 
@@ -50,7 +42,7 @@ class OffloadCache:
     ``load`` misses while offload is on, and ``save`` may write a sidecar.
     A dict means replay: ``load`` wraps the artifact, ``save`` / ``store``
     must not rewrite slot integers.  Offload off is a no-op: load and store
-    stay allowed, remap stays ``None``.
+    stay allowed, remap stays ``None``, and ``bind`` is never called.
     """
 
     def __init__(self, enabled: bool):
@@ -58,47 +50,39 @@ class OffloadCache:
         self.host_slots_path: Path | None = None
         self._slot_table: dict[int, dict[str, Any]] = {}
         self._remap: dict[int, int] | None = None
-        self._miss_reason: str | None = None
 
     def initialize(self, cache_dir: Path) -> None:
         self.host_slots_path = cache_dir / "host_slots.py"
         self._slot_table = {}
         self._remap = None
-        self._miss_reason = None
 
-    def bind(self, graph: fx.GraphModule) -> CacheValidity:
+    def bind(self, graph: fx.GraphModule) -> str | None:
         """Match the sidecar to ``graph``'s bound weights.
 
-        Returns ``KEEP`` when the compile indices are safe to replay (offload
-        off, or sidecar identities match).  Returns ``DROP`` on a miss so the
-        caller can discard indices whose artifacts bake another pool's slots.
+        Returns None when the compile indices are safe to replay, and otherwise
+        why not, so the caller can discard indices whose artifacts bake another
+        pool's slots.
         """
         from ..runtime import host_weights
 
         self._slot_table = collect_host_slot_table(graph)
         self._remap = None
-        self._miss_reason = None
-        if not self.enabled:
-            return CacheValidity.KEEP
-
         sidecar = self._load_sidecar()
-        if sidecar is None:
-            self._miss_reason = "offload host_slots sidecar missing or does not match this process's bound weights"
-            magi_logger.info("host offload: no host_slots sidecar; compile cache will miss and bake one")
-            return CacheValidity.DROP
-        remap = match_host_slot_tables(sidecar, self._slot_table)
+        remap = None if sidecar is None else match_host_slot_tables(sidecar, self._slot_table)
         if remap is None:
-            self._miss_reason = "offload host_slots sidecar missing or does not match this process's bound weights"
-            magi_logger.info(
-                "host offload: host_slots sidecar does not match this process's bound weights; compile cache will miss"
+            reason = (
+                "offload host_slots sidecar missing"
+                if sidecar is None
+                else "offload host_slots sidecar does not match this process's bound weights"
             )
-            return CacheValidity.DROP
+            magi_logger.info("host offload: %s; compile cache will miss and bake a new one", reason)
+            return reason
         current_slots = [remap[baked] for baked, info in sidecar.items() if info.get("resident")]
         if current_slots:
             host_weights.make_resident_many(current_slots)
         self._remap = remap
         magi_logger.info("host offload: compile cache reusable (%d slot(s) remapped)", len(remap))
-        return CacheValidity.KEEP
+        return None
 
     def allows_load(self) -> bool:
         """False only when offload is on and the sidecar has not matched."""
@@ -131,9 +115,6 @@ class OffloadCache:
         table = refresh_resident_flags(self._slot_table)
         printer = pprint.PrettyPrinter(indent=4)
         self.host_slots_path.write_text(printer.pformat(table))
-
-    def miss_reason(self) -> str | None:
-        return self._miss_reason
 
     def _load_sidecar(self) -> dict[int, dict] | None:
         if self.host_slots_path is None or not self.host_slots_path.exists():

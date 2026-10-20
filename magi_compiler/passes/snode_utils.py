@@ -25,11 +25,13 @@ from __future__ import annotations
 from collections.abc import Iterator
 from functools import lru_cache
 
+import sympy
 import torch
 from torch._inductor import ir
 from torch._inductor.comms import _is_fake_dep
 from torch._inductor.scheduler import BaseSchedulerNode, FusedSchedulerNode, GroupedSchedulerNode
 from torch._inductor.utils import contains_collective, contains_wait, is_collective
+from torch._inductor.virtualized import V
 
 from magi_compiler.utils import magi_logger
 
@@ -78,17 +80,42 @@ def issues_transfer(snode: BaseSchedulerNode) -> bool:
     return contains_collective(snode) or leaf_collective_node(snode) is not None
 
 
-_NCCL_WEIGHT_AG_OPS = (
-    torch.ops._c10d_functional.all_gather_into_tensor.default,
-    torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default,
-)
+AG = torch.ops._c10d_functional.all_gather_into_tensor.default
+AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
 
 
-def is_weight_gather(snode: BaseSchedulerNode) -> bool:
-    """An FSDP weight all-gather launch, over NCCL or the copy engine."""
+def is_all_gather_launch(snode: BaseSchedulerNode) -> bool:
+    """An all-gather launch of the shape FSDP gathers weights with -- NCCL or copy
+    engine, single or coalesced -- whether or not lowering tagged it as a weight."""
     node = leaf_collective_node(snode)
     op = node.op_overload if node is not None else None
-    return op is not None and (op in _NCCL_WEIGHT_AG_OPS or op in ce_ag_ops())
+    return op is not None and (op in (AG, AG_COALESCED) or op in ce_ag_ops())
+
+
+def _tagged_as_weight(snode: BaseSchedulerNode) -> bool:
+    # Deferred: fsdp_overlap imports this module.
+    from .fsdp_overlap.node_meta import is_weight_ag
+
+    node = leaf_collective_node(snode)
+    return any(is_weight_ag(o) for o in node.origins or ())
+
+
+def weight_gathers(order: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+    """The FSDP weight-gather launches, in program order.
+
+    The ones lowering tagged as weight gathers, so activation gathers in the same
+    graph are left alone; every all-gather launch when nothing carries the tag.
+    """
+    gathers = [s for s in order if is_all_gather_launch(s)]
+    return [s for s in gathers if _tagged_as_weight(s)] or gathers
+
+
+def ir_node_bytes(node: ir.IRNode) -> int:
+    """Bytes of a single-tensor IR node; a symbolic dimension counts at its size hint."""
+    numel = 1
+    for d in node.get_size():
+        numel *= int(d) if isinstance(d, (int, sympy.Integer)) else int(V.graph.sizevars.size_hint(d, fallback=0))
+    return numel * node.get_dtype().itemsize
 
 
 def is_compute(snode: BaseSchedulerNode) -> bool:
