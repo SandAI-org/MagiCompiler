@@ -132,7 +132,7 @@ def _agree(value) -> bool:
 
 
 def _pipeline(gm, *, transport: str) -> None:
-    """``MagiBackend._apply_weight_pipeline`` with host offload off, inlined.
+    """``WeightPipeline.run`` with host offload off, inlined.
 
     Lower, bind, retarget what bound -- the order is what decides transport per
     weight, which is the thing every rank has to agree on.

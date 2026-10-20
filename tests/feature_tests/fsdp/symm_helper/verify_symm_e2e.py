@@ -169,9 +169,9 @@ def main() -> None:
     ce = args.transport == "copy_engine"
 
     # -- count the rewrites, without asking the compiled model to confess ----
-    # The backend binds the retarget by name at import, so its module attribute
+    # The weight pipeline binds the retarget by name at import, so its module attribute
     # is the seam to patch (the package's too, for anything resolving it there).
-    import magi_compiler.magi_backend.magi_backend as _backend
+    import magi_compiler.magi_backend.weight_pipeline as _pipeline
     import magi_compiler.passes.fsdp_overlap as _fsdp_overlap
 
     n_rewritten = 0
@@ -184,7 +184,7 @@ def main() -> None:
         return got
 
     _fsdp_overlap.rewrite_weight_ag_to_copy_engine = spy_rewrite
-    _backend.rewrite_weight_ag_to_copy_engine = spy_rewrite
+    _pipeline.rewrite_weight_ag_to_copy_engine = spy_rewrite
 
     # -- count the scheduler-stage buckets the copy engine launches ---------
     from magi_compiler.passes.fsdp_overlap.auto_bucket import FsdpAutoBucket
@@ -235,7 +235,7 @@ def main() -> None:
         torch.cuda.synchronize()
 
     _fsdp_overlap.rewrite_weight_ag_to_copy_engine = orig_rewrite
-    _backend.rewrite_weight_ag_to_copy_engine = orig_rewrite
+    _pipeline.rewrite_weight_ag_to_copy_engine = orig_rewrite
     FsdpAutoBucket.__call__ = orig_bucket
 
     # (2) placement: the block's shards are in a window, the head's are not.

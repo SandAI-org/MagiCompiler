@@ -136,7 +136,7 @@ def _bind(gm, examples, **kw):
 
 
 def _pipeline(gm, examples, *, transport="copy_engine") -> int:
-    """``MagiBackend._apply_weight_pipeline`` with host offload off, inlined.
+    """``WeightPipeline.run`` with host offload off, inlined.
 
     Lower, bind, retarget what bound -- one gather per weight; bucketing happens
     later, during scheduling.  Returns how many gathers were retargeted.
