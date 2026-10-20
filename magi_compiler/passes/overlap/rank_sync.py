@@ -42,20 +42,22 @@ from torch._inductor.scheduler import BaseSchedulerNode
 
 from magi_compiler.utils import magi_logger
 
-from ..snode_utils import is_weight_gather, issues_transfer, leaf_collective_node
+from ..snode_utils import issues_transfer, leaf_collective_node, weight_gathers
 
 
-def _collective_kind_key(snode: BaseSchedulerNode) -> tuple:
+def _collective_kind_key(snode: BaseSchedulerNode, is_weight: bool) -> tuple:
     """Coarse, rank-comparable identity of one NCCL-issuing snode."""
     node = leaf_collective_node(snode) or snode.node
     op = (node.op_overload or node.python_kernel_name) if isinstance(node, ir.ExternKernel) else None
     op = op or type(node).__name__
     dims: tuple = ()
+    dtype = None
     try:
         dims = tuple("?" if getattr(d, "free_symbols", None) else int(d) for d in node.get_size())
+        dtype = str(node.get_dtype())
     except Exception:  # noqa: BLE001
         pass
-    return (is_weight_gather(snode), str(op), dims)
+    return (is_weight, str(op), dims, dtype)
 
 
 def collective_skeleton(order: list[BaseSchedulerNode]) -> tuple[list[int], list[tuple]]:
@@ -67,10 +69,18 @@ def collective_skeleton(order: list[BaseSchedulerNode]) -> tuple[list[int], list
     from magi_compiler.profiling.runtime_estimator import snode_issues_collective
 
     idx = [i for i, s in enumerate(order) if snode_issues_collective(s) or issues_transfer(s)]
-    return idx, [_collective_kind_key(order[i]) for i in idx]
+    weights = set(weight_gathers(order))
+    return idx, [_collective_kind_key(order[i], order[i] in weights) for i in idx]
 
 
-def negotiate_mode(anchors, skel_kinds, costs_ok: bool = True, who: str = "FSDP overlap") -> tuple[str, object, int]:
+def exchange(obj, group, world: int) -> list:
+    """Every rank's ``obj``, in rank order: ``all_gather_object`` over ``group``."""
+    peers: list = [None] * world
+    dist.all_gather_object(peers, obj, group=group)
+    return peers
+
+
+def negotiate_mode(n_anchors: int, skel_kinds, costs_ok: bool = True, who: str = "FSDP overlap") -> tuple[str, object, int]:
     """Return (mode, group, world) with a rank-identical placement policy.
 
     Matching collective skeletons use consensus slots; differing skeletons pin
@@ -81,9 +91,7 @@ def negotiate_mode(anchors, skel_kinds, costs_ok: bool = True, who: str = "FSDP 
 
     group = _get_cost_sync_group()
     world = dist.get_world_size()
-    mine = (len(anchors), tuple(skel_kinds), bool(costs_ok))
-    peers: list = [None] * world
-    dist.all_gather_object(peers, mine, group=group)
+    peers = exchange((n_anchors, tuple(skel_kinds), bool(costs_ok)), group, world)
     failed = [rank for rank, p in enumerate(peers) if not p[2]]
     if failed:
         magi_logger.warning(
@@ -132,9 +140,7 @@ def any_rank(flag: bool) -> bool:
     return bool(t.item())
 
 
-def consensus_slot_targets(
-    anchors_in_order, task_of, skel_idx, index_of, sync_group, world, who: str = "FSDP overlap"
-) -> None:
+def consensus_slot_targets(anchors_in_order, task_of, skel_idx, index_of, sync_group, world) -> None:
     """Put each transfer in the same skeleton slot on every rank (max of desired
     slot and dep floor, then non-decreasing).  Index inside the slot stays local.
 
@@ -150,8 +156,7 @@ def consensus_slot_targets(
         own = slot_of(index_of[anchor])
         task = task_of.get(anchor)
         mine.append((slot_of(task.target), slot_of(task.lower)) if task is not None else (own, own))
-    peers: list = [None] * world
-    dist.all_gather_object(peers, mine, group=sync_group)
+    peers = exchange(mine, sync_group, world)
 
     running = 0
     for j, anchor in enumerate(anchors_in_order):
@@ -165,7 +170,7 @@ def consensus_slot_targets(
         slot_hi = skel_idx[q] if q < len(skel_idx) else index_of[anchor]
         task.target = min(max(target, slot_lo), max(slot_hi, slot_lo))
         magi_logger.debug(
-            who + " slot consensus: launch=%d slot=%d mine=%s target=%d->%d bounds=[%d,%d]",
+            "FSDP overlap slot consensus: launch=%d slot=%d mine=%s target=%d->%d bounds=[%d,%d]",
             index_of[anchor],
             q,
             mine[j],

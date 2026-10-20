@@ -24,10 +24,10 @@ from torch.distributed.tensor import DTensor, Shard
 
 from magi_compiler.utils import magi_logger
 
+from ..snode_utils import AG
 from .node_meta import mark_weight_ag
 
 # The functional collectives we lower a SimpleFSDP weight gather into.
-_ALL_GATHER = torch.ops._c10d_functional.all_gather_into_tensor.default
 _WAIT = torch.ops._c10d_functional.wait_tensor.default
 _PAD = torch.ops.aten.constant_pad_nd.default
 _SLICE = torch.ops.aten.slice.Tensor
@@ -193,7 +193,7 @@ def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
                 padded.meta["example_value"] = local.new_empty((chunk, *local.shape[1:]), dtype=cur_dtype)
                 cur = padded
 
-            ag = graph.graph.call_function(_ALL_GATHER, (cur, world, group_name))
+            ag = graph.graph.call_function(AG, (cur, world, group_name))
             ag.meta["example_value"] = local.new_empty((world * chunk, *local.shape[1:]), dtype=cur_dtype)
             mark_weight_ag(ag, uneven=world * chunk != F)
 

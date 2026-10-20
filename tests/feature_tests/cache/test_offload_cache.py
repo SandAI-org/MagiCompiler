@@ -26,7 +26,7 @@ import torch.nn as nn
 
 from magi_compiler.config import CompileConfig
 from magi_compiler.magi_backend.magi_backend import CompilerManager
-from magi_compiler.passes.weight_offload.cache.offload_cache import CacheValidity, OffloadCache
+from magi_compiler.passes.weight_offload.cache.offload_cache import OffloadCache
 from magi_compiler.passes.weight_offload.cache.slot_table import (
     collect_host_slot_table,
     match_host_slot_tables,
@@ -108,16 +108,10 @@ def test_collect_and_refresh_read_the_live_pool():
 def test_disabled_offload_cache_is_a_noop(tmp_path: Path):
     cache = OffloadCache(enabled=False)
     cache.initialize(tmp_path)
-    g = fx.Graph()
-    node = g.placeholder("w")
-    g.output((node,))
-    gm = fx.GraphModule(nn.Module(), g)
 
-    assert cache.bind(gm) is CacheValidity.KEEP
     assert cache.allows_load()
     assert cache.allows_store()
     assert cache._remap is None
-    assert cache.miss_reason() is None
     cache.save()
     assert cache.host_slots_path is not None
     assert not cache.host_slots_path.exists()
@@ -173,11 +167,10 @@ def test_bind_matches_sidecar_and_replays_resident(tmp_path: Path):
     cache = _offload_cache(tmp_path)
     cache.host_slots_path.write_text(repr(sidecar))
 
-    assert cache.bind(_tagged_graph(slot)) is CacheValidity.KEEP
+    assert cache.bind(_tagged_graph(slot)) is None
     assert cache.allows_load()
     assert not cache.allows_store()
     assert cache._remap == {99: slot}
-    assert cache.miss_reason() is None
     assert host_weights.is_resident(slot)
 
 
@@ -186,18 +179,17 @@ def test_bind_misses_without_sidecar(tmp_path: Path):
     slot, _ = _adopt_weight()
     cache = _offload_cache(tmp_path)
 
-    assert cache.bind(_tagged_graph(slot)) is CacheValidity.DROP
+    assert "sidecar missing" in cache.bind(_tagged_graph(slot))
     assert not cache.allows_load()
     assert cache.allows_store()
     assert cache._remap is None
-    assert cache.miss_reason() is not None
 
 
 @requires_cuda
 def test_save_writes_host_slots_sidecar(tmp_path: Path):
     slot, _ = _adopt_weight()
     cache = _offload_cache(tmp_path)
-    assert cache.bind(_tagged_graph(slot)) is CacheValidity.DROP
+    assert cache.bind(_tagged_graph(slot)) is not None
     cache.save()
 
     raw = ast.literal_eval(cache.host_slots_path.read_text())
@@ -222,7 +214,7 @@ def test_replay_does_not_rewrite_sidecar(tmp_path: Path):
     }
     cache = _offload_cache(tmp_path)
     cache.host_slots_path.write_text(repr(sidecar))
-    assert cache.bind(_tagged_graph(slot)) is CacheValidity.KEEP
+    assert cache.bind(_tagged_graph(slot)) is None
     cache.save()
     assert ast.literal_eval(cache.host_slots_path.read_text()) == sidecar
 

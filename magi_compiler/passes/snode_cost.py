@@ -22,26 +22,17 @@ Waits take no time here; ``H2dLoadReorder`` prices loads from bytes and bandwidt
 
 from __future__ import annotations
 
-import copy
 import logging
 import weakref
 
 from torch._inductor.scheduler import BaseSchedulerNode
 
+from magi_compiler.profiling.runtime_estimator import analytical_ns
 from magi_compiler.utils import magi_logger
 
 from .overlap import rank_sync
-from .snode_utils import is_compute, is_weight_gather, issues_transfer
+from .snode_utils import is_all_gather_launch, is_compute, issues_transfer
 from .weight_offload.schedule.h2d_snode import is_h2d_load
-
-
-def _analytical(snode: BaseSchedulerNode) -> float:
-    from torch._inductor.comms import estimate_op_runtime
-
-    try:
-        return max(0.0, float(estimate_op_runtime(snode)))
-    except Exception:  # noqa: BLE001
-        return 0.0
 
 
 def _is_priced(snode: BaseSchedulerNode) -> bool:
@@ -82,7 +73,7 @@ class SnodeCostTable:
             return ns
         if is_h2d_load(snode):
             return 0.0
-        ns = _analytical(snode)
+        ns = max(0.0, analytical_ns(snode))
         if _is_priced(snode):
             self._report_miss(snode, ns)
         self._ns[snode] = ns
@@ -122,16 +113,9 @@ class SnodeCostProfile:
         self.table = table
         self.estimator = estimator
 
-    def __deepcopy__(self, memo):
-        new = SnodeCostProfile.__new__(SnodeCostProfile)
-        memo[id(self)] = new
-        new.table = copy.deepcopy(self.table, memo)
-        new.estimator = copy.deepcopy(self.estimator, memo)
-        return new
-
     @property
     def _syncs(self) -> bool:
-        return bool(getattr(self.estimator, "_sync_across_ranks", False))
+        return self.estimator is not None and self.estimator.sync_across_ranks
 
     def __call__(self, snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         self.table.reset()
@@ -140,7 +124,7 @@ class SnodeCostProfile:
         priced = [s for s in snodes if _is_priced(s)]
         if self.estimator is None:
             for s in priced:
-                self.table.record(s, _analytical(s))
+                self.table.record(s, analytical_ns(s))
             magi_logger.info("snode cost profile: priced %d snode(s) analytically", len(priced))
             return snodes
 
@@ -154,12 +138,8 @@ class SnodeCostProfile:
             except Exception as exc:  # noqa: BLE001
                 magi_logger.warning("snode cost profile: rank-synchronized profiling failed (%s)", exc, rank="all")
                 ok = False
-        requery = getattr(self.estimator, "requery", self.estimator)
         for s in priced:
-            try:
-                self.table.record(s, requery(s))
-            except Exception:  # noqa: BLE001
-                self.table.record(s, _analytical(s))
+            self.table.record(s, self.estimator.requery(s))
         self.table.ok = ok
         self._report(len(priced), n_changed)
         return snodes
@@ -173,7 +153,7 @@ class SnodeCostProfile:
         join it if any peer's does.  A load counts here because the load reorder
         needs the COMPUTE around it priced -- the load itself never is.
         """
-        local = any(is_weight_gather(s) or is_h2d_load(s) for s in snodes)
+        local = any(is_all_gather_launch(s) or is_h2d_load(s) for s in snodes)
         return rank_sync.any_rank(local) if self._syncs else local
 
     def _warm(self, priced) -> bool:
@@ -191,9 +171,9 @@ class SnodeCostProfile:
             "snode cost profile: priced %d snode(s) (cost table: %d distinct ops, measured=%s reused=%s; "
             "%d entr%s changed by the rank-synchronized re-measurement)",
             n_priced,
-            len(getattr(est, "table", {}) or {}),
-            getattr(est, "n_measured", None),
-            getattr(est, "n_cache_hits", None),
+            len(est.table),
+            est.n_measured,
+            est.n_cache_hits,
             n_changed,
             "y" if n_changed == 1 else "ies",
         )
@@ -204,5 +184,5 @@ class SnodeCostProfile:
                 rank="all",
             )
         # summary() builds the whole table eagerly; only pay for it when read.
-        if hasattr(est, "summary") and logging.getLogger("magi_compiler").isEnabledFor(logging.DEBUG):
+        if logging.getLogger("magi_compiler").isEnabledFor(logging.DEBUG):
             magi_logger.debug("snode cost %s", est.summary())

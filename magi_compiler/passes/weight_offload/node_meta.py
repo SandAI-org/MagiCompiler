@@ -28,7 +28,7 @@ import torch.fx as fx
 HOST_SLOT = "magi_host_offload_slot"
 
 # Local bucket planning separates gathers by this tag; rank 0's adopted plan may mix them.
-# Mirrored under ``meta["custom"]`` so AOT preserves it in scheduler-node origins.
+# Kept under ``meta["custom"]``, the field AOT preserves into scheduler-node origins.
 HOST_OFFLOADED = "magi_host_offloaded"
 
 
@@ -38,7 +38,7 @@ def host_slot(node: fx.Node) -> int | None:
 
 
 def is_host_offloaded(node: fx.Node) -> bool:
-    return bool(node.meta.get(HOST_OFFLOADED) or (node.meta.get("custom") or {}).get(HOST_OFFLOADED))
+    return bool((node.meta.get("custom") or {}).get(HOST_OFFLOADED))
 
 
 def mark_host_slot(node: fx.Node, slot: int) -> None:
@@ -46,5 +46,4 @@ def mark_host_slot(node: fx.Node, slot: int) -> None:
 
 
 def mark_host_offloaded(node: fx.Node) -> None:
-    node.meta[HOST_OFFLOADED] = True
     node.meta["custom"] = {**(node.meta.get("custom") or {}), HOST_OFFLOADED: True}

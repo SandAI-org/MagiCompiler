@@ -31,7 +31,7 @@ import torch
 from torch._inductor import ir
 
 from magi_compiler.passes.overlap import CostView, SnodeGraph, memory, scheduler
-from magi_compiler.passes.weight_offload.schedule import h2d_reorder, load_plan
+from magi_compiler.passes.weight_offload.schedule import load_plan
 from magi_compiler.passes.weight_offload.schedule.h2d_reorder import H2dLoadReorder
 
 _MIB = 1 << 20
@@ -64,13 +64,13 @@ class _Dep:
         self.name = name
 
 
-def _make_ir(op_overload, numel, dtype=torch.bfloat16, slots=()):
+def _make_ir(op_overload, numel, dtype=torch.bfloat16, slot=None):
     node = object.__new__(ir.FallbackKernel)
     node.op_overload = op_overload
     node.layout = ir.FixedLayout(device=torch.device("cpu"), dtype=dtype, size=[numel])
-    # Inductor flattens a custom op's non-tensor args here; for the load ops
-    # that is exactly the host-pool slot(s).
-    node.constant_args = tuple(slots)
+    # Inductor flattens a custom op's non-tensor args here; for the load op
+    # that is exactly the host-pool slot.
+    node.constant_args = () if slot is None else (slot,)
     return node
 
 
@@ -79,7 +79,7 @@ class _Snode:
 
     snodes = None
 
-    def __init__(self, name, kind, *, deps=(), cost=0.0, numel=0, slots=()):
+    def __init__(self, name, kind, *, deps=(), cost=0.0, numel=0, slot=None):
         from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
         self.name = name
@@ -91,7 +91,7 @@ class _Snode:
             self.node = object.__new__(ir.MultiOutput)
             self.node.layout = ir.FixedLayout(device=torch.device("cpu"), dtype=torch.bfloat16, size=[numel])
         else:
-            self.node = _make_ir(H2D_LOAD if kind == "load" else "fake.op", numel, slots=slots)
+            self.node = _make_ir(H2D_LOAD if kind == "load" else "fake.op", numel, slot=slot)
 
     def get_name(self):
         return self.name
@@ -107,10 +107,11 @@ class _Snode:
 def stub_wait_predicate(monkeypatch):
     """Inductor decides ``contains_wait`` by isinstance against ``ir._WaitKernel``,
     which a synthetic node cannot be."""
+    import magi_compiler.passes.overlap.graph as overlap_graph
     from magi_compiler.passes import snode_utils
 
     is_wait = lambda s: getattr(s, "kind", None) == "wait"  # noqa: E731
-    monkeypatch.setattr(h2d_reorder, "contains_wait", is_wait)
+    monkeypatch.setattr(overlap_graph, "contains_wait", is_wait)
     monkeypatch.setattr(snode_utils, "contains_wait", is_wait)
 
 
@@ -118,8 +119,8 @@ def _compute(name, cost_ns, deps=()):
     return _Snode(name, "compute", cost=cost_ns, deps=deps)
 
 
-def _load(name, mib, deps=(), slots=()):
-    return _Snode(name, "load", deps=deps, numel=mib * _MIB // 2, slots=slots)  # bf16: 2 bytes/elem
+def _load(name, mib, deps=(), slot=0):
+    return _Snode(name, "load", deps=deps, numel=mib * _MIB // 2, slot=slot)  # bf16: 2 bytes/elem
 
 
 def _wait(name, load_name):
@@ -229,7 +230,7 @@ def test_load_never_crosses_its_own_producer():
     assert out.index("shard_prep") < out.index("ld")
 
 
-def _two_conflicting_loads(slots=(None, None)):
+def _two_conflicting_loads(slots=(0, 0)):
     """The topology one load of in-flight budget cannot hoist both of: both loads
     are still read at ``user``, so the earlier one's bytes are live where the
     later one lands."""
@@ -237,9 +238,9 @@ def _two_conflicting_loads(slots=(None, None)):
         _compute("c0", 5e6),
         _compute("c1", 5e6),
         _compute("c2", 5e6),
-        _load("ld0", 8, slots=[slots[0]] if slots[0] is not None else ()),
+        _load("ld0", 8, slot=slots[0]),
         _wait("w0", "ld0"),
-        _load("ld1", 8, slots=[slots[1]] if slots[1] is not None else ()),
+        _load("ld1", 8, slot=slots[1]),
         _wait("w1", "ld1"),
         _compute("user", 1e6, deps=["w0", "w1"]),
     ]
@@ -276,7 +277,7 @@ def _serialized_loads(slots, *, mib=10):
     """
     order = [_compute("c0", 1e6)]
     for i, slot in enumerate(slots):
-        order += [_load(f"ld{i}", mib, slots=[slot]), _wait(f"w{i}", f"ld{i}"), _compute(f"u{i}", 1e3, deps=[f"w{i}"])]
+        order += [_load(f"ld{i}", mib, slot=slot), _wait(f"w{i}", f"ld{i}"), _compute(f"u{i}", 1e3, deps=[f"w{i}"])]
     return order
 
 
@@ -382,7 +383,7 @@ def _layered_graph(slots, *, layers=6, big_mib=8, small_mib=4, compute_ns=1e6):
     for i in range(layers):
         order.append(_compute(f"c{i}", compute_ns))
         for tag, mib, slot in (("big", big_mib, slots[2 * i]), ("small", small_mib, slots[2 * i + 1])):
-            order.append(_load(f"l{i}_{tag}", mib, slots=(slot,)))
+            order.append(_load(f"l{i}_{tag}", mib, slot=slot))
             order.append(_wait(f"w{i}_{tag}", f"l{i}_{tag}"))
             order.append(_compute(f"u{i}_{tag}", 0.0, deps=[f"w{i}_{tag}"]))
     return order
@@ -551,7 +552,7 @@ def test_a_lone_unhideable_load_is_bought_out_only_when_asked():
         host_weights.reset()
         shard = torch.randn(2 * _MIB // 2, device="cuda", dtype=torch.bfloat16)
         slot = _park(shard)
-        order = [_load("ld", 2, slots=[slot]), _wait("w", "ld"), _compute("user", 1e6, deps=["w"])]
+        order = [_load("ld", 2, slot=slot), _wait("w", "ld"), _compute("user", 1e6, deps=["w"])]
         _reorder(order, max_resident_bytes=resident)
         return host_weights.is_resident(slot), shard
 
@@ -612,7 +613,7 @@ def _plan_stub(name, *, deadline, last_user, nbytes, need=0.0, lower=0, inactive
     return load_plan.LoadPlan(
         anchor=_Snode(name, "load"),
         group=[],
-        slots=[],
+        slot=0,
         deadline=deadline,
         last_user=last_user,
         need=need,
@@ -730,7 +731,7 @@ def test_a_late_small_load_is_not_dragged_to_the_front_of_the_graph():
     Moving it to the front would hold its buffer across unrelated compute."""
     order = [_compute("c0", 6e5)]
     for i in range(3):
-        order += [_load(f"big{i}", 4, slots=()), _wait(f"wb{i}", f"big{i}"), _compute(f"ub{i}", 6e5, deps=[f"wb{i}"])]
+        order += [_load(f"big{i}", 4), _wait(f"wb{i}", f"big{i}"), _compute(f"ub{i}", 6e5, deps=[f"wb{i}"])]
     order += [_load("small", 1), _wait("ws", "small"), _compute("us", 1e3, deps=["ws"])]
 
     out = _reorder(order, max_inflight_bytes=64 * _MIB)

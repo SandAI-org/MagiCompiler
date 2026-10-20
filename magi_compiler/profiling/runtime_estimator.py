@@ -78,14 +78,6 @@ def snode_issues_collective(snode: BaseSchedulerNode) -> bool:
     return _extern_has_internal_collective(snode)
 
 
-def _is_h2d_load(snode: BaseSchedulerNode) -> bool:
-    # Imported per call: ``magi_compiler.passes`` imports this module lazily, and
-    # a module-level import here would close that cycle.
-    from magi_compiler.passes.weight_offload.schedule.h2d_snode import is_h2d_load
-
-    return is_h2d_load(snode)
-
-
 def _get_cost_sync_group():
     from magi_compiler.utils.dist_utils import get_cpu_gloo_group
 
@@ -185,9 +177,11 @@ def _is_multi_output_unpack(snode: BaseSchedulerNode) -> bool:
     """Zero-cost MultiOutput getitem.  Must never hit the structural-key table:
     it shares its origin fx node with the parent extern, so the key collides and
     would return the parent's full runtime."""
-    from torch._inductor.ir import MultiOutput
+    # Imported per call: ``magi_compiler.passes`` imports this module lazily, and
+    # a module-level import here would close that cycle.
+    from magi_compiler.passes.snode_utils import is_multi_output
 
-    return type(snode.node) is MultiOutput
+    return is_multi_output(snode)
 
 
 def _structural_key(snode: BaseSchedulerNode) -> tuple | None:
@@ -421,8 +415,6 @@ def _extern_has_internal_collective(snode: BaseSchedulerNode) -> bool:
 
 
 # ---- collective (weight all-gather) benchmarking --------------------------
-_AG = torch.ops._c10d_functional.all_gather_into_tensor.default
-_AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
 _WAIT = torch.ops._c10d_functional.wait_tensor.default
 
 
@@ -439,8 +431,10 @@ def _collective_spec(node: ir.ExternKernel):
     """(op_overload, group_name, group_size, [(shape, dtype, device), ...]) for a
     collective IR node, or None if it isn't a benchmarkable all-gather."""
     # TODO: support more graph collectives than AG / AG_COALESCED.
+    from magi_compiler.passes.snode_utils import AG, AG_COALESCED
+
     op = node.op_overload
-    if op not in (_AG, _AG_COALESCED):
+    if op not in (AG, AG_COALESCED):
         return None
     group_name = node.constant_args[-1]  # (..., group_size, group_name)
     from torch.distributed.distributed_c10d import _get_group_size_by_name
@@ -464,12 +458,6 @@ def _leaf_ce_ag(snode: BaseSchedulerNode) -> ir.ExternKernel | None:
     from magi_compiler.passes.snode_utils import is_ce_ag_ir, iter_ir_nodes
 
     return next((node for node in iter_ir_nodes(snode) if is_ce_ag_ir(node)), None)
-
-
-def _is_ce_ag_coalesced_ir(node) -> bool:
-    from magi_compiler.passes.snode_utils import is_ce_ag_coalesced
-
-    return is_ce_ag_coalesced(node)
 
 
 def _ce_ag_spec(node: ir.ExternKernel):
@@ -507,9 +495,10 @@ def _ce_ag_launch_wait(snode: BaseSchedulerNode):
             dtype,
         )
         return None
+    from magi_compiler.passes.snode_utils import is_ce_ag_coalesced
     from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER, CE_ALL_GATHER_COALESCED
 
-    if _is_ce_ag_coalesced_ir(node):
+    if is_ce_ag_coalesced(node):
         op = CE_ALL_GATHER_COALESCED
         return (lambda: op(shards, group_size, group_name)), lambda outs: [_WAIT(o) for o in outs]
     return (lambda: CE_ALL_GATHER(shards[0], group_size, group_name)), _WAIT
@@ -553,11 +542,13 @@ def _nccl_launch_wait(snode: BaseSchedulerNode):
     spec = _collective_spec(node) if node is not None else None
     if spec is None:
         return None
+    from magi_compiler.passes.snode_utils import AG_COALESCED
+
     op, group_name, group_size, specs = spec
     ins = [torch.empty(shape, dtype=dt, device=dev) for shape, dt, dev in specs]
-    if op is _AG_COALESCED:
-        return (lambda: _AG_COALESCED(ins, group_size, group_name), lambda outs: [_WAIT(o) for o in outs])
-    return (lambda: _AG(ins[0], group_size, group_name)), _WAIT
+    if op is AG_COALESCED:
+        return (lambda: op(ins, group_size, group_name), lambda outs: [_WAIT(o) for o in outs])
+    return (lambda: op(ins[0], group_size, group_name)), _WAIT
 
 
 def _measure_collective_op(snode: BaseSchedulerNode) -> float:
@@ -592,6 +583,10 @@ class ProfilingRuntimeEstimator:
         new = ProfilingRuntimeEstimator(sync_across_ranks=self._sync_across_ranks)
         memo[id(self)] = new
         return new
+
+    @property
+    def sync_across_ranks(self) -> bool:
+        return self._sync_across_ranks
 
     # Backward-compat alias: some callers/tests read `.table`.
     @property
@@ -693,7 +688,7 @@ class ProfilingRuntimeEstimator:
             # collective / internal-collective ops to analytical (solo replay hangs).
             snode = self._key_snode.get(k)
             if snode is not None and _needs_lockstep_measure(snode):
-                ns = _safe_analytical(snode)
+                ns = analytical_ns(snode)
                 if ns != e.ns:
                     n += 1
                 e.ns = ns
@@ -736,7 +731,7 @@ class ProfilingRuntimeEstimator:
             return self._measure(snode), True
         except BaseException as exc:  # noqa: BLE001
             magi_logger.warning("warm/sync measure fell back to analytical for %s: %s", snode.get_name(), exc)
-            return _safe_analytical(snode), False
+            return analytical_ns(snode), False
 
     def summary(self) -> str:
         """One line per distinct op + a machine-parseable ``ESTLINE`` tag
@@ -792,22 +787,25 @@ class ProfilingRuntimeEstimator:
         # A wait_tensor kernel itself takes ~0 time (the collective's cost is
         # attributed to the launch); keep it analytical (returns 0).
         if contains_wait(snode) and not contains_collective(snode):
-            return _safe_analytical(snode)
+            return analytical_ns(snode)
 
-        if _is_multi_output_unpack(snode) or _is_h2d_load(snode):
+        # A load is never replayed: in sync mode that would issue H2D copies in lockstep.
+        from magi_compiler.passes.weight_offload.schedule.h2d_snode import is_h2d_load
+
+        if _is_multi_output_unpack(snode) or is_h2d_load(snode):
             return 0.0
 
         if _leaf_ce_ag(snode) is not None:
             node = _leaf_ce_ag(snode)
             spec = _ce_ag_spec(node)
             if spec is None:
-                return _safe_analytical(snode)
+                return analytical_ns(snode)
             shapes, dtype, group_size, _gn = spec
             ckey = ("ce_ag", group_size, shapes, str(dtype))
             entry = self._table.get(ckey)
             if entry is not None:
                 return self._reuse(entry)
-            ns = _safe_analytical(snode)
+            ns = analytical_ns(snode)
             self._table[ckey] = ProfileEntry(ns=ns, kind="ce_ag", label=_ce_ag_label(snode), measured=False)
             if self._sync_across_ranks:
                 self._key_snode[ckey] = snode
@@ -822,13 +820,13 @@ class ProfilingRuntimeEstimator:
             cnode = _leaf_collective(snode)
             spec = _collective_spec(cnode) if cnode is not None else None
             if spec is None:
-                return _safe_analytical(snode)  # non-AG / unparseable -> old behaviour
+                return analytical_ns(snode)  # non-AG / unparseable -> old behaviour
             op, _group_name, group_size, specs = spec
             ckey = ("collective", str(op), group_size, tuple((tuple(shape), str(dt)) for shape, dt, _dev in specs))
             entry = self._table.get(ckey)
             if entry is not None:
                 return self._reuse(entry)
-            ns = _safe_analytical(snode)  # Inductor static estimate as the seed
+            ns = analytical_ns(snode)  # Inductor static estimate as the seed
             self._table[ckey] = ProfileEntry(ns=ns, kind="collective", label=_collective_label(snode), measured=False)
             if self._sync_across_ranks:
                 self._key_snode[ckey] = snode  # warm_and_sync -> real measured override
@@ -845,7 +843,7 @@ class ProfilingRuntimeEstimator:
         # benchmark_fused_nodes is unsafe here; eager-replay of the original
         # aten.sin/add/... would time the unfused launches, not the fused kernel.
         if not is_extern and _graph_has_free_symbols():
-            return _safe_analytical(snode)
+            return analytical_ns(snode)
 
         # op -> time table: profile a distinct key once, reuse afterwards.
         key = _structural_key(snode)
@@ -860,7 +858,7 @@ class ProfilingRuntimeEstimator:
         # internal NCCL op -> count mismatch -> hang.  Seed analytical + stash the
         # snode; warm_and_sync re-measures it in rank-lockstep (fixed iters).
         if is_extern and self._sync_across_ranks and _extern_has_internal_collective(snode):
-            ns = _safe_analytical(snode)
+            ns = analytical_ns(snode)
             if key is not None:
                 self._table[key] = ProfileEntry(ns=ns, kind="extern", label=_snode_label(snode), measured=False)
                 self._key_snode[key] = snode
@@ -875,7 +873,7 @@ class ProfilingRuntimeEstimator:
                 _warn_if_implausible(snode, ns)
         except BaseException as exc:  # noqa: BLE001
             magi_logger.debug("Profiling estimator fell back to analytical for %s: %s", snode.get_name(), exc)
-            ns = _safe_analytical(snode)
+            ns = analytical_ns(snode)
             measured = False
 
         if key is not None:
@@ -914,7 +912,7 @@ class ProfilingRuntimeEstimator:
             return ms * 1e6
         except Exception as exc:  # noqa: BLE001
             magi_logger.debug("Profiling estimator fell back to analytical for %s: %s", snode.get_name(), exc)
-            return _safe_analytical(snode)
+            return analytical_ns(snode)
 
 
 def _needs_lockstep_measure(snode: BaseSchedulerNode) -> bool:
@@ -926,7 +924,8 @@ def _needs_lockstep_measure(snode: BaseSchedulerNode) -> bool:
     return isinstance(snode, ExternKernelSchedulerNode) and _extern_has_internal_collective(snode)
 
 
-def _safe_analytical(snode: BaseSchedulerNode) -> float:
+def analytical_ns(snode: BaseSchedulerNode) -> float:
+    """Inductor's static estimate, or 0 for a node it cannot estimate."""
     try:
         return snode.get_estimated_runtime()
     except Exception:  # noqa: BLE001

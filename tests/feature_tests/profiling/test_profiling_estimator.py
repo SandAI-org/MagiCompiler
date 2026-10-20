@@ -40,7 +40,6 @@ from magi_compiler.profiling.runtime_estimator import (
     _ce_ag_label,
     _ce_ag_launch_wait,
     _ce_ag_spec,
-    _is_ce_ag_coalesced_ir,
     _leaf_ce_ag,
     _measure_ce_ag,
     _measure_extern,
@@ -699,9 +698,11 @@ def test_collective_search_keeps_one_level_for_nested_foreach():
 
 
 def test_coalesced_gather_is_distinguished_from_a_single_one():
+    from magi_compiler.passes.snode_utils import is_ce_ag_coalesced
+
     ag, coalesced = _ce_ops()
-    assert _is_ce_ag_coalesced_ir(_ce_ir(coalesced, [(8, 4)]))
-    assert not _is_ce_ag_coalesced_ir(_ce_ir(ag, [(8, 4)]))
+    assert is_ce_ag_coalesced(_ce_ir(coalesced, [(8, 4)]))
+    assert not is_ce_ag_coalesced(_ce_ir(ag, [(8, 4)]))
 
 
 def test_ce_ag_label_reports_transport_world_size_and_member_count():
@@ -814,7 +815,7 @@ def ce_measure_calls(monkeypatch):
 
     monkeypatch.setattr(re_mod, "contains_wait", lambda s: False)
     monkeypatch.setattr(re_mod, "_is_multi_output_unpack", lambda s: False)
-    monkeypatch.setattr(re_mod, "_safe_analytical", lambda s: 111.0)
+    monkeypatch.setattr(re_mod, "analytical_ns", lambda s: 111.0)
     monkeypatch.setattr(re_mod, "_measure_ce_ag", fake_measure)
     return calls
 

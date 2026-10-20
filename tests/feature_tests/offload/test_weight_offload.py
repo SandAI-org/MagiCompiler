@@ -531,7 +531,7 @@ def test_bind_and_insert_puts_the_load_between_the_shard_and_the_gather(dist_1ra
 
     gm, param = _lowered_weight_graph(dist_1rank)
     slot = _park(param._local_tensor, name="layers.3.mlp.w1")
-    assert bind_weights_to_host(gm, [param], FsdpShardSource(), min_bytes=0) == 1
+    assert bind_weights_to_host(gm, [param], FsdpShardSource()) == 1
     assert host_weights.name_of(slot) == "layers.3.mlp.w1"
     assert insert_h2d_loads(gm) == 1
 
@@ -558,7 +558,7 @@ def test_load_sits_above_the_dtype_cast(dist_1rank):
 
     gm, param = _lowered_weight_graph(dist_1rank, forward_dtype=torch.float32)
     _park(param._local_tensor)
-    assert bind_weights_to_host(gm, [param], FsdpShardSource(), min_bytes=0) == 1
+    assert bind_weights_to_host(gm, [param], FsdpShardSource()) == 1
     assert insert_h2d_loads(gm) == 1
 
     order = {n: i for i, n in enumerate(gm.graph.nodes)}
@@ -578,13 +578,13 @@ def test_second_graph_over_the_same_parameters_still_gets_its_loads(dist_1rank):
 
     gm1, param = _lowered_weight_graph(dist_1rank)
     _park(param._local_tensor)
-    assert bind_weights_to_host(gm1, [param], FsdpShardSource(), min_bytes=0) == 1
+    assert bind_weights_to_host(gm1, [param], FsdpShardSource()) == 1
     assert insert_h2d_loads(gm1) == 1
     assert param._local_tensor.untyped_storage().nbytes() == 0
 
     # A second graph over the same live parameter, as a second shape would give.
     gm2, _ = _lowered_weight_graph(dist_1rank)
-    assert bind_weights_to_host(gm2, [param], FsdpShardSource(), min_bytes=0) == 1, "the adopted shard is still a candidate"
+    assert bind_weights_to_host(gm2, [param], FsdpShardSource()) == 1, "the adopted shard is still a candidate"
     assert insert_h2d_loads(gm2) == 1, "the second graph needs its own load"
 
     slots = {n.args[1] for n in _nodes(gm2, H2D_LOAD)}
@@ -629,7 +629,7 @@ def test_a_weight_two_gathers_read_gets_a_load_for_each(dist_1rank):
     expected = param._local_tensor.clone()
     _park(param._local_tensor)
 
-    assert bind_weights_to_host(gm, [param], FsdpShardSource(), min_bytes=0) == 2, "both gathers need a candidate"
+    assert bind_weights_to_host(gm, [param], FsdpShardSource()) == 2, "both gathers need a candidate"
     assert host_weights.num_bound() == 1, "one shard, one set of host bytes"
     torch.testing.assert_close(host_weights.get(0).cuda(), expected)
 
@@ -732,7 +732,7 @@ def test_a_replicated_weight_is_offloaded_even_though_nothing_gathers_it(dist_1r
     expected = param._local_tensor.clone()
     _park(param._local_tensor)
 
-    assert bind_weights_to_host(gm, [param], FsdpShardSource(), min_bytes=0) == 1
+    assert bind_weights_to_host(gm, [param], FsdpShardSource()) == 1
     assert param._local_tensor.untyped_storage().nbytes() == 0, "the full copy must leave the device"
     torch.testing.assert_close(host_weights.get(0).cuda(), expected)
 
@@ -761,10 +761,10 @@ def test_an_ungathered_weight_gets_a_load_to_itself(dist_1rank):
     _park(repl._local_tensor)
 
     examples = {"model_fc1_weight_parameter": shard, "model_odd_weight_parameter": repl}
-    plan, skipped = FsdpShardSource().collect(gm, examples, 0)
+    plan, skipped = FsdpShardSource().collect(gm, examples)
     assert len(plan) == 2, ([c.name for c in plan], skipped)
 
-    assert bind_weights_to_host(gm, list(examples.values()), FsdpShardSource(), min_bytes=0) == 2
+    assert bind_weights_to_host(gm, list(examples.values()), FsdpShardSource()) == 2
     assert insert_h2d_loads(gm) == 2
     loads = _nodes(gm, H2D_LOAD)
     assert len(loads) == 2
@@ -778,20 +778,8 @@ def test_an_unparked_shard_is_not_offloaded(dist_1rank):
     from magi_compiler.passes.weight_offload import bind_weights_to_host
 
     gm, param = _lowered_weight_graph(dist_1rank)
-    assert bind_weights_to_host(gm, [param], FsdpShardSource(), min_bytes=0) == 0
+    assert bind_weights_to_host(gm, [param], FsdpShardSource()) == 0
     assert param._local_tensor.untyped_storage().nbytes() > 0
-
-
-@requires_cuda
-def test_shard_below_the_size_floor_is_left_unloaded(dist_1rank):
-    """A small shard is the worst trade on both axes: fixed DMA overhead dominates
-    the transfer, and it frees almost nothing."""
-    from magi_compiler.passes.fsdp_overlap import FsdpShardSource
-    from magi_compiler.passes.weight_offload import bind_weights_to_host
-
-    gm, param = _lowered_weight_graph(dist_1rank)
-    _park(param._local_tensor)
-    assert bind_weights_to_host(gm, [param], FsdpShardSource(), min_bytes=4 << 20) == 0
 
 
 @requires_cuda
@@ -982,11 +970,8 @@ def _assert_both_names_share_one_slot(root: torch.nn.Module) -> None:
 
 @requires_cuda
 def test_a_shard_below_the_floor_is_materialized_on_the_device(dist_1rank):
-    """The same size floor collect applies, applied early.
-
-    Parking a weight the source will then refuse to load is the one way this can
-    corrupt a run, so the two predicates have to ask the same question.
-    """
+    """The size floor is applied once, here: a shard below it keeps its device
+    storage, so collect never finds a host slot for it."""
     root = _shard_on_meta(dist_1rank, rows=256, cols=64)
     _patched(root.inner, min_shard_mib=1.0)  # 256x64 bf16 = 32 KiB, well under the floor
 
@@ -1125,7 +1110,7 @@ def test_host_first_materializes_hands_off_and_binds_the_compiled_subtree(dist_1
     # Bind while still offloaded, before the restoration check changes the source.
     param = _raw(root.inner.big)
     gm, _ = _lowered_weight_graph(dist_1rank, rows=256, cols=64)
-    assert bind_weights_to_host(gm, [param], FsdpShardSource(), min_bytes=0) == 1
+    assert bind_weights_to_host(gm, [param], FsdpShardSource()) == 1
     assert host_weights.num_bound() == 2, "binding must reuse the slots adopted by handoff"
     assert insert_h2d_loads(gm) == 1
     (load,) = _nodes(gm, H2D_LOAD)
@@ -1310,7 +1295,7 @@ def test_a_plain_parameter_is_offloaded_without_any_fsdp():
     gm, examples = _linear_graph(w)
 
     source = PlainParamSource()
-    assert bind_weights_to_host(gm, examples, source, min_bytes=0) == 1
+    assert bind_weights_to_host(gm, examples, source) == 1
     assert w.untyped_storage().nbytes() == 0, "the stand-in must stay empty"
     assert insert_h2d_loads(gm) == 1
 
@@ -1334,7 +1319,7 @@ def test_only_parameters_are_taken_not_activations():
     # x's "live value" is a plain tensor, not a Parameter.
     examples[0] = torch.randn(8, 256, device="cuda", dtype=torch.bfloat16)
 
-    assert bind_weights_to_host(gm, examples, PlainParamSource(), min_bytes=0) == 1
+    assert bind_weights_to_host(gm, examples, PlainParamSource()) == 1
 
 
 @requires_cuda
@@ -1350,7 +1335,7 @@ def test_each_load_sits_at_its_own_first_reader_not_at_the_declaration():
         _park(p)
     gm, examples = _linear_graph(*params)
 
-    assert bind_weights_to_host(gm, examples, PlainParamSource(), min_bytes=0) == 4
+    assert bind_weights_to_host(gm, examples, PlainParamSource()) == 4
     assert insert_h2d_loads(gm) == 4
 
     order = {n: i for i, n in enumerate(gm.graph.nodes)}
@@ -1365,18 +1350,12 @@ def test_each_load_sits_at_its_own_first_reader_not_at_the_declaration():
 
 @requires_cuda
 @pytest.mark.usefixtures("no_process_group")
-@pytest.mark.parametrize(
-    "parked,min_bytes", [pytest.param(False, 0, id="unparked"), pytest.param(True, 4 << 20, id="below-size-floor")]
-)
-def test_ineligible_plain_parameter_is_not_offloaded(parked, min_bytes):
+def test_unparked_plain_parameter_is_not_offloaded():
     small = torch.nn.Parameter(torch.randn(16, 16, device="cuda", dtype=torch.bfloat16))
-    if parked:
-        _park(small)
     gm, examples = _linear_graph(small)
 
-    assert bind_weights_to_host(gm, examples, PlainParamSource(), min_bytes=min_bytes) == 0
-    if not parked:
-        assert small.untyped_storage().nbytes() > 0
+    assert bind_weights_to_host(gm, examples, PlainParamSource()) == 0
+    assert small.untyped_storage().nbytes() > 0
 
 
 @requires_cuda
@@ -1546,7 +1525,7 @@ def test_plain_host_first_materializes_hands_off_and_binds_the_compiled_subtree(
 
     # Bind before restoring device storage, while the parameter is still offloaded.
     gm, examples = _linear_graph(weight)
-    assert bind_weights_to_host(gm, examples, PlainParamSource(), min_bytes=0) == 1
+    assert bind_weights_to_host(gm, examples, PlainParamSource()) == 1
     assert host_weights.num_bound() == 2, "binding must reuse the slots adopted by handoff"
     assert insert_h2d_loads(gm) == 1
     (load,) = _nodes(gm, H2D_LOAD)

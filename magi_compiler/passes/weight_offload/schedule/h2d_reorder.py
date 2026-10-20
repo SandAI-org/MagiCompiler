@@ -30,7 +30,6 @@ their existing position and are charged to residency, not in-flight storage.
 from __future__ import annotations
 
 from torch._inductor.scheduler import BaseSchedulerNode
-from torch._inductor.utils import contains_wait
 
 from magi_compiler.utils import magi_logger
 
@@ -45,8 +44,7 @@ from ...overlap import (
     live_starts,
     unhoisted_index,
 )
-from ...snode_utils import is_multi_output
-from .h2d_snode import H2D_OPS, is_h2d_load, slots_of
+from .h2d_snode import is_h2d_load, slot_of
 from .load_plan import LoadPlan, load_bytes
 
 _MAX_SPLIT_ROUNDS = 5
@@ -85,7 +83,7 @@ class H2dLoadReorder(OverlapPass):
     def wants(self, order: list[BaseSchedulerNode]) -> bool:
         if any(is_h2d_load(s) for s in order):
             return True
-        magi_logger.debug("h2d load reorder: no weight load among %d snodes (known ops: %s)", len(order), H2D_OPS)
+        magi_logger.debug("h2d load reorder: no weight load among %d snodes", len(order))
         return False
 
     def plan(self, graph: SnodeGraph, cost: CostView, ctx: dict) -> list[LoadPlan] | None:
@@ -107,18 +105,7 @@ class H2dLoadReorder(OverlapPass):
     @staticmethod
     def _group_and_waits(load, graph: SnodeGraph) -> tuple[list, list]:
         """The load plus the ``MultiOutput`` unpack its result reaches readers through, and the waits guarding it."""
-
-        def classify(u):
-            if contains_wait(u):
-                return "wait", False
-            if is_multi_output(u):
-                return "member", True
-            return None, False
-
-        found = graph.walk_users([load], classify)
-        group = [load] + [u for label, u in found if label == "member"]
-        waits = [u for label, u in found if label == "wait"]
-        return group, waits
+        return [load, *graph.unpacks_of(load)], graph.waits_of(load)
 
     def _plan(self, graph: SnodeGraph) -> list[LoadPlan]:
         index_of = graph.index_of
@@ -134,7 +121,7 @@ class H2dLoadReorder(OverlapPass):
                 LoadPlan(
                     anchor=load,
                     group=group,
-                    slots=slots_of(load),
+                    slot=slot_of(load),
                     deadline=min(index_of[w] for w in waits),
                     last_user=graph.last_user_index(group, waits),
                     need=need,
@@ -215,7 +202,7 @@ class H2dLoadReorder(OverlapPass):
     def _select_resident_at(self, plans, prefix, resident_budget, density) -> tuple[set, int, bool]:
         """Bound transferred bytes at each deadline by ``density * bandwidth * prefix[wait]``.
         Promote the smallest weight covering each deficit; the final flag is false
-        when an eligible weight remains but the residency budget cannot pay for it."""
+        when the residency budget cannot pay for a deficit."""
         rate = density * self.bandwidth_bytes_per_ns
         promoted: set = set()
         on_bus: list = []
@@ -223,14 +210,12 @@ class H2dLoadReorder(OverlapPass):
         feasible = True
         for plan in sorted(plans, key=lambda p: (p.deadline, -p.nbytes)):
             kept += plan.nbytes
-            if plan.slots:  # only a load with host slots can be given back
-                on_bus.append(plan)
+            on_bus.append(plan)
             allowance = rate * prefix[min(plan.deadline, len(prefix) - 1)]
             while kept > allowance:
                 pick = self._best_fit(on_bus, kept - allowance, resident_budget - spent)
                 if pick is None:
-                    # Loads without host slots cannot be promoted, regardless of budget.
-                    feasible = feasible and not on_bus
+                    feasible = False
                     break
                 on_bus.remove(pick)
                 promoted.add(pick.anchor)
@@ -277,12 +262,7 @@ class H2dLoadReorder(OverlapPass):
     def _promote(plans) -> int:
         from ..runtime import host_weights
 
-        slots: list[int] = []
-        for p in plans:
-            if not p.inactive:
-                continue
-            slots.extend(p.slots)
-        return host_weights.make_resident_many(slots)
+        return host_weights.make_resident_many([p.slot for p in plans if p.inactive])
 
     # -- reporting --------------------------------------------------------
     def _report(self, plans, targets, index_of, given_back, budget) -> None:
@@ -308,12 +288,9 @@ class H2dLoadReorder(OverlapPass):
             exposed / 1e6,
             by_budget / 1e6,
         )
-        if inflight > budget:
-            magi_logger.warning(
-                "h2d load reorder: in-flight peak %.1f MiB exceeds budget %.0f MiB; memory accounting mismatch",
-                inflight / 2**20,
-                budget / 2**20,
-            )
+        assert (
+            inflight <= budget
+        ), f"h2d load reorder: in-flight peak {inflight} B exceeds the {budget} B budget it was placed under"
 
     def _log_shortfall(self, total, hideable, resident, exposed) -> None:
         """Warn when estimated compute coverage cannot hide the remaining transfers."""

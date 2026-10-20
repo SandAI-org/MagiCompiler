@@ -31,7 +31,7 @@ Layout, in the order a compile meets it:
 The pinned slabs themselves come from ``magi_compiler.host_mem``.
 """
 
-from .cache.offload_cache import CacheValidity, OffloadCache
+from .cache.offload_cache import OffloadCache
 from .graph.bind import bind_weights_to_host, insert_h2d_loads
 from .graph.weight_source import FsdpShardSource, PlainParamSource
 from .host_first import handoff_if_pending, patch_materialize
@@ -42,7 +42,6 @@ from .schedule.h2d_reorder import H2dLoadReorder
 __all__ = [
     "bind_weights_to_host",
     "insert_h2d_loads",
-    "CacheValidity",
     "OffloadCache",
     "H2dLoadReorder",
     "FsdpShardSource",

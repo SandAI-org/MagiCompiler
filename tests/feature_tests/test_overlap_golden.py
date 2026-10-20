@@ -72,12 +72,12 @@ class _Snode:
         return f"<{self.name}>"
 
 
-def _ir(cls, *, op=None, numel=0, slots=()):
+def _ir(cls, *, op=None, numel=0, slot=None):
     node = object.__new__(cls)
     for key, value in {
         "op_overload": op,
         "origins": None,
-        "constant_args": tuple(slots),
+        "constant_args": () if slot is None else (slot,),
         "get_size": lambda: [numel],
         "get_dtype": lambda: torch.bfloat16,
     }.items():
@@ -116,10 +116,10 @@ def _gather(name, deps, cost, coalesced=False):
     return _Snode(name, _ir(ir._CollectiveKernel, op=_AG_COALESCED if coalesced else _AG), deps, cost)
 
 
-def _load(name, mib, deps=(), slots=()):
+def _load(name, mib, deps=(), slot=0):
     from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
-    return _Snode(name, _ir(ir.FallbackKernel, op=H2D_LOAD, numel=mib * _MIB // 2, slots=slots), deps)
+    return _Snode(name, _ir(ir.FallbackKernel, op=H2D_LOAD, numel=mib * _MIB // 2, slot=slot), deps)
 
 
 # -- graph builders -----------------------------------------------------------
@@ -176,7 +176,7 @@ def _h2d_graph(seed, slots):
     act = "embed"
     for i, slot in enumerate(slots):
         mib = 4 + 4 * (i % 3)
-        order.append(_load(f"ld{i}", mib, slots=[slot]))
+        order.append(_load(f"ld{i}", mib, slot=slot))
         order.append(_wait(f"w{i}", f"ld{i}"))
         order.append(_compute(f"mm{i}", rng.uniform(1e5, 3e6), [f"w{i}", act]))
         order.append(_compute(f"pw{i}", rng.uniform(1e3, 5e5), [f"mm{i}"]))

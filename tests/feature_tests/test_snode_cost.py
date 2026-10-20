@@ -60,17 +60,23 @@ def stub_predicates(monkeypatch):
     monkeypatch.setattr(snode_utils, "contains_wait", is_wait)
     monkeypatch.setattr(snode_utils, "issues_transfer", is_gather)
     monkeypatch.setattr(snode_cost, "issues_transfer", is_gather)
-    monkeypatch.setattr(snode_cost, "is_weight_gather", is_gather)
+    monkeypatch.setattr(snode_cost, "is_all_gather_launch", is_gather)
 
 
 class _Estimator:
     """The surface of ``ProfilingRuntimeEstimator`` the profile pass drives."""
 
     def __init__(self, sync=True, fail_sync=False):
-        self._sync_across_ranks = sync
+        self.sync_across_ranks = sync
         self.fail_sync = fail_sync
         self.warmed: list[str] = []
         self.synced = False
+        self.table: dict = {}
+        self.n_measured = 0
+        self.n_cache_hits = 0
+
+    def summary(self):
+        return "stub"
 
     def __call__(self, s):
         self.warmed.append(s.name)
@@ -185,7 +191,7 @@ def test_pass_list_copies_share_one_empty_table_and_pickle():
     """Inductor deepcopies the pass list into the fx-graph cache key and pickles
     it: the copies must drop the snode-keyed entries, yet still point at ONE
     table between them, exactly like the originals do."""
-    from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder
+    from magi_compiler.passes.fsdp_overlap import FsdpAutoBucket, FsdpOverlapReorder
     from magi_compiler.passes.weight_offload import H2dLoadReorder
 
     table = SnodeCostTable()
@@ -193,14 +199,15 @@ def test_pass_list_copies_share_one_empty_table_and_pickle():
     table.record(s, 5.0)
     passes = [
         SnodeCostProfile(table, ProfilingRuntimeEstimator(sync_across_ranks=True)),
+        FsdpAutoBucket(cost_fn=table),
         FsdpOverlapReorder(cost_fn=table),
         H2dLoadReorder(bandwidth_bytes_per_ns=1.0, cost_fn=table),
     ]
     clone = copy.deepcopy(passes)
-    profile, fsdp, h2d = clone
-    assert profile.table is fsdp._cost_fn is h2d._cost_fn
+    profile, bucket, fsdp, h2d = clone
+    assert profile.table is bucket._cost_fn is fsdp._cost_fn is h2d._cost_fn
     assert profile.table is not table and len(profile.table) == 0
-    assert profile.estimator._sync_across_ranks is True
+    assert profile.estimator.sync_across_ranks is True
     pickle.dumps(clone)
     assert len(pickle.loads(pickle.dumps(table))) == 0
 

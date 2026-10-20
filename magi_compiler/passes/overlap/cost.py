@@ -41,7 +41,10 @@ class CostView:
     @property
     def ok(self) -> bool:
         """False when the cost table says pricing failed on this rank."""
-        return bool(getattr(self.cost_fn, "ok", True))
+        # Deferred: snode_cost imports this package.
+        from ..snode_cost import SnodeCostTable
+
+        return not isinstance(self.cost_fn, SnodeCostTable) or self.cost_fn.ok
 
     def __call__(self, snode: BaseSchedulerNode) -> float:
         return max(0.0, float(self.cost_fn(snode)))
