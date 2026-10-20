@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Recognize H2D loads, which provide no compute window for hiding transfers."""
+"""Recognize H2D loads, which provide no compute window for hiding transfers, and read what they move."""
 
 from __future__ import annotations
 
 from torch._inductor import ir
 from torch._inductor.scheduler import BaseSchedulerNode
 
-from ...snode_utils import iter_ir_nodes
+from ...snode_utils import ir_node_bytes, is_multi_output, iter_ir_nodes
 from ..runtime.h2d_op import H2D_LOAD
 
 
@@ -36,3 +36,14 @@ def slot_of(load: BaseSchedulerNode) -> int:
     """
     (slot,) = load.node.constant_args
     return int(slot)
+
+
+def load_bytes(group: list[BaseSchedulerNode]) -> int:
+    """Bytes a load pulls across PCIe.
+
+    Measured on the ``MultiOutput`` unpack rather than on the load itself: a
+    custom op lowers to a ``FallbackKernel`` whose own layout describes no
+    tensor.
+    """
+    unpacks = [s for s in group if is_multi_output(s)]
+    return sum(ir_node_bytes(s.node) for s in (unpacks or group[:1]))
