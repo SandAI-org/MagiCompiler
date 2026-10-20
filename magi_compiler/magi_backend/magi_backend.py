@@ -28,31 +28,13 @@ import torch
 import torch.fx as fx
 from torch._dispatch.python import enable_python_dispatcher
 from torch._guards import detect_fake_mode
-from torch.distributed.tensor import DTensor
 
 import magi_compiler.utils.envs as envs
 from magi_compiler.config import CompileConfig, CompileMode, CudaGraphMode, inductor_compile_config_hash, magi_cache_dump_path
 from magi_compiler.magi_depyf.timeline import observe_lifecycle, observe_lifecycle_context
 from magi_compiler.offload.offload_warpper import OffloadWrapper
 from magi_compiler.passes import CustomJointGraphPartitionFn, FullGraphPassManager, PostGradPassManager, pass_context
-from magi_compiler.passes.fsdp_overlap import (
-    FsdpAutoBucket,
-    FsdpOverlapReorder,
-    bind_weights_for_copy_engine,
-    lower_prim_redistribute_to_collectives,
-    rewrite_weight_ag_to_copy_engine,
-)
-from magi_compiler.passes.snode_cost import SnodeCostProfile, SnodeCostTable
-from magi_compiler.passes.weight_offload import (
-    FsdpShardSource,
-    H2dLoadReorder,
-    OffloadCache,
-    PlainParamSource,
-    bind_weights_to_host,
-    host_weights,
-    insert_h2d_loads,
-)
-from magi_compiler.profiling import ProfilingRuntimeEstimator
+from magi_compiler.passes.weight_offload import OffloadCache
 from magi_compiler.utils import compilation_counter, compute_code_hash, compute_graph_hash, compute_hash, magi_logger
 from magi_compiler.utils.visualize import save_fx_graph_visualization
 
@@ -62,6 +44,7 @@ from .cuda_graph_mgr import gen_wrap_func_for_cudagraph
 from .partition_rules import resolve_defined_ops
 from .piecewise_backend import PiecewiseBackend
 from .piecewise_compiler import CompilerInterface, EagerAdaptor, InductorStandaloneAdaptor
+from .weight_pipeline import WeightPipeline
 
 compilation_start_time: float = 0.0
 
@@ -654,124 +637,22 @@ class MagiBackend:
         self.local_magi_cache_path.mkdir(parents=True, exist_ok=True)
         self.compiler_manager.initialize_cache(self.local_magi_cache_path)
 
-    def _reclaim_unloaded_weights(self, example_inputs) -> None:
-        """Restore this graph's parked weights that the offload rewrite left without loads."""
-        # Other models' slots must stay parked until their own graphs compile.
-        locals_ = (ex._local_tensor if isinstance(ex, DTensor) else ex for ex in example_inputs or ())
-        slots = [slot for t in locals_ if isinstance(t, torch.Tensor) and (slot := host_weights.slot_of(t)) is not None]
-        # Exclude bytes made resident by other calls or passes.
-        before = host_weights.resident_bytes()
-        restored = host_weights.restore_unclaimed(slots)
-        if not restored:
-            return
-        magi_logger.warning(
-            "host offload: restored %d weight(s) without graph loads, %.1f MiB; weights: %s",
-            len(restored),
-            (host_weights.resident_bytes() - before) / 2**20,
-            ", ".join(restored[:8]) + (f", +{len(restored) - 8} more" if len(restored) > 8 else ""),
-        )
-
-    def _validate_weight_pipeline(self) -> None:
-        fsdp_cfg = self.compile_config.fsdp_config
-        offload_cfg = self.compile_config.offload_config
-        if fsdp_cfg.enable_fsdp:
-            assert self.compile_config.disable_graph_split, "fsdp_config.enable_fsdp requires disable_graph_split=True"
-            assert (
-                self.compile_config.cudagraph_mode == CudaGraphMode.NONE
-            ), "fsdp_config.enable_fsdp requires cudagraph_mode=NONE"
-        if offload_cfg.graph_weight_offload:
-            assert (
-                not offload_cfg.model_cpu_offload
-            ), "offload_config.graph_weight_offload and offload_config.model_cpu_offload are mutually exclusive"
-            assert self.compile_config.cudagraph_mode == CudaGraphMode.NONE, (
-                "offload_config.graph_weight_offload requires cudagraph_mode=NONE: "
-                "magi::h2d_load uses a separate stream and CUDA events"
-            )
-            assert not (fsdp_cfg.enable_fsdp and fsdp_cfg.transport == "copy_engine"), (
-                "offload_config.graph_weight_offload requires fsdp_config.transport='nccl': "
-                "copy-engine gathers require device-resident peer shards"
-            )
-
     @observe_lifecycle("weight_pipeline")
     def _apply_weight_pipeline(self, graph: fx.GraphModule, example_inputs) -> None:
-        self._validate_weight_pipeline()
-        fsdp_cfg = self.compile_config.fsdp_config
-        offload_cfg = self.compile_config.offload_config
-
-        if fsdp_cfg.enable_fsdp:
-            lower_prim_redistribute_to_collectives(graph)
-            magi_logger.info("FSDP fullgraph overlap: transport=%s bucket_mode=%s", fsdp_cfg.transport, fsdp_cfg.bucket_mode)
-
-        bound = 0
-        if fsdp_cfg.enable_fsdp and fsdp_cfg.transport == "copy_engine":
-            bind_weights_for_copy_engine(
-                graph=graph, example_inputs=example_inputs, min_shard_bytes=int(fsdp_cfg.symm_min_shard_mib) * 1024 * 1024
-            )
-            rewrite_weight_ag_to_copy_engine(graph)
-        elif offload_cfg.graph_weight_offload:
-            bound = bind_weights_to_host(
-                graph=graph,
-                example_inputs=example_inputs,
-                source=FsdpShardSource() if fsdp_cfg.enable_fsdp else PlainParamSource(),
-            )
-            if bound:
-                insert_h2d_loads(graph)
-
-        self._configure_overlap_passes(loads_inserted=bool(bound))
-
-        if offload_cfg.graph_weight_offload:
-            # The compilation interpreter runs next and must not read storage-free weights.
-            self._reclaim_unloaded_weights(example_inputs)
+        pipeline = WeightPipeline(
+            fsdp_config=self.compile_config.fsdp_config,
+            offload_config=self.compile_config.offload_config,
+            cudagraph_mode=self.compile_config.cudagraph_mode,
+            disable_graph_split=self.compile_config.disable_graph_split,
+        )
+        key = "reorder_for_compute_comm_overlap_passes"
+        # Written after _init_cache: the cache hash takes str() of pass objects, which embeds their addresses.
+        passes = pipeline.run(graph, example_inputs, default_passes=self.inductor_compile_config.get(key))
+        if passes is not None:
+            self.inductor_compile_config["reorder_for_compute_comm_overlap"] = True
+            self.inductor_compile_config[key] = passes
+        if self.compile_config.offload_config.graph_weight_offload:
             self.compiler_manager.bind_offload_cache(graph)
-
-    def _configure_overlap_passes(self, *, loads_inserted: bool) -> None:
-        """Share one cost table across profiling, optional bucketing, and overlap passes.
-        FSDP replaces the default reorders; offload alone preserves them for CP/EP overlap.
-        """
-        fsdp_cfg = self.compile_config.fsdp_config
-        if not (fsdp_cfg.enable_fsdp or loads_inserted):
-            # Offload requested but nothing bound.
-            return
-
-        costs = SnodeCostTable()
-        estimator = None if fsdp_cfg.cost_mode == "analytical" else ProfilingRuntimeEstimator(sync_across_ranks=True)
-        passes: list = [SnodeCostProfile(costs, estimator)]
-
-        if fsdp_cfg.enable_fsdp and fsdp_cfg.bucket_mode == "auto":
-            # Bucketing needs profiled costs and prices the nodes it creates.
-            passes.append(
-                FsdpAutoBucket(
-                    cost_fn=costs,
-                    max_bucket_bytes=int(fsdp_cfg.bucket_size_mib) * 1024 * 1024,
-                    overhead_ratio=fsdp_cfg.auto_bucket_overhead_ratio,
-                )
-            )
-
-        if fsdp_cfg.enable_fsdp:
-            passes.append(
-                FsdpOverlapReorder(
-                    comm_overlap_window_margin_ns=fsdp_cfg.comm_overlap_window_margin_ns,
-                    cost_fn=costs,
-                    comm_overlap_window_scale=fsdp_cfg.comm_overlap_window_scale,
-                )
-            )
-        else:
-            # Append to Inductor's defaults.
-            passes.extend(
-                self.inductor_compile_config.get("reorder_for_compute_comm_overlap_passes") or ["raise_comms", "sink_waits"]
-            )
-
-        if loads_inserted:
-            offload_cfg = self.compile_config.offload_config
-            reorder_loads = H2dLoadReorder(
-                bandwidth_bytes_per_ns=host_weights.h2d_bandwidth_bytes_per_ns(offload_cfg.offload_h2d_bandwidth_gbps),
-                max_device_weight_bytes=int(offload_cfg.offload_max_device_weight_mib) * 1024 * 1024,
-                cost_fn=costs,
-            )
-            passes.append(reorder_loads)
-
-        self.inductor_compile_config["reorder_for_compute_comm_overlap"] = True
-        self.inductor_compile_config["reorder_for_compute_comm_overlap_passes"] = passes
 
     @observe_lifecycle("graph_split")
     def _split_graph(self, graph: fx.GraphModule, example_inputs) -> tuple[fx.GraphModule, list[SplitItem]]:

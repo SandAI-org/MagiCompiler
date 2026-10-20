@@ -118,17 +118,17 @@ def _install(pair: int, diverge: bool = False) -> None:
     ``diverge``: ranks other than 0 drop their last planned bucket, standing in
     for a plan flipped by per-rank cost noise; rank 0's plan must still win.
     """
-    from magi_compiler.magi_backend import magi_backend as mb
+    from magi_compiler.magi_backend import weight_pipeline
 
-    orig = mb.MagiBackend._configure_overlap_passes
+    orig = weight_pipeline.build_scheduler_passes
 
-    def patched(self, **kw):
-        orig(self, **kw)
-        passes = self.inductor_compile_config.get("reorder_for_compute_comm_overlap_passes") or []
+    def patched(**kw):
+        passes = orig(**kw)
         if passes and pair > 0:
             passes.insert(1, PairCoalesce(pair))
+        return passes
 
-    mb.MagiBackend._configure_overlap_passes = patched
+    weight_pipeline.build_scheduler_passes = patched
 
     from magi_compiler.passes.fsdp_overlap import auto_bucket
 
