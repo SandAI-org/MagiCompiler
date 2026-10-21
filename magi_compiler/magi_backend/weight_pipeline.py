@@ -131,11 +131,8 @@ def build_scheduler_passes(
     return passes
 
 
-def _validate(
-    *, fsdp_config: FSDPConfig, offload_config: OffloadConfig, cudagraph_mode: CudaGraphMode, disable_graph_split: bool
-) -> None:
+def _validate(*, fsdp_config: FSDPConfig, offload_config: OffloadConfig, cudagraph_mode: CudaGraphMode) -> None:
     if fsdp_config.enable_fsdp:
-        assert disable_graph_split, "fsdp_config.enable_fsdp requires disable_graph_split=True"
         assert cudagraph_mode == CudaGraphMode.NONE, "fsdp_config.enable_fsdp requires cudagraph_mode=NONE"
     if offload_config.graph_weight_offload:
         assert (
@@ -180,12 +177,11 @@ class WeightPipeline:
         cudagraph_mode: CudaGraphMode,
         disable_graph_split: bool,
     ) -> None:
-        _validate(
-            fsdp_config=fsdp_config,
-            offload_config=offload_config,
-            cudagraph_mode=cudagraph_mode,
-            disable_graph_split=disable_graph_split,
-        )
+        if fsdp_config.enable_fsdp and not disable_graph_split:
+            # enable_fsdp is process-wide: split-graph models (e.g. a VAE beside an FSDP DiT)
+            # share it, but whole-graph FSDP overlap only applies to fullgraph compiles.
+            fsdp_config = fsdp_config.model_copy(update={"enable_fsdp": False})
+        _validate(fsdp_config=fsdp_config, offload_config=offload_config, cudagraph_mode=cudagraph_mode)
         self._fsdp_config = fsdp_config
         self._offload_config = offload_config
 
