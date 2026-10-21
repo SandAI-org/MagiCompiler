@@ -33,7 +33,7 @@ import torch
 from magi_compiler.host_mem import HostMemPool
 from magi_compiler.utils import magi_logger
 
-from .bandwidth import PROBE_BYTES, measure_h2d_bandwidth, probe_world
+from .bandwidth import PROBE_BYTES, measure_h2d_bandwidth
 
 
 @dataclass(frozen=True)
@@ -230,8 +230,7 @@ class HostWeightStore:
     def h2d_bandwidth_bytes_per_ns(self, override_gbps: float = 0.0) -> float:
         """Return H2D bandwidth in bytes/ns, using an override or a process-cached probe.
 
-        The probe aligns ranks to measure shared host-bandwidth contention.
-        Results remain rank-local because H2D placement moves no collectives."""
+        Rank-local: H2D placement moves no collectives, so ranks may disagree."""
         if override_gbps > 0:
             # 1 GB/s == 1e9 bytes / 1e9 ns == 1 byte/ns, so the units coincide.
             return override_gbps
@@ -240,10 +239,9 @@ class HostWeightStore:
 
         self._bandwidth_bytes_per_ns = measure_h2d_bandwidth()
         magi_logger.info(
-            "host offload: measured H2D bandwidth %.1f GB/s (pinned, %d MiB probe, %d rank(s) probing together)",
+            "host offload: measured H2D bandwidth %.1f GB/s (pinned, %d MiB probe, this rank alone)",
             self._bandwidth_bytes_per_ns,
             PROBE_BYTES // 2**20,
-            probe_world(),
         )
         return self._bandwidth_bytes_per_ns
 

@@ -211,7 +211,7 @@ class OffloadConfig(BaseModel):
         description=(
             "Compile-time CPU weight offload for SimpleFSDP (transport='nccl') and unsharded nn.Parameter models. "
             "Requires compile_mode=MAGI_COMPILE and cudagraph_mode=NONE; "
-            "mutually exclusive with model_cpu_offload. "
+            "mutually exclusive with model_cpu_offload and aot. "
             "Host-first materialization loads checkpoints into pinned memory; "
             "handoff temporarily allocates one CUDA shard. "
             "A host-built unsharded model parks eligible weights on its first CUDA move. "
@@ -245,8 +245,9 @@ class OffloadConfig(BaseModel):
         ge=0.0,
         description=(
             "Override the measured host-to-device bandwidth (GB/s) used to size each load's overlap "
-            "window. 0 = calibrate once per process with a pinned probe. Under-estimating is the "
-            "safe direction: it hoists loads further than needed."
+            "window. 0 = calibrate once per process with a rank-local pinned probe, which does not see "
+            "contention from ranks sharing a host link. Under-estimating is the safe direction: it "
+            "hoists loads further than needed."
         ),
     )
 

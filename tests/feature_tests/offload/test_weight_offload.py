@@ -405,20 +405,29 @@ def test_bandwidth_probe_is_plausible_and_reset_clears_its_cache():
     assert host_weights.default_store()._bandwidth_bytes_per_ns is None
 
 
-def test_bandwidth_probe_enters_both_barriers_when_its_setup_fails(monkeypatch):
-    """A rank whose pinned allocation fails still meets its peers at both barriers."""
+@pytest.mark.parametrize(
+    "setup_fails", [pytest.param(False, marks=requires_cuda, id="probed"), pytest.param(True, id="setup-failed")]
+)
+def test_bandwidth_probe_issues_no_collective(monkeypatch, setup_fails):
+    """Only ranks that compile a load probe, so a probe collective would hang the ranks that do not."""
+    import torch.distributed as dist
+
     from magi_compiler.passes.weight_offload.runtime import bandwidth
 
-    barriers = []
-    monkeypatch.setattr(bandwidth.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(bandwidth, "_probe_barrier", lambda: barriers.append(True))
+    collectives = []
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    for name in ("barrier", "all_reduce", "broadcast", "all_gather_object"):
+        monkeypatch.setattr(dist, name, lambda *args, _name=name, **kwargs: collectives.append(_name))
+    if setup_fails:
+        monkeypatch.setattr(bandwidth.torch.cuda, "is_available", lambda: True)
 
-    def failing_empty(*args, **kwargs):
-        raise RuntimeError("pinned allocation failed")
+        def failing_empty(*args, **kwargs):
+            raise RuntimeError("pinned allocation failed")
 
-    monkeypatch.setattr(bandwidth.torch, "empty", failing_empty)
-    assert bandwidth.measure_h2d_bandwidth() == bandwidth.FALLBACK_BYTES_PER_NS
-    assert len(barriers) == 2
+        monkeypatch.setattr(bandwidth.torch, "empty", failing_empty)
+
+    assert bandwidth.measure_h2d_bandwidth() > 0
+    assert collectives == []
 
 
 # ------------------------------------------------------------------- the op
@@ -1042,6 +1051,48 @@ def test_a_host_built_module_parks_on_its_first_move_and_moves_the_rest_with_tor
     module.to("cuda")
     assert host_weights.is_resident(slot) and module.small.weight.device.type == "cuda"
     torch.testing.assert_close(module.big.weight.detach().cpu(), expected)
+
+
+def test_graph_weight_offload_refuses_aot_before_parking_anything():
+    """AOT replay cannot remap baked host slots, so the combination must fail at compile setup."""
+    from magi_compiler import magi_compile
+    from magi_compiler.config import CompileMode
+
+    def patch(cfg):
+        cfg.compile_mode = CompileMode.MAGI_COMPILE
+        cfg.aot = True
+        cfg.offload_config.graph_weight_offload = True
+        return cfg
+
+    module = _Compiled(rows=256, cols=64)
+    with pytest.raises(ValueError, match="does not support aot=True"):
+        magi_compile(module, config_patch=patch, dynamic_arg_dims={"x": 0})
+    assert not getattr(module, "_magi_host_first_installed", False)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "cast",
+    [lambda m: m.half(), lambda m: m.to(torch.bfloat16), lambda m: m.to("cuda", torch.float16)],
+    ids=["half", "to-dtype", "to-device-and-dtype"],
+)
+def test_a_dtype_cast_after_handoff_is_refused_before_it_reads_a_stand_in(cast):
+    """``model.cuda().half()`` must fail loudly rather than cast a storage-free stand-in."""
+    from magi_compiler.passes.weight_offload import host_weights
+
+    module = _patched(_Compiled(rows=256, cols=64), min_shard_mib=0.01)
+    expected = module.big.weight.detach().clone()
+    module.cuda()
+    slot = host_weights.slot_of(module.big.weight)
+    assert slot is not None
+
+    with pytest.raises(RuntimeError, match="already handed to host memory"):
+        cast(module)
+
+    assert module.big.weight.dtype is torch.float32 and module.small.weight.dtype is torch.float32
+    assert host_weights.slot_of(module.big.weight) == slot
+    torch.testing.assert_close(host_weights.get(slot), expected)
+    module.float()  # a cast that changes no stand-in's dtype stays allowed
 
 
 @requires_cuda

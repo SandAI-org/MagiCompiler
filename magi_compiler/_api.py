@@ -266,11 +266,14 @@ def _magi_compile_bound_method(
                 f"backend inserts magi::h2d_load. Got compile_mode={conf.compile_mode.value}. "
                 "TORCH_COMPILE and NONE skip that rewrite and would read the empty stand-in."
             )
+        if conf.aot:
+            raise ValueError(
+                "offload_config.graph_weight_offload does not support aot=True: AOT artifacts keep "
+                "magi::h2d_load's process-local host slot integers but not the weight identity needed "
+                "to remap them, so a replay could load another weight."
+            )
         from magi_compiler.passes.weight_offload import patch_materialize
 
-        # Here rather than at first call: the weights this module will be
-        # compiled against are materialized while the model is being built,
-        # which is long before anything calls forward.
         patch_materialize(instance, conf)
 
     old_method = getattr(instance, method_name)

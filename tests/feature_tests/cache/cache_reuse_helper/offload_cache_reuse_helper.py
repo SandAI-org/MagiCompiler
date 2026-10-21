@@ -43,10 +43,8 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
-    if not dist.is_initialized():
-        # Inductor's compute/comm overlap pass calls get_rank(); a 1-rank
-        # HashStore group avoids a TCP port and is enough for that check.
-        dist.init_process_group("gloo", store=dist.HashStore(), rank=0, world_size=1)
+    # A plain single-GPU model: offload scheduling must not need a process group.
+    assert not dist.is_initialized()
 
     torch._dynamo.reset()
     torch.manual_seed(2026)

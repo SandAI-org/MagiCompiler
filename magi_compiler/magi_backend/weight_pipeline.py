@@ -21,7 +21,11 @@ transfers are then placed behind compute by Inductor reorder passes.
 
 from __future__ import annotations
 
+import functools
+from unittest import mock
+
 import torch
+import torch.distributed as dist
 import torch.fx as fx
 from torch.distributed.tensor import DTensor
 
@@ -50,6 +54,25 @@ _INDUCTOR_DEFAULT_REORDERS = ["raise_comms", "sink_waits"]
 
 def _mib_to_bytes(mib: float) -> int:
     return int(mib) * 1024 * 1024
+
+
+@functools.cache
+def _allow_reorder_without_process_group() -> None:
+    """Let Inductor's overlap reorder run in a process that never initialized torch.distributed."""
+    from torch._inductor import comms
+
+    reorder = comms.reorder_compute_and_comm_for_overlap
+
+    @functools.wraps(reorder)
+    def reorder_as_rank_0(snodes):
+        if dist.is_initialized():
+            return reorder(snodes)
+        # Workaround: torch 2.9's reorder_compute_and_comm_for_overlap gates a debug dump on an
+        # unguarded dist.get_rank(); drop once the minimum torch checks is_initialized() first.
+        with mock.patch.object(dist, "get_rank", lambda group=None: 0):
+            return reorder(snodes)
+
+    comms.reorder_compute_and_comm_for_overlap = reorder_as_rank_0
 
 
 def build_scheduler_passes(
@@ -178,6 +201,8 @@ class WeightPipeline:
         if self._offload_config.graph_weight_offload:
             # The compilation interpreter runs next and must not read storage-free weights.
             _reclaim_unloaded_weights(example_inputs)
+        if passes is not None:
+            _allow_reorder_without_process_group()
         return passes
 
     def _bind_weights(self, graph: fx.GraphModule, example_inputs) -> bool:
