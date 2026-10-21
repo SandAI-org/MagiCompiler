@@ -59,6 +59,7 @@ from torch._inductor.utils import contains_collective, contains_wait
 from torch._inductor.virtualized import V
 
 from magi_compiler.utils import magi_logger
+from magi_compiler.utils.dist_utils import get_cpu_gloo_group
 
 from .materialize_inputs import apply_materialize_inputs, get_materialize_inputs_hook, op_has_internal_collective
 
@@ -76,12 +77,6 @@ def snode_issues_collective(snode: BaseSchedulerNode) -> bool:
     if not isinstance(snode, ExternKernelSchedulerNode):
         return False
     return _extern_has_internal_collective(snode)
-
-
-def _get_cost_sync_group():
-    from magi_compiler.utils.dist_utils import get_cpu_gloo_group
-
-    return get_cpu_gloo_group()
 
 
 @dataclasses.dataclass
@@ -616,7 +611,7 @@ class ProfilingRuntimeEstimator:
         if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() <= 1:
             return self._measure_deferred_locally()
         world = dist.get_world_size()
-        group = _get_cost_sync_group()
+        group = get_cpu_gloo_group()
 
         keys = sorted(self._table.keys(), key=repr)
         key_reprs = [repr(k) for k in keys]

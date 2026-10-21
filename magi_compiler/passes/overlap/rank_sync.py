@@ -41,6 +41,7 @@ from torch._inductor import ir
 from torch._inductor.scheduler import BaseSchedulerNode
 
 from magi_compiler.utils import magi_logger
+from magi_compiler.utils.dist_utils import get_cpu_gloo_group
 
 from ..snode_utils import issues_transfer, leaf_collective_node, weight_gathers
 
@@ -87,9 +88,7 @@ def negotiate_mode(n_anchors: int, skel_kinds, costs_ok: bool = True, who: str =
     transfers between their existing neighbors. Candidate-count or pricing
     failures abort on every rank, so no peer skips a later collective alone.
     """
-    from magi_compiler.profiling.runtime_estimator import _get_cost_sync_group
-
-    group = _get_cost_sync_group()
+    group = get_cpu_gloo_group()
     world = dist.get_world_size()
     peers = exchange((n_anchors, tuple(skel_kinds), bool(costs_ok)), group, world)
     failed = [rank for rank, p in enumerate(peers) if not p[2]]
@@ -133,10 +132,8 @@ def any_rank(flag: bool) -> bool:
     """OR a local flag over the placement sync group, so every rank takes the same branch into a collective."""
     if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() <= 1:
         return flag
-    from magi_compiler.profiling.runtime_estimator import _get_cost_sync_group
-
     t = torch.tensor([int(flag)], dtype=torch.int32)
-    dist.all_reduce(t, op=dist.ReduceOp.MAX, group=_get_cost_sync_group())
+    dist.all_reduce(t, op=dist.ReduceOp.MAX, group=get_cpu_gloo_group())
     return bool(t.item())
 
 
