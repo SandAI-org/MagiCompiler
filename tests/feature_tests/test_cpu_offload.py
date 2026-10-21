@@ -150,6 +150,42 @@ def test_cpu_offload_manual_move(device, mlp_config):
         assert model.mlp.up_proj.weight.device.type == "cpu", "Subsequent .to() calls should not take effect"
 
 
+@torch.library.custom_op("magi_test::add_scalar", mutates_args=())
+def _add_scalar(x: torch.Tensor, value: float) -> torch.Tensor:
+    return x + value
+
+
+@_add_scalar.register_fake
+def _(x, value):
+    return torch.empty_like(x)
+
+
+def create_offload_float_attribute_class():
+    @magi_compile(dynamic_arg_dims={"x": 0})
+    class FloatAttributeModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(8))
+            self.shift = 0.25
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return _add_scalar(x * self.weight, self.shift)
+
+    return FloatAttributeModule
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
+def test_cpu_offload_keeps_python_scalar_inputs_on_cpu():
+    """Dynamo passes an unspecialized Python float as a CPU float64 tensor and reads it back with ``.item()``.
+    Moving it to CUDA with the other inputs failed the compile with ``aten._local_scalar_dense``."""
+    with set_cpu_offload(True):
+        model = create_offload_float_attribute_class()().cuda()
+        x = torch.randn(4, 8, device="cuda")
+        with torch.no_grad():
+            out = model(x)
+        torch.testing.assert_close(out, x * model.weight.detach().cuda() + 0.25)
+
+
 @magi_register_custom_op("athena::my_attention", infer_output_meta_fn=["q"], is_subgraph_boundary=True)
 def my_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     return q + k + v

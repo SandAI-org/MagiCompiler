@@ -105,7 +105,7 @@ class OffloadExecutor:
 
             # case 1: input tensor
             if not is_weight:
-                if isinstance(arg_val, torch.Tensor):
+                if isinstance(arg_val, torch.Tensor) and not is_python_scalar_input(node):
                     arg_val = arg_val.to("cuda", non_blocking=False)
                 env[node] = arg_val
                 continue
@@ -208,6 +208,13 @@ class OffloadExecutor:
                             tensor_obj.record_stream(self.compute_stream)
                         del env[input_node]
         return None
+
+
+def is_python_scalar_input(node: Node) -> bool:
+    """Dynamo passes unspecialized Python scalars as CPU tensors and reads them back with ``.item()``;
+    offload must leave them on CPU like every non-offloaded run does."""
+    grapharg = node.meta.get("grapharg")
+    return grapharg is not None and grapharg.pass_arg_as_tensor
 
 
 class OffloadWrapper:
