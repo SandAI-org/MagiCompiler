@@ -215,6 +215,9 @@ class OffloadConfig(BaseModel):
             "Host-first materialization loads checkpoints into pinned memory; "
             "handoff temporarily allocates one CUDA shard. "
             "A host-built unsharded model parks eligible weights on its first CUDA move. "
+            "Finish dtype conversion before parking -- before that first CUDA move, or before to_empty "
+            "for a meta-built model (e.g. model.half().cuda(), not model.cuda().half()); "
+            "parked weights keep their dtype, and later dtype or combined device+dtype casts are unsupported. "
             "The graph loads separate device buffers with magi::h2d_load and schedules transfers to overlap compute. "
             "See offload_max_device_weight_mib for the residency and in-flight scheduling budget."
         ),
