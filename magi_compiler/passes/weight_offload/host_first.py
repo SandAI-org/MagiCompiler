@@ -19,6 +19,7 @@ it temporarily allocates one local shard. Tied registrations share a reservation
 and slot. Externally materialized weights stay resident; reclaimed weights are reported.
 Device moves update residency without replacing traced stand-ins. Other tensors
 use the class's _apply; DTensor movement stays with the sharding owner.
+Dtype casts that would reach a handed-over stand-in are refused.
 """
 
 from __future__ import annotations
@@ -150,6 +151,28 @@ def _move_target(fn) -> torch.device | None:
     return moved_back.device if moved_back.dtype == probe.dtype and moved_back.device.type == "cpu" else None
 
 
+def _refuse_casting_handed_over(module: nn.Module, fn) -> None:
+    """Raise if ``fn`` would change a stand-in's dtype: torch would read its empty
+    CUDA storage, and the host slot and any compiled load keep the old dtype."""
+    probed = set()
+    for name, param in module.named_parameters():
+        payload = _payload(param)
+        layout = (payload.dtype, payload.device)
+        if layout in probed or host_weights.slot_of(payload) is None:
+            continue
+        probed.add(layout)
+        try:
+            cast = fn(torch.empty(0, dtype=payload.dtype, device=payload.device))
+        except Exception:  # noqa: BLE001 - a function that cannot take a probe is not a cast
+            continue
+        if isinstance(cast, torch.Tensor) and cast.dtype != payload.dtype:
+            raise RuntimeError(
+                f"host offload: cannot cast {type(module).__name__}.{_pretty(name)} from {payload.dtype} to "
+                f"{cast.dtype}: its weights were already handed to host memory. Cast before the first CUDA "
+                "move (or before to_empty), or disable offload_config.graph_weight_offload."
+            )
+
+
 def _manages_device_moves(instance: nn.Module) -> bool:
     return getattr(instance, _PENDING_ATTR, False) or residency.has_slots(instance)
 
@@ -229,7 +252,8 @@ def patch_materialize(instance: nn.Module, conf) -> None:
 
     Redirect eligible CUDA ``to_empty`` allocations to pinned host memory.
     A host-built plain module parks eligible weights on its first CUDA move.
-    Later device moves release or restore promoted slots; dtype casts are delegated."""
+    Later device moves release or restore promoted slots. Dtype casts are delegated
+    until handoff and refused after it."""
     if getattr(instance, "_magi_host_first_installed", False):
         return
     min_bytes = int(conf.offload_config.offload_min_shard_mib * 1024 * 1024)
@@ -251,6 +275,8 @@ def patch_materialize(instance: nn.Module, conf) -> None:
             setattr(self, _SETTLED_ATTR, True)
             if _built_on_host(self):
                 _park_host_built(self, min_bytes)
+        if target is None:
+            _refuse_casting_handed_over(self, fn)
         # Plain torch: not a device move, or no handoff is pending and none ever ran; e.g. a move to
         # the host before the first CUDA move, or a module already on CUDA at that move.
         if target is None or not _manages_device_moves(self):

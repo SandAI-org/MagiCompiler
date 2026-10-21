@@ -16,6 +16,8 @@
 
 The result is cached on the process's ``HostWeightStore`` (see
 ``HostWeightStore.h2d_bandwidth_bytes_per_ns``); this module only runs the probe.
+The probe is rank-local and issues no collective: whether a rank compiles any
+load, and whether its cache is warm, differ across ranks.
 """
 
 from __future__ import annotations
@@ -32,27 +34,7 @@ cannot run.  Under-estimating bandwidth over-estimates the load, which makes the
 reorder pass hoist further than needed -- slower but never incorrect."""
 
 
-def probe_world() -> int:
-    import torch.distributed as dist
-
-    return dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
-
-
 PROBE_ITERS = 20
-"""Enough copies that the ranks stay overlapped for the whole timed window
-rather than straggling apart after the barrier."""
-
-
-def _probe_barrier() -> None:
-    """Line every rank up on the probe, so it measures the contended bandwidth.
-
-    Every rank reaches both barriers whatever its own probe did: one that
-    skipped a barrier would leave its peers waiting in it.
-    """
-    import torch.distributed as dist
-
-    if dist.is_available() and dist.is_initialized():
-        dist.barrier()
 
 
 def _probe_buffers() -> tuple[torch.Tensor, torch.Tensor] | None:
@@ -88,13 +70,14 @@ def _timed_copies_ns(src: torch.Tensor, dst: torch.Tensor) -> float:
 
 
 def measure_h2d_bandwidth() -> float:
-    """Pinned H2D bandwidth in bytes per nanosecond, measured with every rank probing at once."""
+    """Pinned H2D bandwidth in bytes per nanosecond, as this rank sees it alone.
+
+    Ranks sharing a host link are not lined up, so the result can exceed the
+    contended bandwidth; set ``offload_h2d_bandwidth_gbps`` to pin it."""
     if not torch.cuda.is_available():
         return FALLBACK_BYTES_PER_NS
     buffers = _probe_buffers()
-    _probe_barrier()
     elapsed_ns = _timed_copies_ns(*buffers) if buffers is not None else 0.0
-    _probe_barrier()
     if elapsed_ns <= 0:
         return FALLBACK_BYTES_PER_NS
     return PROBE_BYTES * PROBE_ITERS / elapsed_ns
