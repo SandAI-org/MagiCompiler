@@ -179,6 +179,12 @@ def main() -> None:
     ap.add_argument("--cost-mode", default="analytical", choices=["analytical", "profile_sync"])
     ap.add_argument("--diverge", action="store_true", help="non-zero ranks plan one bucket fewer")
     ap.add_argument("--mismatch", action="store_true", help="rank 1 compiles a structurally different graph")
+    ap.add_argument(
+        "--bucket-target-mib",
+        type=float,
+        default=0.0,
+        help="fixed gathered MiB per auto bucket instead of the measured fit (0 = measured)",
+    )
     args = ap.parse_args()
 
     dist.init_process_group("cpu:gloo,cuda:nccl")
@@ -188,6 +194,11 @@ def main() -> None:
     torch.manual_seed(0)
     os.environ.setdefault("MAGI_LOGGING_LEVEL", "INFO")
     _install(args.pair, args.diverge)
+    if args.bucket_target_mib > 0:
+        from magi_compiler.passes.fsdp_overlap import auto_bucket
+
+        # Measured gather costs vary run to run; a fixed target makes the merge count a function of the shape.
+        auto_bucket.PlanParams.target_bytes = property(lambda self: args.bucket_target_mib * 2**20)
 
     from torchtitan.experiments.simple_fsdp.simple_fsdp import data_parallel
 

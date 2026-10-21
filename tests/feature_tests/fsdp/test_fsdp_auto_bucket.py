@@ -315,7 +315,11 @@ def test_fixed_pairs_coalesce_under_their_old_names():
     "extra,cap_mib",
     [
         pytest.param((), None, id="analytical"),
-        pytest.param(("--cost-mode", "profile_sync", "--bucket-size-mib", "4"), 4.0, id="profile-sync-cap"),
+        # Profiled costs, but a fixed 64 MiB target: whether to merge must not depend on
+        # measured latency, and the 4 MiB cap, not the target, has to size the buckets.
+        pytest.param(
+            ("--cost-mode", "profile_sync", "--bucket-size-mib", "4", "--bucket-target-mib", "64"), 4.0, id="profile-sync-cap"
+        ),
         # Inject a missing bucket on rank 1; both ranks must adopt rank 0's plan.
         pytest.param(("--bucket-size-mib", "4", "--diverge"), 4.0, id="divergent-plan"),
         # Rank 1 adds compute but keeps the collective skeleton: exercise SLOT consensus.
