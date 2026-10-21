@@ -20,8 +20,12 @@ import torch
 import torch.nn as nn
 
 from magi_compiler.config import CompileConfig, FSDPConfig
+from magi_compiler.magi_backend import weight_pipeline
 from magi_compiler.magi_backend.magi_backend import MagiBackend
+from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder
 from magi_compiler.utils.ordered_set import OrderedSet
+
+_PASSES_KEY = "reorder_for_compute_comm_overlap_passes"
 
 
 class _Add(nn.Module):
@@ -29,22 +33,29 @@ class _Add(nn.Module):
         return x + 1
 
 
+def _apply_weight_pipeline(cfg: CompileConfig, monkeypatch) -> tuple[list, dict]:
+    """Run the backend's weight pipeline on a tiny graph; return the lowered graphs and the Inductor config."""
+    lowered: list = []
+    monkeypatch.setattr(weight_pipeline, "lower_prim_redistribute_to_collectives", lowered.append)
+    backend = MagiBackend(cfg, 0, "model", OrderedSet(), {})
+    backend._apply_weight_pipeline(torch.fx.symbolic_trace(_Add()), (torch.zeros(2),))
+    return lowered, backend.inductor_compile_config
+
+
 def test_split_graph_skips_fsdp_overlap_when_graph_split_enabled(monkeypatch) -> None:
-    called: list[bool] = []
     cfg = CompileConfig(fsdp_config=FSDPConfig(enable_fsdp=True))
     assert cfg.disable_graph_split is False
-    backend = MagiBackend(cfg, 0, "vae", OrderedSet(), {})
-    monkeypatch.setattr(backend, "_apply_fsdp_fullgraph_overlap", lambda *a, **k: called.append(True))
-    graph = torch.fx.symbolic_trace(_Add())
-    backend._split_graph(graph, (torch.zeros(2),))
-    assert called == []
+
+    lowered, inductor_config = _apply_weight_pipeline(cfg, monkeypatch)
+
+    assert lowered == []
+    assert not any(isinstance(p, FsdpOverlapReorder) for p in inductor_config.get(_PASSES_KEY) or ())
 
 
 def test_fullgraph_still_applies_fsdp_overlap(monkeypatch) -> None:
-    called: list[bool] = []
     cfg = CompileConfig(disable_graph_split=True, fsdp_config=FSDPConfig(enable_fsdp=True))
-    backend = MagiBackend(cfg, 0, "base", OrderedSet(), {})
-    monkeypatch.setattr(backend, "_apply_fsdp_fullgraph_overlap", lambda *a, **k: called.append(True))
-    graph = torch.fx.symbolic_trace(_Add())
-    backend._split_graph(graph, (torch.zeros(2),))
-    assert called == [True]
+
+    lowered, inductor_config = _apply_weight_pipeline(cfg, monkeypatch)
+
+    assert len(lowered) == 1
+    assert any(isinstance(p, FsdpOverlapReorder) for p in inductor_config[_PASSES_KEY])

@@ -266,7 +266,8 @@ class FSDPConfig(BaseModel):
             "Lower SimpleFSDP weight prim_redistribute to explicit collectives, bucket them during scheduling "
             "(bucket_mode), "
             "and install the latest-safe-launch reorder pass that hoists each all-gather launch just far "
-            "enough upstream for compute to hide it. Requires disable_graph_split=True and cudagraph_mode=NONE."
+            "enough upstream for compute to hide it. Requires cudagraph_mode=NONE. Applies only to graphs compiled "
+            "with disable_graph_split=True; split-graph compiles that share this flag (e.g. a VAE) skip it."
         ),
     )
     bucket_mode: Literal["none", "auto"] = Field(
