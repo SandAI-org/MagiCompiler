@@ -87,6 +87,49 @@ def _park(tensor: torch.Tensor, name: str = "") -> int:
 # ------------------------------------------------ cross-rank agreement
 
 
+def _scheduler_passes_worker(rank: int, world: int, port: str, out_dir: str) -> None:
+    """Build one rank's scheduler passes, with a load on rank 0 only, and record their names."""
+    import json
+
+    import torch.distributed as dist
+
+    from magi_compiler.config import FSDPConfig, OffloadConfig
+    from magi_compiler.magi_backend.weight_pipeline import build_scheduler_passes
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = port
+    dist.init_process_group("gloo", rank=rank, world_size=world)
+    try:
+        passes = build_scheduler_passes(
+            fsdp_config=FSDPConfig(),
+            offload_config=OffloadConfig(graph_weight_offload=True, offload_h2d_bandwidth_gbps=20.0),
+            loads_inserted=rank == 0,
+            default_passes=None,
+        )
+        names = [p if isinstance(p, str) else type(p).__name__ for p in passes or ()]
+        with open(os.path.join(out_dir, f"{rank}.json"), "w") as f:
+            json.dump(names, f)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_every_rank_profiles_once_any_rank_inserted_a_load(tmp_path):
+    """Synchronized profiling is a collective: a rank without loads must still install it."""
+    import json
+    import socket
+
+    import torch.multiprocessing as mp
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = str(s.getsockname()[1])
+    mp.spawn(_scheduler_passes_worker, args=(2, port, str(tmp_path)), nprocs=2, join=True)
+
+    with_loads, without_loads = (json.loads((tmp_path / f"{rank}.json").read_text()) for rank in range(2))
+    assert with_loads[:1] == without_loads[:1] == ["SnodeCostProfile"]
+    assert "H2dLoadReorder" in with_loads and "H2dLoadReorder" not in without_loads
+
+
 @requires_cuda
 @pytest.mark.parametrize("ndim", [1, 2])
 def test_alignment_resolves_mesh_groups_without_swallowing_errors(dist_1rank, monkeypatch, ndim):

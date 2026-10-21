@@ -37,6 +37,7 @@ from magi_compiler.passes.fsdp_overlap import (
     lower_prim_redistribute_to_collectives,
     rewrite_weight_ag_to_copy_engine,
 )
+from magi_compiler.passes.overlap import rank_sync
 from magi_compiler.passes.snode_cost import SnodeCostProfile, SnodeCostTable
 from magi_compiler.passes.weight_offload import (
     FsdpShardSource,
@@ -83,8 +84,13 @@ def build_scheduler_passes(
     ``SnodeCostProfile`` runs first and fills the cost table every later pass reads.
     FSDP replaces Inductor's default reorders; offload alone keeps them for CP/EP overlap.
     """
-    if not (fsdp_config.enable_fsdp or loads_inserted):
-        # Offload requested but nothing bound.
+    loads_on_any_rank = loads_inserted
+    if offload_config.graph_weight_offload and not fsdp_config.enable_fsdp:
+        # Synchronized profiling is a collective, so a rank without loads still profiles
+        # when a peer has any. Every rank compiling this graph reaches this call.
+        loads_on_any_rank = rank_sync.any_rank(loads_inserted)
+    if not (fsdp_config.enable_fsdp or loads_on_any_rank):
+        # Offload requested but nothing bound on any rank.
         return None
 
     costs = SnodeCostTable()
@@ -114,6 +120,7 @@ def build_scheduler_passes(
 
     if loads_inserted:
         # Last: loads are hoisted around the gathers' final positions.
+        # Rank-local: placing loads issues no collective.
         passes.append(
             H2dLoadReorder(
                 bandwidth_bytes_per_ns=host_weights.h2d_bandwidth_bytes_per_ns(offload_config.offload_h2d_bandwidth_gbps),
