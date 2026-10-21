@@ -43,7 +43,7 @@ import torch
 from magi_compiler import magi_compile
 from magi_compiler.utils.envs import IS_PT_212
 from tests.model_definition import VAEDecoderLike
-from tests.perf_tests import cuda_benchmark, print_perf_comparison
+from tests.perf_tests import cuda_graph_benchmark, print_perf_comparison
 from tests.perf_tests.utils import assert_magi_vs_torch
 
 # WAN 2.2 VAE 540p latent: [C, T, H, W]; compiled with static shapes here.
@@ -90,10 +90,13 @@ def test_conv_channels_last_vs_torch_compile(device, decoder_input):
     magi_compiled = _compile_decoder(device)
     torch_compiled = _compile_torch(device)
 
+    # GPU time only: at this size magi's host launch time (~0.9ms, the channels-last
+    # copies are extra Triton launches) exceeds its GPU time (~0.6ms), so wall-clock
+    # timing measures the CPU and swings with machine load instead of the conv layout.
     with torch.no_grad():
-        eager_result = cuda_benchmark(lambda: eager_model(eager_input))
-        torch_result = cuda_benchmark(lambda: torch_compiled(torch_input), compilation_warmup=3)
-        magi_result = cuda_benchmark(lambda: magi_compiled(magi_input), compilation_warmup=3)
+        eager_result = cuda_graph_benchmark(lambda: eager_model(eager_input), compilation_warmup=3)
+        torch_result = cuda_graph_benchmark(lambda: torch_compiled(torch_input), compilation_warmup=3)
+        magi_result = cuda_graph_benchmark(lambda: magi_compiled(magi_input), compilation_warmup=3)
 
     speedup = torch_result.median / magi_result.median
     print_perf_comparison(
