@@ -112,8 +112,12 @@ def test_copy_engine_many_scheduler_stage_buckets():
     Each merge leaves its members' launches unscheduled but in the graph's
     lists; dropping them once made a later merge's new node reuse a live name
     and attach another bucket's unpacks to the wrong launch.
+
+    The bucket target is fixed so the merge count does not depend on measured costs:
+    each layer gathers 0.5 MiB, so a 1 MiB target pairs the 48 gathers.
     """
-    p = _run("copy_engine", "29643", "--hidden", "512", "--n-layers", "48", "--n-tokens", "256", ratio=0.1)
+    shape = ("--hidden", "512", "--n-layers", "48", "--n-tokens", "256", "--bucket-target-mib", "1")
+    p = _run("copy_engine", "29643", *shape)
     out = p.stdout + p.stderr
     assert p.returncode == 0, f"script failed:\n{out[-4000:]}"
     line = next(l for l in p.stdout.splitlines() if l.startswith("CHECK auto buckets:"))

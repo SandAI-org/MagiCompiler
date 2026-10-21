@@ -151,6 +151,12 @@ def main() -> None:
     ap.add_argument("--n-layers", type=int, default=6)
     ap.add_argument("--n-tokens", type=int, default=4096)
     ap.add_argument("--transport", default="copy_engine", choices=["nccl", "copy_engine"])
+    ap.add_argument(
+        "--bucket-target-mib",
+        type=float,
+        default=0.0,
+        help="fixed gathered MiB per auto bucket instead of the measured fit (0 = measured)",
+    )
     args = ap.parse_args()
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -187,8 +193,12 @@ def main() -> None:
     _pipeline.rewrite_weight_ag_to_copy_engine = spy_rewrite
 
     # -- count the scheduler-stage buckets the copy engine launches ---------
-    from magi_compiler.passes.fsdp_overlap.auto_bucket import FsdpAutoBucket
+    from magi_compiler.passes.fsdp_overlap.auto_bucket import FsdpAutoBucket, PlanParams
     from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER_COALESCED
+
+    if args.bucket_target_mib > 0:
+        # Measured gather costs vary run to run; a fixed target makes the merge count a function of the shape.
+        PlanParams.target_bytes = property(lambda self: args.bucket_target_mib * 2**20)
 
     n_ce_buckets = 0
     orig_bucket = FsdpAutoBucket.__call__
