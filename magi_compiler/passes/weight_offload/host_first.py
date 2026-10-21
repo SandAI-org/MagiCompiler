@@ -19,7 +19,13 @@ it temporarily allocates one local shard. Tied registrations share a reservation
 and slot. Externally materialized weights stay resident; reclaimed weights are reported.
 Device moves update residency without replacing traced stand-ins. Other tensors
 use the class's _apply; DTensor movement stays with the sharding owner.
-Dtype casts that would reach a handed-over stand-in are refused.
+
+Dtype contract: finish every dtype conversion before parking, i.e. before the
+first CUDA move of a host-built model or before ``to_empty`` of a meta-built one.
+Weights are parked in the dtype they have at that moment and stay in it.
+Supported later calls are pure device moves (``.cuda()``, ``.cpu()``, ``.to(device)``).
+A cast that visibly changes a handed-over stand-in's dtype is refused; anything
+else, e.g. ``.to(device, dtype)``, is unsupported and not reliably detected.
 """
 
 from __future__ import annotations
@@ -137,7 +143,10 @@ def _warn_about_reclaimed(module: nn.Module, parked: list[tuple[list[str], nn.Pa
 
 def _move_target(fn) -> torch.device | None:
     """Where ``fn`` moves a tensor between host and CUDA, or None if it does not or also casts it.
-    Judged by effect, not name, so a caller's own move function is recognized too."""
+    Judged by effect, not name, so a caller's own move function is recognized too.
+
+    The probe has the default dtype, so ``.to(device, dtype)`` with that same dtype
+    reads as a pure move and parked weights skip its cast; see the module's dtype contract."""
     try:
         probe = torch.empty(0)
         moved = fn(probe)
@@ -153,7 +162,10 @@ def _move_target(fn) -> torch.device | None:
 
 def _refuse_casting_handed_over(module: nn.Module, fn) -> None:
     """Raise if ``fn`` would change a stand-in's dtype: torch would read its empty
-    CUDA storage, and the host slot and any compiled load keep the old dtype."""
+    CUDA storage, and the host slot and any compiled load keep the old dtype.
+
+    A guard for the common ``model.cuda().half()``, not a complete classifier;
+    the supported path is to cast before parking (see the module's dtype contract)."""
     probed = set()
     for name, param in module.named_parameters():
         payload = _payload(param)
@@ -168,8 +180,10 @@ def _refuse_casting_handed_over(module: nn.Module, fn) -> None:
         if isinstance(cast, torch.Tensor) and cast.dtype != payload.dtype:
             raise RuntimeError(
                 f"host offload: cannot cast {type(module).__name__}.{_pretty(name)} from {payload.dtype} to "
-                f"{cast.dtype}: its weights were already handed to host memory. Cast before the first CUDA "
-                "move (or before to_empty), or disable offload_config.graph_weight_offload."
+                f"{cast.dtype}: its weights were already handed to host memory. Finish every dtype "
+                "conversion before the first CUDA move (host-built model) or before to_empty (meta-built "
+                "model), e.g. model.half().cuda() instead of model.cuda().half(); or disable "
+                "offload_config.graph_weight_offload."
             )
 
 
@@ -252,8 +266,8 @@ def patch_materialize(instance: nn.Module, conf) -> None:
 
     Redirect eligible CUDA ``to_empty`` allocations to pinned host memory.
     A host-built plain module parks eligible weights on its first CUDA move.
-    Later device moves release or restore promoted slots. Dtype casts are delegated
-    until handoff and refused after it."""
+    Later device moves release or restore promoted slots. Callers must finish dtype
+    conversion before parking; see the module's dtype contract."""
     if getattr(instance, "_magi_host_first_installed", False):
         return
     min_bytes = int(conf.offload_config.offload_min_shard_mib * 1024 * 1024)
@@ -268,6 +282,7 @@ def patch_materialize(instance: nn.Module, conf) -> None:
         if getattr(fn, "__qualname__", "") == _TO_EMPTY:
             return _materialize_on_host(self, fn, recurse)
         # None unless fn is a pure host<->CUDA move: dtype casts and other conversions get None.
+        # Combined device+dtype moves are unsupported once weights are parked (module docstring).
         target = _move_target(fn)
         # Decided once per instance. Weights on the host at the first CUDA move are parked: built on
         # the host, or built on CUDA and moved to the host first. Weights already on CUDA never are.
