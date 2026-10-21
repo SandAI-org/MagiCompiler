@@ -39,11 +39,9 @@ requires_2gpu = pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requir
 requires_torchrun = pytest.mark.skipif(shutil.which("torchrun") is None, reason="requires torchrun")
 
 
-def _run(transport: str, port: str, *shape: str, ratio: float | None = None) -> subprocess.CompletedProcess:
+def _run(transport: str, port: str, *shape: str) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env["MAGI_LOGGING_LEVEL"] = env.get("MAGI_LOGGING_LEVEL", "info")
-    if ratio is not None:
-        env["MAGI_COMPILE_FSDP_CONFIG__AUTO_BUCKET_OVERHEAD_RATIO"] = str(ratio)
     # A cache root of its own: a replayed artifact skips the scheduler passes
     # whose work the helper counts.
     with tempfile.TemporaryDirectory(prefix="magi_symm_e2e_") as cache_root:
@@ -77,15 +75,14 @@ def test_copy_engine_end_to_end():
     """Weights land in symmetric memory, the gathers get retargeted, and two
     consecutive steps both match an unsharded eager model -- the second step
     is where a missing wait would show up."""
-    # The copy engine's default ratio (0.5) leaves gathers this small alone; 0.1
-    # makes the scheduler stage merge them, which is the path under test.
-    p = _run("copy_engine", "29641", ratio=0.1)
+    # Four 2 MiB gathers under a fixed 4 MiB target pair into two coalesced
+    # copy-engine launches, whatever the measured gather costs say.
+    shape = ("--hidden", "1024", "--n-layers", "4", "--n-tokens", "512", "--bucket-target-mib", "4")
+    p = _run("copy_engine", "29641", *shape)
     out = p.stdout + p.stderr
     assert p.returncode == 0, f"script failed:\n{out[-4000:]}"
     assert "CHECK placement: 4/4 block shards" in p.stdout, out[-4000:]
     assert "CHECK rewrite: 4/4 gathers" in p.stdout, out[-4000:]
-    # Four 2 MiB gathers are far under the launch-amortizing size: the scheduler
-    # stage has to merge them into coalesced copy-engine launches.
     line = next(l for l in p.stdout.splitlines() if l.startswith("CHECK auto buckets:"))
     assert int(line.split(":")[1].split()[0]) >= 1, line
     assert "E2E_PASS" in p.stdout, out[-4000:]
