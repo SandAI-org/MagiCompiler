@@ -31,7 +31,7 @@ import torch.nn as nn
 
 from magi_compiler.utils import magi_logger
 
-from .runtime import host_weights
+from .runtime.host_weights import get_global_host_weight_store
 
 _SLOTS_ATTR = "_magi_host_slots"
 """Slots ``handoff`` adopted for this instance; present, possibly empty, once it ran."""
@@ -62,7 +62,7 @@ def _subtree_slots(module: nn.Module) -> list[int]:
 
 
 def _release(module: nn.Module) -> None:
-    store = host_weights.default_store()
+    store = get_global_host_weight_store()
     resident = [slot for slot in _subtree_slots(module) if store.is_resident(slot)]
     if not resident:
         return
@@ -81,7 +81,7 @@ def _promote_released(module: nn.Module) -> None:
     released = getattr(module, _RELEASED_ATTR, ())
     if not released:
         return
-    nbytes = host_weights.default_store().make_resident_many(released)
+    nbytes = get_global_host_weight_store().make_resident_many(released)
     setattr(module, _RELEASED_ATTR, ())
     magi_logger.info(
         "host offload: %s moved to device; promoted %d weight(s) (%.1f MiB) back, the rest load in the graph",

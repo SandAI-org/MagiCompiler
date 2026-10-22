@@ -14,7 +14,7 @@ import torch.nn as nn
 
 from magi_compiler import magi_compile
 from magi_compiler.config import CudaGraphMode
-from magi_compiler.passes.weight_offload import host_weights
+from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
@@ -69,7 +69,7 @@ def main() -> None:
         "shape": list(out.shape),
         "sum": float(out.float().sum().item()),
         "mean": float(out.float().mean().item()),
-        "num_bound": host_weights.default_store().num_bound(),
+        "num_bound": get_global_host_weight_store().num_bound(),
     }
     with open(args.output, "w") as f:
         json.dump(payload, f)

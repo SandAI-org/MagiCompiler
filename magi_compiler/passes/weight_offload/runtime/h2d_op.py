@@ -36,7 +36,7 @@ import torch._C._distributed_c10d as _c10d
 
 from magi_compiler.cuda.event_work import EventWork
 
-from . import host_weights
+from .host_weights import get_global_host_weight_store
 from .slot_remap import resolve_slot
 
 _LIB = torch.library.Library("magi", "FRAGMENT")
@@ -55,7 +55,7 @@ def h2d_stream() -> torch.cuda.Stream:
 
 
 def _check_shard(shard: torch.Tensor, slot: int) -> None:
-    store = host_weights.default_store()
+    store = get_global_host_weight_store()
     host = store.source(slot)
     if tuple(shard.shape) != tuple(host.shape) or shard.dtype != host.dtype:
         raise RuntimeError(
@@ -70,7 +70,7 @@ def _h2d_load(shard: torch.Tensor, slot: int) -> torch.Tensor:
     # Resident slots copy from the device; other slots copy from pinned host storage.
     slot = resolve_slot(slot)
     _check_shard(shard, slot)
-    store = host_weights.default_store()
+    store = get_global_host_weight_store()
     host = store.source(slot)
     # Allocate on the consuming compute stream;
     # record_stream below prevents reuse while the H2D stream is still writing.
@@ -84,8 +84,8 @@ def _h2d_load(shard: torch.Tensor, slot: int) -> torch.Tensor:
         return out
 
     stream = h2d_stream()
-    # The shard's own producers are on the compute stream; ordering after them
-    # costs nothing here and keeps the op correct if a caller ever writes it.
+    # out may reuse a block the compute stream freed before its kernel finishes;
+    # the H2D stream must wait for the compute stream before writing it.
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         out.copy_(host, non_blocking=True)

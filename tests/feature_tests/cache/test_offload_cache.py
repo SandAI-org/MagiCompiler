@@ -40,11 +40,11 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requir
 
 @pytest.fixture(autouse=True)
 def clean_pool():
-    from magi_compiler.passes.weight_offload import host_weights
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
-    host_weights.default_store().reset()
+    get_global_host_weight_store().reset()
     yield
-    host_weights.default_store().reset()
+    get_global_host_weight_store().reset()
 
 
 def _info(name, shape, dtype="torch.bfloat16", nbytes=32, resident=False):
@@ -76,13 +76,13 @@ def test_slot_identity_uses_name_and_layout():
 
 @requires_cuda
 def test_collect_and_refresh_read_the_live_pool():
-    from magi_compiler.passes.weight_offload import host_weights
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
     local = torch.randn(16, 8, device="cuda", dtype=torch.bfloat16)
-    host = host_weights.default_store().reserve(tuple(local.shape), local.dtype, name="layers.0.w")
+    host = get_global_host_weight_store().reserve(tuple(local.shape), local.dtype, name="layers.0.w")
     host.copy_(local.detach())
     local.untyped_storage().resize_(0)
-    slot = host_weights.default_store().adopt(host, local, name="layers.0.w")
+    slot = get_global_host_weight_store().adopt(host, local, name="layers.0.w")
 
     g = fx.Graph()
     node = g.placeholder("L_self_modules_layers_0_parameters_weight_")
@@ -100,7 +100,7 @@ def test_collect_and_refresh_read_the_live_pool():
     assert table[slot]["shape"] == (16, 8)
     assert table[slot]["resident"] is False
 
-    host_weights.default_store().make_resident(slot)
+    get_global_host_weight_store().make_resident(slot)
     refreshed = refresh_resident_flags(table)
     assert refreshed[slot]["resident"] is True
 
@@ -140,19 +140,19 @@ def _tagged_graph(slot: int) -> fx.GraphModule:
 
 
 def _adopt_weight(name: str = "w", shape=(8, 8)):
-    from magi_compiler.passes.weight_offload import host_weights
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
     local = torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
-    host = host_weights.default_store().reserve(tuple(local.shape), local.dtype, name=name)
+    host = get_global_host_weight_store().reserve(tuple(local.shape), local.dtype, name=name)
     host.copy_(local.detach())
     local.untyped_storage().resize_(0)
-    slot = host_weights.default_store().adopt(host, local, name=name)
+    slot = get_global_host_weight_store().adopt(host, local, name=name)
     return slot, local
 
 
 @requires_cuda
 def test_bind_matches_sidecar_and_replays_resident(tmp_path: Path):
-    from magi_compiler.passes.weight_offload import host_weights
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
     slot, local = _adopt_weight()
     sidecar = {
@@ -160,7 +160,7 @@ def test_bind_matches_sidecar_and_replays_resident(tmp_path: Path):
             "name": "w",
             "shape": (8, 8),
             "dtype": str(local.dtype),
-            "nbytes": host_weights.default_store().slot_bytes(slot),
+            "nbytes": get_global_host_weight_store().slot_bytes(slot),
             "resident": True,
         }
     }
@@ -171,7 +171,7 @@ def test_bind_matches_sidecar_and_replays_resident(tmp_path: Path):
     assert cache.allows_load()
     assert not cache.allows_store()
     assert cache._remap == {99: slot}
-    assert host_weights.default_store().is_resident(slot)
+    assert get_global_host_weight_store().is_resident(slot)
 
 
 @requires_cuda
@@ -200,7 +200,7 @@ def test_save_writes_host_slots_sidecar(tmp_path: Path):
 
 @requires_cuda
 def test_replay_does_not_rewrite_sidecar(tmp_path: Path):
-    from magi_compiler.passes.weight_offload import host_weights
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
     slot, local = _adopt_weight()
     sidecar = {
@@ -208,7 +208,7 @@ def test_replay_does_not_rewrite_sidecar(tmp_path: Path):
             "name": "w",
             "shape": (8, 8),
             "dtype": str(local.dtype),
-            "nbytes": host_weights.default_store().slot_bytes(slot),
+            "nbytes": get_global_host_weight_store().slot_bytes(slot),
             "resident": False,
         }
     }
@@ -236,7 +236,7 @@ def test_bind_miss_drops_compile_indices(tmp_path: Path):
 @requires_cuda
 def test_bind_hit_keeps_compile_indices(tmp_path: Path):
     from magi_compiler.magi_backend._cache_data_cls import CacheEntry, CacheHandle
-    from magi_compiler.passes.weight_offload import host_weights
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
     slot, local = _adopt_weight()
     sidecar = {
@@ -244,7 +244,7 @@ def test_bind_hit_keeps_compile_indices(tmp_path: Path):
             "name": "w",
             "shape": (8, 8),
             "dtype": str(local.dtype),
-            "nbytes": host_weights.default_store().slot_bytes(slot),
+            "nbytes": get_global_host_weight_store().slot_bytes(slot),
             "resident": False,
         }
     }
@@ -261,7 +261,7 @@ def test_bind_hit_keeps_compile_indices(tmp_path: Path):
 @requires_cuda
 def test_replay_does_not_store_a_mixed_slot_artifact(tmp_path: Path):
     from magi_compiler.magi_backend._cache_data_cls import CacheEntry, CacheHandle
-    from magi_compiler.passes.weight_offload import host_weights
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
     slot, local = _adopt_weight()
     sidecar = {
@@ -269,7 +269,7 @@ def test_replay_does_not_store_a_mixed_slot_artifact(tmp_path: Path):
             "name": "w",
             "shape": (8, 8),
             "dtype": str(local.dtype),
-            "nbytes": host_weights.default_store().slot_bytes(slot),
+            "nbytes": get_global_host_weight_store().slot_bytes(slot),
             "resident": False,
         }
     }
@@ -288,7 +288,7 @@ def test_replay_does_not_store_a_mixed_slot_artifact(tmp_path: Path):
 
 @requires_cuda
 def test_wrap_loaded_applies_slot_remap(tmp_path: Path):
-    from magi_compiler.passes.weight_offload import host_weights
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
     from magi_compiler.passes.weight_offload.runtime import slot_remap
 
     slot, local = _adopt_weight()
@@ -297,7 +297,7 @@ def test_wrap_loaded_applies_slot_remap(tmp_path: Path):
             "name": "w",
             "shape": (8, 8),
             "dtype": str(local.dtype),
-            "nbytes": host_weights.default_store().slot_bytes(slot),
+            "nbytes": get_global_host_weight_store().slot_bytes(slot),
             "resident": False,
         }
     }

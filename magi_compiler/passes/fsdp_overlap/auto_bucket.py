@@ -339,12 +339,15 @@ class FsdpAutoBucket:
             return None
         # Slot mode already matched the skeletons, weight-ness and dtype included,
         # so rank 0's candidate indices name the same collectives here.
-        try:
-            adopted = [[cands[i] for i in b] for b in peers[0][1]]
-            merged = self._merged(order, adopted)
-            legal = merged is not None
-        except Exception:  # noqa: BLE001 - an unmappable plan is simply not legal here
-            adopted, legal = None, False
+        plan = peers[0][1]
+        adopted = merged = None
+        if all(0 <= i < len(cands) for b in plan for i in b):
+            adopted = [[cands[i] for i in b] for b in plan]
+            try:
+                merged = self._merged(order, adopted)
+            except Exception as exc:  # noqa: BLE001 - every peer still enters _commit's exchange
+                magi_logger.warning("%s: merging rank 0's buckets failed (%s); not legal here", self.name, exc, rank="all")
+        legal = merged is not None
         skeleton_order = self._skeleton_order(merged, skeleton) if legal else None
         return adopted if self._commit(legal, skeleton_order, group, world) else None
 

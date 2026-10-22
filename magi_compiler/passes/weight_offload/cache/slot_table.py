@@ -39,9 +39,9 @@ def collect_host_slot_table(module: nn.Module) -> dict[int, dict[str, Any]]:
     submods, not on the root.
     """
     from ..node_meta import host_slot
-    from ..runtime import host_weights
+    from ..runtime.host_weights import get_global_host_weight_store
 
-    store = host_weights.default_store()
+    store = get_global_host_weight_store()
     table: dict[int, dict[str, Any]] = {}
     for _, child in module.named_modules():
         if not isinstance(child, fx.GraphModule):
@@ -96,7 +96,7 @@ def refresh_resident_flags(table: Mapping[int, Mapping[str, Any]]) -> dict[int, 
     collected.  The sidecar must record that final set so a cache hit can
     replay it.
     """
-    from ..runtime import host_weights
+    from ..runtime.host_weights import get_global_host_weight_store
 
-    store = host_weights.default_store()
+    store = get_global_host_weight_store()
     return {int(slot): {**dict(info), "resident": bool(store.is_resident(int(slot)))} for slot, info in table.items()}

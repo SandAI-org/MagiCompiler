@@ -252,5 +252,5 @@ class HostWeightStore:
 _STORE = HostWeightStore()
 
 
-def default_store() -> HostWeightStore:
+def get_global_host_weight_store() -> HostWeightStore:
     return _STORE
