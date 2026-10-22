@@ -55,10 +55,11 @@ def h2d_stream() -> torch.cuda.Stream:
 
 
 def _check_shard(shard: torch.Tensor, slot: int) -> None:
-    host = host_weights.source(slot)
+    store = host_weights.default_store()
+    host = store.source(slot)
     if tuple(shard.shape) != tuple(host.shape) or shard.dtype != host.dtype:
         raise RuntimeError(
-            f"magi::h2d_load slot {slot} ({host_weights.name_of(slot)!r}) is "
+            f"magi::h2d_load slot {slot} ({store.name_of(slot)!r}) is "
             f"{tuple(host.shape)} {host.dtype}, but the graph asked for "
             f"{tuple(shard.shape)} {shard.dtype}. The compiled artifact's slot "
             "ids do not match this process's host weight store."
@@ -69,12 +70,13 @@ def _h2d_load(shard: torch.Tensor, slot: int) -> torch.Tensor:
     # Resident slots copy from the device; other slots copy from pinned host storage.
     slot = resolve_slot(slot)
     _check_shard(shard, slot)
-    host = host_weights.source(slot)
+    store = host_weights.default_store()
+    host = store.source(slot)
     # Allocate on the consuming compute stream;
     # record_stream below prevents reuse while the H2D stream is still writing.
     out = torch.empty(host.shape, dtype=host.dtype, device=shard.device)
 
-    if host_weights.is_resident(slot):
+    if store.is_resident(slot):
         # D2D runs on the compute stream without a Work; wait_tensor is then a no-op.
         # Keep a separate output: Inductor may reuse a fallback output's storage,
         # so aliasing the parameter would let a later kernel overwrite its weights.
@@ -99,10 +101,21 @@ def _h2d_load_meta(shard: torch.Tensor, slot: int) -> torch.Tensor:
     return torch.empty_like(shard)
 
 
+def _h2d_load_bwd(ctx, grad: torch.Tensor):
+    # AOTAutograd traces the joint graph at compile time, so this fires before the first step runs.
+    raise RuntimeError(
+        "magi::h2d_load has no backward: offload_config.graph_weight_offload is inference-only, "
+        "and an offloaded weight would silently get no gradient. Run the compiled module under "
+        "torch.no_grad() or torch.inference_mode(), set requires_grad=False on its weights, "
+        "or disable offload_config.graph_weight_offload for training."
+    )
+
+
 def _register() -> None:
     _LIB.define(_SCHEMA)
     _LIB.impl("h2d_load", _h2d_load, "CUDA")
     _LIB.impl("h2d_load", _h2d_load_meta, "Meta")
+    torch.library.register_autograd("magi::h2d_load", _h2d_load_bwd, lib=_LIB)
 
 
 _register()

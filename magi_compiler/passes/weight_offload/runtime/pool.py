@@ -50,8 +50,8 @@ host-to-device throughput."""
 
 @dataclass
 class _Slab:
-    buf: torch.Tensor
-    used: int  # elements handed out, alignment padding included
+    storage: torch.Tensor
+    used_numel: int  # elements handed out, alignment padding included
 
 
 class HostMemPool:
@@ -84,20 +84,22 @@ class HostMemPool:
         numel = 1
         for d in shape:
             numel *= d
-        return self._carve(dtype, numel).view(shape)
+        return self._carve(numel=numel, dtype=dtype).view(shape)
 
-    def _carve(self, dtype: torch.dtype, numel: int) -> torch.Tensor:
-        align = max(1, self._align_bytes // dtype.itemsize)
-        want = (numel + align - 1) // align * align
+    def _carve(self, numel: int, dtype: torch.dtype) -> torch.Tensor:
+        align_numel = max(1, self._align_bytes // dtype.itemsize)
+        padded_numel = (numel + align_numel - 1) // align_numel * align_numel
 
         for slab in self._slabs:
-            if slab.buf.dtype is not dtype:
+            if slab.storage.dtype is not dtype:
                 continue
-            if slab.used + want <= slab.buf.numel():
-                start = slab.used
-                slab.used += want
-                return slab.buf[start : start + numel]
+            if slab.used_numel + padded_numel <= slab.storage.numel():
+                offset = slab.used_numel
+                slab.used_numel += padded_numel
+                return slab.storage[offset : offset + numel]
 
-        buf = torch.empty(max(want, self._slab_bytes // dtype.itemsize), dtype=dtype, device="cpu", pin_memory=self._pinned)
-        self._slabs.append(_Slab(buf=buf, used=want))
-        return buf[:numel]
+        storage = torch.empty(
+            max(padded_numel, self._slab_bytes // dtype.itemsize), dtype=dtype, device="cpu", pin_memory=self._pinned
+        )
+        self._slabs.append(_Slab(storage=storage, used_numel=padded_numel))
+        return storage[:numel]

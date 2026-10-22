@@ -30,17 +30,17 @@ from typing import Sequence
 
 import torch
 
-from magi_compiler.host_mem import HostMemPool
 from magi_compiler.utils import magi_logger
 
 from .bandwidth import PROBE_BYTES, measure_h2d_bandwidth
+from .pool import HostMemPool
 
 
 @dataclass(frozen=True)
 class HostWeight:
     """One shard parked in host memory, plus the tensor it came out of.
 
-    ``device_tensor`` is kept so :func:`restore_all` can put the shard back
+    ``device_tensor`` is kept so :meth:`HostWeightStore.restore_all` can put the shard back
     without the caller having to remember which parameter a slot belonged to.
     """
 
@@ -233,6 +233,7 @@ class HostWeightStore:
         Rank-local: H2D placement moves no collectives, so ranks may disagree."""
         if override_gbps > 0:
             # 1 GB/s == 1e9 bytes / 1e9 ns == 1 byte/ns, so the units coincide.
+            self._bandwidth_bytes_per_ns = override_gbps
             return override_gbps
         if self._bandwidth_bytes_per_ns is not None:
             return self._bandwidth_bytes_per_ns
@@ -253,83 +254,3 @@ _STORE = HostWeightStore()
 
 def default_store() -> HostWeightStore:
     return _STORE
-
-
-def reserve(shape: Sequence[int], dtype: torch.dtype, name: str = "") -> torch.Tensor:
-    return _STORE.reserve(shape, dtype, name)
-
-
-def adopt(host: torch.Tensor, device_tensor: torch.Tensor, name: str = "") -> int:
-    return _STORE.adopt(host, device_tensor, name)
-
-
-def slot_of(local: torch.Tensor) -> int | None:
-    return _STORE.slot_of(local)
-
-
-def name_of(slot: int) -> str:
-    return _STORE.name_of(slot)
-
-
-def get(slot: int) -> torch.Tensor:
-    return _STORE.get(slot)
-
-
-def source(slot: int) -> torch.Tensor:
-    return _STORE.source(slot)
-
-
-def make_resident(slot: int) -> int:
-    return _STORE.make_resident(slot)
-
-
-def make_resident_many(slots: Sequence[int]) -> int:
-    return _STORE.make_resident_many(slots)
-
-
-def release_resident_many(slots: Sequence[int]) -> int:
-    return _STORE.release_resident_many(slots)
-
-
-def is_resident(slot: int) -> bool:
-    return _STORE.is_resident(slot)
-
-
-def mark_claimed(slot: int) -> None:
-    _STORE.mark_claimed(slot)
-
-
-def restore_unclaimed(slots: Sequence[int]) -> list[str]:
-    return _STORE.restore_unclaimed(slots)
-
-
-def slot_bytes(slot: int) -> int:
-    return _STORE.slot_bytes(slot)
-
-
-def resident_bytes() -> int:
-    return _STORE.resident_bytes()
-
-
-def bound_bytes() -> int:
-    return _STORE.bound_bytes()
-
-
-def total_bound_bytes() -> int:
-    return _STORE.total_bound_bytes()
-
-
-def num_bound() -> int:
-    return _STORE.num_bound()
-
-
-def restore_all() -> None:
-    _STORE.restore_all()
-
-
-def reset() -> None:
-    _STORE.reset()
-
-
-def h2d_bandwidth_bytes_per_ns(override_gbps: float = 0.0) -> float:
-    return _STORE.h2d_bandwidth_bytes_per_ns(override_gbps)

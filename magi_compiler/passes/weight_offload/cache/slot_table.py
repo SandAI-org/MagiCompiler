@@ -41,6 +41,7 @@ def collect_host_slot_table(module: nn.Module) -> dict[int, dict[str, Any]]:
     from ..node_meta import host_slot
     from ..runtime import host_weights
 
+    store = host_weights.default_store()
     table: dict[int, dict[str, Any]] = {}
     for _, child in module.named_modules():
         if not isinstance(child, fx.GraphModule):
@@ -49,13 +50,13 @@ def collect_host_slot_table(module: nn.Module) -> dict[int, dict[str, Any]]:
             slot = host_slot(node)
             if slot is None or slot in table:
                 continue
-            host = host_weights.get(slot)
+            host = store.get(slot)
             table[int(slot)] = {
-                "name": host_weights.name_of(slot),
+                "name": store.name_of(slot),
                 "shape": tuple(int(d) for d in host.shape),
                 "dtype": str(host.dtype),
-                "nbytes": int(host_weights.slot_bytes(slot)),
-                "resident": bool(host_weights.is_resident(slot)),
+                "nbytes": int(store.slot_bytes(slot)),
+                "resident": bool(store.is_resident(slot)),
             }
     return table
 
@@ -97,4 +98,5 @@ def refresh_resident_flags(table: Mapping[int, Mapping[str, Any]]) -> dict[int, 
     """
     from ..runtime import host_weights
 
-    return {int(slot): {**dict(info), "resident": bool(host_weights.is_resident(int(slot)))} for slot, info in table.items()}
+    store = host_weights.default_store()
+    return {int(slot): {**dict(info), "resident": bool(store.is_resident(int(slot)))} for slot, info in table.items()}

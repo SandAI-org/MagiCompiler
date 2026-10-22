@@ -123,7 +123,9 @@ def build_scheduler_passes(
         # Rank-local: placing loads issues no collective.
         passes.append(
             H2dLoadReorder(
-                bandwidth_bytes_per_ns=host_weights.h2d_bandwidth_bytes_per_ns(offload_config.offload_h2d_bandwidth_gbps),
+                bandwidth_bytes_per_ns=host_weights.default_store().h2d_bandwidth_bytes_per_ns(
+                    offload_config.offload_h2d_bandwidth_gbps
+                ),
                 max_device_weight_bytes=_mib_to_bytes(offload_config.offload_max_device_weight_mib),
                 cost_fn=costs,
             )
@@ -151,17 +153,18 @@ def _validate(*, fsdp_config: FSDPConfig, offload_config: OffloadConfig, cudagra
 def _reclaim_unloaded_weights(example_inputs) -> None:
     """Restore this graph's parked weights that the offload rewrite left without loads."""
     # Other models' slots must stay parked until their own graphs compile.
+    store = host_weights.default_store()
     locals_ = (ex._local_tensor if isinstance(ex, DTensor) else ex for ex in example_inputs or ())
-    slots = [slot for t in locals_ if isinstance(t, torch.Tensor) and (slot := host_weights.slot_of(t)) is not None]
+    slots = [slot for t in locals_ if isinstance(t, torch.Tensor) and (slot := store.slot_of(t)) is not None]
     # Exclude bytes made resident by other calls or passes.
-    before = host_weights.resident_bytes()
-    restored = host_weights.restore_unclaimed(slots)
+    before = store.resident_bytes()
+    restored = store.restore_unclaimed(slots)
     if not restored:
         return
     magi_logger.warning(
         "host offload: restored %d weight(s) without graph loads, %.1f MiB; weights: %s",
         len(restored),
-        (host_weights.resident_bytes() - before) / 2**20,
+        (store.resident_bytes() - before) / 2**20,
         ", ".join(restored[:8]) + (f", +{len(restored) - 8} more" if len(restored) > 8 else ""),
     )
 

@@ -294,24 +294,24 @@ def test_fsdp_prep_cost_hides_nothing(world_of_one):
 def test_h2d_schedule_is_frozen(golden, key, seed, n, kwargs):
     from magi_compiler.passes.weight_offload import H2dLoadReorder, host_weights
 
-    host_weights.reset()
+    host_weights.default_store().reset()
     try:
         slots = []
         for i in range(n):
             mib = 4 + 4 * (i % 3)
             shard = torch.randn(mib * _MIB // 2, device="cuda", dtype=torch.bfloat16)
-            host = host_weights.reserve(tuple(shard.shape), shard.dtype, name=f"w{i}")
+            host = host_weights.default_store().reserve(tuple(shard.shape), shard.dtype, name=f"w{i}")
             host.copy_(shard)
             shard.untyped_storage().resize_(0)
-            slots.append(host_weights.adopt(host, shard, name=f"w{i}"))
+            slots.append(host_weights.default_store().adopt(host, shard, name=f"w{i}"))
         order = _h2d_graph(seed, slots)
         params = {"bandwidth_bytes_per_ns": 10.0, "window_margin_ns": 0.0, "bus_utilization": 0.9, **kwargs}
         reorder = H2dLoadReorder(cost_fn=lambda s: s.cost, **params)
         names = [s.name for s in reorder(order)]
-        resident = [i for i, slot in enumerate(slots) if host_weights.is_resident(slot)]
+        resident = [i for i, slot in enumerate(slots) if host_weights.default_store().is_resident(slot)]
         _check(golden, key, names, resident)
     finally:
-        host_weights.reset()
+        host_weights.default_store().reset()
 
 
 # -- frozen schedules ---------------------------------------------------------

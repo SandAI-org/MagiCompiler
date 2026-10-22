@@ -200,5 +200,5 @@ def _splice_load(graph: fx.GraphModule, holder: fx.Node, slot: int, order) -> in
     # Everything that read the (now storage-free) weight reads the loaded copy
     # instead -- except the load itself, which still needs it.
     holder.replace_all_uses_with(wait, delete_user_cb=lambda user: user is not load)
-    host_weights.mark_claimed(slot)
+    host_weights.default_store().mark_claimed(slot)
     return 1

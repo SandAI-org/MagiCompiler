@@ -42,9 +42,9 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requir
 def clean_pool():
     from magi_compiler.passes.weight_offload import host_weights
 
-    host_weights.reset()
+    host_weights.default_store().reset()
     yield
-    host_weights.reset()
+    host_weights.default_store().reset()
 
 
 def _info(name, shape, dtype="torch.bfloat16", nbytes=32, resident=False):
@@ -79,10 +79,10 @@ def test_collect_and_refresh_read_the_live_pool():
     from magi_compiler.passes.weight_offload import host_weights
 
     local = torch.randn(16, 8, device="cuda", dtype=torch.bfloat16)
-    host = host_weights.reserve(tuple(local.shape), local.dtype, name="layers.0.w")
+    host = host_weights.default_store().reserve(tuple(local.shape), local.dtype, name="layers.0.w")
     host.copy_(local.detach())
     local.untyped_storage().resize_(0)
-    slot = host_weights.adopt(host, local, name="layers.0.w")
+    slot = host_weights.default_store().adopt(host, local, name="layers.0.w")
 
     g = fx.Graph()
     node = g.placeholder("L_self_modules_layers_0_parameters_weight_")
@@ -100,7 +100,7 @@ def test_collect_and_refresh_read_the_live_pool():
     assert table[slot]["shape"] == (16, 8)
     assert table[slot]["resident"] is False
 
-    host_weights.make_resident(slot)
+    host_weights.default_store().make_resident(slot)
     refreshed = refresh_resident_flags(table)
     assert refreshed[slot]["resident"] is True
 
@@ -143,10 +143,10 @@ def _adopt_weight(name: str = "w", shape=(8, 8)):
     from magi_compiler.passes.weight_offload import host_weights
 
     local = torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
-    host = host_weights.reserve(tuple(local.shape), local.dtype, name=name)
+    host = host_weights.default_store().reserve(tuple(local.shape), local.dtype, name=name)
     host.copy_(local.detach())
     local.untyped_storage().resize_(0)
-    slot = host_weights.adopt(host, local, name=name)
+    slot = host_weights.default_store().adopt(host, local, name=name)
     return slot, local
 
 
@@ -160,7 +160,7 @@ def test_bind_matches_sidecar_and_replays_resident(tmp_path: Path):
             "name": "w",
             "shape": (8, 8),
             "dtype": str(local.dtype),
-            "nbytes": host_weights.slot_bytes(slot),
+            "nbytes": host_weights.default_store().slot_bytes(slot),
             "resident": True,
         }
     }
@@ -171,7 +171,7 @@ def test_bind_matches_sidecar_and_replays_resident(tmp_path: Path):
     assert cache.allows_load()
     assert not cache.allows_store()
     assert cache._remap == {99: slot}
-    assert host_weights.is_resident(slot)
+    assert host_weights.default_store().is_resident(slot)
 
 
 @requires_cuda
@@ -208,7 +208,7 @@ def test_replay_does_not_rewrite_sidecar(tmp_path: Path):
             "name": "w",
             "shape": (8, 8),
             "dtype": str(local.dtype),
-            "nbytes": host_weights.slot_bytes(slot),
+            "nbytes": host_weights.default_store().slot_bytes(slot),
             "resident": False,
         }
     }
@@ -244,7 +244,7 @@ def test_bind_hit_keeps_compile_indices(tmp_path: Path):
             "name": "w",
             "shape": (8, 8),
             "dtype": str(local.dtype),
-            "nbytes": host_weights.slot_bytes(slot),
+            "nbytes": host_weights.default_store().slot_bytes(slot),
             "resident": False,
         }
     }
@@ -269,7 +269,7 @@ def test_replay_does_not_store_a_mixed_slot_artifact(tmp_path: Path):
             "name": "w",
             "shape": (8, 8),
             "dtype": str(local.dtype),
-            "nbytes": host_weights.slot_bytes(slot),
+            "nbytes": host_weights.default_store().slot_bytes(slot),
             "resident": False,
         }
     }
@@ -297,7 +297,7 @@ def test_wrap_loaded_applies_slot_remap(tmp_path: Path):
             "name": "w",
             "shape": (8, 8),
             "dtype": str(local.dtype),
-            "nbytes": host_weights.slot_bytes(slot),
+            "nbytes": host_weights.default_store().slot_bytes(slot),
             "resident": False,
         }
     }
