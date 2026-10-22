@@ -39,23 +39,23 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="promot
 
 @pytest.fixture
 def clean_host_weights():
-    from magi_compiler.passes.weight_offload import host_weights
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
-    host_weights.default_store().reset()
+    get_global_host_weight_store().reset()
     try:
         yield
     finally:
-        host_weights.default_store().reset()
+        get_global_host_weight_store().reset()
 
 
 def _park(tensor: torch.Tensor, name: str = "") -> int:
     """Put ``tensor`` in the host pool the production way: reserve, fill, empty, adopt."""
-    from magi_compiler.passes.weight_offload import host_weights
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
-    host = host_weights.default_store().reserve(tuple(tensor.shape), tensor.dtype, name=name)
+    host = get_global_host_weight_store().reserve(tuple(tensor.shape), tensor.dtype, name=name)
     host.copy_(tensor.detach())
     tensor.untyped_storage().resize_(0)
-    return host_weights.default_store().adopt(host, tensor, name=name)
+    return get_global_host_weight_store().adopt(host, tensor, name=name)
 
 
 class _Dep:
@@ -330,13 +330,13 @@ def test_inflight_bytes_determine_whether_loads_share_a_window(budget_mib, can_o
 )
 def test_residency_budget_applies_even_to_fully_hideable_loads(resident_mib, expected_resident):
     """Zero budget keeps offload enabled; ample budget removes even hidden PCIe traffic."""
-    from magi_compiler.passes.weight_offload import host_weights
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
     shards = [torch.randn(8 * _MIB // 2, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
     slots = [_park(s) for s in shards]
     _reorder(_two_conflicting_loads(slots), max_resident_bytes=resident_mib * _MIB)
-    assert [host_weights.default_store().is_resident(slot) for slot in slots] == [expected_resident] * 2
-    assert host_weights.default_store().resident_bytes() == (16 * _MIB if expected_resident else 0)
+    assert [get_global_host_weight_store().is_resident(slot) for slot in slots] == [expected_resident] * 2
+    assert get_global_host_weight_store().resident_bytes() == (16 * _MIB if expected_resident else 0)
 
 
 @requires_cuda
@@ -344,15 +344,15 @@ def test_residency_budget_applies_even_to_fully_hideable_loads(resident_mib, exp
 def test_the_residency_budget_buys_out_the_transfer_nothing_can_hide():
     """When two loads exceed one compute window, residency must remove exposed H2D work.
     Without residency, the later load stays at its wait when hoisting cannot help."""
-    from magi_compiler.passes.weight_offload import host_weights
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
     def run(resident):
         # Use fresh tensors because _park releases their device storage.
-        host_weights.default_store().reset()
+        get_global_host_weight_store().reset()
         shards = [torch.randn(10 * _MIB // 2, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
         slots = [_park(s) for s in shards]
         out = _reorder(_serialized_loads(slots), max_resident_bytes=resident, max_inflight_bytes=20 * _MIB)
-        return out, [host_weights.default_store().is_resident(s) for s in slots]
+        return out, [get_global_host_weight_store().is_resident(s) for s in slots]
 
     out, resident = run(0)
     assert not any(resident), "an empty budget buys nothing"
@@ -367,12 +367,12 @@ def test_the_residency_budget_buys_out_the_transfer_nothing_can_hide():
 @pytest.mark.usefixtures("clean_host_weights")
 def test_the_residency_budget_is_a_ceiling_not_a_target():
     """Three 10 MiB weights compete for a 10 MiB budget: restore exactly one."""
-    from magi_compiler.passes.weight_offload import host_weights
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
     shards = [torch.randn(10 * _MIB // 2, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
     slots = [_park(s) for s in shards]
     _reorder(_serialized_loads(slots), max_resident_bytes=10 * _MIB, max_inflight_bytes=40 * _MIB)
-    assert host_weights.default_store().resident_bytes() == 10 * _MIB
+    assert get_global_host_weight_store().resident_bytes() == 10 * _MIB
 
 
 def _layered_graph(slots, *, layers=6, big_mib=8, small_mib=4, compute_ns=1e6):
@@ -393,30 +393,30 @@ def _layered_graph(slots, *, layers=6, big_mib=8, small_mib=4, compute_ns=1e6):
 def test_residency_closes_each_windows_own_deficit():
     """A 4 MiB promotion must cover a 3.4 MiB window deficit.
     Promoting 8 MiB instead would exhaust the budget needed by later windows."""
-    from magi_compiler.passes.weight_offload import host_weights
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
     slots, sizes = [], [8, 4] * 6
     for mib in sizes:
         slots.append(_park(torch.randn(mib * _MIB // 2, device="cuda", dtype=torch.bfloat16)))
     _reorder(_layered_graph(slots), max_device_weight_bytes=(24 + 16) * _MIB)
 
-    resident = {i for i, s in enumerate(slots) if host_weights.default_store().is_resident(s)}
+    resident = {i for i, s in enumerate(slots) if get_global_host_weight_store().is_resident(s)}
     assert resident == {1, 3, 5, 7, 9, 11}, "every block gives back its own smaller weight"
-    assert host_weights.default_store().resident_bytes() == 24 * _MIB
+    assert get_global_host_weight_store().resident_bytes() == 24 * _MIB
 
 
 @requires_cuda
 @pytest.mark.usefixtures("clean_host_weights")
 def test_residency_is_spread_across_the_graph_not_stacked_at_the_front():
     """Distribute residency across overloaded windows rather than exhausting it at the front."""
-    from magi_compiler.passes.weight_offload import host_weights
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
     slots = []
     for mib in [8, 4] * 6:
         slots.append(_park(torch.randn(mib * _MIB // 2, device="cuda", dtype=torch.bfloat16)))
     _reorder(_layered_graph(slots), max_device_weight_bytes=64 * _MIB)
 
-    blocks_touched = {i // 2 for i, s in enumerate(slots) if host_weights.default_store().is_resident(s)}
+    blocks_touched = {i // 2 for i, s in enumerate(slots) if get_global_host_weight_store().is_resident(s)}
     assert len(blocks_touched) >= 5, f"residency only reached blocks {sorted(blocks_touched)}"
 
 
@@ -424,7 +424,7 @@ def test_residency_is_spread_across_the_graph_not_stacked_at_the_front():
 @pytest.mark.usefixtures("clean_host_weights")
 def test_device_weight_budget_reserves_inflight_room_before_residency():
     """One budget, split by the pass: residency never eats the in-flight floor."""
-    from magi_compiler.passes.weight_offload import host_weights
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
     slots = []
     for mib in [8, 4] * 6:
@@ -433,7 +433,7 @@ def test_device_weight_budget_reserves_inflight_room_before_residency():
 
     # 2 x the largest bucket is reserved for in-flight before residency is
     # handed anything, so a 30 MiB budget can buy at most 14 MiB back.
-    assert 0 < host_weights.default_store().resident_bytes() <= 14 * _MIB
+    assert 0 < get_global_host_weight_store().resident_bytes() <= 14 * _MIB
 
 
 def test_last_user_is_the_consumer_not_the_wait():
@@ -545,15 +545,15 @@ def test_the_budget_charges_for_the_last_user_not_the_last_wait():
 @pytest.mark.usefixtures("clean_host_weights")
 def test_a_lone_unhideable_load_is_bought_out_only_when_asked():
     """A load with no preceding compute becomes resident only when given a residency budget."""
-    from magi_compiler.passes.weight_offload import host_weights
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
     def run(resident):
-        host_weights.default_store().reset()
+        get_global_host_weight_store().reset()
         shard = torch.randn(2 * _MIB // 2, device="cuda", dtype=torch.bfloat16)
         slot = _park(shard)
         order = [_load("ld", 2, slot=slot), _wait("w", "ld"), _compute("user", 1e6, deps=["w"])]
         _reorder(order, max_resident_bytes=resident)
-        return host_weights.default_store().is_resident(slot), shard
+        return get_global_host_weight_store().is_resident(slot), shard
 
     resident, shard = run(0)
     assert not resident and shard.untyped_storage().nbytes() == 0, "it should still be offloaded"

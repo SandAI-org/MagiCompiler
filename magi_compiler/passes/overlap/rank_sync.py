@@ -56,7 +56,8 @@ def _collective_kind_key(snode: BaseSchedulerNode, is_weight: bool) -> tuple:
     try:
         dims = tuple("?" if getattr(d, "free_symbols", None) else int(d) for d in node.get_size())
         dtype = str(node.get_dtype())
-    except Exception:  # noqa: BLE001
+    except (AttributeError, NotImplementedError):
+        # A NoneLayout has a size but no dtype, a MultiOutputLayout neither.
         pass
     return (is_weight, str(op), dims, dtype)
 

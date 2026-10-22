@@ -81,11 +81,10 @@ def gather_info(snode: BaseSchedulerNode) -> GatherInfo | None:
     except (TypeError, ValueError):
         return None
     inp = node.inputs[0]
-    try:
-        shard_bytes, dtype = ir_node_bytes(inp), inp.get_dtype()
-    except Exception:  # noqa: BLE001
+    # Candidates are listed before the skeleton exchange, so an unsized input must not raise.
+    if not isinstance(inp.maybe_get_layout(), ir.Layout):
         return None
-    return GatherInfo(str(group_name), world, dtype, shard_bytes, kind)
+    return GatherInfo(str(group_name), world, inp.get_dtype(), ir_node_bytes(inp), kind)
 
 
 def _launch_group(
@@ -191,7 +190,7 @@ def ir_coalesce_supported() -> bool:
             and hasattr(ir, "MultiOutput")
             and hasattr(Scheduler, "create_scheduler_node")
         )
-    except Exception:  # noqa: BLE001
+    except ImportError:
         return False
 
 

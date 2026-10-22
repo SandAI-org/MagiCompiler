@@ -124,11 +124,11 @@ def parked_slot(local: Any) -> tuple[int | None, str | None]:
     already applied the size floor.  Collect never copies a resident shard off
     the device.
     """
-    from ..runtime import host_weights
+    from ..runtime.host_weights import get_global_host_weight_store
 
     if not isinstance(local, torch.Tensor):
         return None, "graph input is not a tensor"
-    slot = host_weights.default_store().slot_of(local)
+    slot = get_global_host_weight_store().slot_of(local)
     if slot is None:
         return None, "weight was not materialized in host memory"
     return slot, None
@@ -141,7 +141,7 @@ class PlainParamSource(WeightSource):
     def collect(
         self, graph: fx.GraphModule, placeholder_examples: Mapping[str, Any]
     ) -> tuple[list[OffloadCandidate], Counter]:
-        from ..runtime import host_weights
+        from ..runtime.host_weights import get_global_host_weight_store
 
         candidates: list[OffloadCandidate] = []
         skipped: Counter = Counter()
@@ -169,7 +169,7 @@ class PlainParamSource(WeightSource):
                     holder=node,
                     local=live,
                     name=_param_name(node),
-                    nbytes=host_weights.default_store().slot_bytes(slot),
+                    nbytes=get_global_host_weight_store().slot_bytes(slot),
                     tag=None,
                     slot=slot,
                 )
@@ -247,7 +247,7 @@ def _weight_behind(to_local: fx.Node) -> fx.Node | None:
 
 
 def _shard_candidate(*, holder, source, param, skipped, tag=None) -> OffloadCandidate | None:
-    from ..runtime import host_weights
+    from ..runtime.host_weights import get_global_host_weight_store
 
     # Only weights.  An activation that happens to be a DTensor changes every
     # forward, so parking it would serve stale bytes that no later check notices.
@@ -264,7 +264,7 @@ def _shard_candidate(*, holder, source, param, skipped, tag=None) -> OffloadCand
         holder=holder,
         local=local,
         name=_param_name(source),
-        nbytes=host_weights.default_store().slot_bytes(slot),
+        nbytes=get_global_host_weight_store().slot_bytes(slot),
         tag=tag,
         slot=slot,
         group=mesh_group(param),

@@ -37,7 +37,7 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 from magi_compiler.utils import magi_logger
 
 from . import residency
-from .runtime import host_weights
+from .runtime.host_weights import get_global_host_weight_store
 
 _TO_EMPTY = "Module.to_empty.<locals>.<lambda>"
 """Only ``to_empty`` materializes; dtype casts and other ``_apply`` uses keep torch behavior."""
@@ -86,31 +86,15 @@ def _rebuild(param: DTensor, local: torch.Tensor) -> DTensor:
     return DTensor(local, spec, requires_grad=False)
 
 
-def _replace_param(module: nn.Module, names: list[str], param: nn.Parameter, new_data) -> nn.Parameter:
-    """Replace before tracing, updating every tied registration if ``swap_tensors`` fails.
-    Return the registered Parameter: construction can detach the input, and the
-    host store must key its slot on the object the graph will actually use."""
-    replacement = nn.Parameter(new_data, requires_grad=param.requires_grad)
-    try:
-        torch.utils.swap_tensors(param, replacement)
-        return param
-    except Exception as exc:  # noqa: BLE001
-        # Re-registration must update every tied path when identity cannot be preserved.
-        magi_logger.warning(
-            "host offload: swap_tensors on %s failed (%s); re-registering %d path(s) instead", names[0], exc, len(names)
-        )
-
-    for name in names:
-        parent_path, _, attr = name.rpartition(".")
-        parent = module.get_submodule(parent_path) if parent_path else module
-        parent.register_parameter(attr, replacement)
-    return replacement
+def _replace_param(param: nn.Parameter, new_data) -> None:
+    """Swap ``new_data`` into ``param`` in place before tracing.
+    Identity must survive: tied registrations, optimizers and hooks hold this object."""
+    torch.utils.swap_tensors(param, nn.Parameter(new_data, requires_grad=param.requires_grad))
 
 
 def _parked_params(module: nn.Module) -> list[tuple[list[str], nn.Parameter]]:
     """Group CPU payloads by Parameter identity, retaining every tied registration.
-    After CUDA ``to_empty``, these are the weights redirected into host slabs;
-    all names are needed if handoff falls back to re-registration."""
+    After CUDA ``to_empty``, these are the weights redirected into host slabs."""
     groups: dict[int, tuple[list[str], nn.Parameter]] = {}
     for name, param in module.named_parameters(recurse=True, remove_duplicate=False):
         if isinstance(param, DTensor):
@@ -170,7 +154,7 @@ def _refuse_casting_handed_over(module: nn.Module, fn) -> None:
     for name, param in module.named_parameters():
         payload = _payload(param)
         layout = (payload.dtype, payload.device)
-        if layout in probed or host_weights.default_store().slot_of(payload) is None:
+        if layout in probed or get_global_host_weight_store().slot_of(payload) is None:
             continue
         probed.add(layout)
         try:
@@ -207,7 +191,7 @@ def _leaving_parked(fn):
     """``fn`` for everything but the stand-ins, whose placement is the pool's."""
 
     def apply(t):
-        return t if host_weights.default_store().slot_of(t) is not None else fn(t)
+        return t if get_global_host_weight_store().slot_of(t) is not None else fn(t)
 
     return apply
 
@@ -224,11 +208,10 @@ def _hand_over(module: nn.Module, parked: list[tuple[list[str], nn.Parameter, to
         stand_in = torch.empty(host.shape, dtype=host.dtype, device=device)
         stand_in.untyped_storage().resize_(0)
         new_data = _rebuild(param, stand_in) if isinstance(param, DTensor) else stand_in
-        installed = _replace_param(module, names, param, new_data)
-        # After, not before: registration is what decides which tensor object
-        # the graph will be traced against, and the slot is keyed on it.
-        device_tensor = _payload(installed)
-        slots.append(host_weights.default_store().adopt(host, device_tensor, name=_pretty(names[0])))
+        _replace_param(param, new_data)
+        # After, not before: the slot is keyed on the tensor the graph will be traced against.
+        device_tensor = _payload(param)
+        slots.append(get_global_host_weight_store().adopt(host, device_tensor, name=_pretty(names[0])))
         nbytes += host.numel() * host.element_size()
     residency.record_slots(module, slots)
     return nbytes
@@ -246,7 +229,7 @@ def _park_host_built(module: nn.Module, min_bytes: int) -> int:
             groups.setdefault(id(param), ([], param))[0].append(name)
     parked = []
     for names, param in groups.values():
-        host = host_weights.default_store().reserve(param.shape, param.dtype, name=_pretty(names[0]))
+        host = get_global_host_weight_store().reserve(param.shape, param.dtype, name=_pretty(names[0]))
         host.copy_(param.detach())
         parked.append((names, param, host))
     if not parked:
@@ -363,7 +346,7 @@ def patch_materialize(instance: nn.Module, conf) -> None:
             host = hosts.get(id(t))
             if host is None:
                 payload = _payload(t)
-                host = host_weights.default_store().reserve(payload.shape, payload.dtype, name=name)
+                host = get_global_host_weight_store().reserve(payload.shape, payload.dtype, name=name)
                 hosts[id(t)] = host
                 parked.append(host.numel() * host.element_size())
             return _rebuild(t, host) if isinstance(t, DTensor) else host

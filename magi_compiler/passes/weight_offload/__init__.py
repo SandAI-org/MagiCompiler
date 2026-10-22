@@ -34,7 +34,7 @@ from .graph.bind import bind_weights_to_host, insert_h2d_loads
 from .graph.weight_source import FsdpShardSource, PlainParamSource
 from .host_first import handoff_if_pending, patch_materialize
 from .node_meta import is_host_offloaded
-from .runtime import host_weights
+from .runtime.host_weights import get_global_host_weight_store
 from .schedule.h2d_reorder import H2dLoadReorder
 
 __all__ = [
@@ -44,8 +44,8 @@ __all__ = [
     "H2dLoadReorder",
     "FsdpShardSource",
     "PlainParamSource",
+    "get_global_host_weight_store",
     "handoff_if_pending",
-    "host_weights",
     "patch_materialize",
     "is_host_offloaded",
 ]

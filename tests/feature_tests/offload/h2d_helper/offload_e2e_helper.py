@@ -180,15 +180,15 @@ def main() -> None:
         out = compiled(x)
         torch.cuda.synchronize()
 
-    from magi_compiler.passes.weight_offload import host_weights
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
     if rank == 0:
         print(
-            f"OFFLOAD_FREED mib={host_weights.default_store().bound_bytes() / 2**20:.2f} shards={host_weights.default_store().num_bound()} "
-            f"promoted_mib={host_weights.default_store().resident_bytes() / 2**20:.2f}",
+            f"OFFLOAD_FREED mib={get_global_host_weight_store().bound_bytes() / 2**20:.2f} shards={get_global_host_weight_store().num_bound()} "
+            f"promoted_mib={get_global_host_weight_store().resident_bytes() / 2**20:.2f}",
             flush=True,
         )
-        if host_weights.default_store().num_bound() == 0:
+        if get_global_host_weight_store().num_bound() == 0:
             # Offload tags what the redistribute lowering exposed, so zero shards
             # means the lowering found nothing -- which is a property of the
             # installed SimpleFSDP, not of this run.  Say so explicitly: a numeric

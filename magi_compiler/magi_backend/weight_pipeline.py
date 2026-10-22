@@ -44,7 +44,7 @@ from magi_compiler.passes.weight_offload import (
     H2dLoadReorder,
     PlainParamSource,
     bind_weights_to_host,
-    host_weights,
+    get_global_host_weight_store,
     insert_h2d_loads,
 )
 from magi_compiler.profiling import ProfilingRuntimeEstimator
@@ -53,7 +53,7 @@ from magi_compiler.utils import magi_logger
 _INDUCTOR_DEFAULT_REORDERS = ["raise_comms", "sink_waits"]
 
 
-def _mib_to_bytes(mib: float) -> int:
+def _mib_to_bytes(mib: int) -> int:
     return int(mib) * 1024 * 1024
 
 
@@ -123,7 +123,7 @@ def build_scheduler_passes(
         # Rank-local: placing loads issues no collective.
         passes.append(
             H2dLoadReorder(
-                bandwidth_bytes_per_ns=host_weights.default_store().h2d_bandwidth_bytes_per_ns(
+                bandwidth_bytes_per_ns=get_global_host_weight_store().h2d_bandwidth_bytes_per_ns(
                     offload_config.offload_h2d_bandwidth_gbps
                 ),
                 max_device_weight_bytes=_mib_to_bytes(offload_config.offload_max_device_weight_mib),
@@ -153,7 +153,7 @@ def _validate(*, fsdp_config: FSDPConfig, offload_config: OffloadConfig, cudagra
 def _reclaim_unloaded_weights(example_inputs) -> None:
     """Restore this graph's parked weights that the offload rewrite left without loads."""
     # Other models' slots must stay parked until their own graphs compile.
-    store = host_weights.default_store()
+    store = get_global_host_weight_store()
     locals_ = (ex._local_tensor if isinstance(ex, DTensor) else ex for ex in example_inputs or ())
     slots = [slot for t in locals_ if isinstance(t, torch.Tensor) and (slot := store.slot_of(t)) is not None]
     # Exclude bytes made resident by other calls or passes.
