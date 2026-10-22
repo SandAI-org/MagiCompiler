@@ -170,7 +170,7 @@ def _refuse_casting_handed_over(module: nn.Module, fn) -> None:
     for name, param in module.named_parameters():
         payload = _payload(param)
         layout = (payload.dtype, payload.device)
-        if layout in probed or host_weights.slot_of(payload) is None:
+        if layout in probed or host_weights.default_store().slot_of(payload) is None:
             continue
         probed.add(layout)
         try:
@@ -207,7 +207,7 @@ def _leaving_parked(fn):
     """``fn`` for everything but the stand-ins, whose placement is the pool's."""
 
     def apply(t):
-        return t if host_weights.slot_of(t) is not None else fn(t)
+        return t if host_weights.default_store().slot_of(t) is not None else fn(t)
 
     return apply
 
@@ -228,7 +228,7 @@ def _hand_over(module: nn.Module, parked: list[tuple[list[str], nn.Parameter, to
         # After, not before: registration is what decides which tensor object
         # the graph will be traced against, and the slot is keyed on it.
         device_tensor = _payload(installed)
-        slots.append(host_weights.adopt(host, device_tensor, name=_pretty(names[0])))
+        slots.append(host_weights.default_store().adopt(host, device_tensor, name=_pretty(names[0])))
         nbytes += host.numel() * host.element_size()
     residency.record_slots(module, slots)
     return nbytes
@@ -246,7 +246,7 @@ def _park_host_built(module: nn.Module, min_bytes: int) -> int:
             groups.setdefault(id(param), ([], param))[0].append(name)
     parked = []
     for names, param in groups.values():
-        host = host_weights.reserve(param.shape, param.dtype, name=_pretty(names[0]))
+        host = host_weights.default_store().reserve(param.shape, param.dtype, name=_pretty(names[0]))
         host.copy_(param.detach())
         parked.append((names, param, host))
     if not parked:
@@ -363,7 +363,7 @@ def patch_materialize(instance: nn.Module, conf) -> None:
             host = hosts.get(id(t))
             if host is None:
                 payload = _payload(t)
-                host = host_weights.reserve(payload.shape, payload.dtype, name=name)
+                host = host_weights.default_store().reserve(payload.shape, payload.dtype, name=name)
                 hosts[id(t)] = host
                 parked.append(host.numel() * host.element_size())
             return _rebuild(t, host) if isinstance(t, DTensor) else host

@@ -276,7 +276,7 @@ class H2dLoadReorder(OverlapPass):
     def _promote(plans) -> int:
         from ..runtime import host_weights
 
-        return host_weights.make_resident_many([p.slot for p in plans if p.inactive])
+        return host_weights.default_store().make_resident_many([p.slot for p in plans if p.inactive])
 
     # -- reporting --------------------------------------------------------
     def _report(self, plans, targets, index_of, given_back, budget) -> None:

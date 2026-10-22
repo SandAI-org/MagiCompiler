@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from magi_compiler.passes.weight_offload.graph.weight_source import FsdpShardSource
-
 from .auto_bucket import FsdpAutoBucket
 from .copy_engine import bind_weights_for_copy_engine, copy_engine_weight_candidates, rewrite_weight_ag_to_copy_engine
 from .node_meta import CE_BOUND, UNEVEN_SHARD, WEIGHT_AG, is_ce_bound, is_uneven_shard, is_weight_ag
@@ -27,7 +25,6 @@ __all__ = [
     "lower_prim_redistribute_to_collectives",
     "rewrite_weight_ag_to_copy_engine",
     "FsdpOverlapReorder",
-    "FsdpShardSource",
     "CE_BOUND",
     "UNEVEN_SHARD",
     "WEIGHT_AG",

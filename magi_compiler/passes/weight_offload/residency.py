@@ -62,11 +62,12 @@ def _subtree_slots(module: nn.Module) -> list[int]:
 
 
 def _release(module: nn.Module) -> None:
-    resident = [slot for slot in _subtree_slots(module) if host_weights.is_resident(slot)]
+    store = host_weights.default_store()
+    resident = [slot for slot in _subtree_slots(module) if store.is_resident(slot)]
     if not resident:
         return
     torch.cuda.synchronize()
-    nbytes = host_weights.release_resident_many(resident)
+    nbytes = store.release_resident_many(resident)
     setattr(module, _RELEASED_ATTR, getattr(module, _RELEASED_ATTR, ()) + tuple(resident))
     magi_logger.info(
         "host offload: %s moved to host; freed %d promoted weight(s) (%.1f MiB) on the device",
@@ -80,7 +81,7 @@ def _promote_released(module: nn.Module) -> None:
     released = getattr(module, _RELEASED_ATTR, ())
     if not released:
         return
-    nbytes = host_weights.make_resident_many(released)
+    nbytes = host_weights.default_store().make_resident_many(released)
     setattr(module, _RELEASED_ATTR, ())
     magi_logger.info(
         "host offload: %s moved to device; promoted %d weight(s) (%.1f MiB) back, the rest load in the graph",

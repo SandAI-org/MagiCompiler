@@ -210,7 +210,9 @@ class OffloadConfig(BaseModel):
         False,
         description=(
             "Compile-time CPU weight offload for SimpleFSDP (transport='nccl') and unsharded nn.Parameter models. "
-            "Requires compile_mode=MAGI_COMPILE and cudagraph_mode=NONE; "
+            "Inference only: run under torch.no_grad() or torch.inference_mode(); a graph that needs the "
+            "offloaded weights' gradients fails to compile. "
+            "Requires compile_mode=MAGI_COMPILE, disable_graph_split=True and cudagraph_mode=NONE; "
             "mutually exclusive with model_cpu_offload and aot. "
             "Host-first materialization loads checkpoints into pinned memory; "
             "handoff temporarily allocates one CUDA shard. "

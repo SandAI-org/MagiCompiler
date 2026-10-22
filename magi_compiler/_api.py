@@ -272,6 +272,14 @@ def _magi_compile_bound_method(
                 "magi::h2d_load's process-local host slot integers but not the weight identity needed "
                 "to remap them, so a replay could load another weight."
             )
+        if not conf.disable_graph_split:
+            raise ValueError(
+                "offload_config.graph_weight_offload requires disable_graph_split=True: the residency "
+                "budget (offload_max_device_weight_mib) is spent once per Inductor compile, so every "
+                "piecewise subgraph would spend it again, and no load can be hoisted across a split. "
+                f"Set disable_graph_split=True in {type(instance).__name__}'s config_patch, or disable "
+                "graph_weight_offload for this model."
+            )
         from magi_compiler.passes.weight_offload import patch_materialize
 
         patch_materialize(instance, conf)

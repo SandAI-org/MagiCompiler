@@ -35,6 +35,7 @@ def _patch_offload(cfg):
     cfg.offload_config.graph_weight_offload = True
     cfg.offload_config.offload_min_shard_mib = 0.0
     cfg.cudagraph_mode = CudaGraphMode.NONE
+    cfg.disable_graph_split = True
     return cfg
 
 
@@ -68,7 +69,7 @@ def main() -> None:
         "shape": list(out.shape),
         "sum": float(out.float().sum().item()),
         "mean": float(out.float().mean().item()),
-        "num_bound": host_weights.num_bound(),
+        "num_bound": host_weights.default_store().num_bound(),
     }
     with open(args.output, "w") as f:
         json.dump(payload, f)

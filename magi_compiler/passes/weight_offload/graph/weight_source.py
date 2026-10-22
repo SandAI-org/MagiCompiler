@@ -30,19 +30,38 @@ import torch.fx as fx
 from torch.distributed.tensor import DTensor
 
 from ...snode_utils import AG
+from ..runtime.h2d_op import H2D_LOAD
+
+aten = torch.ops.aten
 
 # Producers we walk through when tracing a value back to the parameter behind it.
-_PREP_METHODS = {"to_local", "contiguous", "to", "view", "reshape"}
-_PREP_FUNCTIONS = ("constant_pad_nd", "_to_copy", "convert_element_type", "view", "reshape", "clone")
+_PREP_METHODS = frozenset({"to_local", "contiguous", "to", "view", "reshape"})
+# Overload packets, so every overload of a listed op matches and nothing else does.
+_PREP_FUNCTIONS = frozenset(
+    {
+        aten.constant_pad_nd,
+        aten._to_copy,
+        aten.view,
+        aten.reshape,
+        aten.clone,
+        torch.ops.prims.convert_element_type,
+        torch.reshape,
+        torch.clone,
+    }
+)
+_LOAD_OR_WAIT = frozenset({H2D_LOAD.overloadpacket, torch.ops._c10d_functional.wait_tensor})
+
+
+def _function_key(target: Any) -> Any:
+    return target.overloadpacket if isinstance(target, torch._ops.OpOverload) else target
 
 
 def _is_prep(node: fx.Node) -> bool:
     """A cheap reshaping producer that a weight's value may pass through."""
     if node.op == "call_method":
-        return str(node.target) in _PREP_METHODS
+        return node.target in _PREP_METHODS
     if node.op == "call_function":
-        name = getattr(node.target, "__name__", "") or str(node.target)
-        return any(t in name for t in _PREP_FUNCTIONS)
+        return _function_key(node.target) in _PREP_FUNCTIONS
     return False
 
 
@@ -109,7 +128,7 @@ def parked_slot(local: Any) -> tuple[int | None, str | None]:
 
     if not isinstance(local, torch.Tensor):
         return None, "graph input is not a tensor"
-    slot = host_weights.slot_of(local)
+    slot = host_weights.default_store().slot_of(local)
     if slot is None:
         return None, "weight was not materialized in host memory"
     return slot, None
@@ -147,7 +166,12 @@ class PlainParamSource(WeightSource):
             # Each placeholder needs a load, even when tied weights share one host slot.
             candidates.append(
                 OffloadCandidate(
-                    holder=node, local=live, name=_param_name(node), nbytes=host_weights.slot_bytes(slot), tag=None, slot=slot
+                    holder=node,
+                    local=live,
+                    name=_param_name(node),
+                    nbytes=host_weights.default_store().slot_bytes(slot),
+                    tag=None,
+                    slot=slot,
                 )
             )
         return candidates, skipped
@@ -202,14 +226,13 @@ def _feeds_a_weight_gather(node: fx.Node) -> bool:
         seen.add(user)
         if user.op == "call_function" and user.target is AG:
             return True
-        name = getattr(user.target, "__name__", "") or str(user.target)
-        if _is_prep(user) or "h2d_load" in name or "wait_tensor" in name:
+        if _is_prep(user) or (user.op == "call_function" and _function_key(user.target) in _LOAD_OR_WAIT):
             q.extend(user.users)
     return False
 
 
 def _weight_behind(to_local: fx.Node) -> fx.Node | None:
-    """The parameter placeholder a ``to_local`` reads, through its redistribute."""
+    """The placeholder or get_attr a ``to_local`` reads, through its redistribute."""
     src = to_local.args[0] if to_local.args else None
     if not isinstance(src, fx.Node):
         return None
@@ -220,16 +243,17 @@ def _weight_behind(to_local: fx.Node) -> fx.Node | None:
         src = src.args[0] if src.args else None
     if not isinstance(src, fx.Node) or src.op not in ("placeholder", "get_attr"):
         return None
-    # Only weights.  An activation that happens to be a DTensor changes every
-    # forward, so parking it would serve stale bytes -- and unlike a wrong
-    # placement that is not something any later check would notice.
-    text = f"{src.name} {src.target}".lower()
-    return src if any(t in text for t in ("parameter", "parameters", "weight", "bias")) else None
+    return src
 
 
 def _shard_candidate(*, holder, source, param, skipped, tag=None) -> OffloadCandidate | None:
     from ..runtime import host_weights
 
+    # Only weights.  An activation that happens to be a DTensor changes every
+    # forward, so parking it would serve stale bytes that no later check notices.
+    if not isinstance(param, torch.nn.Parameter):
+        skipped["graph input is not a parameter"] += 1
+        return None
     local = param._local_tensor if isinstance(param, DTensor) else None
     # Reuse the adopted slot; each compiled graph still needs its own load.
     slot, why = parked_slot(local=local)
@@ -240,7 +264,7 @@ def _shard_candidate(*, holder, source, param, skipped, tag=None) -> OffloadCand
         holder=holder,
         local=local,
         name=_param_name(source),
-        nbytes=host_weights.slot_bytes(slot),
+        nbytes=host_weights.default_store().slot_bytes(slot),
         tag=tag,
         slot=slot,
         group=mesh_group(param),

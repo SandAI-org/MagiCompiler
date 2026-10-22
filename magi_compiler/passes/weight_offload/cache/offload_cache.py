@@ -79,7 +79,7 @@ class OffloadCache:
             return reason
         current_slots = [remap[baked] for baked, info in sidecar.items() if info.get("resident")]
         if current_slots:
-            host_weights.make_resident_many(current_slots)
+            host_weights.default_store().make_resident_many(current_slots)
         self._remap = remap
         magi_logger.info("host offload: compile cache reusable (%d slot(s) remapped)", len(remap))
         return None

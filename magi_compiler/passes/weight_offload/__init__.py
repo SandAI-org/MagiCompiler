@@ -25,10 +25,8 @@ Layout, in the order a compile meets it:
 * ``graph/``      -- FX weight pipeline: bind parked weights, splice loads in.
 * ``schedule/``   -- Inductor scheduler pass: place each load, buy residency.
 * ``cache/``      -- host-slot sidecar next to the piecewise compile cache.
-* ``runtime/``    -- what the compiled graph calls: host weight slots, ``magi::h2d_load``.
+* ``runtime/``    -- what the compiled graph calls: host weight slots, the pinned slab pool, ``magi::h2d_load``.
 * ``residency``   -- device moves of a compiled module: free / re-promote its promoted shards.
-
-The pinned slabs themselves come from ``magi_compiler.host_mem``.
 """
 
 from .cache.offload_cache import OffloadCache
