@@ -32,7 +32,7 @@ from torch._guards import detect_fake_mode
 import magi_compiler.utils.envs as envs
 from magi_compiler.config import CompileConfig, CompileMode, CudaGraphMode, inductor_compile_config_hash, magi_cache_dump_path
 from magi_compiler.magi_depyf.timeline import observe_lifecycle, observe_lifecycle_context
-from magi_compiler.offload.offload_warpper import OffloadWrapper, is_python_scalar_input
+from magi_compiler.offload.offload_warpper import OffloadWrapper, is_python_scalar_input, mark_python_scalar_inputs
 from magi_compiler.passes import CustomJointGraphPartitionFn, FullGraphPassManager, PostGradPassManager, pass_context
 from magi_compiler.utils import compilation_counter, compute_code_hash, compute_graph_hash, compute_hash, magi_logger
 from magi_compiler.utils.visualize import save_fx_graph_visualization
@@ -741,6 +741,7 @@ class MagiBackend:
 
         self._init_cache(graph=graph, example_inputs=example_inputs)
 
+        mark_python_scalar_inputs(graph)
         self.full_graph_pass_manager(graph)
 
         split_gm, piecewise_graphs = self._split_graph(graph, example_inputs)
