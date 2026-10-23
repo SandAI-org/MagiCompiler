@@ -43,7 +43,7 @@ from magi_compiler.passes.weight_offload import (
     FsdpShardSource,
     H2dLoadReorder,
     PlainParamSource,
-    bind_weights_to_host,
+    bind_host_slots_to_graph,
     get_global_host_weight_store,
     insert_h2d_loads,
 )
@@ -51,6 +51,9 @@ from magi_compiler.profiling import ProfilingRuntimeEstimator
 from magi_compiler.utils import magi_logger
 
 _INDUCTOR_DEFAULT_REORDERS = ["raise_comms", "sink_waits"]
+
+_MAX_LOGGED_WEIGHT_NAMES = 8
+"""Arbitrary cap that keeps the restored-weights warning to one readable line."""
 
 
 def _mib_to_bytes(mib: int) -> int:
@@ -88,7 +91,7 @@ def build_scheduler_passes(
     if offload_config.graph_weight_offload and not fsdp_config.enable_fsdp:
         # Synchronized profiling is a collective, so a rank without loads still profiles
         # when a peer has any. Every rank compiling this graph reaches this call.
-        loads_on_any_rank = rank_sync.any_rank(loads_inserted)
+        loads_on_any_rank = rank_sync.any_rank_has_flag(loads_inserted)
     if not (fsdp_config.enable_fsdp or loads_on_any_rank):
         # Offload requested but nothing bound on any rank.
         return None
@@ -103,7 +106,7 @@ def build_scheduler_passes(
             # bucketing needs profiled costs and prices the nodes it creates.
             passes.append(
                 FsdpAutoBucket(
-                    cost_fn=costs,
+                    runtime_ns_fn=costs,
                     max_bucket_bytes=_mib_to_bytes(fsdp_config.bucket_size_mib),
                     overhead_ratio=fsdp_config.auto_bucket_overhead_ratio,
                 )
@@ -111,7 +114,7 @@ def build_scheduler_passes(
         passes.append(
             FsdpOverlapReorder(
                 comm_overlap_window_margin_ns=fsdp_config.comm_overlap_window_margin_ns,
-                cost_fn=costs,
+                runtime_ns_fn=costs,
                 comm_overlap_window_scale=fsdp_config.comm_overlap_window_scale,
             )
         )
@@ -126,14 +129,16 @@ def build_scheduler_passes(
                 bandwidth_bytes_per_ns=get_global_host_weight_store().h2d_bandwidth_bytes_per_ns(
                     offload_config.offload_h2d_bandwidth_gbps
                 ),
-                max_device_weight_bytes=_mib_to_bytes(offload_config.offload_max_device_weight_mib),
-                cost_fn=costs,
+                weight_budget_bytes=_mib_to_bytes(offload_config.offload_max_device_weight_mib),
+                runtime_ns_fn=costs,
             )
         )
     return passes
 
 
-def _validate(*, fsdp_config: FSDPConfig, offload_config: OffloadConfig, cudagraph_mode: CudaGraphMode) -> None:
+def _validate_weight_pipeline_config(
+    *, fsdp_config: FSDPConfig, offload_config: OffloadConfig, cudagraph_mode: CudaGraphMode
+) -> None:
     if fsdp_config.enable_fsdp:
         assert cudagraph_mode == CudaGraphMode.NONE, "fsdp_config.enable_fsdp requires cudagraph_mode=NONE"
     if offload_config.graph_weight_offload:
@@ -150,22 +155,33 @@ def _validate(*, fsdp_config: FSDPConfig, offload_config: OffloadConfig, cudagra
         )
 
 
-def _reclaim_unloaded_weights(example_inputs) -> None:
+def _restore_unclaimed_weights(example_inputs) -> None:
     """Restore this graph's parked weights that the offload rewrite left without loads."""
     # Other models' slots must stay parked until their own graphs compile.
     store = get_global_host_weight_store()
-    locals_ = (ex._local_tensor if isinstance(ex, DTensor) else ex for ex in example_inputs or ())
-    slots = [slot for t in locals_ if isinstance(t, torch.Tensor) and (slot := store.slot_of(t)) is not None]
+    input_local_tensors = (ex._local_tensor if isinstance(ex, DTensor) else ex for ex in example_inputs or ())
+    input_host_slots = []
+    for tensor in input_local_tensors:
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        host_slot = store.slot_for_tensor(tensor)
+        if host_slot is not None:
+            input_host_slots.append(host_slot)
     # Exclude bytes made resident by other calls or passes.
-    before = store.resident_bytes()
-    restored = store.restore_unclaimed(slots)
-    if not restored:
+    resident_bytes_before = store.resident_bytes()
+    restored_weight_names = store.restore_unclaimed_weights(input_host_slots)
+    if not restored_weight_names:
         return
+    restored_bytes = store.resident_bytes() - resident_bytes_before
+    shown_names = ", ".join(restored_weight_names[:_MAX_LOGGED_WEIGHT_NAMES])
+    hidden_name_count = len(restored_weight_names) - _MAX_LOGGED_WEIGHT_NAMES
+    if hidden_name_count > 0:
+        shown_names += f", +{hidden_name_count} more"
     magi_logger.warning(
         "host offload: restored %d weight(s) without graph loads, %.1f MiB; weights: %s",
-        len(restored),
-        (store.resident_bytes() - before) / 2**20,
-        ", ".join(restored[:8]) + (f", +{len(restored) - 8} more" if len(restored) > 8 else ""),
+        len(restored_weight_names),
+        restored_bytes / 2**20,
+        shown_names,
     )
 
 
@@ -184,7 +200,7 @@ class WeightPipeline:
             # enable_fsdp is process-wide: split-graph models (e.g. a VAE beside an FSDP DiT)
             # share it, but whole-graph FSDP overlap only applies to fullgraph compiles.
             fsdp_config = fsdp_config.model_copy(update={"enable_fsdp": False})
-        _validate(fsdp_config=fsdp_config, offload_config=offload_config, cudagraph_mode=cudagraph_mode)
+        _validate_weight_pipeline_config(fsdp_config=fsdp_config, offload_config=offload_config, cudagraph_mode=cudagraph_mode)
         self._fsdp_config = fsdp_config
         self._offload_config = offload_config
 
@@ -206,7 +222,7 @@ class WeightPipeline:
         )
         if self._offload_config.graph_weight_offload:
             # The compilation interpreter runs next and must not read storage-free weights.
-            _reclaim_unloaded_weights(example_inputs)
+            _restore_unclaimed_weights(example_inputs)
         if passes is not None:
             _allow_reorder_without_process_group()
         return passes
@@ -222,11 +238,12 @@ class WeightPipeline:
             return False
         if not self._offload_config.graph_weight_offload:
             return False
-        bound = bind_weights_to_host(
+        bound_weight_count = bind_host_slots_to_graph(
             graph=graph,
             example_inputs=example_inputs,
             source=FsdpShardSource() if fsdp_config.enable_fsdp else PlainParamSource(),
         )
-        if bound:
-            insert_h2d_loads(graph)
-        return bool(bound)
+        if bound_weight_count == 0:
+            return False
+        insert_h2d_loads(graph)
+        return True

@@ -125,7 +125,7 @@ class CompilerManager:
 
         self.cache_dir: Path = cache_dir
         self.cache_file_path: Path = cache_dir / "subgraph_indices.py"
-        self.offload_cache.initialize(cache_dir)
+        self.offload_cache.reset_for_cache_directory(cache_dir)
 
         if self.disable_cache:
             magi_logger.info("MagiCompiler's cache is disabled.")
@@ -163,7 +163,7 @@ class CompilerManager:
         data = printer.pformat(serializable)
         with self.cache_file_path.open("w") as f:
             f.write(data)
-        self.offload_cache.save()
+        self.offload_cache.save_slot_sidecar()
 
     def bind_offload_cache(self, graph: fx.GraphModule) -> None:
         """Match the host_slots sidecar to this process's bound weights.
@@ -175,7 +175,7 @@ class CompilerManager:
         """
         if self.disable_cache:
             return
-        reason = self.offload_cache.bind(graph)
+        reason = self.offload_cache.prepare_graph_replay(graph)
         if reason is not None:
             self.cache.clear()
             self._remaining_restart_skips = {}
@@ -184,7 +184,7 @@ class CompilerManager:
 
     @observe_lifecycle("compiler_manager_load")
     def load(self, graph: fx.GraphModule, example_inputs: list[Any], cache_entry: CacheEntry) -> Callable | None:
-        if not self.offload_cache.allows_load():
+        if not self.offload_cache.can_replay_artifact():
             return None
         if cache_entry not in self.cache:
             return None
@@ -214,7 +214,7 @@ class CompilerManager:
             f"Directly load the {cache_entry.graph_index}-th graph from {cache_entry.backend_name} via handle {cache_handle}",
         )
         compiled = self.compiler.load(graph, example_inputs, cache_entry, cache_handle)
-        compiled = self.offload_cache.wrap_loaded(compiled) if compiled else None
+        compiled = self.offload_cache.wrap_with_slot_remap(compiled) if compiled else None
         return compiled
 
     @observe_lifecycle("compiler_manager_compile")
@@ -280,7 +280,7 @@ class CompilerManager:
     ) -> bool:
         if self.disable_cache:
             return False
-        if not self.offload_cache.allows_store():
+        if not self.offload_cache.can_store_artifact():
             # Replay session: artifacts on disk use baked slots.  A freshly
             # compiled graph would bake this process's slots; mixing the two
             # under one sidecar is unsafe.

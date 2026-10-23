@@ -12,32 +12,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""One transfer's placement problem, in the terms every overlap pass shares."""
+"""One transfer's placement problem, and the placement the scheduler returns for a set of them."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Mapping
 
 from torch._inductor.scheduler import BaseSchedulerNode
 
 
-@dataclass(eq=False)
+@dataclass(frozen=True, eq=False)
 class TransferTask:
     """A transfer to hide behind compute, and where it may go.
 
-    Indices are positions in the order the pass received.  A pass declares the
-    problem (``anchor`` .. ``uses_transfer_bus``); the scheduler fills in the
-    answer (``launch_index`` onward).  Identity-hashed, so a task can key a dict.
+    Indices are positions in the order the pass received.  A pure input: the
+    scheduler returns its placement in a ``ScheduleResult`` instead of writing
+    it back here.  Identity-hashed, so a task can key a dict.
     """
 
     anchor: BaseSchedulerNode  # the snode that issues the transfer
-    moving_nodes: list  # snodes that move with it, anchor included
+    moving_nodes: tuple  # snodes that move with it, anchor included
     earliest_launch_index: int  # 1 + the last real producer
     deadline_index: int  # first index the transfer has to be done by; unhoisted it sits at deadline_index - 1
     required_overlap_ns: float  # compute (or bus) time that fully hides it
-    nbytes: int = 0
+    transfer_bytes: int = 0
     last_user_index: int = -1  # inclusive end of the buffer's live range
-    uses_transfer_bus: bool = True  # False: left in place, off the bus and the in-flight budget
-    launch_index: int | None = None  # where the scheduler placed the anchor
-    unhidden_transfer_ns: float = 0.0  # what the placement could not hide
-    budget_bound: bool = False  # the in-flight budget, not the resource, is what stopped it
+
+
+@dataclass(frozen=True)
+class ScheduleResult:
+    """Where the scheduler placed the tasks on the bus.
+
+    Tasks kept off the bus have no entry in either map: they stay at their
+    original index and hide nothing.
+    """
+
+    launch_index_by_anchor: Mapping[BaseSchedulerNode, int]
+    unhidden_ns_by_anchor: Mapping[BaseSchedulerNode, float]
+    # The in-flight budget, not the bus, is what left these transfers partly unhidden.
+    inflight_budget_limited_anchors: frozenset
+
+    @property
+    def total_unhidden_ns(self) -> float:
+        return sum(self.unhidden_ns_by_anchor.values())
+
+    @property
+    def inflight_budget_limited_unhidden_ns(self) -> float:
+        return sum(self.unhidden_ns_by_anchor[anchor] for anchor in self.inflight_budget_limited_anchors)

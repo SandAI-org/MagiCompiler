@@ -81,8 +81,8 @@ def issues_comm(snode: BaseSchedulerNode) -> bool:
     return contains_collective(snode) or leaf_comm_node(snode) is not None
 
 
-AG = torch.ops._c10d_functional.all_gather_into_tensor.default
-AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
+ALL_GATHER_OP = torch.ops._c10d_functional.all_gather_into_tensor.default
+COALESCED_ALL_GATHER_OP = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
 
 
 def is_all_gather_launch(snode: BaseSchedulerNode) -> bool:
@@ -90,7 +90,7 @@ def is_all_gather_launch(snode: BaseSchedulerNode) -> bool:
     engine, single or coalesced -- whether or not lowering tagged it as a weight."""
     node = leaf_comm_node(snode)
     op = node.op_overload if node is not None else None
-    return op is not None and (op in (AG, AG_COALESCED) or op in ce_ag_ops())
+    return op is not None and (op in (ALL_GATHER_OP, COALESCED_ALL_GATHER_OP) or op in ce_ag_ops())
 
 
 def _tagged_as_weight(snode: BaseSchedulerNode) -> bool:
@@ -136,45 +136,45 @@ def is_multi_output(snode: BaseSchedulerNode) -> bool:
     return isinstance(snode.node, ir.MultiOutput)
 
 
-def earliest_legal_index(group, index_of, buf_to_snode, *, skip=()) -> int:
-    """First boundary after external producers, excluding group and skip members.
+def earliest_legal_index(moving_nodes, original_index_by_node, producer_by_buffer, *, ignored_producers=()) -> int:
+    """First boundary after external producers, excluding the moving nodes and ``ignored_producers``.
 
     Ignore fake dependencies: ancestors include advisory collective-order edges
     that would prevent legal hoisting. Only real data dependencies constrain it.
     """
-    group_set = set(group) | set(skip)
-    lo = 0
-    for s in group:
-        for d in s.unmet_dependencies:  # buffer names
+    excluded_nodes = set(moving_nodes) | set(ignored_producers)
+    earliest_index = 0
+    for node in moving_nodes:
+        for d in node.unmet_dependencies:  # buffer names
             if _is_fake_dep(d):  # WeakDep / StarDep -- ordering hint, not data
                 continue
-            prod = buf_to_snode.get(d.name)
-            if prod is None or prod in group_set:
+            producer = producer_by_buffer.get(d.name)
+            if producer is None or producer in excluded_nodes:
                 continue
-            lo = max(lo, index_of.get(prod, 0) + 1)
-    return lo
+            earliest_index = max(earliest_index, original_index_by_node.get(producer, 0) + 1)
+    return earliest_index
 
 
-def validate_topological_order(new_order, buf_to_snode) -> bool:
+def validate_topological_order(new_order, producer_by_buffer) -> bool:
     """Check real producers precede their readers; Inductor does not repair the order.
     Use the same dependency rules as earliest_legal_index, excluding fused self-edges.
     """
-    pos = {s: i for i, s in enumerate(new_order)}
-    for s in new_order:
-        sp = pos[s]
-        for d in s.unmet_dependencies:  # buffer names
+    new_index_by_node = {s: i for i, s in enumerate(new_order)}
+    for node in new_order:
+        node_index = new_index_by_node[node]
+        for d in node.unmet_dependencies:  # buffer names
             if _is_fake_dep(d):  # WeakDep / StarDep -- advisory ordering, not data
                 continue
-            prod = buf_to_snode.get(d.name)
-            if prod is s:  # fused snode may name its own internal buffers
+            producer = producer_by_buffer.get(d.name)
+            if producer is node:  # fused snode may name its own internal buffers
                 continue
-            if prod is not None and pos.get(prod, -1) >= sp:
+            if producer is not None and new_index_by_node.get(producer, -1) >= node_index:
                 magi_logger.debug(
                     "validate fail: %s@%d needs buffer-dep %s@%d (buf %s)",
-                    s.get_name(),
-                    sp,
-                    prod.get_name(),
-                    pos.get(prod, -1),
+                    node.get_name(),
+                    node_index,
+                    producer.get_name(),
+                    new_index_by_node.get(producer, -1),
                     d.name,
                 )
                 return False

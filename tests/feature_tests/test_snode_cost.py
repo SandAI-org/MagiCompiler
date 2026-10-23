@@ -30,12 +30,11 @@ from torch._inductor import ir
 
 from magi_compiler.passes import snode_cost, snode_utils
 from magi_compiler.passes.snode_cost import SnodeCostProfile, SnodeCostTable
-from magi_compiler.profiling import ProfilingRuntimeEstimator
-from magi_compiler.profiling import runtime_estimator as re_mod
+from magi_compiler.profiling import ProfilingRuntimeEstimator, runtime_estimator
 from magi_compiler.profiling.runtime_estimator import ProfileEntry
 
 
-class _Snode:
+class FakeSnode:
     snodes = None
 
     def __init__(self, name, kind):
@@ -63,7 +62,7 @@ def stub_predicates(monkeypatch):
     monkeypatch.setattr(snode_cost, "is_all_gather_launch", is_gather)
 
 
-class _Estimator:
+class FakeRuntimeEstimator:
     """The surface of ``ProfilingRuntimeEstimator`` the profile pass drives."""
 
     def __init__(self, sync=True, fail_sync=False):
@@ -88,99 +87,99 @@ class _Estimator:
         self.synced = True
         return 1
 
-    def requery(self, s):
+    def estimate_without_reuse_count(self, s):
         return 200.0 if self.synced else 100.0
 
 
-def _graph(*kinds):
-    return [_Snode(f"{k}{i}", k) for i, k in enumerate(kinds)]
+def _make_snode_order(*kinds):
+    return [FakeSnode(f"{k}{i}", k) for i, k in enumerate(kinds)]
 
 
 def test_prices_compute_and_gathers_never_a_load_or_a_wait():
-    order = _graph("compute", "load", "wait", "gather", "compute")
+    order = _make_snode_order("compute", "load", "wait", "gather", "compute")
     c0, load, wait, gather, c4 = order
-    est, table = _Estimator(), SnodeCostTable()
-    out = SnodeCostProfile(table, est)(order)
+    estimator, table = FakeRuntimeEstimator(), SnodeCostTable()
+    out = SnodeCostProfile(table, estimator)(order)
 
     assert out is order, "the profile pass must never reorder"
-    assert est.warmed == ["compute0", "gather3", "compute4"]
-    assert est.synced
+    assert estimator.warmed == ["compute0", "gather3", "compute4"]
+    assert estimator.synced
     # The passes after it read the synced value, not the warm-up seed.
     assert table(c0) == table(gather) == table(c4) == 200.0
-    assert table.ok
+    assert table.is_profiling_valid
     assert load not in table and wait not in table
     assert table(load) == 0.0, "a load is priced from bytes / bandwidth, never by the table"
 
 
 def test_a_load_alone_is_reason_to_price_the_compute_around_it():
-    order = _graph("compute", "load", "wait", "compute")
-    est = _Estimator()
-    SnodeCostProfile(SnodeCostTable(), est)(order)
-    assert est.warmed == ["compute0", "compute3"]
+    order = _make_snode_order("compute", "load", "wait", "compute")
+    estimator = FakeRuntimeEstimator()
+    SnodeCostProfile(SnodeCostTable(), estimator)(order)
+    assert estimator.warmed == ["compute0", "compute3"]
 
 
 def test_graph_without_gather_or_load_is_not_priced():
-    est, table = _Estimator(), SnodeCostTable()
-    SnodeCostProfile(table, est)(_graph("compute", "compute"))
-    assert est.warmed == [] and not est.synced
+    estimator, table = FakeRuntimeEstimator(), SnodeCostTable()
+    SnodeCostProfile(table, estimator)(_make_snode_order("compute", "compute"))
+    assert estimator.warmed == [] and not estimator.synced
     assert len(table) == 0
 
 
 def test_analytical_mode_records_the_same_snodes():
-    order = _graph("compute", "load", "wait", "gather")
+    order = _make_snode_order("compute", "load", "wait", "gather")
     table = SnodeCostTable()
     SnodeCostProfile(table, None)(order)
     assert [s.name for s in order if s in table] == ["compute0", "gather3"]
 
 
 def test_sync_failure_marks_the_table_but_still_records():
-    order = _graph("compute", "gather")
+    order = _make_snode_order("compute", "gather")
     table = SnodeCostTable()
-    SnodeCostProfile(table, _Estimator(fail_sync=True))(order)
-    assert not table.ok
+    SnodeCostProfile(table, FakeRuntimeEstimator(fail_sync=True))(order)
+    assert not table.is_profiling_valid
     assert table(order[0]) == 100.0
 
 
 def test_each_compile_starts_from_an_empty_table():
     table = SnodeCostTable()
-    profile = SnodeCostProfile(table, _Estimator())
-    first = _graph("compute", "gather")
+    profile = SnodeCostProfile(table, FakeRuntimeEstimator())
+    first = _make_snode_order("compute", "gather")
     profile(first)
-    table.ok = False
-    second = _graph("gather", "compute")
+    table.is_profiling_valid = False
+    second = _make_snode_order("gather", "compute")
     profile(second)
     assert first[0] not in table and second[1] in table
-    assert table.ok
+    assert table.is_profiling_valid
 
 
 def test_a_miss_on_a_priced_kind_warns_once_per_compile(monkeypatch):
     """Compute and collectives are always recorded by the profile pass, so a
     miss on one means the chain is broken; waits and loads are never recorded,
     so missing them is silent."""
-    warned: list = []
-    monkeypatch.setattr(snode_cost.magi_logger, "warning", lambda msg, *a, **k: warned.append(a[0]))
+    warned_node_names: list = []
+    monkeypatch.setattr(snode_cost.magi_logger, "warning", lambda msg, *a, **k: warned_node_names.append(a[0]))
     table = SnodeCostTable()
-    SnodeCostProfile(table, _Estimator())(_graph("gather", "compute"))
+    SnodeCostProfile(table, FakeRuntimeEstimator())(_make_snode_order("gather", "compute"))
 
-    for s in _graph("wait", "load"):
+    for s in _make_snode_order("wait", "load"):
         table(s)
-    assert warned == []
+    assert warned_node_names == []
 
-    stray_compute, stray_gather = _Snode("new_c", "compute"), _Snode("new_g", "gather")
+    stray_compute, stray_gather = FakeSnode("new_c", "compute"), FakeSnode("new_g", "gather")
     table(stray_compute)
     table(stray_gather)
     table(stray_compute)
-    assert warned == ["new_c"], "one WARNING per compile; later misses go to DEBUG"
+    assert warned_node_names == ["new_c"], "one WARNING per compile; later misses go to DEBUG"
 
     table.reset()
-    table(_Snode("next_compile", "compute"))
-    assert warned == ["new_c", "next_compile"]
+    table(FakeSnode("next_compile", "compute"))
+    assert warned_node_names == ["new_c", "next_compile"]
 
 
 def test_table_does_not_keep_a_finished_graph_alive():
     table = SnodeCostTable()
-    s = _Snode("c", "compute")
-    table.record(s, 1.0)
+    s = FakeSnode("c", "compute")
+    table.record_runtime_ns(s, 1.0)
     assert len(table) == 1
     del s
     gc.collect()
@@ -195,17 +194,17 @@ def test_pass_list_copies_share_one_empty_table_and_pickle():
     from magi_compiler.passes.weight_offload import H2dLoadReorder
 
     table = SnodeCostTable()
-    s = _Snode("c", "compute")
-    table.record(s, 5.0)
+    s = FakeSnode("c", "compute")
+    table.record_runtime_ns(s, 5.0)
     passes = [
         SnodeCostProfile(table, ProfilingRuntimeEstimator(sync_across_ranks=True)),
-        FsdpAutoBucket(cost_fn=table),
-        FsdpOverlapReorder(cost_fn=table),
-        H2dLoadReorder(bandwidth_bytes_per_ns=1.0, cost_fn=table),
+        FsdpAutoBucket(runtime_ns_fn=table),
+        FsdpOverlapReorder(runtime_ns_fn=table),
+        H2dLoadReorder(bandwidth_bytes_per_ns=1.0, runtime_ns_fn=table),
     ]
     clone = copy.deepcopy(passes)
     profile, bucket, fsdp, h2d = clone
-    assert profile.table is bucket._cost_fn is fsdp._cost_fn is h2d._cost_fn
+    assert profile.table is bucket._runtime_ns_fn is fsdp._runtime_ns_fn is h2d._runtime_ns_fn
     assert profile.table is not table and len(profile.table) == 0
     assert profile.estimator.sync_across_ranks is True
     pickle.dumps(clone)
@@ -216,29 +215,29 @@ def test_pass_list_copies_share_one_empty_table_and_pickle():
 # ProfilingRuntimeEstimator changes the profile pass relies on
 # ---------------------------------------------------------------------------
 def test_estimator_never_prices_a_load():
-    est = ProfilingRuntimeEstimator(sync_across_ranks=True)
-    assert est(_Snode("ld", "load")) == 0.0
-    assert est.table == {} and est._key_snode == {}
+    estimator = ProfilingRuntimeEstimator(sync_across_ranks=True)
+    assert estimator(FakeSnode("ld", "load")) == 0.0
+    assert estimator.table == {} and estimator._key_snode == {}
 
 
 def test_single_rank_sync_measures_the_deferred_entries(monkeypatch):
     """Without peers there is nobody to desync: a deferred entry is measured in
     place rather than keeping its analytical seed for good."""
-    est = ProfilingRuntimeEstimator(sync_across_ranks=True)
-    est._table[("k",)] = ProfileEntry(ns=1.0, kind="extern", label="x", measured=False)
-    est._key_snode[("k",)] = object()
-    monkeypatch.setattr(est, "_measure_one", lambda snode: (42.0, True))
-    assert est.warm_and_sync() == 1
-    entry = est.table[("k",)]
+    estimator = ProfilingRuntimeEstimator(sync_across_ranks=True)
+    estimator._table[("k",)] = ProfileEntry(ns=1.0, kind="extern", label="x", measured=False)
+    estimator._key_snode[("k",)] = object()
+    monkeypatch.setattr(estimator, "_measure_one", lambda snode: (42.0, True))
+    assert estimator.warm_and_sync() == 1
+    entry = estimator.table[("k",)]
     assert entry.ns == 42.0 and entry.measured
-    assert est._key_snode == {}
+    assert estimator._key_snode == {}
 
 
 def test_requery_is_not_counted_as_a_reuse(monkeypatch):
-    est = ProfilingRuntimeEstimator()
-    est._table[("k",)] = ProfileEntry(ns=7.0, kind="compute", label="x", measured=True)
-    monkeypatch.setattr(re_mod, "_structural_key", lambda snode: ("k",))
-    s = _Snode("c", "compute")
-    assert est(s) == 7.0
-    assert est.requery(s) == 7.0
-    assert est.table[("k",)].reuse_count == 1 and est.n_cache_hits == 1
+    estimator = ProfilingRuntimeEstimator()
+    estimator._table[("k",)] = ProfileEntry(ns=7.0, kind="compute", label="x", measured=True)
+    monkeypatch.setattr(runtime_estimator, "_structural_key", lambda snode: ("k",))
+    s = FakeSnode("c", "compute")
+    assert estimator(s) == 7.0
+    assert estimator.estimate_without_reuse_count(s) == 7.0
+    assert estimator.table[("k",)].reuse_count == 1 and estimator.n_cache_hits == 1

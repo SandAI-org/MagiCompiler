@@ -30,22 +30,22 @@ Layout, in the order a compile meets it:
 """
 
 from .cache.offload_cache import OffloadCache
-from .graph.bind import bind_weights_to_host, insert_h2d_loads
+from .graph.bind import bind_host_slots_to_graph, insert_h2d_loads
 from .graph.weight_source import FsdpShardSource, PlainParamSource
-from .host_first import handoff_if_pending, patch_materialize
+from .host_first import handoff_host_weights_if_pending, install_host_first_hooks
 from .node_meta import is_host_offloaded
 from .runtime.host_weights import get_global_host_weight_store
 from .schedule.h2d_reorder import H2dLoadReorder
 
 __all__ = [
-    "bind_weights_to_host",
+    "bind_host_slots_to_graph",
     "insert_h2d_loads",
     "OffloadCache",
     "H2dLoadReorder",
     "FsdpShardSource",
     "PlainParamSource",
     "get_global_host_weight_store",
-    "handoff_if_pending",
-    "patch_materialize",
+    "handoff_host_weights_if_pending",
+    "install_host_first_hooks",
     "is_host_offloaded",
 ]

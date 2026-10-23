@@ -27,7 +27,7 @@ import weakref
 
 from torch._inductor.scheduler import BaseSchedulerNode
 
-from magi_compiler.profiling.runtime_estimator import analytical_ns
+from magi_compiler.profiling.runtime_estimator import analytical_runtime_ns
 from magi_compiler.utils import magi_logger
 
 from .overlap import rank_sync
@@ -35,7 +35,7 @@ from .snode_utils import is_all_gather_launch, is_compute, issues_comm
 from .weight_offload.schedule.h2d_snode import is_h2d_load
 
 
-def _is_priced(snode: BaseSchedulerNode) -> bool:
+def _should_record_cost(snode: BaseSchedulerNode) -> bool:
     """The snodes ``SnodeCostProfile`` records; the table warns on a miss for these alone."""
     return is_compute(snode) or issues_comm(snode)
 
@@ -47,45 +47,51 @@ class SnodeCostTable:
     Loads are unpriced; missing waits are expected and do not warn."""
 
     def __init__(self) -> None:
-        self._ns: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+        self._runtime_ns_by_node: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
         # False: pricing failed on this rank.  The FSDP reorder reduces it across
         # ranks before trusting any placement built on these numbers.
-        self.ok = True
-        self._misses = 0
+        self.is_profiling_valid = True
+        self._cache_miss_count = 0
 
     def reset(self) -> None:
-        self._ns = weakref.WeakKeyDictionary()
-        self.ok = True
-        self._misses = 0
+        self._runtime_ns_by_node = weakref.WeakKeyDictionary()
+        self.is_profiling_valid = True
+        self._cache_miss_count = 0
 
-    def record(self, snode: BaseSchedulerNode, ns: float) -> None:
-        self._ns[snode] = max(0.0, float(ns))
+    def record_runtime_ns(self, snode: BaseSchedulerNode, runtime_ns: float) -> None:
+        self._runtime_ns_by_node[snode] = max(0.0, float(runtime_ns))
 
     def __contains__(self, snode: BaseSchedulerNode) -> bool:
-        return snode in self._ns
+        return snode in self._runtime_ns_by_node
 
     def __len__(self) -> int:
-        return len(self._ns)
+        return len(self._runtime_ns_by_node)
 
     def __call__(self, snode: BaseSchedulerNode) -> float:
-        ns = self._ns.get(snode)
-        if ns is not None:
-            return ns
+        runtime_ns = self._runtime_ns_by_node.get(snode)
+        if runtime_ns is not None:
+            return runtime_ns
         if is_h2d_load(snode):
             return 0.0
-        ns = max(0.0, analytical_ns(snode))
-        if _is_priced(snode):
-            self._report_miss(snode, ns)
-        self._ns[snode] = ns
-        return ns
+        runtime_ns = max(0.0, analytical_runtime_ns(snode))
+        if _should_record_cost(snode):
+            self._report_miss(snode, runtime_ns)
+        self._runtime_ns_by_node[snode] = runtime_ns
+        return runtime_ns
 
-    def _report_miss(self, snode: BaseSchedulerNode, ns: float) -> None:
-        self._misses += 1
+    def _report_miss(self, snode: BaseSchedulerNode, runtime_ns: float) -> None:
+        self._cache_miss_count += 1
         # Once per compile at WARNING: a pass that bypassed the profile misses on
         # every snode it reads.
-        log = magi_logger.warning if self._misses == 1 else magi_logger.debug
-        hint = " Check profile ordering and pricing of new nodes." if self._misses == 1 else ""
-        log("snode cost table: unpriced node=%s; analytical fallback=%.1fus%s", snode.get_name(), ns / 1e3, hint, rank="all")
+        log = magi_logger.warning if self._cache_miss_count == 1 else magi_logger.debug
+        hint = " Check profile ordering and pricing of new nodes." if self._cache_miss_count == 1 else ""
+        log(
+            "snode cost table: unpriced node=%s; analytical fallback=%.1fus%s",
+            snode.get_name(),
+            runtime_ns / 1e3,
+            hint,
+            rank="all",
+        )
 
     # Inductor deepcopies the pass list into the fx-graph cache key and pickles
     # the copy; snodes hold FakeTensors, so neither may carry the entries.
@@ -114,37 +120,37 @@ class SnodeCostProfile:
         self.estimator = estimator
 
     @property
-    def _syncs(self) -> bool:
+    def _should_sync_ranks(self) -> bool:
         return self.estimator is not None and self.estimator.sync_across_ranks
 
     def __call__(self, snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         self.table.reset()
-        if not self._needed(snodes):
+        if not self._needs_cost_profile(snodes):
             return snodes
-        priced = [s for s in snodes if _is_priced(s)]
+        priced_nodes = [s for s in snodes if _should_record_cost(s)]
         if self.estimator is None:
-            for s in priced:
-                self.table.record(s, analytical_ns(s))
-            magi_logger.info("snode cost profile: priced %d snode(s) analytically", len(priced))
+            for s in priced_nodes:
+                self.table.record_runtime_ns(snode=s, runtime_ns=analytical_runtime_ns(s))
+            magi_logger.info("snode cost profile: priced %d snode(s) analytically", len(priced_nodes))
             return snodes
 
-        ok = self._warm(priced)
-        n_changed = 0
-        if self._syncs:
-            # Every rank that got past _needed reaches this call, even one whose
+        is_profiling_valid = self._populate_estimator(priced_nodes)
+        changed_entry_count = 0
+        if self._should_sync_ranks:
+            # Every rank that got past _needs_cost_profile reaches this call, even one whose
             # warm-up failed: warm_and_sync is a lockstep collective.
             try:
-                n_changed = self.estimator.warm_and_sync()
+                changed_entry_count = self.estimator.warm_and_sync()
             except Exception as exc:  # noqa: BLE001
                 magi_logger.warning("snode cost profile: rank-synchronized profiling failed (%s)", exc, rank="all")
-                ok = False
-        for s in priced:
-            self.table.record(s, self.estimator.requery(s))
-        self.table.ok = ok
-        self._report(len(priced), n_changed)
+                is_profiling_valid = False
+        for s in priced_nodes:
+            self.table.record_runtime_ns(snode=s, runtime_ns=self.estimator.estimate_without_reuse_count(s))
+        self.table.is_profiling_valid = is_profiling_valid
+        self._log_profile_summary(priced_node_count=len(priced_nodes), changed_entry_count=changed_entry_count)
         return snodes
 
-    def _needed(self, snodes) -> bool:
+    def _needs_cost_profile(self, snodes) -> bool:
         """Whether a pass downstream will read the table for this graph.
 
         Only graphs with a weight gather or a weight load have one.  When the
@@ -153,31 +159,31 @@ class SnodeCostProfile:
         join it if any peer's does.  A load counts here because the load reorder
         needs the COMPUTE around it priced -- the load itself never is.
         """
-        local = any(is_all_gather_launch(s) or is_h2d_load(s) for s in snodes)
-        return rank_sync.any_rank(local) if self._syncs else local
+        needs_local_profile = any(is_all_gather_launch(s) or is_h2d_load(s) for s in snodes)
+        return rank_sync.any_rank_has_flag(needs_local_profile) if self._should_sync_ranks else needs_local_profile
 
-    def _warm(self, priced) -> bool:
+    def _populate_estimator(self, priced_nodes) -> bool:
         try:
-            for s in priced:
+            for s in priced_nodes:
                 self.estimator(s)
             return True
         except Exception as exc:  # noqa: BLE001
             magi_logger.warning("snode cost profile: warm-up measurement failed (%s)", exc, rank="all")
             return False
 
-    def _report(self, n_priced: int, n_changed: int) -> None:
-        est = self.estimator
+    def _log_profile_summary(self, priced_node_count: int, changed_entry_count: int) -> None:
+        estimator = self.estimator
         magi_logger.info(
             "snode cost profile: priced %d snode(s) (cost table: %d distinct ops, measured=%s reused=%s; "
             "%d entr%s changed by the rank-synchronized re-measurement)",
-            n_priced,
-            len(est.table),
-            est.n_measured,
-            est.n_cache_hits,
-            n_changed,
-            "y" if n_changed == 1 else "ies",
+            priced_node_count,
+            len(estimator.table),
+            estimator.n_measured,
+            estimator.n_cache_hits,
+            changed_entry_count,
+            "y" if changed_entry_count == 1 else "ies",
         )
-        if not self.table.ok:
+        if not self.table.is_profiling_valid:
             magi_logger.warning(
                 "snode cost profile: pricing failed on this rank; the FSDP reorder will leave the graph "
                 "unchanged on every rank, and the load reorder places against the partial costs",
@@ -185,4 +191,4 @@ class SnodeCostProfile:
             )
         # summary() builds the whole table eagerly; only pay for it when read.
         if logging.getLogger("magi_compiler").isEnabledFor(logging.DEBUG):
-            magi_logger.debug("snode cost %s", est.summary())
+            magi_logger.debug("snode cost %s", estimator.summary())

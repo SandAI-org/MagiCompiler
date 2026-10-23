@@ -168,9 +168,9 @@ def main() -> None:
     mesh = init_device_mesh("cuda", (world,), mesh_dim_names=("dp",))
     os.environ.setdefault("MAGI_LOGGING_LEVEL", "INFO")
 
-    def log(*a):
+    def log(*args):
         if rank == 0:
-            print(*a, flush=True)
+            print(*args, flush=True)
 
     ce = args.transport == "copy_engine"
 
@@ -193,12 +193,12 @@ def main() -> None:
     _pipeline.rewrite_weight_ag_to_copy_engine = spy_rewrite
 
     # -- count the scheduler-stage buckets the copy engine launches ---------
-    from magi_compiler.passes.fsdp_overlap.auto_bucket import FsdpAutoBucket, PlanParams
+    from magi_compiler.passes.fsdp_overlap.auto_bucket import BucketPlanParams, FsdpAutoBucket
     from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER_COALESCED
 
     if args.bucket_target_mib > 0:
         # Measured gather costs vary run to run; a fixed target makes the merge count a function of the shape.
-        PlanParams.target_bytes = property(lambda self: args.bucket_target_mib * 2**20)
+        BucketPlanParams.target_gathered_bytes = property(lambda self: args.bucket_target_mib * 2**20)
 
     n_ce_buckets = 0
     orig_bucket = FsdpAutoBucket.__call__

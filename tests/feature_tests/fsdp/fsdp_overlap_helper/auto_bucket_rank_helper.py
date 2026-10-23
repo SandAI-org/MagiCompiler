@@ -45,7 +45,7 @@ from magi_compiler.passes.fsdp_overlap.auto_bucket import FsdpAutoBucket  # noqa
 from magi_compiler.passes.overlap import rank_sync  # noqa: E402
 
 
-class _IR:
+class FakeCollectiveIR:
     op_overload = "fake.op"
     origins = None
 
@@ -59,7 +59,7 @@ class _CandidateSnode:
     snodes = None
 
     def __init__(self) -> None:
-        self.node = _IR()
+        self.node = FakeCollectiveIR()
 
 
 class _SlotSnode:
@@ -70,7 +70,7 @@ class _SlotSnode:
         return self.name
 
 
-def _report(ok: bool, marker: str) -> bool:
+def _report_rank_consensus(ok: bool, marker: str) -> bool:
     verdict = torch.tensor([int(ok)], dtype=torch.int32)
     dist.all_reduce(verdict, op=dist.ReduceOp.MIN)
     all_ok = bool(verdict.item())
@@ -87,30 +87,35 @@ def _check_candidate_negotiation() -> bool:
         return list(order[:n_cands])
 
     seen: dict = {}
-    real_negotiate = rank_sync.negotiate_mode
+    real_negotiate = rank_sync.negotiate_placement_mode
 
-    def negotiate(n_anchors, skel_kinds, costs_ok=True, who="FSDP overlap"):
-        mode, group, world = real_negotiate(n_anchors=n_anchors, skel_kinds=skel_kinds, costs_ok=costs_ok, who=who)
+    def negotiate(candidate_count, collective_signatures, is_profiling_valid=True, pass_name="FSDP overlap"):
+        mode, group, world_size = real_negotiate(
+            candidate_count=candidate_count,
+            collective_signatures=collective_signatures,
+            is_profiling_valid=is_profiling_valid,
+            pass_name=pass_name,
+        )
         seen["mode"] = mode
-        seen["n"] = n_anchors
-        return mode, group, world
+        seen["n"] = candidate_count
+        return mode, group, world_size
 
-    with patch.object(FsdpAutoBucket, "_candidates", staticmethod(candidates)), patch.object(
-        rank_sync, "negotiate_mode", negotiate
+    with patch.object(FsdpAutoBucket, "_collect_candidates", staticmethod(candidates)), patch.object(
+        rank_sync, "negotiate_placement_mode", negotiate
     ):
         snodes = [_CandidateSnode() for _ in range(3)]
-        out = FsdpAutoBucket(cost_fn=lambda s: 0.0)(snodes)
+        out = FsdpAutoBucket(runtime_ns_fn=lambda s: 0.0)(snodes)
 
     unchanged = out is snodes
     ok = seen.get("mode") == "abort" and seen.get("n") == n_cands and unchanged
     print(f"BUCKET_NEGOTIATED rank={rank} mode={seen.get('mode')} n={seen.get('n')} unchanged={unchanged}", flush=True)
-    return _report(ok, "BUCKET_RANK")
+    return _report_rank_consensus(ok, "BUCKET_RANK")
 
 
 def _check_slot_consensus() -> bool:
-    rank, world = dist.get_rank(), dist.get_world_size()
+    rank, world_size = dist.get_rank(), dist.get_world_size()
     g0, x, g1, g2 = (_SlotSnode(n) for n in ("g0", "x", "g1", "g2"))
-    order, cands, skeleton = [g0, x, g1, g2], [g0, g1, g2], [g0, x, g1, g2]
+    order, gather_candidates, skeleton = [g0, x, g1, g2], [g0, g1, g2], [g0, x, g1, g2]
     before_x, after_x = [g0, g1, x, g2], [x, g0, g1, g2]
 
     cases = [
@@ -121,19 +126,27 @@ def _check_slot_consensus() -> bool:
         ("same-plan-illegal", None, True, "unbucketed"),
     ]
     ok = True
-    for name, odd_merged, same_plan, expected in cases:
-        merged = odd_merged if rank == 1 else before_x
-        with patch.object(FsdpAutoBucket, "_merged", staticmethod(lambda order, buckets, m=merged: m)):
-            p = FsdpAutoBucket(cost_fn=lambda s: 0.0)
+    for name, rank_one_order, same_plan, expected in cases:
+        merged = rank_one_order if rank == 1 else before_x
+        with patch.object(FsdpAutoBucket, "_simulate_bucket_merges", staticmethod(lambda order, buckets, m=merged: m)):
+            p = FsdpAutoBucket(runtime_ns_fn=lambda s: 0.0)
             # Every rank adopts rank 0's plan, even when its own plan differs.
             buckets = [[g0, g1]] if rank == 0 or same_plan else []
-            out = p._adopt(ok=True, buckets=buckets, order=order, cands=cands, group=None, world=world, skeleton=skeleton)
-        got = "unbucketed" if out is None else "applied"
+            out = p._adopt_rank_zero_buckets(
+                is_local_plan_valid=True,
+                buckets=buckets,
+                order=order,
+                candidates=gather_candidates,
+                sync_group=None,
+                world_size=world_size,
+                skeleton_nodes=skeleton,
+            )
+        adoption_status = "unbucketed" if out is None else "applied"
         if out is not None and [[s.name for s in b] for b in out] != [["g0", "g1"]]:
-            got = f"wrong:{out}"
-        ok = ok and got == expected
-        print(f"SLOT_CASE rank={rank} case={name} expected={expected} got={got}", flush=True)
-    return _report(ok, "SLOT")
+            adoption_status = f"wrong:{out}"
+        ok = ok and adoption_status == expected
+        print(f"SLOT_CASE rank={rank} case={name} expected={expected} got={adoption_status}", flush=True)
+    return _report_rank_consensus(ok, "SLOT")
 
 
 def main() -> None:

@@ -22,7 +22,7 @@ A unified device-weight budget starts with minimal pipelining room and assigns
 the remainder to residency. More in-flight room is tried only when that budget
 limits overlap. Separate resident/in-flight budgets remain supported.
 
-``alap_schedule`` places transfers by deadline. Serialized bus time and buffer
+``schedule_transfers_alap`` places transfers by deadline. Serialized bus time and buffer
 lifetime through the last consumer are separate constraints. Resident loads keep
 their existing position and are charged to residency, not in-flight storage.
 """
@@ -38,40 +38,58 @@ from magi_compiler.utils import magi_logger
 from ...overlap import (
     DEFAULT_WINDOW_MARGIN_NS,
     CostView,
+    OverlapCallState,
     OverlapPass,
+    ScheduleResult,
     SnodeGraph,
     TransferTask,
-    alap_schedule,
-    device_peak,
-    inflight_peak,
-    live_starts,
+    inflight_peak_bytes,
+    schedule_transfers_alap,
     unhoisted_index,
+    weight_storage_peak_bytes,
 )
-from .h2d_snode import is_h2d_load, load_bytes, slot_of
+from .h2d_snode import host_slot_of_load, is_h2d_load, load_bytes
 
-_MAX_SPLIT_ROUNDS = 5
-"""Times ``_schedule`` may grow the in-flight budget out of the residency one."""
+_MAX_BUDGET_SPLIT_ROUNDS = 5
+"""Times ``_choose_load_schedule`` may grow the in-flight budget out of the residency one."""
 
-_DENSITY_SEARCH_ROUNDS = 8
+_DENSITY_SEARCH_STEPS = 8
 """Bisection steps for the target bus density; 8 lands within 0.4% of it."""
 
 
-@dataclass(eq=False)
-class LoadPlan(TransferTask):
+@dataclass(frozen=True, eq=False)
+class H2dLoadTask(TransferTask):
     """One load's placement problem: how much transfer to hide, and where it may go.
 
-    ``anchor`` is the load, ``deadline_index`` its earliest wait (the hard upper
-    bound), and ``uses_transfer_bus=False`` means bought out of the offload plan:
-    resident, so the transfer is now device-to-device and off the bus.
+    ``anchor`` is the load, ``deadline_index`` its earliest wait (the hard upper bound).
     """
 
-    slot: int = field(kw_only=True)  # host-pool slot this load pulls
+    host_slot: int = field(kw_only=True)  # host-pool slot this load pulls
+
+
+@dataclass(frozen=True)
+class LoadSchedule:
+    """One residency / in-flight budget split and the placement it produced."""
+
+    # Loads bought out of the offload plan: they copy device-to-device in place, off the bus.
+    resident_anchors: frozenset
+    inflight_budget_bytes: int
+    schedule_result: ScheduleResult
+
+
+@dataclass
+class H2dLoadCallState(OverlapCallState):
+    """The chosen schedule and what committing it cost, for the later hooks."""
+
+    load_schedule: LoadSchedule | None = None  # set by assign_launch_indices
+    promoted_bytes: int = 0  # set by on_commit: device bytes the resident weights took back
 
 
 class H2dLoadReorder(OverlapPass):
     """Callable reorder pass.  Run me after ``FsdpOverlapReorder``."""
 
-    name = "h2d load reorder"
+    log_prefix = "h2d load reorder"
+    call_state_type = H2dLoadCallState
 
     def __init__(
         self,
@@ -80,244 +98,297 @@ class H2dLoadReorder(OverlapPass):
         window_scale: float = 1.0,
         max_resident_bytes: int = 0,
         max_inflight_bytes: int = 0,
-        max_device_weight_bytes: int = 0,
+        weight_budget_bytes: int = 0,
         bus_utilization: float = 1.0,
-        cost_fn=None,
+        runtime_ns_fn=None,
     ) -> None:
-        super().__init__(cost_fn)
+        super().__init__(runtime_ns_fn)
         self.bandwidth_bytes_per_ns = max(1e-6, bandwidth_bytes_per_ns)
         self.window_margin_ns = window_margin_ns
         self.window_scale = window_scale
         self.max_resident_bytes = max_resident_bytes
         self.max_inflight_bytes = max_inflight_bytes
-        self.max_device_weight_bytes = max_device_weight_bytes
+        self.weight_budget_bytes = weight_budget_bytes
         self.bus_utilization = min(1.0, max(1e-3, bus_utilization))
 
     # -- OverlapPass hooks ------------------------------------------------
-    def wants(self, order: list[BaseSchedulerNode]) -> bool:
+    def has_transfer_candidates(self, order: list[BaseSchedulerNode]) -> bool:
         if any(is_h2d_load(s) for s in order):
             return True
         magi_logger.debug("h2d load reorder: no weight load among %d snodes", len(order))
         return False
 
-    def plan(self, graph: SnodeGraph, cost: CostView, ctx: dict) -> list[LoadPlan] | None:
-        return self._plan(graph) or None
+    def build_transfer_tasks(
+        self, graph: SnodeGraph, cost: CostView, call_state: H2dLoadCallState
+    ) -> list[H2dLoadTask] | None:
+        return self._build_load_tasks(graph) or None
 
-    def place(self, graph: SnodeGraph, cost: CostView, plans: list[LoadPlan], ctx: dict) -> None:
-        prefix = cost.prefix(graph.order)
-        targets, budget = self._schedule(plans, graph.order, graph.index_of, prefix)
-        ctx.update(targets=targets, budget=budget)
+    def assign_launch_indices(
+        self, graph: SnodeGraph, cost: CostView, tasks: list[H2dLoadTask], call_state: H2dLoadCallState
+    ) -> dict:
+        load_schedule = self._choose_load_schedule(
+            tasks=tasks,
+            original_index_by_node=graph.original_index_by_node,
+            compute_prefix_ns=cost.compute_prefix_ns(graph.order),
+        )
+        call_state.load_schedule = load_schedule
+        return load_schedule.schedule_result.launch_index_by_anchor
 
-    def on_commit(self, graph: SnodeGraph, plans: list[LoadPlan], ctx: dict) -> None:
-        ctx["given_back"] = self._promote(plans)
+    def on_commit(self, graph: SnodeGraph, tasks: list[H2dLoadTask], call_state: H2dLoadCallState) -> None:
+        resident_anchors = call_state.load_schedule.resident_anchors
+        call_state.promoted_bytes = self._make_selected_weights_resident(tasks=tasks, resident_anchors=resident_anchors)
 
-    def report(self, graph: SnodeGraph, cost: CostView, plans: list[LoadPlan], committed: bool, ctx: dict) -> None:
+    def log_reorder_summary(
+        self,
+        graph: SnodeGraph,
+        cost: CostView,
+        tasks: list[H2dLoadTask],
+        launch_index_by_anchor: dict,
+        committed: bool,
+        call_state: H2dLoadCallState,
+    ) -> None:
         if committed:
-            self._report(plans, ctx["targets"], graph.index_of, ctx["given_back"], ctx["budget"])
+            self._log_load_schedule(
+                tasks=tasks,
+                load_schedule=call_state.load_schedule,
+                original_index_by_node=graph.original_index_by_node,
+                promoted_bytes=call_state.promoted_bytes,
+            )
 
     # -- planning ---------------------------------------------------------
     @staticmethod
-    def _group_and_waits(load, graph: SnodeGraph) -> tuple[list, list]:
+    def _load_nodes_and_waits(load, graph: SnodeGraph) -> tuple[list, list]:
         """The load plus the ``MultiOutput`` unpack its result reaches readers through, and the waits guarding it."""
         return [load, *graph.unpacks_of(load)], graph.waits_of(load)
 
-    def _plan(self, graph: SnodeGraph) -> list[LoadPlan]:
-        index_of = graph.index_of
-        plans: list[LoadPlan] = []
+    def _build_load_tasks(self, graph: SnodeGraph) -> list[H2dLoadTask]:
+        original_index_by_node = graph.original_index_by_node
+        tasks: list[H2dLoadTask] = []
         for load in (s for s in graph.order if is_h2d_load(s)):
-            group, waits = self._group_and_waits(load, graph)
+            moving_nodes, waits = self._load_nodes_and_waits(load=load, graph=graph)
             if not waits:
                 magi_logger.debug("h2d load reorder: %s has no wait; leaving it in place", load.get_name())
                 continue
-            nbytes = load_bytes(group)
-            required_overlap_ns = nbytes / self.bandwidth_bytes_per_ns * self.window_scale + self.window_margin_ns
-            plans.append(
-                LoadPlan(
+            transfer_bytes = load_bytes(moving_nodes)
+            required_overlap_ns = transfer_bytes / self.bandwidth_bytes_per_ns * self.window_scale + self.window_margin_ns
+            tasks.append(
+                H2dLoadTask(
                     anchor=load,
-                    moving_nodes=group,
-                    slot=slot_of(load),
-                    deadline_index=min(index_of[w] for w in waits),
-                    last_user_index=graph.last_user_index(group, waits),
+                    moving_nodes=tuple(moving_nodes),
+                    host_slot=host_slot_of_load(load),
+                    deadline_index=min(original_index_by_node[w] for w in waits),
+                    last_user_index=graph.last_user_index(moving_nodes, waits),
                     required_overlap_ns=required_overlap_ns,
-                    earliest_launch_index=graph.earliest_legal_index(group),
-                    nbytes=nbytes,
-                    unhidden_transfer_ns=required_overlap_ns,
+                    earliest_launch_index=graph.earliest_legal_index(moving_nodes),
+                    transfer_bytes=transfer_bytes,
                 )
             )
-        return plans
+        return tasks
 
     # -- scheduling --------------------------------------------------------
-    def _inflight_budget(self, plans) -> int:
+    def _effective_inflight_budget_bytes(self, tasks) -> int:
         """Never go below the unhoisted live-buffer peak.
         Without an explicit limit, allow that peak plus one largest load."""
-        floor = inflight_peak(plans, {p.anchor: unhoisted_index(p) for p in plans})
+        minimum_inflight_bytes = inflight_peak_bytes(tasks, {p.anchor: unhoisted_index(p) for p in tasks})
         if self.max_inflight_bytes <= 0:
-            return floor + max((p.nbytes for p in plans), default=0)
-        if self.max_inflight_bytes < floor:
+            return minimum_inflight_bytes + max((p.transfer_bytes for p in tasks), default=0)
+        if self.max_inflight_bytes < minimum_inflight_bytes:
             magi_logger.warning(
                 "h2d load reorder: in-flight budget raised from %.1f to %.1f MiB (unhoisted peak)",
                 self.max_inflight_bytes / 2**20,
-                floor / 2**20,
+                minimum_inflight_bytes / 2**20,
             )
-            return floor
+            return minimum_inflight_bytes
         return self.max_inflight_bytes
 
-    def _hideable_bytes(self, plans, prefix) -> float:
+    def _overlap_capacity_bytes(self, tasks, compute_prefix_ns) -> float:
         """Compute after the last load deadline cannot hide any weight transfer."""
-        last_wait = max(p.deadline_index for p in plans)
-        return self.bus_utilization * prefix[min(last_wait, len(prefix) - 1)] * self.bandwidth_bytes_per_ns
+        last_wait_index = max(p.deadline_index for p in tasks)
+        return (
+            self.bus_utilization
+            * compute_prefix_ns[min(last_wait_index, len(compute_prefix_ns) - 1)]
+            * self.bandwidth_bytes_per_ns
+        )
 
-    def _budget_splits(self, plans):
+    def _iter_budget_splits(self, tasks):
         """Try residency-first splits, starting at the unhoisted floor or twice the largest load.
         Further splits trade one load's worth of residency for in-flight room."""
-        floor = inflight_peak(plans, {p.anchor: unhoisted_index(p) for p in plans})
-        biggest = max((p.nbytes for p in plans), default=0)
-        if self.max_device_weight_bytes <= 0:
-            yield self.max_resident_bytes, self._inflight_budget(plans)
+        minimum_inflight_bytes = inflight_peak_bytes(tasks, {p.anchor: unhoisted_index(p) for p in tasks})
+        largest_load_bytes = max((p.transfer_bytes for p in tasks), default=0)
+        if self.weight_budget_bytes <= 0:
+            yield self.max_resident_bytes, self._effective_inflight_budget_bytes(tasks)
             return
-        device = self.max_device_weight_bytes
-        if floor >= device:
+        weight_budget_bytes = self.weight_budget_bytes
+        if minimum_inflight_bytes >= weight_budget_bytes:
             magi_logger.warning(
                 "h2d load reorder: device-weight budget %.0f MiB <= unhoisted peak %.1f MiB; residency disabled",
-                device / 2**20,
-                floor / 2**20,
+                weight_budget_bytes / 2**20,
+                minimum_inflight_bytes / 2**20,
             )
-            yield 0, floor
+            yield 0, minimum_inflight_bytes
             return
-        inflight = min(device, max(floor, 2 * biggest))
-        for _ in range(_MAX_SPLIT_ROUNDS):
-            yield device - inflight, inflight
-            if inflight >= device or biggest <= 0:
+        inflight_budget_bytes = min(weight_budget_bytes, max(minimum_inflight_bytes, 2 * largest_load_bytes))
+        for _ in range(_MAX_BUDGET_SPLIT_ROUNDS):
+            yield weight_budget_bytes - inflight_budget_bytes, inflight_budget_bytes
+            if inflight_budget_bytes >= weight_budget_bytes or largest_load_bytes <= 0:
                 return
-            inflight = min(device, inflight + biggest)
+            inflight_budget_bytes = min(weight_budget_bytes, inflight_budget_bytes + largest_load_bytes)
 
-    def _schedule(self, plans, order, index_of, prefix) -> tuple[dict, int]:
-        """Buy the residency the step cannot overlap, then place what is left."""
-        total = sum(p.nbytes for p in plans)
-        hideable = self._hideable_bytes(plans, prefix)
-        best: tuple[float, dict, int, set] | None = None
-        for resident_budget, inflight_budget in self._budget_splits(plans):
-            promoted, spent = self._select_resident(plans, prefix, resident_budget)
-            targets = self._sweep(plans, order, index_of, prefix, promoted, inflight_budget)
-            exposed = sum(p.unhidden_transfer_ns for p in plans)
-            if best is None or exposed < best[0] - 1e-9:
-                best = (exposed, targets, inflight_budget, promoted)
+    def _choose_load_schedule(self, tasks, original_index_by_node, compute_prefix_ns) -> LoadSchedule:
+        """Buy the residency the step cannot overlap, then place what is left.
+        Resident loads stay in place and consume neither bus time nor in-flight budget."""
+        best_schedule: LoadSchedule | None = None
+        for resident_budget_bytes, inflight_budget_bytes in self._iter_budget_splits(tasks):
+            resident_anchors = self._search_resident_weights(
+                tasks=tasks, compute_prefix_ns=compute_prefix_ns, resident_budget_bytes=resident_budget_bytes
+            )
+            schedule_result = schedule_transfers_alap(
+                tasks, compute_prefix_ns, original_index_by_node, inflight_budget_bytes, off_bus_anchors=resident_anchors
+            )
+            total_unhidden_ns = schedule_result.total_unhidden_ns
+            if best_schedule is None or total_unhidden_ns < best_schedule.schedule_result.total_unhidden_ns - 1e-9:
+                best_schedule = LoadSchedule(
+                    resident_anchors=resident_anchors,
+                    inflight_budget_bytes=inflight_budget_bytes,
+                    schedule_result=schedule_result,
+                )
             # Only an in-flight shortage is worth buying more in-flight room for;
             # if the bus itself is full, taking bytes off residency makes it worse.
-            if exposed <= 0 or not any(p.budget_bound for p in plans):
+            if total_unhidden_ns <= 0 or not schedule_result.inflight_budget_limited_anchors:
                 break
-        assert best is not None  # _budget_splits always yields at least once
-        _, targets, inflight_budget, promoted = best
-        # Re-run the winner so the plans carry its placement, not the last try's.
-        targets = self._sweep(plans, order, index_of, prefix, promoted, inflight_budget)
-        self._log_shortfall(
-            total,
-            hideable,
-            sum(p.nbytes for p in plans if not p.uses_transfer_bus),
-            sum(p.unhidden_transfer_ns for p in plans),
+        assert best_schedule is not None  # _budget_splits always yields at least once
+        self._log_overlap_shortfall(
+            total_load_bytes=sum(p.transfer_bytes for p in tasks),
+            overlap_capacity_bytes=self._overlap_capacity_bytes(tasks=tasks, compute_prefix_ns=compute_prefix_ns),
+            resident_bytes=sum(p.transfer_bytes for p in tasks if p.anchor in best_schedule.resident_anchors),
+            unhidden_ns=best_schedule.schedule_result.total_unhidden_ns,
         )
-        return targets, inflight_budget
+        return best_schedule
 
-    def _select_resident_at(self, plans, prefix, resident_budget, density) -> tuple[set, int, bool]:
-        """Bound transferred bytes at each deadline by ``density * bandwidth * prefix[wait]``.
-        Promote the smallest weight covering each deficit; the final flag is false
+    def _select_resident_for_density(
+        self, tasks, compute_prefix_ns, resident_budget_bytes, trial_density
+    ) -> tuple[frozenset, bool]:
+        """Bound transferred bytes at each deadline by the target bus density and available compute time.
+        Promote the smallest weight covering each deficit; the flag is false
         when the residency budget cannot pay for a deficit."""
-        rate = density * self.bandwidth_bytes_per_ns
-        promoted: set = set()
-        on_bus: list = []
-        kept = spent = 0
-        feasible = True
-        for plan in sorted(plans, key=lambda p: (p.deadline_index, -p.nbytes)):
-            kept += plan.nbytes
-            on_bus.append(plan)
-            allowance = rate * prefix[min(plan.deadline_index, len(prefix) - 1)]
-            while kept > allowance:
-                pick = self._best_fit(on_bus, kept - allowance, resident_budget - spent)
-                if pick is None:
-                    feasible = False
+        effective_bandwidth_bytes_per_ns = trial_density * self.bandwidth_bytes_per_ns
+        resident_anchors: set = set()
+        bus_tasks: list = []
+        pending_transfer_bytes = resident_bytes = 0
+        is_density_feasible = True
+        for task in sorted(tasks, key=lambda t: (t.deadline_index, -t.transfer_bytes)):
+            pending_transfer_bytes += task.transfer_bytes
+            bus_tasks.append(task)
+            allowed_transfer_bytes = (
+                effective_bandwidth_bytes_per_ns * compute_prefix_ns[min(task.deadline_index, len(compute_prefix_ns) - 1)]
+            )
+            while pending_transfer_bytes > allowed_transfer_bytes:
+                selected_weight = self._pick_weight_for_deficit(
+                    candidates=bus_tasks,
+                    deficit_bytes=pending_transfer_bytes - allowed_transfer_bytes,
+                    remaining_resident_bytes=resident_budget_bytes - resident_bytes,
+                )
+                if selected_weight is None:
+                    is_density_feasible = False
                     break
-                on_bus.remove(pick)
-                promoted.add(pick.anchor)
-                kept -= pick.nbytes
-                spent += pick.nbytes
-        return promoted, spent, feasible
+                bus_tasks.remove(selected_weight)
+                resident_anchors.add(selected_weight.anchor)
+                pending_transfer_bytes -= selected_weight.transfer_bytes
+                resident_bytes += selected_weight.transfer_bytes
+        return frozenset(resident_anchors), is_density_feasible
 
     @staticmethod
-    def _best_fit(candidates, deficit: float, room: int):
+    def _pick_weight_for_deficit(candidates, deficit_bytes: float, remaining_resident_bytes: int):
         """Smallest affordable weight covering the deficit, or largest affordable partial relief."""
-        affordable = [p for p in candidates if p.nbytes <= room]
-        if not affordable:
+        affordable_weights = [p for p in candidates if p.transfer_bytes <= remaining_resident_bytes]
+        if not affordable_weights:
             return None
-        covering = [p for p in affordable if p.nbytes >= deficit]
-        return min(covering, key=lambda p: p.nbytes) if covering else max(affordable, key=lambda p: p.nbytes)
+        covering_weights = [p for p in affordable_weights if p.transfer_bytes >= deficit_bytes]
+        return (
+            min(covering_weights, key=lambda p: p.transfer_bytes)
+            if covering_weights
+            else max(affordable_weights, key=lambda p: p.transfer_bytes)
+        )
 
-    def _select_resident(self, plans, prefix, resident_budget) -> tuple[set, int]:
-        """Search for the lowest feasible prefix density within the residency budget.
+    def _search_resident_weights(self, tasks, compute_prefix_ns, resident_budget_bytes) -> frozenset:
+        """Search for the lowest feasible bus density within the residency budget.
         If none fits, use ``bus_utilization`` and spend the available budget there."""
-        lo, hi = 0.0, self.bus_utilization
-        best: tuple[set, int] | None = None
-        for _ in range(_DENSITY_SEARCH_ROUNDS):
-            mid = (lo + hi) / 2
-            promoted, spent, feasible = self._select_resident_at(plans, prefix, resident_budget, mid)
-            if feasible:
-                best = (promoted, spent)
-                hi = mid
+        min_density, max_density = 0.0, self.bus_utilization
+        best_resident_anchors: frozenset | None = None
+        for _ in range(_DENSITY_SEARCH_STEPS):
+            trial_density = (min_density + max_density) / 2
+            resident_anchors, is_density_feasible = self._select_resident_for_density(
+                tasks=tasks,
+                compute_prefix_ns=compute_prefix_ns,
+                resident_budget_bytes=resident_budget_bytes,
+                trial_density=trial_density,
+            )
+            if is_density_feasible:
+                best_resident_anchors = resident_anchors
+                max_density = trial_density
             else:
-                lo = mid
-        if best is not None:
-            return best
-        promoted, spent, _ = self._select_resident_at(plans, prefix, resident_budget, self.bus_utilization)
-        return promoted, spent
-
-    def _sweep(self, plans, order, index_of, prefix, promoted, budget) -> dict:
-        """Resident loads stay in place and consume neither bus time nor in-flight budget.
-        Their bytes are already charged to residency; other loads use deadline order."""
-        for plan in plans:
-            plan.uses_transfer_bus = plan.anchor not in promoted
-        return alap_schedule(plans, prefix, index_of, budget)
+                min_density = trial_density
+        if best_resident_anchors is not None:
+            return best_resident_anchors
+        resident_anchors, _ = self._select_resident_for_density(
+            tasks=tasks,
+            compute_prefix_ns=compute_prefix_ns,
+            resident_budget_bytes=resident_budget_bytes,
+            trial_density=self.bus_utilization,
+        )
+        return resident_anchors
 
     # -- committing --------------------------------------------------------
     @staticmethod
-    def _promote(plans) -> int:
+    def _make_selected_weights_resident(tasks, resident_anchors) -> int:
         from ..runtime.host_weights import get_global_host_weight_store
 
-        return get_global_host_weight_store().make_resident_many([p.slot for p in plans if not p.uses_transfer_bus])
+        resident_slots = [p.host_slot for p in tasks if p.anchor in resident_anchors]
+        return get_global_host_weight_store().make_weights_resident(resident_slots)
 
     # -- reporting --------------------------------------------------------
-    def _report(self, plans, targets, index_of, given_back, budget) -> None:
-        resident = [p for p in plans if not p.uses_transfer_bus]
-        exposed = sum(p.unhidden_transfer_ns for p in plans)
-        by_budget = sum(p.unhidden_transfer_ns for p in plans if p.budget_bound)
-        inflight = inflight_peak(plans, live_starts(plans, targets, index_of))
-        moved = sum(1 for load, target in targets.items() if target != index_of[load])
-        on_bus = sum(p.nbytes for p in plans if p.uses_transfer_bus)
+    def _log_load_schedule(self, tasks, load_schedule: LoadSchedule, original_index_by_node, promoted_bytes) -> None:
+        schedule_result = load_schedule.schedule_result
+        launch_index_by_anchor = schedule_result.launch_index_by_anchor
+        inflight_budget_bytes = load_schedule.inflight_budget_bytes
+        resident_anchors = load_schedule.resident_anchors
+
+        peak_inflight_bytes = inflight_peak_bytes(tasks, launch_index_by_anchor)
+        hoisted_load_count = sum(
+            1 for load, launch_index in launch_index_by_anchor.items() if launch_index != original_index_by_node[load]
+        )
+        bus_transfer_bytes = sum(p.transfer_bytes for p in tasks if p.anchor not in resident_anchors)
+        peak_weight_storage_bytes = weight_storage_peak_bytes(
+            tasks, launch_index_by_anchor, original_index_by_node, resident_anchors
+        )
         magi_logger.info(
             "h2d load reorder: promoted %.1f MiB; resident loads=%d; bus=%.1f MiB at %.1f GB/s; "
             "Hoisted %d/%d load(s); in-flight peak %.1f MiB of the %.0f MiB budget; "
             "device-weight peak=%.1f MiB; exposed=%.1fms (budget-bound=%.1fms)",
-            given_back / 2**20,
-            len(resident),
-            on_bus / 2**20,
+            promoted_bytes / 2**20,
+            len(resident_anchors),
+            bus_transfer_bytes / 2**20,
             self.bandwidth_bytes_per_ns,
-            moved,
-            len(plans),
-            inflight / 2**20,
-            budget / 2**20,
-            device_peak(plans, targets, index_of) / 2**20,
-            exposed / 1e6,
-            by_budget / 1e6,
+            hoisted_load_count,
+            len(tasks),
+            peak_inflight_bytes / 2**20,
+            inflight_budget_bytes / 2**20,
+            peak_weight_storage_bytes / 2**20,
+            schedule_result.total_unhidden_ns / 1e6,
+            schedule_result.inflight_budget_limited_unhidden_ns / 1e6,
         )
-        assert (
-            inflight <= budget
-        ), f"h2d load reorder: in-flight peak {inflight} B exceeds the {budget} B budget it was placed under"
+        assert peak_inflight_bytes <= inflight_budget_bytes, (
+            f"h2d load reorder: in-flight peak {peak_inflight_bytes} B exceeds "
+            f"the {inflight_budget_bytes} B budget it was placed under"
+        )
 
-    def _log_shortfall(self, total, hideable, resident, exposed) -> None:
+    def _log_overlap_shortfall(self, total_load_bytes, overlap_capacity_bytes, resident_bytes, unhidden_ns) -> None:
         """Warn when estimated compute coverage cannot hide the remaining transfers."""
-        unavoidable = total - resident - hideable
-        if unavoidable <= 0 or exposed <= 0:
+        uncovered_bytes = total_load_bytes - resident_bytes - overlap_capacity_bytes
+        if uncovered_bytes <= 0 or unhidden_ns <= 0:
             return
         magi_logger.warning(
             "h2d load reorder: estimated transfer coverage deficit=%.1f MiB (%.1fms); consider more residency",
-            unavoidable / 2**20,
-            unavoidable / self.bandwidth_bytes_per_ns / 1e6,
+            uncovered_bytes / 2**20,
+            uncovered_bytes / self.bandwidth_bytes_per_ns / 1e6,
         )

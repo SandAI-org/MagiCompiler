@@ -26,7 +26,7 @@ from torch._inductor.utils import contains_wait
 from ..snode_utils import is_compute, is_multi_output
 
 
-def default_cost_fn():
+def default_runtime_ns_fn():
     from torch._inductor.comms import estimate_op_runtime
 
     return estimate_op_runtime
@@ -35,30 +35,31 @@ def default_cost_fn():
 class CostView:
     """Nonnegative nanoseconds per snode; cost-query errors propagate."""
 
-    def __init__(self, cost_fn) -> None:
-        self.cost_fn = cost_fn
+    def __init__(self, runtime_ns_fn) -> None:
+        self.runtime_ns_fn = runtime_ns_fn
 
     @property
-    def ok(self) -> bool:
+    def is_profiling_valid(self) -> bool:
         """False when the cost table says pricing failed on this rank."""
         # Deferred: snode_cost imports this package.
         from ..snode_cost import SnodeCostTable
 
-        return not isinstance(self.cost_fn, SnodeCostTable) or self.cost_fn.ok
+        return not isinstance(self.runtime_ns_fn, SnodeCostTable) or self.runtime_ns_fn.is_profiling_valid
 
     def __call__(self, snode: BaseSchedulerNode) -> float:
-        return max(0.0, float(self.cost_fn(snode)))
+        return max(0.0, float(self.runtime_ns_fn(snode)))
 
-    def prefix(self, order: list[BaseSchedulerNode]) -> list[float]:
-        """``prefix[i]``: ns of compute that runs before the snode at index ``i``.
+    def compute_prefix_ns(self, order: list[BaseSchedulerNode]) -> list[float]:
+        """Element ``i``: ns of compute that runs before the snode at index ``i``.
 
         The time axis every transfer is placed on.  Only compute counts: a
         transfer or a wait on it hides nothing.
         """
-        prefix = [0.0] * (len(order) + 1)
+        compute_prefix_ns = [0.0] * (len(order) + 1)
         for i, s in enumerate(order):
-            prefix[i + 1] = prefix[i] + (self(s) if is_compute(s) else 0.0)
-        return prefix
+            compute_ns = self(s) if is_compute(s) else 0.0
+            compute_prefix_ns[i + 1] = compute_prefix_ns[i] + compute_ns
+        return compute_prefix_ns
 
     def is_transparent(self, snode: BaseSchedulerNode) -> bool:
         """A forwarder that is not a real use of a transfer's result: waits,

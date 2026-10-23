@@ -288,7 +288,7 @@ def test_internal_collective_extern_not_measured_in_sync_warmup(monkeypatch, syn
 
     measured = {"called": False}
 
-    def _boom(*a, **k):
+    def _boom(*args, **kwargs):
         measured["called"] = True
         raise AssertionError("must not be measured in sync warm-up")
 
@@ -548,6 +548,32 @@ def test_collective_profile_accuracy_multi_rank():
     assert "COLL_PASS" in p.stdout, out[-3000:]
 
 
+_RANK_LOCAL_HELPER = Path(__file__).parent / "profiling_helper" / "estimator_rank_local_helper.py"
+
+
+@requires_cuda
+@pytest.mark.skipif(shutil.which("torchrun") is None, reason="requires torchrun")
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires >=2 GPUs")
+def test_hooked_internal_collective_keyed_by_replay_inputs():
+    """An uneven split gives each rank different fx shapes for the same internal-collective
+    op; it must still be lockstep-measured when its hook replays rank-identical inputs,
+    and fall back to analytical without hanging when it does not."""
+    env = os.environ.copy()
+    env["MAGI_LOGGING_LEVEL"] = "warning"
+    env["PYTHONPATH"] = f"{Path(__file__).parents[3]}:{env.get('PYTHONPATH', '')}"
+    p = subprocess.run(
+        ["torchrun", "--nproc_per_node=2", "--master_port=29682", str(_RANK_LOCAL_HELPER)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    out = p.stdout + p.stderr
+    assert p.returncode == 0, f"helper failed:\n{out[-3000:]}"
+    assert "RANK_LOCAL_MATCHED ok=True" in p.stdout, out[-3000:]
+    assert "RANK_LOCAL_UNMATCHED ok=True" in p.stdout, out[-3000:]
+
+
 # ===========================================================================
 # COPY-ENGINE GATHER (``fsdp_config.transport="copy_engine"``).
 #
@@ -584,7 +610,7 @@ class _FakeBuf:
         self.layout = _FakeLayout(tuple(shape), dtype)
 
 
-def _ce_ir(op, shapes, dtype=torch.bfloat16, group_size=1, group_name="grp"):
+def _make_ce_gather_ir(op, shapes, dtype=torch.bfloat16, group_size=1, group_name="grp"):
     node = object.__new__(ir.FallbackKernel)
     node.op_overload = op
     node.inputs = [_FakeBuf(s, dtype) for s in shapes]
@@ -594,7 +620,7 @@ def _ce_ir(op, shapes, dtype=torch.bfloat16, group_size=1, group_name="grp"):
     return node
 
 
-def _mm_ir():
+def _make_matmul_ir():
     node = object.__new__(ir.FallbackKernel)
     node.op_overload = torch.ops.aten.mm.default
     node.inputs = []
@@ -602,7 +628,7 @@ def _mm_ir():
     return node
 
 
-def _gather_snode(node=None, snodes=(), group_type=FusedSchedulerNode):
+def _make_test_snode(node=None, snodes=(), group_type=FusedSchedulerNode):
     snode = object.__new__(group_type if snodes else ExternKernelSchedulerNode)
     snode.node = node
     if snodes:
@@ -612,7 +638,7 @@ def _gather_snode(node=None, snodes=(), group_type=FusedSchedulerNode):
 
 def _ce_snode(shape=(_CE_ROWS, 64), group_size=1):
     ag, _ = _ce_ops()
-    return _gather_snode(node=_ce_ir(ag, [shape], group_size=group_size))
+    return _make_test_snode(node=_make_ce_gather_ir(ag, [shape], group_size=group_size))
 
 
 # --- spec / recognition / label: structural, no window needed ---------------
@@ -620,7 +646,7 @@ def test_ce_ag_spec_is_read_off_constant_args_not_the_origin_node():
     """``get_origin_node()`` is unset on these nodes; reading the group from it
     yields None, which degraded the gather to a zero cost and a zero window."""
     ag, _ = _ce_ops()
-    node = _ce_ir(ag, [(_CE_ROWS, 64)], group_size=8, group_name="fsdp")
+    node = _make_ce_gather_ir(ag, [(_CE_ROWS, 64)], group_size=8, group_name="fsdp")
     assert node.get_origin_node() is None  # the trap this test exists for
 
     shapes, dtype, group_size, group_name = _ce_ag_spec(node)
@@ -634,7 +660,7 @@ def test_ce_ag_spec_of_a_coalesced_gather_has_one_shape_per_member():
     """The bucket's cost is the whole batch, so every member's shape must be in
     the spec -- and in the cache key built from it."""
     _, coalesced = _ce_ops()
-    shapes, _dtype, group_size, _gn = _ce_ag_spec(_ce_ir(coalesced, [(8, 4), (16, 4), (32, 4)], group_size=4))
+    shapes, _dtype, group_size, _gn = _ce_ag_spec(_make_ce_gather_ir(coalesced, [(8, 4), (16, 4), (32, 4)], group_size=4))
     assert shapes == ((8, 4), (16, 4), (32, 4))
     assert group_size == 4
 
@@ -642,14 +668,14 @@ def test_ce_ag_spec_of_a_coalesced_gather_has_one_shape_per_member():
 @pytest.mark.parametrize("constant_args", [(), (1,)], ids=["empty", "group_name_only"])
 def test_ce_ag_spec_is_none_when_the_group_args_are_missing(constant_args):
     ag, _ = _ce_ops()
-    node = _ce_ir(ag, [(8, 4)])
+    node = _make_ce_gather_ir(ag, [(8, 4)])
     node.constant_args = constant_args
     assert _ce_ag_spec(node) is None
 
 
 def test_ce_ag_spec_is_none_when_the_node_has_no_inputs():
     ag, _ = _ce_ops()
-    assert _ce_ag_spec(_ce_ir(ag, [])) is None
+    assert _ce_ag_spec(_make_ce_gather_ir(ag, [])) is None
 
 
 @pytest.mark.parametrize("group_type", [GroupedSchedulerNode, FusedSchedulerNode, ForeachKernelSchedulerNode])
@@ -657,18 +683,20 @@ def test_leaf_ce_ag_finds_the_gather_in_a_plain_and_in_a_fused_snode(group_type)
     """Inductor may hand the pass either the gather's own snode or a fused snode
     that contains it; the cost model has to price both."""
     ag, _ = _ce_ops()
-    node = _ce_ir(ag, [(8, 4)])
+    node = _make_ce_gather_ir(ag, [(8, 4)])
 
-    assert _leaf_ce_ag(_gather_snode(node=node)) is node
-    fused = _gather_snode(snodes=[_gather_snode(node=_mm_ir()), _gather_snode(node=node)], group_type=group_type)
+    assert _leaf_ce_ag(_make_test_snode(node=node)) is node
+    fused = _make_test_snode(
+        snodes=[_make_test_snode(node=_make_matmul_ir()), _make_test_snode(node=node)], group_type=group_type
+    )
     assert _leaf_ce_ag(fused) is node
 
 
 def test_leaf_ce_ag_is_none_for_an_ordinary_kernel():
     """A copy-engine gather is a plain FallbackKernel, so the probe cannot key on
     'is a fallback' -- an mm must not be mistaken for one."""
-    assert _leaf_ce_ag(_gather_snode(node=_mm_ir())) is None
-    assert _leaf_ce_ag(_gather_snode()) is None
+    assert _leaf_ce_ag(_make_test_snode(node=_make_matmul_ir())) is None
+    assert _leaf_ce_ag(_make_test_snode()) is None
 
 
 def test_collective_search_preserves_transport_and_child_order():
@@ -676,10 +704,10 @@ def test_collective_search_preserves_transport_and_child_order():
     from magi_compiler.passes.snode_utils import leaf_comm_node
 
     ag, _ = _ce_ops()
-    ce = _ce_ir(ag, [(8, 4)])
+    ce = _make_ce_gather_ir(ag, [(8, 4)])
     native = object.__new__(ir._CollectiveKernel)
     native.op_overload = torch.ops._c10d_functional.all_gather_into_tensor.default
-    group = _gather_snode(snodes=[_gather_snode(node=ce), _gather_snode(node=native)])
+    group = _make_test_snode(snodes=[_make_test_snode(node=ce), _make_test_snode(node=native)])
 
     assert leaf_comm_node(group) is ce
     assert _leaf_ce_ag(group) is ce
@@ -690,8 +718,8 @@ def test_collective_search_keeps_one_level_for_nested_foreach():
     """Foreach.get_nodes() flattens further than the comm search contract."""
     from magi_compiler.passes.snode_utils import leaf_comm_node
 
-    inner = _gather_snode(snodes=[_ce_snode()])
-    outer = _gather_snode(snodes=[inner], group_type=ForeachKernelSchedulerNode)
+    inner = _make_test_snode(snodes=[_ce_snode()])
+    outer = _make_test_snode(snodes=[inner], group_type=ForeachKernelSchedulerNode)
     assert _leaf_ce_ag(inner) is not None
     assert _leaf_ce_ag(outer) is None
     assert leaf_comm_node(outer) is None
@@ -701,16 +729,16 @@ def test_coalesced_gather_is_distinguished_from_a_single_one():
     from magi_compiler.passes.snode_utils import is_ce_ag_coalesced_ir
 
     ag, coalesced = _ce_ops()
-    assert is_ce_ag_coalesced_ir(_ce_ir(coalesced, [(8, 4)]))
-    assert not is_ce_ag_coalesced_ir(_ce_ir(ag, [(8, 4)]))
+    assert is_ce_ag_coalesced_ir(_make_ce_gather_ir(coalesced, [(8, 4)]))
+    assert not is_ce_ag_coalesced_ir(_make_ce_gather_ir(ag, [(8, 4)]))
 
 
 def test_ce_ag_label_reports_transport_world_size_and_member_count():
     """``summary()`` is diffed against nsys traces by hand, so a copy-engine
     gather must not be labelled like the NCCL one it replaced."""
     ag, coalesced = _ce_ops()
-    single = _ce_ag_label(_gather_snode(node=_ce_ir(ag, [(8, 4)], group_size=2)))
-    batch = _ce_ag_label(_gather_snode(node=_ce_ir(coalesced, [(8, 4), (16, 4)], group_size=2)))
+    single = _ce_ag_label(_make_test_snode(node=_make_ce_gather_ir(ag, [(8, 4)], group_size=2)))
+    batch = _ce_ag_label(_make_test_snode(node=_make_ce_gather_ir(coalesced, [(8, 4), (16, 4)], group_size=2)))
 
     assert single == "ce_all_gather(ws=2,8x4)"
     assert batch == "ce_all_gather_coalesced(ws=2,n=2,8x4)"
@@ -755,7 +783,7 @@ def _register_shards(shapes, dtype=torch.bfloat16):
 def _ce_replay_snode(shapes, coalesced=False):
     ag, ag_coalesced = _ce_ops()
     op = ag_coalesced if coalesced else ag
-    return _gather_snode(node=_ce_ir(op, shapes, group_size=1, group_name=_ce_group_name()))
+    return _make_test_snode(node=_make_ce_gather_ir(op, shapes, group_size=1, group_name=_ce_group_name()))
 
 
 @requires_cuda
@@ -815,7 +843,7 @@ def ce_measure_calls(monkeypatch):
 
     monkeypatch.setattr(re_mod, "contains_wait", lambda s: False)
     monkeypatch.setattr(re_mod, "_is_multi_output_unpack", lambda s: False)
-    monkeypatch.setattr(re_mod, "analytical_ns", lambda s: 111.0)
+    monkeypatch.setattr(re_mod, "analytical_runtime_ns", lambda s: 111.0)
     monkeypatch.setattr(re_mod, "_measure_ce_ag", fake_measure)
     return calls
 

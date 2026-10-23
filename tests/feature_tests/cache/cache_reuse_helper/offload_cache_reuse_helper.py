@@ -69,7 +69,7 @@ def main() -> None:
         "shape": list(out.shape),
         "sum": float(out.float().sum().item()),
         "mean": float(out.float().mean().item()),
-        "num_bound": get_global_host_weight_store().num_bound(),
+        "weight_count": get_global_host_weight_store().weight_count(),
     }
     with open(args.output, "w") as f:
         json.dump(payload, f)

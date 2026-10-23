@@ -280,9 +280,9 @@ def _magi_compile_bound_method(
                 f"Set disable_graph_split=True in {type(instance).__name__}'s config_patch, or disable "
                 "graph_weight_offload for this model."
             )
-        from magi_compiler.passes.weight_offload import patch_materialize
+        from magi_compiler.passes.weight_offload import install_host_first_hooks
 
-        patch_materialize(instance, conf)
+        install_host_first_hooks(instance=instance, conf=conf)
 
     old_method = getattr(instance, method_name)
 
@@ -308,9 +308,9 @@ def _magi_compile_bound_method(
         # weights: a shard still sitting in host memory would be lowered into CPU
         # kernels, or replayed against an artifact that expects it on the device.
         # A no-op after the first call, and when host-first is off.
-        from magi_compiler.passes.weight_offload import handoff_if_pending
+        from magi_compiler.passes.weight_offload import handoff_host_weights_if_pending
 
-        handoff_if_pending(instance)
+        handoff_host_weights_if_pending(instance)
 
         return _run_orchestration(state, args, kwargs)
 

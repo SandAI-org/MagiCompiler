@@ -34,13 +34,13 @@ from magi_compiler.utils import magi_logger
 from .runtime.host_weights import get_global_host_weight_store
 
 _SLOTS_ATTR = "_magi_host_slots"
-"""Slots ``handoff`` adopted for this instance; present, possibly empty, once it ran."""
+"""Slots ``handoff_host_weights`` adopted for this instance; present, possibly empty, once it ran."""
 
 _RELEASED_ATTR = "_magi_released_slots"
 """Promoted slots a move to the host freed, to be promoted again on the way back."""
 
 
-def record_slots(module: nn.Module, slots: Sequence[int]) -> None:
+def record_handoff_slots(module: nn.Module, slots: Sequence[int]) -> None:
     setattr(module, _SLOTS_ATTR, tuple(slots))
 
 
@@ -48,44 +48,44 @@ def is_handoff_complete(module: nn.Module) -> bool:
     return hasattr(module, _SLOTS_ATTR)
 
 
-def move(module: nn.Module, *, to_host: bool) -> None:
+def update_residency_for_device_move(module: nn.Module, *, to_host: bool) -> None:
     """Apply a device move of ``module`` to the residency of its host-offloaded weights."""
     if to_host:
-        _release(module)
+        _release_resident_weights(module)
     else:
-        _promote_released(module)
+        _restore_released_weights(module)
 
 
-def _subtree_slots(module: nn.Module) -> list[int]:
+def _collect_subtree_host_slots(module: nn.Module) -> list[int]:
     # A nested compiled instance may have parked its own weights.
     return [slot for m in module.modules() for slot in getattr(m, _SLOTS_ATTR, ())]
 
 
-def _release(module: nn.Module) -> None:
+def _release_resident_weights(module: nn.Module) -> None:
     store = get_global_host_weight_store()
-    resident = [slot for slot in _subtree_slots(module) if store.is_resident(slot)]
-    if not resident:
+    resident_slots = [slot for slot in _collect_subtree_host_slots(module) if store.is_resident(slot)]
+    if not resident_slots:
         return
     torch.cuda.synchronize()
-    nbytes = store.release_resident_many(resident)
-    setattr(module, _RELEASED_ATTR, getattr(module, _RELEASED_ATTR, ()) + tuple(resident))
+    released_bytes = store.release_resident_weights(resident_slots)
+    setattr(module, _RELEASED_ATTR, getattr(module, _RELEASED_ATTR, ()) + tuple(resident_slots))
     magi_logger.info(
         "host offload: %s moved to host; freed %d promoted weight(s) (%.1f MiB) on the device",
         type(module).__name__,
-        len(resident),
-        nbytes / 2**20,
+        len(resident_slots),
+        released_bytes / 2**20,
     )
 
 
-def _promote_released(module: nn.Module) -> None:
-    released = getattr(module, _RELEASED_ATTR, ())
-    if not released:
+def _restore_released_weights(module: nn.Module) -> None:
+    released_slots = getattr(module, _RELEASED_ATTR, ())
+    if not released_slots:
         return
-    nbytes = get_global_host_weight_store().make_resident_many(released)
+    restored_bytes = get_global_host_weight_store().make_weights_resident(released_slots)
     setattr(module, _RELEASED_ATTR, ())
     magi_logger.info(
         "host offload: %s moved to device; promoted %d weight(s) (%.1f MiB) back, the rest load in the graph",
         type(module).__name__,
-        len(released),
-        nbytes / 2**20,
+        len(released_slots),
+        restored_bytes / 2**20,
     )

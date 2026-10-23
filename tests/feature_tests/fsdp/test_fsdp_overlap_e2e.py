@@ -35,17 +35,24 @@ from pathlib import Path
 import pytest
 import torch
 
-_HELPER = Path(__file__).parent / "fsdp_overlap_helper" / "e2e_helper.py"
+_FSDP_E2E_HELPER_PATH = Path(__file__).parent / "fsdp_overlap_helper" / "e2e_helper.py"
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 requires_torchrun = pytest.mark.skipif(shutil.which("torchrun") is None, reason="requires torchrun")
 
 
-def _run(nproc: int, cost_mode: str, port: str) -> subprocess.CompletedProcess:
+def _run_fsdp_e2e(nproc: int, cost_mode: str, port: str) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env["MAGI_LOGGING_LEVEL"] = "info"  # so the backend's chain INFO logs are captured
     return subprocess.run(
-        ["torchrun", f"--nproc_per_node={nproc}", f"--master_port={port}", str(_HELPER), "--cost-mode", cost_mode],
+        [
+            "torchrun",
+            f"--nproc_per_node={nproc}",
+            f"--master_port={port}",
+            str(_FSDP_E2E_HELPER_PATH),
+            "--cost-mode",
+            cost_mode,
+        ],
         env=env,
         capture_output=True,
         text=True,
@@ -57,13 +64,13 @@ def _run(nproc: int, cost_mode: str, port: str) -> subprocess.CompletedProcess:
 @requires_torchrun
 def test_e2e_single_rank():
     """world=1: whole overlap chain compiles + runs + output matches eager."""
-    p = _run(1, "analytical", "29641")
-    out = p.stdout + p.stderr
-    assert p.returncode == 0, f"helper failed:\n{out[-4000:]}"
-    assert "E2E_COMPILED" in p.stdout, out[-4000:]
-    assert "E2E_PASS" in p.stdout, out[-4000:]
+    process_result = _run_fsdp_e2e(1, "analytical", "29641")
+    combined_log = process_result.stdout + process_result.stderr
+    assert process_result.returncode == 0, f"helper failed:\n{combined_log[-4000:]}"
+    assert "E2E_COMPILED" in process_result.stdout, combined_log[-4000:]
+    assert "E2E_PASS" in process_result.stdout, combined_log[-4000:]
     # the chain was actually invoked
-    assert "FSDP fullgraph overlap" in out, out[-4000:]
+    assert "FSDP fullgraph overlap" in combined_log, combined_log[-4000:]
 
 
 @requires_cuda
@@ -73,13 +80,13 @@ def test_e2e_multi_rank_full_chain():
     """world=2: real Shard(0) weights -> the reorder repositions real weight
     all-gathers.  Asserts the full chain ran (no deadlock, output correct, and the
     reorder pass touched >=1 gather)."""
-    p = _run(2, "analytical", "29642")
-    out = p.stdout + p.stderr
-    assert p.returncode == 0, f"helper failed:\n{out[-4000:]}"
-    assert "E2E_PASS" in p.stdout, out[-4000:]
+    process_result = _run_fsdp_e2e(2, "analytical", "29642")
+    combined_log = process_result.stdout + process_result.stderr
+    assert process_result.returncode == 0, f"helper failed:\n{combined_log[-4000:]}"
+    assert "E2E_PASS" in process_result.stdout, combined_log[-4000:]
     # the reorder pass ran on a graph WITH weight all-gathers (Shard(0) at world>1)
-    assert "FSDP overlap reorder: repositioned" in out, (
-        "reorder pass did not run on any weight all-gather at world=2\n" + out[-4000:]
+    assert "FSDP overlap reorder: repositioned" in combined_log, (
+        "reorder pass did not run on any weight all-gather at world=2\n" + combined_log[-4000:]
     )
 
 
@@ -89,7 +96,7 @@ def test_e2e_multi_rank_full_chain():
 def test_e2e_multi_rank_profile_sync():
     """world=2 with profile_sync cost mode: exercises warm_and_sync's rank-lockstep
     real measurement path end to end."""
-    p = _run(2, "profile_sync", "29643")
-    out = p.stdout + p.stderr
-    assert p.returncode == 0, f"helper failed:\n{out[-4000:]}"
-    assert "E2E_PASS" in p.stdout, out[-4000:]
+    process_result = _run_fsdp_e2e(2, "profile_sync", "29643")
+    combined_log = process_result.stdout + process_result.stderr
+    assert process_result.returncode == 0, f"helper failed:\n{combined_log[-4000:]}"
+    assert "E2E_PASS" in process_result.stdout, combined_log[-4000:]

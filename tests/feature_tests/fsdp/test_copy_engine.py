@@ -36,8 +36,8 @@ import torch.fx as fx
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
-_AG = torch.ops._c10d_functional.all_gather_into_tensor.default
-_WAIT = torch.ops._c10d_functional.wait_tensor.default
+_ALL_GATHER_OP = torch.ops._c10d_functional.all_gather_into_tensor.default
+_WAIT_TENSOR_OP = torch.ops._c10d_functional.wait_tensor.default
 _TO_COPY = torch.ops.aten._to_copy.default
 _PAD = torch.ops.aten.constant_pad_nd.default
 
@@ -103,11 +103,11 @@ def _graph_with_gathers(
         elif derive == "pad":
             cur = g.call_function(_PAD, (cur, [0, 0, 0, 2], 0.0))
             cur.meta["example_value"] = local._local_tensor.new_empty((10, 4))
-        ag = g.call_function(_AG, (cur, 1, "dummy_group"))
+        ag = g.call_function(_ALL_GATHER_OP, (cur, 1, "dummy_group"))
         ag.meta["example_value"] = local._local_tensor.new_empty(local._local_tensor.shape)
         if marked:
             mark_weight_ag(ag, uneven=uneven)
-        outs.append(g.call_function(_WAIT, (ag,)))
+        outs.append(g.call_function(_WAIT_TENSOR_OP, (ag,)))
     g.output(tuple(outs))
     return fx.GraphModule(torch.nn.Module(), g)
 
@@ -143,7 +143,7 @@ def test_plain_weight_gathers_are_candidates(mesh_1rank):
     gm = _graph_with_gathers(mesh_1rank, 3)
     candidates = _candidates(gm)
 
-    assert [g for g, _h in candidates] == _gathers(gm, _AG)
+    assert [g for g, _h in candidates] == _gathers(gm, _ALL_GATHER_OP)
     assert all(h.op == "placeholder" for _g, h in candidates)
 
 
@@ -197,12 +197,12 @@ def test_bound_gathers_are_retargeted_and_waits_untouched(mesh_1rank):
     assert _pretend_bound(gm) == 4
     assert rewrite_weight_ag_to_copy_engine(gm) == 4
 
-    assert not _gathers(gm, _AG)
+    assert not _gathers(gm, _ALL_GATHER_OP)
     symm = _gathers(gm, _symm_op())
     assert len(symm) == 4
     # The wait is the load-bearing part of the design: it must be the same stock
     # node, still reading the gather.
-    waits = _gathers(gm, _WAIT)
+    waits = _gathers(gm, _WAIT_TENSOR_OP)
     assert len(waits) == 4
     assert [w.args[0] for w in waits] == symm
 
@@ -228,7 +228,7 @@ def test_an_unbound_gather_is_never_retargeted(mesh_1rank):
 
     gm = _graph_with_gathers(mesh_1rank, 3)  # candidates, but nothing bound them
     assert rewrite_weight_ag_to_copy_engine(gm) == 0
-    assert len(_gathers(gm, _AG)) == 3
+    assert len(_gathers(gm, _ALL_GATHER_OP)) == 3
     assert not _gathers(gm, _symm_op())
 
 
@@ -238,17 +238,17 @@ def test_mixed_graph_splits_by_transport(mesh_1rank):
 
     gm = _graph_with_gathers(mesh_1rank, 2)
     # Splice in one unmarked gather reading a graph input directly.
-    node = _gathers(gm, _AG)[0]
+    node = _gathers(gm, _ALL_GATHER_OP)[0]
     with gm.graph.inserting_before(node):
         other = gm.graph.placeholder("activation")
         other.meta["example_value"] = torch.randn(4, 4, device="cuda")
-        extra = gm.graph.call_function(_AG, (other, 1, "dummy_group"))
+        extra = gm.graph.call_function(_ALL_GATHER_OP, (other, 1, "dummy_group"))
         extra.meta["example_value"] = torch.randn(4, 4, device="cuda")
     gm.graph.lint()
 
     assert _pretend_bound(gm) == 2
     assert rewrite_weight_ag_to_copy_engine(gm) == 2
-    assert len(_gathers(gm, _AG)) == 1
+    assert len(_gathers(gm, _ALL_GATHER_OP)) == 1
     assert len(_gathers(gm, _symm_op())) == 2
 
 
@@ -277,6 +277,6 @@ def test_selection_matches_what_the_lowering_pass_emits(mesh_1rank):
 
     assert _pretend_bound(gm) == 1
     assert rewrite_weight_ag_to_copy_engine(gm) == 1
-    assert not _gathers(gm, _AG)
+    assert not _gathers(gm, _ALL_GATHER_OP)
     symm = _gathers(gm, _symm_op())
-    assert _gathers(gm, _WAIT)[0].args[0] is symm[0]
+    assert _gathers(gm, _WAIT_TENSOR_OP)[0].args[0] is symm[0]

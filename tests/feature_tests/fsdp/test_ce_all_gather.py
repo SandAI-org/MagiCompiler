@@ -36,7 +36,7 @@ import torch.nn as nn
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
-_WAIT = torch.ops._c10d_functional.wait_tensor
+_WAIT_TENSOR_OP = torch.ops._c10d_functional.wait_tensor
 
 
 @pytest.fixture(scope="module")
@@ -108,7 +108,7 @@ def test_gather_matches_nccl_bitwise(mesh_1rank):
     _, shards = _symm_model(mesh_1rank)
 
     for shard in shards:
-        got = _WAIT(torch.ops.magi.ce_all_gather(shard, 1, ""))
+        got = _WAIT_TENSOR_OP(torch.ops.magi.ce_all_gather(shard, 1, ""))
         ref = torch.empty_like(got)
         torch.distributed.all_gather_into_tensor(ref, shard)
         torch.cuda.synchronize()
@@ -122,8 +122,8 @@ def test_coalesced_wrap_matches_per_member_gather(mesh_1rank):
     outs = torch.ops.magi.ce_all_gather_coalesced(list(shards), 1, "")
     assert len(outs) == len(shards)
     for out, shard in zip(outs, shards):
-        got = _WAIT(out)
-        ref = _WAIT(torch.ops.magi.ce_all_gather(shard, 1, ""))
+        got = _WAIT_TENSOR_OP(out)
+        ref = _WAIT_TENSOR_OP(torch.ops.magi.ce_all_gather(shard, 1, ""))
         assert torch.equal(got, ref)
 
 
@@ -133,7 +133,7 @@ def test_wait_tensor_picks_up_the_registered_event(mesh_1rank):
     _, shards = _symm_model(mesh_1rank)
     shard = shards[0]
 
-    out = _WAIT(torch.ops.magi.ce_all_gather(shard, 1, ""))
+    out = _WAIT_TENSOR_OP(torch.ops.magi.ce_all_gather(shard, 1, ""))
     # No synchronize: the value must be correct because of the wait alone.
     assert torch.equal(out, shard.expand_as(out)), "wait_tensor did not order the copies"
 
@@ -145,8 +145,8 @@ def test_each_gather_returns_a_fresh_buffer(mesh_1rank):
     _, shards = _symm_model(mesh_1rank)
     a = torch.ops.magi.ce_all_gather(shards[0], 1, "")
     b = torch.ops.magi.ce_all_gather(shards[1], 1, "")
-    _WAIT(a)
-    _WAIT(b)
+    _WAIT_TENSOR_OP(a)
+    _WAIT_TENSOR_OP(b)
     torch.cuda.synchronize()
     assert a.data_ptr() != b.data_ptr()
     assert torch.equal(a, shards[0].expand_as(a))
@@ -258,11 +258,11 @@ def test_per_peer_fallback_matches_the_batched_path(mesh_1rank, monkeypatch):
     from magi_compiler.symm_mem import all_gather as ag_mod
 
     _, shards = _symm_model(mesh_1rank)
-    batched = _WAIT(torch.ops.magi.ce_all_gather(shards[0], 1, ""))
+    batched = _WAIT_TENSOR_OP(torch.ops.magi.ce_all_gather(shards[0], 1, ""))
     torch.cuda.synchronize()
 
     monkeypatch.setattr(ag_mod, "_batcher", lambda: None)
-    fallback = _WAIT(torch.ops.magi.ce_all_gather(shards[0], 1, ""))
+    fallback = _WAIT_TENSOR_OP(torch.ops.magi.ce_all_gather(shards[0], 1, ""))
     torch.cuda.synchronize()
 
     assert torch.equal(fallback, batched)

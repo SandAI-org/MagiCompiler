@@ -37,12 +37,12 @@ import torch
 import torch.distributed as dist
 from torch._inductor import ir
 
-_REGEN = os.environ.get("MAGI_REGEN_GOLDEN") == "1"
+_REGENERATE_GOLDENS = os.environ.get("MAGI_REGEN_GOLDEN") == "1"
 # Anchored to line starts: the pattern's own source line must not match.
-_GOLDEN_BLOCK = re.compile(r"^(# BEGIN GOLDEN.*\n)(?:.*\n)*?(# END GOLDEN)$", re.MULTILINE)
-_MIB = 1 << 20
-_AG = torch.ops._c10d_functional.all_gather_into_tensor.default
-_AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
+_GOLDEN_BLOCK_PATTERN = re.compile(r"^(# BEGIN GOLDEN.*\n)(?:.*\n)*?(# END GOLDEN)$", re.MULTILINE)
+BYTES_PER_MIB = 1 << 20
+_ALL_GATHER_OP = torch.ops._c10d_functional.all_gather_into_tensor.default
+_COALESCED_ALL_GATHER_OP = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
 
 
 class _Dep:
@@ -50,13 +50,13 @@ class _Dep:
         self.name = name
 
 
-class _Snode:
+class FakeSnode:
     snodes = None
 
-    def __init__(self, name, node, deps=(), cost=0.0):
+    def __init__(self, name, node, deps=(), runtime_ns=0.0):
         self.name = name
         self.node = node
-        self.cost = cost
+        self.runtime_ns = runtime_ns
         self.unmet_dependencies = [_Dep(d) for d in deps]
 
     def get_name(self):
@@ -100,26 +100,28 @@ class _Compute:
         return torch.bfloat16
 
 
-def _compute(name, cost, deps=()):
-    return _Snode(name, _Compute(), deps, cost)
+def _compute_node(name, runtime_ns, deps=()):
+    return FakeSnode(name, _Compute(), deps, runtime_ns)
 
 
-def _wait(name, dep):
-    return _Snode(name, _ir(ir._WaitKernel), [dep])
+def _wait_node(name, dep):
+    return FakeSnode(name, _ir(ir._WaitKernel), [dep])
 
 
-def _unpack(name, dep, numel=0):
-    return _Snode(name, _ir(ir.MultiOutput, numel=numel), [dep])
+def _unpack_node(name, dep, numel=0):
+    return FakeSnode(name, _ir(ir.MultiOutput, numel=numel), [dep])
 
 
-def _gather(name, deps, cost, coalesced=False):
-    return _Snode(name, _ir(ir._CollectiveKernel, op=_AG_COALESCED if coalesced else _AG), deps, cost)
+def _gather(name, deps, runtime_ns, coalesced=False):
+    return FakeSnode(
+        name, _ir(ir._CollectiveKernel, op=_COALESCED_ALL_GATHER_OP if coalesced else _ALL_GATHER_OP), deps, runtime_ns
+    )
 
 
-def _load(name, mib, deps=(), slot=0):
+def _load_node(name, mib, deps=(), slot=0):
     from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
-    return _Snode(name, _ir(ir.FallbackKernel, op=H2D_LOAD, numel=mib * _MIB // 2, slot=slot), deps)
+    return FakeSnode(name, _ir(ir.FallbackKernel, op=H2D_LOAD, numel=mib * BYTES_PER_MIB // 2, slot=slot), deps)
 
 
 # -- graph builders -----------------------------------------------------------
@@ -133,58 +135,58 @@ def _fsdp_graph(seed, *, form):
     the chain the launch has to carry).
     """
     rng = random.Random(seed)
-    order = [_compute("embed", rng.uniform(1e4, 4e6))]
+    order = [_compute_node("embed", rng.uniform(1e4, 4e6))]
     act = "embed"
     for i in range(rng.randint(5, 9)):
         comm = rng.uniform(5e4, 3e6)
         consumers = []
         if form == "plain":
             order.append(_gather(f"ag{i}", [], comm))
-            order.append(_wait(f"w{i}", f"ag{i}"))
+            order.append(_wait_node(f"w{i}", f"ag{i}"))
             consumers = [f"w{i}"]
         elif form == "coalesced":
             members = rng.randint(2, 3)
             order.append(_gather(f"ag{i}", [], comm, coalesced=True))
             for k in range(members):
-                order.append(_unpack(f"mo{i}_{k}", f"ag{i}"))
+                order.append(_unpack_node(f"mo{i}_{k}", f"ag{i}"))
             for k in range(members):
-                order.append(_wait(f"w{i}_{k}", f"mo{i}_{k}"))
+                order.append(_wait_node(f"w{i}_{k}", f"mo{i}_{k}"))
             consumers = [f"w{i}_{k}" for k in range(members)]
         else:
-            order.append(_load(f"ld{i}", 4))
-            order.append(_wait(f"lw{i}", f"ld{i}"))
-            order.append(_compute(f"cast{i}", 0.0, [f"lw{i}"]))
+            order.append(_load_node(f"ld{i}", 4))
+            order.append(_wait_node(f"lw{i}", f"ld{i}"))
+            order.append(_compute_node(f"cast{i}", 0.0, [f"lw{i}"]))
             order.append(_gather(f"ag{i}", [f"cast{i}"], comm))
-            order.append(_wait(f"w{i}", f"ag{i}"))
+            order.append(_wait_node(f"w{i}", f"ag{i}"))
             consumers = [f"w{i}"]
         # A free view between the wait and its real consumer: transparent.
-        order.append(_compute(f"view{i}", 0.0, consumers))
-        order.append(_compute(f"mm{i}", rng.uniform(1e4, 5e6), [f"view{i}", act]))
-        order.append(_compute(f"pw{i}", rng.uniform(1e3, 3e5), [f"mm{i}"]))
+        order.append(_compute_node(f"view{i}", 0.0, consumers))
+        order.append(_compute_node(f"mm{i}", rng.uniform(1e4, 5e6), [f"view{i}", act]))
+        order.append(_compute_node(f"pw{i}", rng.uniform(1e3, 3e5), [f"mm{i}"]))
         act = f"pw{i}"
         if rng.random() < 0.4:
-            order.append(_compute(f"attn{i}", rng.uniform(1e6, 3e7), [act]))
+            order.append(_compute_node(f"attn{i}", rng.uniform(1e6, 3e7), [act]))
             act = f"attn{i}"
-    order.append(_compute("head", rng.uniform(1e4, 1e6), [act]))
+    order.append(_compute_node("head", rng.uniform(1e4, 1e6), [act]))
     return order
 
 
 def _h2d_graph(seed, slots):
     """One load per layer, parked directly in front of its wait (phase 1)."""
     rng = random.Random(seed)
-    order = [_compute("embed", rng.uniform(1e5, 4e6))]
+    order = [_compute_node("embed", rng.uniform(1e5, 4e6))]
     act = "embed"
     for i, slot in enumerate(slots):
         mib = 4 + 4 * (i % 3)
-        order.append(_load(f"ld{i}", mib, slot=slot))
-        order.append(_wait(f"w{i}", f"ld{i}"))
-        order.append(_compute(f"mm{i}", rng.uniform(1e5, 3e6), [f"w{i}", act]))
-        order.append(_compute(f"pw{i}", rng.uniform(1e3, 5e5), [f"mm{i}"]))
+        order.append(_load_node(f"ld{i}", mib, slot=slot))
+        order.append(_wait_node(f"w{i}", f"ld{i}"))
+        order.append(_compute_node(f"mm{i}", rng.uniform(1e5, 3e6), [f"w{i}", act]))
+        order.append(_compute_node(f"pw{i}", rng.uniform(1e3, 5e5), [f"mm{i}"]))
         act = f"pw{i}"
         if rng.random() < 0.3:
-            order.append(_compute(f"attn{i}", rng.uniform(1e6, 8e6), [act]))
+            order.append(_compute_node(f"attn{i}", rng.uniform(1e6, 8e6), [act]))
             act = f"attn{i}"
-    order.append(_compute("head", rng.uniform(1e5, 1e6), [act]))
+    order.append(_compute_node("head", rng.uniform(1e5, 1e6), [act]))
     return order
 
 
@@ -200,11 +202,11 @@ _FSDP_CASES = [
 
 _H2D_CASES = [
     ("h2d_default_s1", 1, 8, {}),
-    ("h2d_inflight_s3", 3, 10, {"max_inflight_bytes": 24 * _MIB}),
-    ("h2d_resident_s5", 5, 10, {"max_resident_bytes": 24 * _MIB}),
-    ("h2d_device_s7", 7, 12, {"max_device_weight_bytes": 64 * _MIB}),
-    ("h2d_util_s9", 9, 10, {"bus_utilization": 0.6, "max_resident_bytes": 32 * _MIB}),
-    ("h2d_slowbus_s10", 10, 10, {"bandwidth_bytes_per_ns": 2.0, "max_resident_bytes": 40 * _MIB}),
+    ("h2d_inflight_s3", 3, 10, {"max_inflight_bytes": 24 * BYTES_PER_MIB}),
+    ("h2d_resident_s5", 5, 10, {"max_resident_bytes": 24 * BYTES_PER_MIB}),
+    ("h2d_device_s7", 7, 12, {"weight_budget_bytes": 64 * BYTES_PER_MIB}),
+    ("h2d_util_s9", 9, 10, {"bus_utilization": 0.6, "max_resident_bytes": 32 * BYTES_PER_MIB}),
+    ("h2d_slowbus_s10", 10, 10, {"bandwidth_bytes_per_ns": 2.0, "max_resident_bytes": 40 * BYTES_PER_MIB}),
     ("h2d_margin_s11", 11, 10, {"window_margin_ns": 2e5, "window_scale": 1.3}),
 ]
 
@@ -224,10 +226,10 @@ def world_of_one():
         dist_utils._CPU_GLOO_GROUP = "uninit"
 
 
-def _render_golden(data):
+def _render_golden(golden_entries):
     lines = ["_GOLDEN = {"]
-    for key in sorted(data):
-        entry = data[key]
+    for key in sorted(golden_entries):
+        entry = golden_entries[key]
         value = json.dumps(entry) if isinstance(entry, str) else f"({json.dumps(entry[0])}, {entry[1]!r})"
         lines.append(f"    {json.dumps(key)}: {value},")
     lines.append("}")
@@ -238,20 +240,22 @@ def _render_golden(data):
 def golden():
     # Cases this run skipped or deselected keep their entry; cases that no
     # longer exist are dropped.
-    known = {c[0] for c in _FSDP_CASES} | {c[0] for c in _H2D_CASES}
-    data = {k: v for k, v in _GOLDEN.items() if k in known}
-    yield data
-    if _REGEN:
+    known_case_names = {c[0] for c in _FSDP_CASES} | {c[0] for c in _H2D_CASES}
+    golden_entries = {k: v for k, v in _GOLDEN.items() if k in known_case_names}
+    yield golden_entries
+    if _REGENERATE_GOLDENS:
         path = Path(__file__)
-        text, n = _GOLDEN_BLOCK.subn(lambda m: m.group(1) + _render_golden(data) + "\n" + m.group(2), path.read_text())
-        assert n == 1, "the BEGIN/END GOLDEN markers at the bottom of this file are missing"
+        text, replacement_count = _GOLDEN_BLOCK_PATTERN.subn(
+            lambda m: m.group(1) + _render_golden(golden_entries) + "\n" + m.group(2), path.read_text()
+        )
+        assert replacement_count == 1, "the BEGIN/END GOLDEN markers at the bottom of this file are missing"
         path.write_text(text)
 
 
-def _check(golden, key, order, resident=None):
+def _check_or_update_golden(golden, key, order, resident=None):
     """``order`` is the snode names in schedule order; ``resident`` the promoted load indices (h2d only)."""
     entry = " ".join(order) if resident is None else (" ".join(order), resident)
-    if _REGEN:
+    if _REGENERATE_GOLDENS:
         golden[key] = entry
         return
     assert key in golden, f"no golden entry for {key}; regenerate with MAGI_REGEN_GOLDEN=1"
@@ -266,9 +270,9 @@ def test_fsdp_schedule_is_frozen(world_of_one, golden, key, form, seed, scale, m
 
     order = _fsdp_graph(seed, form=form)
     reorder = FsdpOverlapReorder(
-        comm_overlap_window_margin_ns=margin, comm_overlap_window_scale=scale, cost_fn=lambda s: s.cost
+        comm_overlap_window_margin_ns=margin, comm_overlap_window_scale=scale, runtime_ns_fn=lambda s: s.runtime_ns
     )
-    _check(golden, key, [s.name for s in reorder(order)])
+    _check_or_update_golden(golden, key, [s.name for s in reorder(order)])
 
 
 def test_fsdp_prep_cost_hides_nothing(world_of_one):
@@ -277,14 +281,14 @@ def test_fsdp_prep_cost_hides_nothing(world_of_one):
     from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder
 
     order = [
-        _compute("embed", 1e6),
-        _compute("mm_a", 1e6, ["embed"]),
-        _compute("cast", 5e6),
+        _compute_node("embed", 1e6),
+        _compute_node("mm_a", 1e6, ["embed"]),
+        _compute_node("cast", 5e6),
         _gather("ag", ["cast"], 3e6),
-        _wait("w", "ag"),
-        _compute("mm", 1e6, ["w", "mm_a"]),
+        _wait_node("w", "ag"),
+        _compute_node("mm", 1e6, ["w", "mm_a"]),
     ]
-    reorder = FsdpOverlapReorder(comm_overlap_window_margin_ns=0.0, cost_fn=lambda s: s.cost)
+    reorder = FsdpOverlapReorder(comm_overlap_window_margin_ns=0.0, runtime_ns_fn=lambda s: s.runtime_ns)
     names = [s.name for s in reorder(order)]
     assert names == ["cast", "ag", "embed", "mm_a", "w", "mm"]
 
@@ -299,17 +303,17 @@ def test_h2d_schedule_is_frozen(golden, key, seed, n, kwargs):
         slots = []
         for i in range(n):
             mib = 4 + 4 * (i % 3)
-            shard = torch.randn(mib * _MIB // 2, device="cuda", dtype=torch.bfloat16)
-            host = get_global_host_weight_store().reserve(tuple(shard.shape), shard.dtype, name=f"w{i}")
+            shard = torch.randn(mib * BYTES_PER_MIB // 2, device="cuda", dtype=torch.bfloat16)
+            host = get_global_host_weight_store().reserve_host_buffer(tuple(shard.shape), shard.dtype, parameter_name=f"w{i}")
             host.copy_(shard)
             shard.untyped_storage().resize_(0)
-            slots.append(get_global_host_weight_store().adopt(host, shard, name=f"w{i}"))
+            slots.append(get_global_host_weight_store().bind_host_buffer(host, shard, parameter_name=f"w{i}"))
         order = _h2d_graph(seed, slots)
         params = {"bandwidth_bytes_per_ns": 10.0, "window_margin_ns": 0.0, "bus_utilization": 0.9, **kwargs}
-        reorder = H2dLoadReorder(cost_fn=lambda s: s.cost, **params)
+        reorder = H2dLoadReorder(runtime_ns_fn=lambda s: s.runtime_ns, **params)
         names = [s.name for s in reorder(order)]
         resident = [i for i, slot in enumerate(slots) if get_global_host_weight_store().is_resident(slot)]
-        _check(golden, key, names, resident)
+        _check_or_update_golden(golden, key, names, resident)
     finally:
         get_global_host_weight_store().reset()
 
