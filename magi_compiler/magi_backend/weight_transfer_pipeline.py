@@ -37,8 +37,8 @@ from magi_compiler.passes.fsdp_overlap import (
     lower_prim_redistribute_to_collectives,
     rewrite_weight_ag_to_copy_engine,
 )
-from magi_compiler.passes.overlap import rank_sync
 from magi_compiler.passes.snode_cost import SnodeCostProfile, SnodeCostTable
+from magi_compiler.passes.transfer_overlap import rank_sync
 from magi_compiler.passes.weight_offload import (
     FsdpShardSource,
     H2dLoadReorder,
@@ -79,7 +79,7 @@ def _allow_reorder_without_process_group() -> None:
     comms.reorder_compute_and_comm_for_overlap = reorder_as_rank_0
 
 
-def build_scheduler_passes(
+def build_transfer_overlap_passes(
     *, fsdp_config: FSDPConfig, offload_config: OffloadConfig, loads_inserted: bool, default_passes: list | None
 ) -> list | None:
     """Inductor's ``reorder_for_compute_comm_overlap_passes`` for this graph; None leaves Inductor's own.
@@ -136,7 +136,7 @@ def build_scheduler_passes(
     return passes
 
 
-def _validate_weight_pipeline_config(
+def _validate_weight_transfer_config(
     *, fsdp_config: FSDPConfig, offload_config: OffloadConfig, cudagraph_mode: CudaGraphMode
 ) -> None:
     if fsdp_config.enable_fsdp:
@@ -185,7 +185,7 @@ def _restore_unclaimed_weights(example_inputs) -> None:
     )
 
 
-class WeightPipeline:
+class WeightTransferPipeline:
     """FSDP and graph-weight-offload rewrites of one whole graph, and the scheduler passes that place them."""
 
     def __init__(
@@ -200,11 +200,13 @@ class WeightPipeline:
             # enable_fsdp is process-wide: split-graph models (e.g. a VAE beside an FSDP DiT)
             # share it, but whole-graph FSDP overlap only applies to fullgraph compiles.
             fsdp_config = fsdp_config.model_copy(update={"enable_fsdp": False})
-        _validate_weight_pipeline_config(fsdp_config=fsdp_config, offload_config=offload_config, cudagraph_mode=cudagraph_mode)
+        _validate_weight_transfer_config(fsdp_config=fsdp_config, offload_config=offload_config, cudagraph_mode=cudagraph_mode)
         self._fsdp_config = fsdp_config
         self._offload_config = offload_config
 
-    def run(self, graph: fx.GraphModule, example_inputs, *, default_passes: list | None) -> list | None:
+    def rewrite_graph_and_build_scheduler_passes(
+        self, graph: fx.GraphModule, example_inputs, *, default_passes: list | None
+    ) -> list | None:
         """Rewrite ``graph`` in place; return its scheduler passes, or None to leave Inductor's own."""
         if self._fsdp_config.enable_fsdp:
             lower_prim_redistribute_to_collectives(graph)
@@ -214,7 +216,7 @@ class WeightPipeline:
                 self._fsdp_config.bucket_mode,
             )
         loads_inserted = self._bind_weights(graph, example_inputs)
-        passes = build_scheduler_passes(
+        passes = build_transfer_overlap_passes(
             fsdp_config=self._fsdp_config,
             offload_config=self._offload_config,
             loads_inserted=loads_inserted,

@@ -608,7 +608,7 @@ class ProfilingRuntimeEstimator:
         # Kept OFF ProfileEntry: snodes hold unpicklable FakeTensors and the entry
         # is pickled into the fx-graph cache key.
         self._key_snode: dict = {}
-        self._replay_keys: dict = {}  # structural -> table key; replay inputs are full-size
+        self._profile_key_by_structural_key: dict = {}  # structural -> table key; replay inputs are full-size
 
     def __deepcopy__(self, memo):
         # Config serialization deepcopies the pass list; return a clean instance.
@@ -919,10 +919,10 @@ class ProfilingRuntimeEstimator:
         return ns
 
     def _table_key(self, snode: BaseSchedulerNode) -> tuple | None:
-        key = _structural_key(snode)
-        if key is not None and key not in self._replay_keys:
-            self._replay_keys[key] = _replay_key(snode) or key
-        return self._replay_keys.get(key)
+        structural_key = _structural_key(snode)
+        if structural_key is not None and structural_key not in self._profile_key_by_structural_key:
+            self._profile_key_by_structural_key[structural_key] = _replay_key(snode) or structural_key
+        return self._profile_key_by_structural_key.get(structural_key)
 
     def _measure_extern_safe(self, snode: BaseSchedulerNode) -> float:
         with _shapeenv_sandbox(), _suppress_guards():

@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Scheduler-node helpers shared by every reorder pass.
-
-Kept apart from the passes themselves because two of them -- the FSDP all-gather
-reorder and the weight-load reorder -- have to agree exactly on what a real
-dependency is, and a second copy of that judgement is a miscompile waiting to
-happen.
-"""
+"""Shared scheduler-node classification, collective discovery and IR size helpers."""
 
 from __future__ import annotations
 
@@ -28,12 +22,9 @@ from functools import lru_cache
 import sympy
 import torch
 from torch._inductor import ir
-from torch._inductor.comms import _is_fake_dep
 from torch._inductor.scheduler import BaseSchedulerNode, FusedSchedulerNode, GroupedSchedulerNode
 from torch._inductor.utils import contains_collective, contains_wait, is_collective
 from torch._inductor.virtualized import V
-
-from magi_compiler.utils import magi_logger
 
 
 @lru_cache(maxsize=1)
@@ -134,48 +125,3 @@ def is_compute(snode: BaseSchedulerNode) -> bool:
 def is_multi_output(snode: BaseSchedulerNode) -> bool:
     """A custom op's result reaches its readers through one of these, not directly."""
     return isinstance(snode.node, ir.MultiOutput)
-
-
-def earliest_legal_index(moving_nodes, original_index_by_node, producer_by_buffer, *, ignored_producers=()) -> int:
-    """First boundary after external producers, excluding the moving nodes and ``ignored_producers``.
-
-    Ignore fake dependencies: ancestors include advisory collective-order edges
-    that would prevent legal hoisting. Only real data dependencies constrain it.
-    """
-    excluded_nodes = set(moving_nodes) | set(ignored_producers)
-    earliest_index = 0
-    for node in moving_nodes:
-        for d in node.unmet_dependencies:  # buffer names
-            if _is_fake_dep(d):  # WeakDep / StarDep -- ordering hint, not data
-                continue
-            producer = producer_by_buffer.get(d.name)
-            if producer is None or producer in excluded_nodes:
-                continue
-            earliest_index = max(earliest_index, original_index_by_node.get(producer, 0) + 1)
-    return earliest_index
-
-
-def validate_topological_order(new_order, producer_by_buffer) -> bool:
-    """Check real producers precede their readers; Inductor does not repair the order.
-    Use the same dependency rules as earliest_legal_index, excluding fused self-edges.
-    """
-    new_index_by_node = {s: i for i, s in enumerate(new_order)}
-    for node in new_order:
-        node_index = new_index_by_node[node]
-        for d in node.unmet_dependencies:  # buffer names
-            if _is_fake_dep(d):  # WeakDep / StarDep -- advisory ordering, not data
-                continue
-            producer = producer_by_buffer.get(d.name)
-            if producer is node:  # fused snode may name its own internal buffers
-                continue
-            if producer is not None and new_index_by_node.get(producer, -1) >= node_index:
-                magi_logger.debug(
-                    "validate fail: %s@%d needs buffer-dep %s@%d (buf %s)",
-                    node.get_name(),
-                    node_index,
-                    producer.get_name(),
-                    new_index_by_node.get(producer, -1),
-                    d.name,
-                )
-                return False
-    return True

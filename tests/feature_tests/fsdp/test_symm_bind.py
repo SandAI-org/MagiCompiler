@@ -135,8 +135,8 @@ def _bind(gm, examples, **kwargs):
     return bind_graph_weights(gm, copy_engine_weight_candidates(gm), dict(zip(names, examples)), **kwargs)
 
 
-def _apply_weight_pipeline(gm, examples, *, transport="copy_engine") -> int:
-    """``WeightPipeline.run`` with host offload off, inlined.
+def _apply_weight_transfer_pipeline(gm, examples, *, transport="copy_engine") -> int:
+    """``WeightTransferPipeline.rewrite_graph_and_build_scheduler_passes`` with host offload off, inlined.
 
     Lower, bind, retarget what bound -- one gather per weight; bucketing happens
     later, during scheduling.  Returns how many gathers were retargeted.
@@ -504,7 +504,7 @@ def test_bound_weights_are_retargeted_one_gather_each(mesh_1rank):
     from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER
 
     gm, examples = _graph([_param(mesh_1rank) for _ in range(4)])
-    assert _apply_weight_pipeline(gm, examples) == 4
+    assert _apply_weight_transfer_pipeline(gm, examples) == 4
     assert len([x for x in gm.graph.nodes if x.target is CE_ALL_GATHER]) == 4
     assert not [x for x in gm.graph.nodes if x.target is _ALL_GATHER_OP]
 
@@ -519,7 +519,7 @@ def test_an_unbound_weight_alone_stays_on_nccl(mesh_1rank):
     gathers = [n for n in gm.graph.nodes if n.target is _ALL_GATHER_OP]
     gathers[1].meta[UNEVEN_SHARD] = True
 
-    assert _apply_weight_pipeline(gm, examples) == 3
+    assert _apply_weight_transfer_pipeline(gm, examples) == 3
     assert len([n for n in gm.graph.nodes if n.target is CE_ALL_GATHER]) == 3
     assert len([n for n in gm.graph.nodes if n.target is _ALL_GATHER_OP]) == 1  # the uneven one, on NCCL
 
@@ -530,6 +530,6 @@ def test_nccl_transport_binds_nothing(mesh_1rank):
     from magi_compiler.symm_mem import registered_buffers
 
     gm, examples = _graph([_param(mesh_1rank) for _ in range(2)])
-    _apply_weight_pipeline(gm, examples, transport="nccl")
+    _apply_weight_transfer_pipeline(gm, examples, transport="nccl")
 
     assert registered_buffers() == []

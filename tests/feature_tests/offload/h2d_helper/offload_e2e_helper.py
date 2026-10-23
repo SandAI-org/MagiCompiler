@@ -14,7 +14,7 @@
 
 """torchrun entrypoint: compile-time weight offload, end to end, on a SimpleFSDP model.
 
-Chain under test (magi_backend._apply_weight_pipeline with
+Chain under test (magi_backend._apply_weight_transfer_pipeline with
 ``offload_config.graph_weight_offload``)::
 
     FX: lowering -> tag parked slots -> h2d_load insertion

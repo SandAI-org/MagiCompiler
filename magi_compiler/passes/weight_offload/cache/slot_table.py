@@ -63,13 +63,13 @@ def collect_host_slot_table(module: nn.Module) -> dict[int, dict[str, Any]]:
 
 def _slot_by_weight_identity(slot_table: Mapping[int, Mapping[str, Any]]) -> dict[tuple, int] | None:
     """``identity -> slot``, or None if two slots share an identity."""
-    slots_by_identity: dict[tuple, int] = {}
+    slot_by_weight_identity: dict[tuple, int] = {}
     for slot, slot_metadata in slot_table.items():
         weight_identity = slot_identity(slot_metadata)
-        if weight_identity in slots_by_identity:
+        if weight_identity in slot_by_weight_identity:
             return None
-        slots_by_identity[weight_identity] = int(slot)
-    return slots_by_identity
+        slot_by_weight_identity[weight_identity] = int(slot)
+    return slot_by_weight_identity
 
 
 def match_host_slot_tables(

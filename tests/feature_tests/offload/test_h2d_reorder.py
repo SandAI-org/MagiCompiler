@@ -32,7 +32,7 @@ import pytest
 import torch
 from torch._inductor import ir
 
-from magi_compiler.passes.overlap import CostView, SnodeGraph, memory, scheduler
+from magi_compiler.passes.transfer_overlap import CostView, SnodeGraph, memory, scheduler
 from magi_compiler.passes.weight_offload.schedule.h2d_reorder import H2dLoadReorder, H2dLoadTask
 
 BYTES_PER_MIB = 1 << 20
@@ -108,11 +108,11 @@ class FakeSnode:
 def stub_wait_predicate(monkeypatch):
     """Inductor decides ``contains_wait`` by isinstance against ``ir._WaitKernel``,
     which a synthetic node cannot be."""
-    import magi_compiler.passes.overlap.graph as overlap_graph
+    import magi_compiler.passes.transfer_overlap.graph as transfer_overlap_graph
     from magi_compiler.passes import snode_utils
 
     is_wait = lambda s: getattr(s, "kind", None) == "wait"  # noqa: E731
-    monkeypatch.setattr(overlap_graph, "contains_wait", is_wait)
+    monkeypatch.setattr(transfer_overlap_graph, "contains_wait", is_wait)
     monkeypatch.setattr(snode_utils, "contains_wait", is_wait)
 
 

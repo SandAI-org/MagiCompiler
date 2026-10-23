@@ -43,8 +43,8 @@ from torch._inductor.scheduler import BaseSchedulerNode, NodeUser
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
-from ..overlap import SnodeGraph
 from ..snode_utils import ALL_GATHER_OP, COALESCED_ALL_GATHER_OP, ce_ag_ops, ir_node_bytes, iter_ir_nodes
+from ..transfer_overlap import SnodeGraph
 
 
 @dataclass(frozen=True)

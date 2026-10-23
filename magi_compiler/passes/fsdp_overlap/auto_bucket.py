@@ -40,10 +40,10 @@ from dataclasses import dataclass
 import torch.distributed as dist
 from torch._inductor.scheduler import BaseSchedulerNode
 
-from magi_compiler.passes.overlap import CostView, SnodeGraph, rank_sync
-from magi_compiler.passes.overlap.cost import default_runtime_ns_fn
 from magi_compiler.passes.snode_cost import SnodeCostTable
 from magi_compiler.passes.snode_utils import weight_gathers
+from magi_compiler.passes.transfer_overlap import CostView, SnodeGraph, rank_sync
+from magi_compiler.passes.transfer_overlap.cost import default_runtime_ns_fn
 from magi_compiler.passes.weight_offload.node_meta import is_host_offloaded
 from magi_compiler.utils import magi_logger
 
@@ -360,10 +360,10 @@ class FsdpAutoBucket:
         """
         if world_size <= 1:
             return buckets if is_local_plan_valid else None
-        candidate_index = {s: i for i, s in enumerate(candidates)}
+        candidate_index_by_node = {s: i for i, s in enumerate(candidates)}
         local_bucket_indices = None
         if is_local_plan_valid:
-            local_bucket_indices = [[candidate_index[s] for s in bucket] for bucket in buckets]
+            local_bucket_indices = [[candidate_index_by_node[s] for s in bucket] for bucket in buckets]
         rank_plans = rank_sync.gather_rank_objects((is_local_plan_valid, local_bucket_indices), sync_group, world_size)
         failed_ranks = [rank for rank, (is_valid, _) in enumerate(rank_plans) if not is_valid]
         if failed_ranks:
@@ -423,9 +423,9 @@ class FsdpAutoBucket:
         In a merged stand-in order the members of a bucket sit together where its
         coalesced launch will go, so equal digests mean the same collective sequence.
         """
-        skeleton_position = {s: j for j, s in enumerate(skeleton_nodes)}
-        skeleton_sequence = [skeleton_position[s] for s in merged_order if s in skeleton_position]
-        return hashlib.sha256(repr(skeleton_sequence).encode()).hexdigest()
+        skeleton_index_by_node = {s: j for j, s in enumerate(skeleton_nodes)}
+        merged_collective_indices = [skeleton_index_by_node[s] for s in merged_order if s in skeleton_index_by_node]
+        return hashlib.sha256(repr(merged_collective_indices).encode()).hexdigest()
 
     @staticmethod
     def _simulate_bucket_merges(order, buckets):

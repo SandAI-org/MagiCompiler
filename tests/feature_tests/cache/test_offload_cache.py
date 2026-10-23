@@ -109,7 +109,7 @@ def test_collect_and_refresh_read_the_live_pool():
 
 def test_disabled_offload_cache_is_a_noop(tmp_path: Path):
     cache = OffloadCache(enabled=False)
-    cache.reset_for_cache_directory(tmp_path)
+    cache.initialize(tmp_path)
 
     assert cache.can_replay_artifact()
     assert cache.can_store_artifact()
@@ -121,7 +121,7 @@ def test_disabled_offload_cache_is_a_noop(tmp_path: Path):
 
 def _make_offload_cache(tmp_path: Path) -> OffloadCache:
     cache = OffloadCache(enabled=True)
-    cache.reset_for_cache_directory(tmp_path)
+    cache.initialize(tmp_path)
     return cache
 
 

@@ -131,8 +131,8 @@ def _agree(value) -> bool:
     return all(v == seen[0] for v in seen)
 
 
-def _apply_weight_pipeline(gm, *, transport: str) -> None:
-    """``WeightPipeline.run`` with host offload off, inlined.
+def _apply_weight_transfer_pipeline(gm, *, transport: str) -> None:
+    """``WeightTransferPipeline.rewrite_graph_and_build_scheduler_passes`` with host offload off, inlined.
 
     Lower, bind, retarget what bound -- the order is what decides transport per
     weight, which is the thing every rank has to agree on.
@@ -155,7 +155,7 @@ def _check_transport(mesh, rows: int, *, n: int, cols: int, say) -> bool:
 
     reset_registry()  # each check accounts for its own windows
     gm = _build_graph(mesh, [rows] * n, cols)
-    _apply_weight_pipeline(gm, transport="copy_engine")
+    _apply_weight_transfer_pipeline(gm, transport="copy_engine")
     targets = _gather_targets(gm)
     ok = _agree(targets)
     say(f"UNEVEN_TRANSPORT rows={rows} agree={ok} targets={targets}")
@@ -200,7 +200,7 @@ def _check_mixed(mesh, *, even_rows: int, uneven_rows: int, cols: int, say) -> b
 
     reset_registry()
     gm = _build_graph(mesh, [even_rows, uneven_rows, even_rows, uneven_rows], cols)
-    _apply_weight_pipeline(gm, transport="copy_engine")
+    _apply_weight_transfer_pipeline(gm, transport="copy_engine")
     targets = _gather_targets(gm)
     ok = _agree(targets) and targets == {"ce": 2, "nccl": 2}
     say(f"UNEVEN_MIXED agree={ok} targets={targets}")
