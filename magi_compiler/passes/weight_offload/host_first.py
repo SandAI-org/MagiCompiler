@@ -172,7 +172,7 @@ def _refuse_casting_handed_over(module: nn.Module, fn) -> None:
 
 
 def _manages_device_moves(instance: nn.Module) -> bool:
-    return getattr(instance, _PENDING_ATTR, False) or residency.has_slots(instance)
+    return getattr(instance, _PENDING_ATTR, False) or residency.is_handoff_complete(instance)
 
 
 def _is_sharded(module: nn.Module) -> bool:

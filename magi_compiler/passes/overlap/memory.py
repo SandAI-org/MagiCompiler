@@ -15,9 +15,9 @@
 """Device memory held by transfer buffers, over the snode index space.
 
 A buffer is live over the closed range ``[start, last_user]``: ``rebuild``
-inserts a group *before* the node at its target, so that node already sees the
-new buffer while the earlier buffer's ``last_user`` still reads the old one.
-Two ranges therefore overlap iff ``earlier.last_user >= later.start``.
+inserts a group *before* the node at its launch index, so that node already sees
+the new buffer while the earlier buffer's ``last_user`` still reads the old one.
+Two ranges therefore overlap iff ``earlier.last_user_index >= later.start``.
 """
 
 from __future__ import annotations
@@ -57,8 +57,8 @@ class InflightMap:
 
 
 def live_starts(tasks, targets, index_of) -> dict:
-    """Where each buffer still on the resource comes alive; inactive ones never do."""
-    return {t.anchor: targets.get(t.anchor, index_of[t.anchor]) for t in tasks if not t.inactive}
+    """Where each buffer still on the resource comes alive; ones off the bus never do."""
+    return {t.anchor: targets.get(t.anchor, index_of[t.anchor]) for t in tasks if t.uses_transfer_bus}
 
 
 def peak_point(tasks, starts) -> tuple[int, int]:
@@ -67,7 +67,7 @@ def peak_point(tasks, starts) -> tuple[int, int]:
         at = starts.get(t.anchor)
         if at is not None:
             events.append((at, t.nbytes))
-            events.append((t.last_user, -t.nbytes))
+            events.append((t.last_user_index, -t.nbytes))
     events.sort(key=lambda ev: (ev[0], ev[1] < 0))
     peak = live = where = 0
     for idx, delta in events:
@@ -91,4 +91,4 @@ def device_peak(tasks, targets, index_of) -> int:
     Unlike the H2D in-flight budget, this report counts resident output lifetimes too.
     """
     starts = {t.anchor: targets.get(t.anchor, index_of[t.anchor]) for t in tasks}
-    return peak_with(tasks, starts, {t.anchor for t in tasks if t.inactive})
+    return peak_with(tasks, starts, {t.anchor for t in tasks if not t.uses_transfer_bus})

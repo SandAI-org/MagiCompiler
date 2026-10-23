@@ -43,12 +43,12 @@ from torch._inductor.scheduler import BaseSchedulerNode
 from magi_compiler.utils import magi_logger
 from magi_compiler.utils.dist_utils import get_cpu_gloo_group
 
-from ..snode_utils import issues_transfer, leaf_collective_node, weight_gathers
+from ..snode_utils import issues_comm, leaf_comm_node, weight_gathers
 
 
 def _collective_kind_key(snode: BaseSchedulerNode, is_weight: bool) -> tuple:
     """Coarse, rank-comparable identity of one NCCL-issuing snode."""
-    node = leaf_collective_node(snode) or snode.node
+    node = leaf_comm_node(snode) or snode.node
     op = (node.op_overload or node.python_kernel_name) if isinstance(node, ir.ExternKernel) else None
     op = op or type(node).__name__
     dims: tuple = ()
@@ -64,13 +64,13 @@ def _collective_kind_key(snode: BaseSchedulerNode, is_weight: bool) -> tuple:
 
 def collective_skeleton(order: list[BaseSchedulerNode]) -> tuple[list[int], list[tuple]]:
     """The graph's collective skeleton: indices (ascending) and rank-comparable
-    kinds of every snode that issues a transfer -- functional NCCL collectives,
+    kinds of every snode that issues comm -- functional NCCL collectives,
     custom ops with an internal collective, and copy-engine / symmetric-memory
     gathers.  This sequence is what must stay rank-identical; the compute
     between two consecutive entries is rank-private."""
     from magi_compiler.profiling.runtime_estimator import snode_issues_collective
 
-    idx = [i for i, s in enumerate(order) if snode_issues_collective(s) or issues_transfer(s)]
+    idx = [i for i, s in enumerate(order) if snode_issues_collective(s) or issues_comm(s)]
     weights = set(weight_gathers(order))
     return idx, [_collective_kind_key(order[i], order[i] in weights) for i in idx]
 
@@ -153,7 +153,7 @@ def consensus_slot_targets(anchors_in_order, task_of, skel_idx, index_of, sync_g
     for anchor in anchors_in_order:
         own = slot_of(index_of[anchor])
         task = task_of.get(anchor)
-        mine.append((slot_of(task.target), slot_of(task.lower)) if task is not None else (own, own))
+        mine.append((slot_of(task.launch_index), slot_of(task.earliest_launch_index)) if task is not None else (own, own))
     peers = exchange(mine, sync_group, world)
 
     running = 0
@@ -163,17 +163,17 @@ def consensus_slot_targets(anchors_in_order, task_of, skel_idx, index_of, sync_g
         task = task_of.get(anchor)
         if task is None:
             continue
-        target = task.target
-        slot_lo = max(task.lower, skel_idx[q - 1] + 1 if q > 0 else 0)
+        local_launch_index = task.launch_index
+        slot_lo = max(task.earliest_launch_index, skel_idx[q - 1] + 1 if q > 0 else 0)
         slot_hi = skel_idx[q] if q < len(skel_idx) else index_of[anchor]
-        task.target = min(max(target, slot_lo), max(slot_hi, slot_lo))
+        task.launch_index = min(max(local_launch_index, slot_lo), max(slot_hi, slot_lo))
         magi_logger.debug(
-            "FSDP overlap slot consensus: launch=%d slot=%d mine=%s target=%d->%d bounds=[%d,%d]",
+            "FSDP overlap slot consensus: launch=%d slot=%d mine=%s launch_index=%d->%d bounds=[%d,%d]",
             index_of[anchor],
             q,
             mine[j],
-            target,
-            task.target,
+            local_launch_index,
+            task.launch_index,
             slot_lo,
             slot_hi,
         )

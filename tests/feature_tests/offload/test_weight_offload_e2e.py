@@ -224,7 +224,8 @@ def test_host_first_weights_are_all_claimed_by_the_graph():
     Restoring an unclaimed weight is safe but would lose its offload saving."""
     p = _run(1, "--host-first")
     out = _check(p)
-    assert "are not loaded by any compiled graph" not in out, out[-4000:]
+    assert _marker(p.stdout, "OFFLOAD_FREED", "shards") > 0, out[-4000:]
+    assert _marker(p.stdout, "OFFLOAD_FREED", "restored_unclaimed") == 0, out[-4000:]
 
 
 @requires_cuda

@@ -47,7 +47,9 @@ class HostWeight:
     host: torch.Tensor
     device_tensor: torch.Tensor
     nbytes: int
-    name: str = ""  # the parameter this shard came from, for the placement logs
+    # The parameter this shard came from; with shape and dtype it is the identity
+    # a cached artifact's slots are matched by in another process (slot_table.py).
+    name: str = ""
 
 
 class HostWeightStore:
@@ -131,7 +133,7 @@ class HostWeightStore:
         return self._by_tensor.get(id(local))
 
     def name_of(self, slot: int) -> str:
-        """The parameter behind a slot, for the placement logs."""
+        """The parameter behind a slot; part of its cross-process cache identity."""
         return self._entry(slot).name
 
     def get(self, slot: int) -> torch.Tensor:
@@ -211,11 +213,11 @@ class HostWeightStore:
         """Bytes of promoted shards, i.e. device memory offload gave back."""
         return sum(self._slots[s].nbytes for s in self._resident)
 
-    def bound_bytes(self) -> int:
+    def offloaded_bytes(self) -> int:
         """Device bytes actually freed: everything bound, less what was promoted back."""
         return sum(s.nbytes for s in self._slots) - self.resident_bytes()
 
-    def total_bound_bytes(self) -> int:
+    def total_weight_bytes(self) -> int:
         """Every bound shard, promoted or not -- the base the residency budget is a fraction of."""
         return sum(s.nbytes for s in self._slots)
 

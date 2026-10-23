@@ -216,7 +216,7 @@ def main() -> None:
         fallback kernel at 0us, so without this the launches barely move."""
         from torch._inductor.comms import estimate_op_runtime
 
-        if snode_utils.is_ce_ag_ir(snode_utils.leaf_collective_node(snode)):
+        if snode_utils.is_ce_ag_ir(snode_utils.leaf_comm_node(snode)):
             return 1e7  # 10ms, far more than the whole graph's compute
         return estimate_op_runtime(snode)
 

@@ -875,8 +875,8 @@ def test_promotion_switches_the_source_and_updates_the_byte_accounting():
     expected = shards[0].clone()
     slots = [_park(shard) for shard in shards]
     slot = slots[0]
-    total = get_global_host_weight_store().total_bound_bytes()
-    assert get_global_host_weight_store().bound_bytes() == total
+    total = get_global_host_weight_store().total_weight_bytes()
+    assert get_global_host_weight_store().offloaded_bytes() == total
     assert get_global_host_weight_store().resident_bytes() == 0
     assert get_global_host_weight_store().source(slot).device.type == "cpu"
 
@@ -885,8 +885,8 @@ def test_promotion_switches_the_source_and_updates_the_byte_accounting():
     assert get_global_host_weight_store().source(slot).is_cuda
     torch.testing.assert_close(get_global_host_weight_store().source(slot), expected)
     assert not get_global_host_weight_store().is_resident(slots[1])
-    assert get_global_host_weight_store().total_bound_bytes() == total
-    assert get_global_host_weight_store().bound_bytes() == total - get_global_host_weight_store().slot_bytes(slot)
+    assert get_global_host_weight_store().total_weight_bytes() == total
+    assert get_global_host_weight_store().offloaded_bytes() == total - get_global_host_weight_store().slot_bytes(slot)
     assert get_global_host_weight_store().resident_bytes() == get_global_host_weight_store().slot_bytes(slot)
     assert get_global_host_weight_store().make_resident(slot) == 0, "promotion must be idempotent"
 

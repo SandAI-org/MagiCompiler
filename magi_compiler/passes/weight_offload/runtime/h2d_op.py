@@ -56,11 +56,11 @@ def h2d_stream() -> torch.cuda.Stream:
 
 def _check_shard(shard: torch.Tensor, slot: int) -> None:
     store = get_global_host_weight_store()
-    host = store.source(slot)
-    if tuple(shard.shape) != tuple(host.shape) or shard.dtype != host.dtype:
+    copy_source = store.source(slot)
+    if tuple(shard.shape) != tuple(copy_source.shape) or shard.dtype != copy_source.dtype:
         raise RuntimeError(
             f"magi::h2d_load slot {slot} ({store.name_of(slot)!r}) is "
-            f"{tuple(host.shape)} {host.dtype}, but the graph asked for "
+            f"{tuple(copy_source.shape)} {copy_source.dtype}, but the graph asked for "
             f"{tuple(shard.shape)} {shard.dtype}. The compiled artifact's slot "
             "ids do not match this process's host weight store."
         )
@@ -71,16 +71,16 @@ def _h2d_load(shard: torch.Tensor, slot: int) -> torch.Tensor:
     slot = resolve_slot(slot)
     _check_shard(shard, slot)
     store = get_global_host_weight_store()
-    host = store.source(slot)
+    copy_source = store.source(slot)
     # Allocate on the consuming compute stream;
     # record_stream below prevents reuse while the H2D stream is still writing.
-    out = torch.empty(host.shape, dtype=host.dtype, device=shard.device)
+    out = torch.empty(copy_source.shape, dtype=copy_source.dtype, device=shard.device)
 
     if store.is_resident(slot):
         # D2D runs on the compute stream without a Work; wait_tensor is then a no-op.
         # Keep a separate output: Inductor may reuse a fallback output's storage,
         # so aliasing the parameter would let a later kernel overwrite its weights.
-        out.copy_(host)
+        out.copy_(copy_source)
         return out
 
     stream = h2d_stream()
@@ -88,7 +88,7 @@ def _h2d_load(shard: torch.Tensor, slot: int) -> torch.Tensor:
     # the H2D stream must wait for the compute stream before writing it.
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        out.copy_(host, non_blocking=True)
+        out.copy_(copy_source, non_blocking=True)
         event = torch.cuda.Event()
         event.record(stream)
     out.record_stream(stream)

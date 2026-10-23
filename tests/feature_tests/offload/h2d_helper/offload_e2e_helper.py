@@ -30,7 +30,7 @@ Run: torchrun --nproc_per_node=N tests/feature_tests/offload/h2d_helper/offload_
 Markers printed on rank 0 (grepped by the test):
   OFFLOAD_CONFIG world=<n> bucket_mode=<m> host_first=True
   OFFLOAD_LOAD peak_mib=<f> weights_mib=<f>
-  OFFLOAD_FREED mib=<f>  shards=<n>
+  OFFLOAD_FREED mib=<f>  shards=<n>  promoted_mib=<f>  restored_unclaimed=<n>
   OFFLOAD_COMPILED
   OFFLOAD_NUMERIC rel=<f> ok=<bool>
   OFFLOAD_PASS / OFFLOAD_FAIL
@@ -93,6 +93,20 @@ def _fill_shards(model: nn.Module, ref: nn.Module, rank: int, world: int) -> flo
         local.copy_(piece)
         nbytes += local.numel() * local.element_size()
     return nbytes / 2**20
+
+
+def _count_restored_unclaimed(store) -> list[str]:
+    """Record every weight the compile restores because no graph load claimed it."""
+    restored: list[str] = []
+    restore_unclaimed = store.restore_unclaimed
+
+    def _recording_restore_unclaimed(slots):
+        names = restore_unclaimed(slots)
+        restored.extend(names)
+        return names
+
+    store.restore_unclaimed = _recording_restore_unclaimed
+    return restored
 
 
 def main() -> None:
@@ -176,16 +190,18 @@ def main() -> None:
 
     log(f"OFFLOAD_LOAD peak_mib={peak_mib:.2f} weights_mib={weights_mib:.2f}", rank)
 
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
+
+    restored_unclaimed = _count_restored_unclaimed(get_global_host_weight_store())
     with torch.no_grad():
         out = compiled(x)
         torch.cuda.synchronize()
 
-    from magi_compiler.passes.weight_offload import get_global_host_weight_store
-
     if rank == 0:
         print(
-            f"OFFLOAD_FREED mib={get_global_host_weight_store().bound_bytes() / 2**20:.2f} shards={get_global_host_weight_store().num_bound()} "
-            f"promoted_mib={get_global_host_weight_store().resident_bytes() / 2**20:.2f}",
+            f"OFFLOAD_FREED mib={get_global_host_weight_store().offloaded_bytes() / 2**20:.2f} shards={get_global_host_weight_store().num_bound()} "
+            f"promoted_mib={get_global_host_weight_store().resident_bytes() / 2**20:.2f} "
+            f"restored_unclaimed={len(restored_unclaimed)}",
             flush=True,
         )
         if get_global_host_weight_store().num_bound() == 0:

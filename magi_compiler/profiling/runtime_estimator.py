@@ -490,10 +490,10 @@ def _ce_ag_launch_wait(snode: BaseSchedulerNode):
             dtype,
         )
         return None
-    from magi_compiler.passes.snode_utils import is_ce_ag_coalesced
+    from magi_compiler.passes.snode_utils import is_ce_ag_coalesced_ir
     from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER, CE_ALL_GATHER_COALESCED
 
-    if is_ce_ag_coalesced(node):
+    if is_ce_ag_coalesced_ir(node):
         op = CE_ALL_GATHER_COALESCED
         return (lambda: op(shards, group_size, group_name)), lambda outs: [_WAIT(o) for o in outs]
     return (lambda: CE_ALL_GATHER(shards[0], group_size, group_name)), _WAIT

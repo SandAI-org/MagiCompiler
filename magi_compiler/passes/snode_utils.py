@@ -62,22 +62,23 @@ def is_ce_ag_ir(node: ir.Operation | None) -> bool:
     return isinstance(node, ir.ExternKernel) and node.op_overload is not None and node.op_overload in ce_ag_ops()
 
 
-def is_ce_ag_coalesced(node: ir.Operation | None) -> bool:
+def is_ce_ag_coalesced_ir(node: ir.Operation | None) -> bool:
     return isinstance(node, ir.ExternKernel) and node.op_overload is not None and node.op_overload is ce_ag_ops()[1]
 
 
-def is_gather_ir(node: ir.Operation | None) -> bool:
+def is_comm_ir(node: ir.Operation | None) -> bool:
+    """A c10d collective or a copy-engine gather: an IR node that talks to peer GPUs."""
     return node is not None and (is_collective(node) or is_ce_ag_ir(node))
 
 
-def leaf_collective_node(snode: BaseSchedulerNode) -> ir.ExternKernel | None:
-    """The underlying collective IR node for a (possibly grouped) snode, or None."""
-    return next((node for node in iter_ir_nodes(snode) if is_gather_ir(node)), None)
+def leaf_comm_node(snode: BaseSchedulerNode) -> ir.ExternKernel | None:
+    """The underlying comm IR node for a (possibly grouped) snode, or None."""
+    return next((node for node in iter_ir_nodes(snode) if is_comm_ir(node)), None)
 
 
-def issues_transfer(snode: BaseSchedulerNode) -> bool:
-    """True if this snode moves bytes between devices rather than computing."""
-    return contains_collective(snode) or leaf_collective_node(snode) is not None
+def issues_comm(snode: BaseSchedulerNode) -> bool:
+    """True if this snode exchanges bytes with peer GPUs; a host-to-device load is not comm."""
+    return contains_collective(snode) or leaf_comm_node(snode) is not None
 
 
 AG = torch.ops._c10d_functional.all_gather_into_tensor.default
@@ -87,7 +88,7 @@ AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.defau
 def is_all_gather_launch(snode: BaseSchedulerNode) -> bool:
     """An all-gather launch of the shape FSDP gathers weights with -- NCCL or copy
     engine, single or coalesced -- whether or not lowering tagged it as a weight."""
-    node = leaf_collective_node(snode)
+    node = leaf_comm_node(snode)
     op = node.op_overload if node is not None else None
     return op is not None and (op in (AG, AG_COALESCED) or op in ce_ag_ops())
 
@@ -96,7 +97,7 @@ def _tagged_as_weight(snode: BaseSchedulerNode) -> bool:
     # Deferred: fsdp_overlap imports this module.
     from .fsdp_overlap.node_meta import is_weight_ag
 
-    node = leaf_collective_node(snode)
+    node = leaf_comm_node(snode)
     return any(is_weight_ag(o) for o in node.origins or ())
 
 
@@ -121,13 +122,13 @@ def ir_node_bytes(node: ir.IRNode) -> int:
 def is_compute(snode: BaseSchedulerNode) -> bool:
     """True if this snode's runtime is compute a transfer can hide behind.
 
-    A weight load is excluded along with the collectives: counting a PCIe
+    A weight load is excluded along with comm: counting a PCIe
     transfer as compute would spend the same microseconds hiding two transfers.
     """
     # Imported per call: weight_offload's package init imports this module.
     from .weight_offload.schedule.h2d_snode import is_h2d_load
 
-    return not issues_transfer(snode) and not is_h2d_load(snode) and not contains_wait(snode)
+    return not issues_comm(snode) and not is_h2d_load(snode) and not contains_wait(snode)
 
 
 def is_multi_output(snode: BaseSchedulerNode) -> bool:

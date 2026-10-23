@@ -14,15 +14,15 @@
 
 """Placing transfers on one serial resource so compute hides them.
 
-Every task has a duration (``need``), a release (``lower``) and a deadline, one
-stream runs them back to back, and a task should start as LATE as that allows so
-its buffer lives briefly.  ``alap_schedule`` solves that on the time axis (the
-compute prefix sum), where a long kernel's leftover time is simply there for
-the next task.
+Every task has a duration (``required_overlap_ns``), a release
+(``earliest_launch_index``) and a deadline, one stream runs them back to back,
+and a task should start as LATE as that allows so its buffer lives briefly.
+``alap_schedule`` solves that on the time axis (the compute prefix sum), where
+a long kernel's leftover time is simply there for the next task.
 
-A task's ``deadline`` is the first index its transfer has to be done by, so
-``deadline - 1`` is where it sits unhoisted: a load in front of its wait, a
-gather at its own position.
+A task's ``deadline_index`` is the first index its transfer has to be done by,
+so ``deadline_index - 1`` is where it sits unhoisted: a load in front of its
+wait, a gather at its own position.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from .task import TransferTask
 
 def unhoisted_index(task: TransferTask) -> int:
     """Where a task sits when it is not hoisted at all: against its own deadline."""
-    return max(task.lower, task.deadline - 1)
+    return max(task.earliest_launch_index, task.deadline_index - 1)
 
 
 def latest_finish(active: list[TransferTask], prefix: list[float]) -> dict:
@@ -50,9 +50,9 @@ def latest_finish(active: list[TransferTask], prefix: list[float]) -> dict:
     limit = float("inf")
     out: dict = {}
     for task in reversed(active):
-        limit = min(prefix[task.deadline], limit)
+        limit = min(prefix[task.deadline_index], limit)
         out[task.anchor] = limit
-        limit -= task.need
+        limit -= task.required_overlap_ns
     return out
 
 
@@ -70,58 +70,63 @@ def issue_index(prefix: list[float], t_start: float, lo: int, deadline: int, emi
 
 
 def alap_schedule(tasks: list[TransferTask], prefix: list[float], index_of: dict, budget: float) -> dict:
-    """Place active transfers in deadline order on one serial resource.
+    """Place transfers that use the bus in deadline order on one serial resource.
 
-    Reserve each active task's unhoisted live range before moving any task.
+    Reserve each such task's unhoisted live range before moving any task.
     A backward pass computes latest finishes;
     a forward pass places launches within dependency, bus and live-byte limits.
-    Inactive tasks stay put and use no bus time or in-flight budget.
-    Fill target, exposed and budget_bound; return active anchor-to-target indices."""
+    Tasks off the bus stay put and use no bus time or in-flight budget.
+    Fill launch_index, unhidden_transfer_ns and budget_bound;
+    return anchor-to-launch-index for the tasks on the bus."""
     live = InflightMap(budget)
     for task in tasks:
-        if task.inactive:
-            task.exposed = 0.0
-            task.target = None
+        if not task.uses_transfer_bus:
+            task.unhidden_transfer_ns = 0.0
+            task.launch_index = None
             task.budget_bound = False
         else:
-            live.add(unhoisted_index(task), task.last_user, task.nbytes)
+            live.add(unhoisted_index(task), task.last_user_index, task.nbytes)
 
-    active = sorted((t for t in tasks if not t.inactive), key=lambda t: (t.deadline, index_of[t.anchor]))
+    active = sorted((t for t in tasks if t.uses_transfer_bus), key=lambda t: (t.deadline_index, index_of[t.anchor]))
     finish = latest_finish(active, prefix)
 
     targets: dict = {}
     bus_end = 0.0
     emitted = -1
     for task in active:
-        live.remove(unhoisted_index(task), task.last_user, task.nbytes)
-        floor = live.earliest_start(task.last_user, task.nbytes)
-        lo = max(task.lower, floor)
+        live.remove(unhoisted_index(task), task.last_user_index, task.nbytes)
+        floor = live.earliest_start(task.last_user_index, task.nbytes)
+        lo = max(task.earliest_launch_index, floor)
 
         # As late as the deadlines allow, but never before the task is legal to
         # issue; it starts once the resource is free as well.
-        t_issue = max(prefix[lo], finish[task.anchor] - task.need)
+        t_issue = max(prefix[lo], finish[task.anchor] - task.required_overlap_ns)
         t_start = max(t_issue, bus_end)
-        bus_end = t_start + task.need
-        task.exposed = max(0.0, bus_end - prefix[task.deadline])
+        bus_end = t_start + task.required_overlap_ns
+        task.unhidden_transfer_ns = max(0.0, bus_end - prefix[task.deadline_index])
         # The in-flight floor is the limit only when relaxing it would have
         # started the transfer sooner; otherwise the resource was full regardless.
-        task.budget_bound = task.exposed > 0 and prefix[lo] > prefix[task.lower] and prefix[lo] > t_start - task.need
+        task.budget_bound = (
+            task.unhidden_transfer_ns > 0
+            and prefix[lo] > prefix[task.earliest_launch_index]
+            and prefix[lo] > t_start - task.required_overlap_ns
+        )
 
-        at = issue_index(prefix, t_start, lo, task.deadline, emitted)
-        task.target = at
+        at = issue_index(prefix, t_start, lo, task.deadline_index, emitted)
+        task.launch_index = at
         targets[task.anchor] = at
         emitted = at
-        live.add(at, task.last_user, task.nbytes)
+        live.add(at, task.last_user_index, task.nbytes)
     return targets
 
 
 def enforce_monotone(tasks: list[TransferTask]) -> None:
-    """Clamp targets non-decreasing in program order, so cost jitter or
+    """Clamp launch indices non-decreasing in program order, so cost jitter or
     same-slot per-rank indices cannot swap two transfers on one stream."""
     running = -1
     for task in tasks:
-        if task.target is None:
+        if task.launch_index is None:
             continue
-        if task.target < running:
-            task.target = running
-        running = task.target
+        if task.launch_index < running:
+            task.launch_index = running
+        running = task.launch_index

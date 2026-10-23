@@ -30,7 +30,7 @@ from torch._inductor.comms import _is_fake_dep
 from torch._inductor.scheduler import BaseSchedulerNode
 from torch._inductor.utils import contains_wait
 
-from ..snode_utils import earliest_legal_index, is_multi_output, issues_transfer, validate_topological_order
+from ..snode_utils import earliest_legal_index, is_multi_output, issues_comm, validate_topological_order
 
 Classify = Callable[[BaseSchedulerNode], "tuple[str | None, bool]"]
 
@@ -76,9 +76,6 @@ class SnodeGraph:
         casts, pads.  A real collective is not prep; it has a plan of its own.
         A producer left out raises the transfer's legal floor instead.
         """
-        # Deferred: weight_offload's package init imports this one.
-        from ..weight_offload.schedule.h2d_snode import is_h2d_load
-
         members = set(group)
         stack = list(members)
         reached: set[BaseSchedulerNode] = set()
@@ -86,7 +83,7 @@ class SnodeGraph:
             for prod in self.real_producers(stack.pop()):
                 if prod is None or prod in members or prod in reached:
                     continue
-                if issues_transfer(prod) and not is_h2d_load(prod):
+                if issues_comm(prod):
                     continue
                 reached.add(prod)
                 stack.append(prod)
@@ -141,17 +138,20 @@ class SnodeGraph:
     def rebuild(self, tasks) -> list[BaseSchedulerNode]:
         """Apply every placed task in ONE stable sort.
 
-        Targets live in the original index space, so incremental moves would
-        shift them.  A task's group sorts to ``target - 0.5`` -- just before the
-        node originally at ``target`` -- members keep their internal order, and
-        everything else keeps its original index.  Tasks with no target stay put;
-        a snode in two groups follows the earlier task (``tasks`` in program order).
+        Launch indices live in the original index space, so incremental moves would
+        shift them.  A task's moving nodes sort to ``launch_index - 0.5`` -- just
+        before the node originally at ``launch_index`` -- members keep their internal
+        order, and everything else keeps its original index.  Tasks with no launch
+        index stay put; a snode moving with two tasks follows the earlier one
+        (``tasks`` in program order).
         """
-        member_target = {m: t.target for t in reversed(tasks) if t.target is not None for m in t.group}
+        member_launch_index = {
+            m: t.launch_index for t in reversed(tasks) if t.launch_index is not None for m in t.moving_nodes
+        }
         index_of = self.index_of
 
         def _key(s):
-            target = member_target.get(s)
-            return (target - 0.5, index_of[s]) if target is not None else (index_of[s], 0.0)
+            launch_index = member_launch_index.get(s)
+            return (launch_index - 0.5, index_of[s]) if launch_index is not None else (index_of[s], 0.0)
 
         return sorted(self.order, key=_key)

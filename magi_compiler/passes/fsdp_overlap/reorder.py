@@ -36,13 +36,7 @@ from magi_compiler.passes.overlap import (
     enforce_monotone,
     rank_sync,
 )
-from magi_compiler.passes.snode_utils import (
-    AG_COALESCED,
-    is_ce_ag_coalesced,
-    is_ce_ag_ir,
-    leaf_collective_node,
-    weight_gathers,
-)
+from magi_compiler.passes.snode_utils import AG_COALESCED, is_ce_ag_coalesced_ir, is_ce_ag_ir, leaf_comm_node, weight_gathers
 from magi_compiler.utils import magi_logger
 
 
@@ -59,7 +53,7 @@ class FsdpOverlapReorder(OverlapPass):
     ) -> None:
         super().__init__(cost_fn)
         self.comm_overlap_window_margin_ns = comm_overlap_window_margin_ns
-        # need = comm * scale + margin: collectives are measured in isolation but
+        # required_overlap_ns = comm * scale + margin: collectives are measured in isolation but
         # run concurrent with the compute that hides them.
         self.comm_overlap_window_scale = comm_overlap_window_scale
 
@@ -84,20 +78,20 @@ class FsdpOverlapReorder(OverlapPass):
             if not self._has_real_consumer(group, graph, cost):
                 continue
             comm = cost(launch)
-            lower = graph.earliest_legal_index(group)
+            earliest_launch_index = graph.earliest_legal_index(group)
             if mode == "pinned":
                 # No skeleton to negotiate against: keep the AG between the same two
                 # NCCL-issuing snodes it already sat between.
-                lower = rank_sync.raise_lower_for_nccl_barriers(lower, index_of[launch], order)
+                earliest_launch_index = rank_sync.raise_lower_for_nccl_barriers(earliest_launch_index, index_of[launch], order)
             # A gather is never delayed past where it already sits: its own
             # position is the unhoisted one, so the deadline is the next index.
             tasks.append(
                 TransferTask(
                     anchor=launch,
-                    group=group,
-                    lower=lower,
-                    deadline=index_of[launch] + 1,
-                    need=comm * self.comm_overlap_window_scale + self.comm_overlap_window_margin_ns,
+                    moving_nodes=group,
+                    earliest_launch_index=earliest_launch_index,
+                    deadline_index=index_of[launch] + 1,
+                    required_overlap_ns=comm * self.comm_overlap_window_scale + self.comm_overlap_window_margin_ns,
                 )
             )
         return tasks
@@ -105,7 +99,7 @@ class FsdpOverlapReorder(OverlapPass):
     def place(self, graph: SnodeGraph, cost: CostView, tasks: list[TransferTask], ctx: dict) -> None:
         # A group member (the shard prep above all) is rebuilt ahead of its own
         # launch, out of every window it sits in now: it hides no gather.
-        moving = {m for t in tasks for m in t.group}
+        moving = {m for t in tasks for m in t.moving_nodes}
         full = cost
         cost = CostView(lambda s: 0.0 if s in moving else full(s))
         # No in-flight byte budget on gathers.
@@ -126,7 +120,7 @@ class FsdpOverlapReorder(OverlapPass):
         return committed
 
     def report(self, graph: SnodeGraph, cost: CostView, tasks: list[TransferTask], committed: bool, ctx: dict) -> None:
-        moved = sum(1 for t in tasks if graph.index_of[t.anchor] != t.target) if committed else 0
+        moved = sum(1 for t in tasks if graph.index_of[t.anchor] != t.launch_index) if committed else 0
         magi_logger.info("FSDP overlap reorder: repositioned %d/%d weight all-gather launch(es)", moved, len(ctx["launches"]))
 
     # -- group detection --------------------------------------------------
@@ -139,8 +133,8 @@ class FsdpOverlapReorder(OverlapPass):
         Always plus the upstream shard prep (see ``SnodeGraph.prep_chain``).
         """
         group = [launch]
-        node = leaf_collective_node(launch)
-        if node is not None and (node.op_overload is AG_COALESCED or is_ce_ag_coalesced(node)):
+        node = leaf_comm_node(launch)
+        if node is not None and (node.op_overload is AG_COALESCED or is_ce_ag_coalesced_ir(node)):
             group.extend(graph.unpacks_of(launch))
         if is_ce_ag_ir(node):
             produced = set(launch.get_buffer_names())

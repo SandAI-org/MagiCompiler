@@ -60,9 +60,9 @@ _DENSITY_SEARCH_ROUNDS = 8
 class LoadPlan(TransferTask):
     """One load's placement problem: how much transfer to hide, and where it may go.
 
-    ``anchor`` is the load, ``deadline`` its earliest wait (the hard upper
-    bound), and ``inactive`` means bought out of the offload plan: resident, so
-    the transfer is now device-to-device and off the bus.
+    ``anchor`` is the load, ``deadline_index`` its earliest wait (the hard upper
+    bound), and ``uses_transfer_bus=False`` means bought out of the offload plan:
+    resident, so the transfer is now device-to-device and off the bus.
     """
 
     slot: int = field(kw_only=True)  # host-pool slot this load pulls
@@ -130,18 +130,18 @@ class H2dLoadReorder(OverlapPass):
                 magi_logger.debug("h2d load reorder: %s has no wait; leaving it in place", load.get_name())
                 continue
             nbytes = load_bytes(group)
-            need = nbytes / self.bandwidth_bytes_per_ns * self.window_scale + self.window_margin_ns
+            required_overlap_ns = nbytes / self.bandwidth_bytes_per_ns * self.window_scale + self.window_margin_ns
             plans.append(
                 LoadPlan(
                     anchor=load,
-                    group=group,
+                    moving_nodes=group,
                     slot=slot_of(load),
-                    deadline=min(index_of[w] for w in waits),
-                    last_user=graph.last_user_index(group, waits),
-                    need=need,
-                    lower=graph.earliest_legal_index(group),
+                    deadline_index=min(index_of[w] for w in waits),
+                    last_user_index=graph.last_user_index(group, waits),
+                    required_overlap_ns=required_overlap_ns,
+                    earliest_launch_index=graph.earliest_legal_index(group),
                     nbytes=nbytes,
-                    exposed=need,
+                    unhidden_transfer_ns=required_overlap_ns,
                 )
             )
         return plans
@@ -164,7 +164,7 @@ class H2dLoadReorder(OverlapPass):
 
     def _hideable_bytes(self, plans, prefix) -> float:
         """Compute after the last load deadline cannot hide any weight transfer."""
-        last_wait = max(p.deadline for p in plans)
+        last_wait = max(p.deadline_index for p in plans)
         return self.bus_utilization * prefix[min(last_wait, len(prefix) - 1)] * self.bandwidth_bytes_per_ns
 
     def _budget_splits(self, plans):
@@ -199,7 +199,7 @@ class H2dLoadReorder(OverlapPass):
         for resident_budget, inflight_budget in self._budget_splits(plans):
             promoted, spent = self._select_resident(plans, prefix, resident_budget)
             targets = self._sweep(plans, order, index_of, prefix, promoted, inflight_budget)
-            exposed = sum(p.exposed for p in plans)
+            exposed = sum(p.unhidden_transfer_ns for p in plans)
             if best is None or exposed < best[0] - 1e-9:
                 best = (exposed, targets, inflight_budget, promoted)
             # Only an in-flight shortage is worth buying more in-flight room for;
@@ -210,7 +210,12 @@ class H2dLoadReorder(OverlapPass):
         _, targets, inflight_budget, promoted = best
         # Re-run the winner so the plans carry its placement, not the last try's.
         targets = self._sweep(plans, order, index_of, prefix, promoted, inflight_budget)
-        self._log_shortfall(total, hideable, sum(p.nbytes for p in plans if p.inactive), sum(p.exposed for p in plans))
+        self._log_shortfall(
+            total,
+            hideable,
+            sum(p.nbytes for p in plans if not p.uses_transfer_bus),
+            sum(p.unhidden_transfer_ns for p in plans),
+        )
         return targets, inflight_budget
 
     def _select_resident_at(self, plans, prefix, resident_budget, density) -> tuple[set, int, bool]:
@@ -222,10 +227,10 @@ class H2dLoadReorder(OverlapPass):
         on_bus: list = []
         kept = spent = 0
         feasible = True
-        for plan in sorted(plans, key=lambda p: (p.deadline, -p.nbytes)):
+        for plan in sorted(plans, key=lambda p: (p.deadline_index, -p.nbytes)):
             kept += plan.nbytes
             on_bus.append(plan)
-            allowance = rate * prefix[min(plan.deadline, len(prefix) - 1)]
+            allowance = rate * prefix[min(plan.deadline_index, len(prefix) - 1)]
             while kept > allowance:
                 pick = self._best_fit(on_bus, kept - allowance, resident_budget - spent)
                 if pick is None:
@@ -268,7 +273,7 @@ class H2dLoadReorder(OverlapPass):
         """Resident loads stay in place and consume neither bus time nor in-flight budget.
         Their bytes are already charged to residency; other loads use deadline order."""
         for plan in plans:
-            plan.inactive = plan.anchor in promoted
+            plan.uses_transfer_bus = plan.anchor not in promoted
         return alap_schedule(plans, prefix, index_of, budget)
 
     # -- committing --------------------------------------------------------
@@ -276,16 +281,16 @@ class H2dLoadReorder(OverlapPass):
     def _promote(plans) -> int:
         from ..runtime.host_weights import get_global_host_weight_store
 
-        return get_global_host_weight_store().make_resident_many([p.slot for p in plans if p.inactive])
+        return get_global_host_weight_store().make_resident_many([p.slot for p in plans if not p.uses_transfer_bus])
 
     # -- reporting --------------------------------------------------------
     def _report(self, plans, targets, index_of, given_back, budget) -> None:
-        resident = [p for p in plans if p.inactive]
-        exposed = sum(p.exposed for p in plans)
-        by_budget = sum(p.exposed for p in plans if p.budget_bound)
+        resident = [p for p in plans if not p.uses_transfer_bus]
+        exposed = sum(p.unhidden_transfer_ns for p in plans)
+        by_budget = sum(p.unhidden_transfer_ns for p in plans if p.budget_bound)
         inflight = inflight_peak(plans, live_starts(plans, targets, index_of))
         moved = sum(1 for load, target in targets.items() if target != index_of[load])
-        on_bus = sum(p.nbytes for p in plans if not p.inactive)
+        on_bus = sum(p.nbytes for p in plans if p.uses_transfer_bus)
         magi_logger.info(
             "h2d load reorder: promoted %.1f MiB; resident loads=%d; bus=%.1f MiB at %.1f GB/s; "
             "Hoisted %d/%d load(s); in-flight peak %.1f MiB of the %.0f MiB budget; "
