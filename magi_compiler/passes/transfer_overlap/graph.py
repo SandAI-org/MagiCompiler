@@ -18,7 +18,7 @@ Every question a placement asks of the graph -- who reads this buffer, where
 may this group legally go, is the rebuilt order still topological -- is asked
 against REAL data dependencies only.  Inductor's fake ``WeakDep`` edges order
 collectives on the comm stream; they are advisory, and the passes exist to
-cross them (see ``snode_utils.earliest_legal_index``).
+cross them (see ``SnodeGraph.earliest_legal_index``).
 """
 
 from __future__ import annotations
@@ -30,7 +30,9 @@ from torch._inductor.comms import _is_fake_dep
 from torch._inductor.scheduler import BaseSchedulerNode
 from torch._inductor.utils import contains_wait
 
-from ..snode_utils import earliest_legal_index, is_multi_output, issues_comm, validate_topological_order
+from magi_compiler.utils import magi_logger
+
+from ..snode_utils import is_multi_output, issues_comm
 
 UserClassifier = Callable[[BaseSchedulerNode], "tuple[str | None, bool]"]
 
@@ -103,16 +105,41 @@ class SnodeGraph:
     def earliest_legal_index(
         self, moving_nodes: Iterable[BaseSchedulerNode], *, ignored_producers: Iterable[BaseSchedulerNode] = ()
     ) -> int:
-        return earliest_legal_index(
-            moving_nodes=moving_nodes,
-            original_index_by_node=self.original_index_by_node,
-            producer_by_buffer=self.producer_by_buffer,
-            ignored_producers=ignored_producers,
-        )
+        """First boundary after external data producers, excluding ``ignored_producers``."""
+        excluded_nodes = set(moving_nodes) | set(ignored_producers)
+        earliest_index = 0
+        for node in moving_nodes:
+            for dependency in node.unmet_dependencies:  # buffer dependencies
+                if _is_fake_dep(dependency):  # WeakDep / StarDep -- ordering hint, not data
+                    continue
+                producer = self.producer_by_buffer.get(dependency.name)
+                if producer is None or producer in excluded_nodes:
+                    continue
+                earliest_index = max(earliest_index, self.original_index_by_node.get(producer, 0) + 1)
+        return earliest_index
 
     def is_topological_order(self, new_order: list[BaseSchedulerNode]) -> bool:
         """Whether every real producer still precedes its readers in ``new_order``."""
-        return validate_topological_order(new_order, self.producer_by_buffer)
+        new_index_by_node = {node: index for index, node in enumerate(new_order)}
+        for node in new_order:
+            node_index = new_index_by_node[node]
+            for dependency in node.unmet_dependencies:  # buffer dependencies
+                if _is_fake_dep(dependency):  # WeakDep / StarDep -- advisory ordering, not data
+                    continue
+                producer = self.producer_by_buffer.get(dependency.name)
+                if producer is node:  # fused snode may name its own internal buffers
+                    continue
+                if producer is not None and new_index_by_node.get(producer, -1) >= node_index:
+                    magi_logger.debug(
+                        "validate fail: %s@%d needs buffer-dep %s@%d (buf %s)",
+                        node.get_name(),
+                        node_index,
+                        producer.get_name(),
+                        new_index_by_node.get(producer, -1),
+                        dependency.name,
+                    )
+                    return False
+        return True
 
     def collect_classified_users(
         self, start: Iterable[BaseSchedulerNode], classify: UserClassifier

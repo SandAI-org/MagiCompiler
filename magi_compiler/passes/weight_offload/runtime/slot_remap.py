@@ -37,22 +37,22 @@ def resolve_runtime_host_slot(slot: int) -> int:
     Identity when no remap is installed -- compile-time loads and a cache miss
     both mint and bake the same integers.
     """
-    remap = _ACTIVE_SLOT_REMAP.get()
-    if remap is None:
+    current_slot_by_cached_slot = _ACTIVE_SLOT_REMAP.get()
+    if current_slot_by_cached_slot is None:
         return slot
     try:
-        return remap[slot]
+        return current_slot_by_cached_slot[slot]
     except KeyError:
         raise RuntimeError(
             f"magi::h2d_load got baked slot {slot} which is not in this artifact's "
-            f"remap {sorted(remap)}. The compiled graph's slot ids do not match the sidecar."
+            f"remap {sorted(current_slot_by_cached_slot)}. The compiled graph's slot ids do not match the sidecar."
         ) from None
 
 
 @contextmanager
-def using_slot_remap(remap: dict[int, int] | None) -> Iterator[None]:
+def using_slot_remap(current_slot_by_cached_slot: dict[int, int] | None) -> Iterator[None]:
     """Install ``baked -> current`` for the duration of a loaded compiled graph."""
-    token = _ACTIVE_SLOT_REMAP.set(remap)
+    token = _ACTIVE_SLOT_REMAP.set(current_slot_by_cached_slot)
     try:
         yield
     finally:

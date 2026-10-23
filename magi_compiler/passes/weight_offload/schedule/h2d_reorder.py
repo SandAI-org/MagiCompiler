@@ -35,7 +35,7 @@ from torch._inductor.scheduler import BaseSchedulerNode
 
 from magi_compiler.utils import magi_logger
 
-from ...overlap import (
+from ...transfer_overlap import (
     DEFAULT_WINDOW_MARGIN_NS,
     CostView,
     OverlapCallState,

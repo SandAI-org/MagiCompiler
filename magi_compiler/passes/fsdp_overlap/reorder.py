@@ -28,7 +28,14 @@ from torch._inductor.comms import _is_fake_dep
 from torch._inductor.scheduler import BaseSchedulerNode
 from torch._inductor.utils import contains_wait
 
-from magi_compiler.passes.overlap import (
+from magi_compiler.passes.snode_utils import (
+    COALESCED_ALL_GATHER_OP,
+    is_ce_ag_coalesced_ir,
+    is_ce_ag_ir,
+    leaf_comm_node,
+    weight_gathers,
+)
+from magi_compiler.passes.transfer_overlap import (
     DEFAULT_WINDOW_MARGIN_NS,
     CostView,
     OverlapCallState,
@@ -38,13 +45,6 @@ from magi_compiler.passes.overlap import (
     enforce_launch_order,
     rank_sync,
     schedule_transfers_alap,
-)
-from magi_compiler.passes.snode_utils import (
-    COALESCED_ALL_GATHER_OP,
-    is_ce_ag_coalesced_ir,
-    is_ce_ag_ir,
-    leaf_comm_node,
-    weight_gathers,
 )
 from magi_compiler.utils import magi_logger
 
@@ -146,13 +146,13 @@ class FsdpOverlapReorder(OverlapPass):
         launch_index_by_anchor = schedule_result.launch_index_by_anchor
         if call_state.world_size > 1 and call_state.placement_mode != "pinned":
             launch_index_by_anchor = rank_sync.align_collective_slots(
-                call_state.launches,
-                {t.anchor: t for t in tasks},
-                launch_index_by_anchor,
-                call_state.collective_indices,
-                graph.original_index_by_node,
-                call_state.sync_group,
-                call_state.world_size,
+                anchors_in_order=call_state.launches,
+                task_by_anchor={task.anchor: task for task in tasks},
+                launch_index_by_anchor=launch_index_by_anchor,
+                collective_indices=call_state.collective_indices,
+                original_index_by_node=graph.original_index_by_node,
+                sync_group=call_state.sync_group,
+                world_size=call_state.world_size,
             )
         return enforce_launch_order(tasks, launch_index_by_anchor)
 

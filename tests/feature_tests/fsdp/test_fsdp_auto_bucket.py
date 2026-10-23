@@ -138,7 +138,7 @@ def test_each_process_group_gets_its_own_fit(monkeypatch):
     pooling their timings must not underprice collective transfers."""
     from magi_compiler.passes.fsdp_overlap import auto_bucket
     from magi_compiler.passes.fsdp_overlap.ir_coalesce import GatherInfo
-    from magi_compiler.passes.overlap import CostView
+    from magi_compiler.passes.transfer_overlap import CostView
 
     class _Gather:
         def __init__(self, group, group_size, local_mib, us_per_gathered_mib, fixed_us):
@@ -247,7 +247,7 @@ def test_weight_gathers_prefer_tags_and_fallback_to_all():
 def test_collective_signature_includes_weight_tag_and_dtype():
     """Slot mode, which auto-bucket requires, compares these keys; rank 0's bucket
     indices only name the same collectives on a peer whose keys match."""
-    from magi_compiler.passes.overlap.rank_sync import _collective_signature
+    from magi_compiler.passes.transfer_overlap.rank_sync import _collective_signature
 
     bf16 = _gather_snode(tagged=True)
     assert _collective_signature(bf16, True) == _collective_signature(_gather_snode(tagged=True), True)

@@ -118,9 +118,9 @@ def _install_coalesce_test_hooks(bucket_member_count: int, diverge: bool = False
     ``diverge``: ranks other than 0 drop their last planned bucket, standing in
     for a plan flipped by per-rank cost noise; rank 0's plan must still win.
     """
-    from magi_compiler.magi_backend import weight_pipeline
+    from magi_compiler.magi_backend import weight_transfer_pipeline
 
-    original_build_passes = weight_pipeline.build_scheduler_passes
+    original_build_passes = weight_transfer_pipeline.build_transfer_overlap_passes
 
     def build_test_passes(**kwargs):
         passes = original_build_passes(**kwargs)
@@ -128,7 +128,7 @@ def _install_coalesce_test_hooks(bucket_member_count: int, diverge: bool = False
             passes.insert(1, FixedSizeCoalesce(bucket_member_count))
         return passes
 
-    weight_pipeline.build_scheduler_passes = build_test_passes
+    weight_transfer_pipeline.build_transfer_overlap_passes = build_test_passes
 
     from magi_compiler.passes.fsdp_overlap import auto_bucket
 

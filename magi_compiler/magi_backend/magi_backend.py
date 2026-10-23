@@ -44,7 +44,7 @@ from .cuda_graph_mgr import gen_wrap_func_for_cudagraph
 from .partition_rules import resolve_defined_ops
 from .piecewise_backend import PiecewiseBackend
 from .piecewise_compiler import CompilerInterface, EagerAdaptor, InductorStandaloneAdaptor
-from .weight_pipeline import WeightPipeline
+from .weight_transfer_pipeline import WeightTransferPipeline
 
 compilation_start_time: float = 0.0
 
@@ -125,7 +125,7 @@ class CompilerManager:
 
         self.cache_dir: Path = cache_dir
         self.cache_file_path: Path = cache_dir / "subgraph_indices.py"
-        self.offload_cache.reset_for_cache_directory(cache_dir)
+        self.offload_cache.initialize(cache_dir)
 
         if self.disable_cache:
             magi_logger.info("MagiCompiler's cache is disabled.")
@@ -637,9 +637,9 @@ class MagiBackend:
         self.local_magi_cache_path.mkdir(parents=True, exist_ok=True)
         self.compiler_manager.initialize_cache(self.local_magi_cache_path)
 
-    @observe_lifecycle("weight_pipeline")
-    def _apply_weight_pipeline(self, graph: fx.GraphModule, example_inputs) -> None:
-        pipeline = WeightPipeline(
+    @observe_lifecycle("weight_transfer_pipeline")
+    def _apply_weight_transfer_pipeline(self, graph: fx.GraphModule, example_inputs) -> None:
+        weight_transfer_pipeline = WeightTransferPipeline(
             fsdp_config=self.compile_config.fsdp_config,
             offload_config=self.compile_config.offload_config,
             cudagraph_mode=self.compile_config.cudagraph_mode,
@@ -647,7 +647,9 @@ class MagiBackend:
         )
         key = "reorder_for_compute_comm_overlap_passes"
         # Written after _init_cache: the cache hash takes str() of pass objects, which embeds their addresses.
-        passes = pipeline.run(graph, example_inputs, default_passes=self.inductor_compile_config.get(key))
+        passes = weight_transfer_pipeline.rewrite_graph_and_build_scheduler_passes(
+            graph=graph, example_inputs=example_inputs, default_passes=self.inductor_compile_config.get(key)
+        )
         if passes is not None:
             self.inductor_compile_config["reorder_for_compute_comm_overlap"] = True
             self.inductor_compile_config[key] = passes
@@ -732,7 +734,7 @@ class MagiBackend:
 
         # Still whole-graph, but it needs the example inputs and it configures
         # Inductor's scheduling, neither of which a FullGraphPassManager pass does.
-        self._apply_weight_pipeline(graph, example_inputs)
+        self._apply_weight_transfer_pipeline(graph, example_inputs)
 
         split_gm, piecewise_graphs = self._split_graph(graph, example_inputs)
 

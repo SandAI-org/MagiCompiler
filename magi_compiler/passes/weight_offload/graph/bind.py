@@ -54,7 +54,7 @@ def _candidate_key(candidate: OffloadCandidate) -> tuple:
 
 
 def _collect_candidate_sync_groups(
-    candidates: list[OffloadCandidate], placeholder_examples: Mapping[str, Any]
+    candidates: list[OffloadCandidate], example_value_by_placeholder_name: Mapping[str, Any]
 ) -> dict[int, Any]:
     """Process groups this rank must enter, even if collect found nothing there.
 
@@ -63,7 +63,7 @@ def _collect_candidate_sync_groups(
     peers are waiting on.
     """
     process_groups_by_id: dict[int, Any] = {}
-    for obj in placeholder_examples.values():
+    for obj in example_value_by_placeholder_name.values():
         process_group = parameter_mesh_group(obj)
         if process_group is not None:
             process_groups_by_id[id(process_group)] = process_group
@@ -74,7 +74,7 @@ def _collect_candidate_sync_groups(
 
 
 def _intersect_rank_candidates(
-    candidates: list[OffloadCandidate], placeholder_examples: Mapping[str, Any], skip_counts: Counter
+    candidates: list[OffloadCandidate], example_value_by_placeholder_name: Mapping[str, Any], skip_counts: Counter
 ) -> list[OffloadCandidate]:
     """Keep the candidates every rank in each shard group also planned.
 
@@ -86,18 +86,20 @@ def _intersect_rank_candidates(
     if not (dist.is_available() and dist.is_initialized()):
         return candidates
 
-    process_groups_by_id = _collect_candidate_sync_groups(candidates=candidates, placeholder_examples=placeholder_examples)
+    process_groups_by_id = _collect_candidate_sync_groups(
+        candidates=candidates, example_value_by_placeholder_name=example_value_by_placeholder_name
+    )
     if not process_groups_by_id:
         return candidates
 
-    candidates_by_group: dict[int, list[OffloadCandidate]] = {group_id: [] for group_id in process_groups_by_id}
+    candidates_by_group_id: dict[int, list[OffloadCandidate]] = {group_id: [] for group_id in process_groups_by_id}
     for candidate in candidates:
-        if candidate.process_group is not None and id(candidate.process_group) in candidates_by_group:
-            candidates_by_group[id(candidate.process_group)].append(candidate)
+        if candidate.process_group is not None and id(candidate.process_group) in candidates_by_group_id:
+            candidates_by_group_id[id(candidate.process_group)].append(candidate)
 
     kept_candidate_ids: set[int] = set()
     for group_id, process_group in process_groups_by_id.items():
-        group_candidates = candidates_by_group[group_id]
+        group_candidates = candidates_by_group_id[group_id]
         candidate_keys = [_candidate_key(candidate) for candidate in group_candidates]
         world_size = dist.get_world_size(process_group)
         keys_by_rank: list[Any] = [None] * world_size
@@ -141,13 +143,15 @@ def bind_host_slots_to_graph(graph: fx.GraphModule, example_inputs: Sequence[Any
     Returns how many weights are now served from host memory.
     """
     placeholders = graph.graph.find_nodes(op="placeholder")
-    placeholder_examples: Mapping[str, Any] = dict(zip((n.name for n in placeholders), example_inputs or ()))
+    example_value_by_placeholder_name: Mapping[str, Any] = dict(zip((n.name for n in placeholders), example_inputs or ()))
 
-    candidates, skip_counts = source.collect_candidates(graph=graph, placeholder_examples=placeholder_examples)
+    candidates, skip_counts = source.collect_candidates(
+        graph=graph, example_value_by_placeholder_name=example_value_by_placeholder_name
+    )
 
     # Before the empty check, so every rank still enters each of its groups.
     agreed_candidates = _intersect_rank_candidates(
-        candidates=candidates, placeholder_examples=placeholder_examples, skip_counts=skip_counts
+        candidates=candidates, example_value_by_placeholder_name=example_value_by_placeholder_name, skip_counts=skip_counts
     )
     if not agreed_candidates:
         magi_logger.info("host offload: nothing to offload (%s)", _format_skip_reasons(skip_counts))
@@ -176,10 +180,10 @@ def insert_h2d_loads(graph: fx.GraphModule) -> int:
 
     Returns how many load nodes were inserted.
     """
-    node_indices = {n: i for i, n in enumerate(graph.graph.nodes)}
+    original_index_by_node = {n: i for i, n in enumerate(graph.graph.nodes)}
     weight_nodes = [n for n in graph.graph.nodes if host_slot(n) is not None]
     inserted_load_count = sum(
-        _insert_weight_load(graph=graph, weight_node=h, host_slot=host_slot(h), node_indices=node_indices)
+        _insert_weight_load(graph=graph, weight_node=h, host_slot=host_slot(h), original_index_by_node=original_index_by_node)
         for h in weight_nodes
     )
 
@@ -190,7 +194,7 @@ def insert_h2d_loads(graph: fx.GraphModule) -> int:
     return inserted_load_count
 
 
-def _insert_weight_load(graph: fx.GraphModule, weight_node: fx.Node, host_slot: int, node_indices) -> int:
+def _insert_weight_load(graph: fx.GraphModule, weight_node: fx.Node, host_slot: int, original_index_by_node) -> int:
     """Insert a load for ``weight_node`` in front of its first reader and re-point its readers at it.
 
     The load has to sit above every reader, so whatever the graph does to the
@@ -202,7 +206,7 @@ def _insert_weight_load(graph: fx.GraphModule, weight_node: fx.Node, host_slot: 
     readers = list(weight_node.users)
     if not readers:
         return 0
-    first_reader = min(readers, key=lambda n: node_indices.get(n, len(node_indices)))
+    first_reader = min(readers, key=lambda n: original_index_by_node.get(n, len(original_index_by_node)))
     example_value = weight_node.meta.get("example_value")
     with graph.graph.inserting_before(first_reader):
         load = graph.graph.call_function(H2D_LOAD, (weight_node, host_slot))

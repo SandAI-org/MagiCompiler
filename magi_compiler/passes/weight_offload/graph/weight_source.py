@@ -71,10 +71,10 @@ def _parameter_name_from_node(node: fx.Node) -> str:
     return ".".join(parts) or raw
 
 
-def _resolve_node_value(graph: fx.GraphModule, node: fx.Node, placeholder_examples: Mapping[str, Any]) -> Any:
+def _resolve_node_value(graph: fx.GraphModule, node: fx.Node, example_value_by_placeholder_name: Mapping[str, Any]) -> Any:
     """The live object a placeholder or get_attr stands for, or None."""
     if node.op == "placeholder":
-        return placeholder_examples.get(node.name)
+        return example_value_by_placeholder_name.get(node.name)
     if node.op == "get_attr":
         obj: Any = graph
         for part in str(node.target).split("."):
@@ -112,7 +112,7 @@ class WeightSource(Protocol):
     """How to find offloadable weights in one flavour of graph."""
 
     def collect_candidates(
-        self, graph: fx.GraphModule, placeholder_examples: Mapping[str, Any]
+        self, graph: fx.GraphModule, example_value_by_placeholder_name: Mapping[str, Any]
     ) -> tuple[list[OffloadCandidate], Counter]:
         """Every candidate, plus counts of why other weights were skipped."""
 
@@ -139,7 +139,7 @@ class PlainParamSource(WeightSource):
     """Discover registered Parameters behind placeholders and get_attr nodes."""
 
     def collect_candidates(
-        self, graph: fx.GraphModule, placeholder_examples: Mapping[str, Any]
+        self, graph: fx.GraphModule, example_value_by_placeholder_name: Mapping[str, Any]
     ) -> tuple[list[OffloadCandidate], Counter]:
         from ..runtime.host_weights import get_global_host_weight_store
 
@@ -149,7 +149,9 @@ class PlainParamSource(WeightSource):
         for node in graph.graph.nodes:
             if node.op not in ("placeholder", "get_attr"):
                 continue
-            parameter_value = _resolve_node_value(graph=graph, node=node, placeholder_examples=placeholder_examples)
+            parameter_value = _resolve_node_value(
+                graph=graph, node=node, example_value_by_placeholder_name=example_value_by_placeholder_name
+            )
             if parameter_value is None:
                 continue
             if not isinstance(parameter_value, torch.nn.Parameter):
@@ -283,7 +285,7 @@ class FsdpShardSource(WeightSource):
     rank 0's adopted plan may mix them on another rank."""
 
     def collect_candidates(
-        self, graph: fx.GraphModule, placeholder_examples: Mapping[str, Any]
+        self, graph: fx.GraphModule, example_value_by_placeholder_name: Mapping[str, Any]
     ) -> tuple[list[OffloadCandidate], Counter]:
         from magi_compiler.passes.fsdp_overlap.node_meta import is_weight_ag
 
@@ -301,7 +303,7 @@ class FsdpShardSource(WeightSource):
                 skip_counts["gather does not reach a to_local(parameter)"] += 1
                 continue
             parameter_value = _resolve_node_value(
-                graph=graph, node=weight_node.args[0], placeholder_examples=placeholder_examples
+                graph=graph, node=weight_node.args[0], example_value_by_placeholder_name=example_value_by_placeholder_name
             )
             if parameter_value is None:
                 skip_counts["graph input has no live parameter behind it"] += 1
@@ -324,7 +326,7 @@ class FsdpShardSource(WeightSource):
 
         self._append_ungathered_candidates(
             graph=graph,
-            placeholder_examples=placeholder_examples,
+            example_value_by_placeholder_name=example_value_by_placeholder_name,
             candidates=candidates,
             skip_counts=skip_counts,
             seen_weight_nodes=seen_weight_nodes,
@@ -332,7 +334,9 @@ class FsdpShardSource(WeightSource):
         return candidates, skip_counts
 
     @staticmethod
-    def _append_ungathered_candidates(graph, placeholder_examples, candidates, skip_counts, seen_weight_nodes) -> None:
+    def _append_ungathered_candidates(
+        graph, example_value_by_placeholder_name, candidates, skip_counts, seen_weight_nodes
+    ) -> None:
         """Collect weight holders without downstream gathers, including replicated weights."""
         for node in graph.graph.nodes:
             if node in seen_weight_nodes or not _is_local_extraction(node) or not node.users:
@@ -340,7 +344,9 @@ class FsdpShardSource(WeightSource):
             parameter_node = _find_parameter_source(node)
             if parameter_node is None or _feeds_a_weight_gather(node):
                 continue
-            parameter_value = _resolve_node_value(graph=graph, node=parameter_node, placeholder_examples=placeholder_examples)
+            parameter_value = _resolve_node_value(
+                graph=graph, node=parameter_node, example_value_by_placeholder_name=example_value_by_placeholder_name
+            )
             if not isinstance(parameter_value, DTensor):
                 continue
             # This holder feeds no weight gather to tag for bucket planning.

@@ -34,6 +34,7 @@ this.
 from __future__ import annotations
 
 import bisect
+from typing import Mapping
 
 import torch
 import torch.distributed as dist
@@ -44,6 +45,7 @@ from magi_compiler.utils import magi_logger
 from magi_compiler.utils.dist_utils import get_cpu_gloo_group
 
 from ..snode_utils import issues_comm, leaf_comm_node, weight_gathers
+from .task import TransferTask
 
 
 def _collective_signature(snode: BaseSchedulerNode, is_weight: bool) -> tuple:
@@ -146,15 +148,21 @@ def any_rank_has_flag(flag: bool) -> bool:
 
 
 def align_collective_slots(
-    anchors_in_order, task_of, launch_index_by_anchor, collective_indices, original_index_by_node, sync_group, world_size
-) -> dict:
+    anchors_in_order: list[BaseSchedulerNode],
+    task_by_anchor: Mapping[BaseSchedulerNode, TransferTask],
+    launch_index_by_anchor: Mapping[BaseSchedulerNode, int],
+    collective_indices: list[int],
+    original_index_by_node: Mapping[BaseSchedulerNode, int],
+    sync_group,
+    world_size: int,
+) -> dict[BaseSchedulerNode, int]:
     """Put each transfer in the same collective slot on every rank (max of desired
     slot and dep floor, then non-decreasing).  Index inside the slot stays local.
 
     A collective slot is a gap between two consecutive collectives of the
     skeleton, not a host-pool slot.  ``anchors_in_order`` lists every candidate
     in program order, planned or not, so the per-rank lists stay aligned;
-    ``task_of`` maps the planned ones, and ``launch_index_by_anchor`` their local
+    ``task_by_anchor`` maps the planned ones, and ``launch_index_by_anchor`` their local
     placement.  Returns the aligned placement.
     """
 
@@ -165,7 +173,7 @@ def align_collective_slots(
     # Per candidate: (the slot this rank wants, the earliest slot its dependencies allow).
     local_slot_bounds = []
     for anchor in anchors_in_order:
-        task = task_of.get(anchor)
+        task = task_by_anchor.get(anchor)
         if task is None:
             # Unplanned: it stays where it is, so it wants its own slot and no earlier one.
             original_slot = collective_slot_of_index(original_index_by_node[anchor])
@@ -183,7 +191,7 @@ def align_collective_slots(
         latest_floor_slot = max(bounds[candidate_index][1] for bounds in slot_bounds_by_rank)
         agreed_slot = max(latest_desired_slot, latest_floor_slot, previous_slot)
         previous_slot = agreed_slot
-        task = task_of.get(anchor)
+        task = task_by_anchor.get(anchor)
         if task is None:
             continue
         local_launch_index = launch_index_by_anchor[anchor]

@@ -33,7 +33,7 @@ import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
 
 from magi_compiler.passes.fsdp_overlap import reorder  # noqa: E402
-from magi_compiler.passes.overlap import rank_sync  # noqa: E402
+from magi_compiler.passes.transfer_overlap import rank_sync  # noqa: E402
 
 
 class FakeCollectiveIR:

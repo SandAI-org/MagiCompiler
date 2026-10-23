@@ -94,13 +94,13 @@ def _scheduler_passes_worker(rank: int, world_size: int, port: str, out_dir: str
     import torch.distributed as dist
 
     from magi_compiler.config import FSDPConfig, OffloadConfig
-    from magi_compiler.magi_backend.weight_pipeline import build_scheduler_passes
+    from magi_compiler.magi_backend.weight_transfer_pipeline import build_transfer_overlap_passes
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = port
     dist.init_process_group("gloo", rank=rank, world_size=world_size)
     try:
-        passes = build_scheduler_passes(
+        passes = build_transfer_overlap_passes(
             fsdp_config=FSDPConfig(),
             offload_config=OffloadConfig(graph_weight_offload=True, offload_h2d_bandwidth_gbps=20.0),
             loads_inserted=rank == 0,
@@ -145,8 +145,10 @@ def test_alignment_resolves_mesh_groups_without_swallowing_errors(dist_1rank, mo
     weight = torch.nn.Parameter(DTensor.from_local(torch.ones(4), device_mesh=mesh, placements=[Replicate()] * ndim))
     examples = {"weight": weight, "plain": torch.nn.Parameter(torch.ones(4)), "activation": torch.ones(4)}
     group = mesh.get_group(mesh_dim=0)
-    assert bind._collect_candidate_sync_groups(candidates=[], placeholder_examples=examples) == {id(group): group}
-    assert bind._intersect_rank_candidates(candidates=[], placeholder_examples=examples, skip_counts=Counter()) == []
+    assert bind._collect_candidate_sync_groups(candidates=[], example_value_by_placeholder_name=examples) == {id(group): group}
+    assert (
+        bind._intersect_rank_candidates(candidates=[], example_value_by_placeholder_name=examples, skip_counts=Counter()) == []
+    )
 
     failure = RuntimeError("mesh group lookup failed")
 
@@ -155,7 +157,7 @@ def test_alignment_resolves_mesh_groups_without_swallowing_errors(dist_1rank, mo
 
     monkeypatch.setattr(mesh, "get_group", fail_group)
     with pytest.raises(RuntimeError, match="mesh group lookup failed") as caught:
-        bind._intersect_rank_candidates(candidates=[], placeholder_examples=examples, skip_counts=Counter())
+        bind._intersect_rank_candidates(candidates=[], example_value_by_placeholder_name=examples, skip_counts=Counter())
     assert caught.value is failure
 
 

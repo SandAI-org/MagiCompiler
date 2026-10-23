@@ -75,7 +75,7 @@ import torch.distributed as dist  # noqa: E402
 
 from magi_compiler.passes import snode_utils  # noqa: E402
 from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder  # noqa: E402
-from magi_compiler.passes.overlap import rank_sync  # noqa: E402
+from magi_compiler.passes.transfer_overlap import rank_sync  # noqa: E402
 
 
 def _mode_ladder_selfcheck(rank: int) -> bool:

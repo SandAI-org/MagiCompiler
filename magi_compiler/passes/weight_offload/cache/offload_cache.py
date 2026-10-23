@@ -48,7 +48,7 @@ class OffloadCache:
         self._graph_slot_table: dict[int, dict[str, Any]] = {}
         self._cached_to_current_slots: dict[int, int] | None = None
 
-    def reset_for_cache_directory(self, cache_dir: Path) -> None:
+    def initialize(self, cache_dir: Path) -> None:
         self.host_slots_path = cache_dir / "host_slots.py"
         self._graph_slot_table = {}
         self._cached_to_current_slots = None
