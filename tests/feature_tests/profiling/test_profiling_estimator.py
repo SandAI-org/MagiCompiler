@@ -673,7 +673,7 @@ def test_leaf_ce_ag_is_none_for_an_ordinary_kernel():
 
 def test_collective_search_preserves_transport_and_child_order():
     """A mixed group must retain distinct native-only and CE-only pricing targets."""
-    from magi_compiler.passes.snode_utils import leaf_collective_node
+    from magi_compiler.passes.snode_utils import leaf_comm_node
 
     ag, _ = _ce_ops()
     ce = _ce_ir(ag, [(8, 4)])
@@ -681,28 +681,28 @@ def test_collective_search_preserves_transport_and_child_order():
     native.op_overload = torch.ops._c10d_functional.all_gather_into_tensor.default
     group = _gather_snode(snodes=[_gather_snode(node=ce), _gather_snode(node=native)])
 
-    assert leaf_collective_node(group) is ce
+    assert leaf_comm_node(group) is ce
     assert _leaf_ce_ag(group) is ce
     assert re_mod._leaf_collective(group) is native
 
 
 def test_collective_search_keeps_one_level_for_nested_foreach():
-    """Foreach.get_nodes() flattens further than the transfer search contract."""
-    from magi_compiler.passes.snode_utils import leaf_collective_node
+    """Foreach.get_nodes() flattens further than the comm search contract."""
+    from magi_compiler.passes.snode_utils import leaf_comm_node
 
     inner = _gather_snode(snodes=[_ce_snode()])
     outer = _gather_snode(snodes=[inner], group_type=ForeachKernelSchedulerNode)
     assert _leaf_ce_ag(inner) is not None
     assert _leaf_ce_ag(outer) is None
-    assert leaf_collective_node(outer) is None
+    assert leaf_comm_node(outer) is None
 
 
 def test_coalesced_gather_is_distinguished_from_a_single_one():
-    from magi_compiler.passes.snode_utils import is_ce_ag_coalesced
+    from magi_compiler.passes.snode_utils import is_ce_ag_coalesced_ir
 
     ag, coalesced = _ce_ops()
-    assert is_ce_ag_coalesced(_ce_ir(coalesced, [(8, 4)]))
-    assert not is_ce_ag_coalesced(_ce_ir(ag, [(8, 4)]))
+    assert is_ce_ag_coalesced_ir(_ce_ir(coalesced, [(8, 4)]))
+    assert not is_ce_ag_coalesced_ir(_ce_ir(ag, [(8, 4)]))
 
 
 def test_ce_ag_label_reports_transport_world_size_and_member_count():

@@ -58,8 +58,8 @@ def stub_predicates(monkeypatch):
     is_wait = lambda s: getattr(s, "kind", None) == "wait"  # noqa: E731
     is_gather = lambda s: getattr(s, "kind", None) == "gather"  # noqa: E731
     monkeypatch.setattr(snode_utils, "contains_wait", is_wait)
-    monkeypatch.setattr(snode_utils, "issues_transfer", is_gather)
-    monkeypatch.setattr(snode_cost, "issues_transfer", is_gather)
+    monkeypatch.setattr(snode_utils, "issues_comm", is_gather)
+    monkeypatch.setattr(snode_cost, "issues_comm", is_gather)
     monkeypatch.setattr(snode_cost, "is_all_gather_launch", is_gather)
 
 

@@ -230,8 +230,9 @@ class FsdpAutoBucket:
         offloaded = any(is_host_offloaded(o) for o in snode.node.origins or ())
         return (info.kind, info.dtype, offloaded)
 
-    def _runs(self, cands: list[BaseSchedulerNode]) -> list[list[BaseSchedulerNode]]:
-        """Consecutive gathers on one group, split by (transport, dtype, host-offloaded).
+    def _partition_compatible_gathers(self, cands: list[BaseSchedulerNode]) -> list[list[BaseSchedulerNode]]:
+        """Split into runs of consecutive gathers on one group, then each run by
+        (transport, dtype, host-offloaded); a partition need not be contiguous within its run.
 
         Transport and dtype because one launch is one op.  Host offload only
         because a resident member would wait for its bucket-mates' host loads.
@@ -297,7 +298,7 @@ class FsdpAutoBucket:
         graph = SnodeGraph(order)
         params_by_group = self._params_by_group(cands, cost)
         buckets: list[list[BaseSchedulerNode]] = []
-        for run in self._runs(cands):
+        for run in self._partition_compatible_gathers(cands):
             params = params_by_group[self._fit_key(gather_info(run[0]))]
             pairs = [(s, self._member(snode=s, graph=graph)) for s in run]
             usable = [(s, m) for s, m in pairs if m is not None]

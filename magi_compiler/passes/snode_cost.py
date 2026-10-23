@@ -31,13 +31,13 @@ from magi_compiler.profiling.runtime_estimator import analytical_ns
 from magi_compiler.utils import magi_logger
 
 from .overlap import rank_sync
-from .snode_utils import is_all_gather_launch, is_compute, issues_transfer
+from .snode_utils import is_all_gather_launch, is_compute, issues_comm
 from .weight_offload.schedule.h2d_snode import is_h2d_load
 
 
 def _is_priced(snode: BaseSchedulerNode) -> bool:
     """The snodes ``SnodeCostProfile`` records; the table warns on a miss for these alone."""
-    return is_compute(snode) or issues_transfer(snode)
+    return is_compute(snode) or issues_comm(snode)
 
 
 class SnodeCostTable:

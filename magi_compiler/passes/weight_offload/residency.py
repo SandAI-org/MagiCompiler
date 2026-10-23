@@ -44,7 +44,7 @@ def record_slots(module: nn.Module, slots: Sequence[int]) -> None:
     setattr(module, _SLOTS_ATTR, tuple(slots))
 
 
-def has_slots(module: nn.Module) -> bool:
+def is_handoff_complete(module: nn.Module) -> bool:
     return hasattr(module, _SLOTS_ATTR)
 
 

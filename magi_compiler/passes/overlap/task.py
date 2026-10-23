@@ -26,18 +26,18 @@ class TransferTask:
     """A transfer to hide behind compute, and where it may go.
 
     Indices are positions in the order the pass received.  A pass declares the
-    problem (``anchor`` .. ``nbytes``); the scheduler fills in the answer
-    (``target`` onward).  Identity-hashed, so a task can key a dict.
+    problem (``anchor`` .. ``uses_transfer_bus``); the scheduler fills in the
+    answer (``launch_index`` onward).  Identity-hashed, so a task can key a dict.
     """
 
     anchor: BaseSchedulerNode  # the snode that issues the transfer
-    group: list  # snodes that move with it, anchor included
-    lower: int  # earliest legal index: 1 + the last real producer
-    deadline: int  # first index the transfer has to be done by; unhoisted it sits at deadline - 1
-    need: float  # ns of compute (or bus) time that fully hides it
+    moving_nodes: list  # snodes that move with it, anchor included
+    earliest_launch_index: int  # 1 + the last real producer
+    deadline_index: int  # first index the transfer has to be done by; unhoisted it sits at deadline_index - 1
+    required_overlap_ns: float  # compute (or bus) time that fully hides it
     nbytes: int = 0
-    last_user: int = -1  # inclusive end of the buffer's live range
-    target: int | None = None  # where the scheduler placed the anchor
-    exposed: float = 0.0  # ns the placement could not hide
-    inactive: bool = False  # left in place and off the resource
+    last_user_index: int = -1  # inclusive end of the buffer's live range
+    uses_transfer_bus: bool = True  # False: left in place, off the bus and the in-flight budget
+    launch_index: int | None = None  # where the scheduler placed the anchor
+    unhidden_transfer_ns: float = 0.0  # what the placement could not hide
     budget_bound: bool = False  # the in-flight budget, not the resource, is what stopped it

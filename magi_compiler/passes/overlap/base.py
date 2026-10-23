@@ -85,7 +85,7 @@ class OverlapPass:
         raise NotImplementedError
 
     def place(self, graph: SnodeGraph, cost: CostView, tasks: list[TransferTask], ctx: dict) -> None:
-        """Set ``target`` on every task that moves."""
+        """Set ``launch_index`` on every task that moves."""
         raise NotImplementedError
 
     def agree(self, ok: bool, ctx: dict) -> bool:

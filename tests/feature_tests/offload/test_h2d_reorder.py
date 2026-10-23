@@ -207,9 +207,9 @@ def test_two_loads_do_not_spend_the_same_compute():
     p._schedule(plans, order, graph.index_of, prefix)
 
     assert len(plans) == 2
-    assert [plan.need for plan in plans] == pytest.approx([629145.6, 629145.6])
-    assert plans[0].exposed == 0
-    assert plans[1].exposed == pytest.approx(258291.2), "the shared bus cannot hide 1.258 ms in 1 ms"
+    assert [plan.required_overlap_ns for plan in plans] == pytest.approx([629145.6, 629145.6])
+    assert plans[0].unhidden_transfer_ns == 0
+    assert plans[1].unhidden_transfer_ns == pytest.approx(258291.2), "the shared bus cannot hide 1.258 ms in 1 ms"
     assert not any(plan.budget_bound for plan in plans), "both buffers fit; the shortage is on the bus"
 
     out = _reorder(order, max_inflight_bytes=12 * _MIB)
@@ -442,8 +442,8 @@ def test_last_user_is_the_consumer_not_the_wait():
     graph = SnodeGraph(order)
     plans = H2dLoadReorder(bandwidth_bytes_per_ns=10.0, window_margin_ns=0.0, cost_fn=lambda s: s.cost)._plan(graph)
     assert len(plans) == 1
-    assert plans[0].deadline == graph.index_of[order[2]]
-    assert plans[0].last_user == graph.index_of[order[3]]
+    assert plans[0].deadline_index == graph.index_of[order[2]]
+    assert plans[0].last_user_index == graph.index_of[order[3]]
 
 
 def test_load_without_a_wait_is_left_alone():
@@ -562,7 +562,7 @@ def test_a_lone_unhideable_load_is_bought_out_only_when_asked():
 
 
 def _equal_boundary_order():
-    """``ld0.last_user`` lands exactly on where ld1 wants to start."""
+    """``ld0.last_user_index`` lands exactly on where ld1 wants to start."""
     return [
         _compute("c0", 5e6),
         _load("ld0", 4),
@@ -607,34 +607,34 @@ def test_adjacent_closed_ranges_both_stay_offloaded():
     assert out.index("user0") < out.index("ld1"), "closed ranges may touch, not overlap"
 
 
-def _plan_stub(name, *, deadline, last_user, nbytes, need=0.0, lower=0, inactive=False):
+def _plan_stub(name, *, deadline_index, last_user_index, nbytes, required_overlap_ns=0.0, resident=False):
     """A ``LoadPlan`` carrying only the fields the memory and pricing helpers read."""
     return LoadPlan(
         anchor=_Snode(name, "load"),
-        group=[],
+        moving_nodes=[],
         slot=0,
-        deadline=deadline,
-        last_user=last_user,
-        need=need,
-        lower=lower,
+        deadline_index=deadline_index,
+        last_user_index=last_user_index,
+        required_overlap_ns=required_overlap_ns,
+        earliest_launch_index=0,
         nbytes=nbytes,
-        exposed=need,
-        inactive=inactive,
+        unhidden_transfer_ns=required_overlap_ns,
+        uses_transfer_bus=not resident,
     )
 
 
 def test_latest_finish_chains_the_deadlines_backwards():
     """A transfer may not end after its own wait, nor after the next one starts."""
     prefix = [0.0, 100.0, 300.0, 600.0, 1000.0]
-    early = _plan_stub("early", deadline=2, last_user=4, nbytes=_MIB, need=100.0)
-    late = _plan_stub("late", deadline=4, last_user=5, nbytes=_MIB, need=250.0)
+    early = _plan_stub("early", deadline_index=2, last_user_index=4, nbytes=_MIB, required_overlap_ns=100.0)
+    late = _plan_stub("late", deadline_index=4, last_user_index=5, nbytes=_MIB, required_overlap_ns=250.0)
 
     limits = scheduler.latest_finish([early, late], prefix)
     assert limits[late.anchor] == 1000.0, "the last one is held only by its own wait"
     assert limits[early.anchor] == 300.0, "its own wait is tighter than 1000 - 250"
 
     # Grow the later transfer until it is what binds the earlier one.
-    late.need = 800.0
+    late.required_overlap_ns = 800.0
     limits = scheduler.latest_finish([early, late], prefix)
     assert limits[early.anchor] == 200.0, "it now has to be done before `late` starts"
 
@@ -658,14 +658,14 @@ def test_peak_counts_a_promoted_weight_twice_where_its_copy_runs():
     ``h2d_load`` copies even a resident slot into a fresh buffer, so a promoted
     weight costs its bytes for the whole graph AND again where its load runs.
     """
-    kept = _plan_stub("kept", deadline=4, last_user=3, nbytes=4 * _MIB)
-    resident = _plan_stub("resident", deadline=11, last_user=11, nbytes=8 * _MIB, inactive=True)
+    kept = _plan_stub("kept", deadline_index=4, last_user_index=3, nbytes=4 * _MIB)
+    resident = _plan_stub("resident", deadline_index=11, last_user_index=11, nbytes=8 * _MIB, resident=True)
     plans = [kept, resident]
     index_of = {kept.anchor: 0, resident.anchor: 10}
 
     assert memory.device_peak(plans, {kept.anchor: 0}, index_of) == 8 * _MIB + 8 * _MIB
 
-    resident.last_user = 3  # its buffer now overlaps the kept load's
+    resident.last_user_index = 3  # its buffer now overlaps the kept load's
     index_of[resident.anchor] = 1
     assert memory.device_peak(plans, {kept.anchor: 0}, index_of) == 8 * _MIB + 12 * _MIB
 
@@ -691,17 +691,17 @@ def test_inflight_peak_counts_closed_interval_touch():
     """Same-index start/end is overlap under a closed interval; peak is the sum."""
 
     class _Fake:
-        def __init__(self, last_user, nbytes):
+        def __init__(self, last_user_index, nbytes):
             self.anchor = object()
-            self.last_user = last_user
+            self.last_user_index = last_user_index
             self.nbytes = nbytes
 
-    earlier = _Fake(last_user=4, nbytes=100)
-    later = _Fake(last_user=7, nbytes=50)
+    earlier = _Fake(last_user_index=4, nbytes=100)
+    later = _Fake(last_user_index=7, nbytes=50)
     peak = memory.inflight_peak([earlier, later], {earlier.anchor: 0, later.anchor: 4})
     assert peak == 150
 
-    later_after = _Fake(last_user=7, nbytes=50)
+    later_after = _Fake(last_user_index=7, nbytes=50)
     peak_adjacent = memory.inflight_peak([earlier, later_after], {earlier.anchor: 0, later_after.anchor: 5})
     assert peak_adjacent == 100
 
