@@ -14,7 +14,7 @@
 
 """Bind parked weights, then insert their graph-side loads.
 
-``bind_weights_to_host`` intersects candidates within each shard group;
+``bind_host_slots_to_graph`` intersects candidates within each shard group;
 it tags the graph without moving bytes. Unsharded parameters need no cross-rank vote.
 ``insert_h2d_loads`` inserts one load/wait pair per tagged holder before all readers.
 The load preserves the stored dtype; existing casts and padding run on the device.
@@ -34,40 +34,47 @@ import torch.fx as fx
 from magi_compiler.utils import magi_logger
 
 from ..node_meta import host_slot, mark_host_offloaded, mark_host_slot
-from .weight_source import OffloadCandidate, WeightSource, mesh_group
+from .weight_source import OffloadCandidate, WeightSource, parameter_mesh_group
 
-_WAIT = torch.ops._c10d_functional.wait_tensor.default
+_WAIT_TENSOR_OP = torch.ops._c10d_functional.wait_tensor.default
 
 
-def _candidate_key(c: OffloadCandidate) -> tuple:
+def _candidate_key(candidate: OffloadCandidate) -> tuple:
     """Identity a peer rank can match without sharing tensor objects.
 
     Name + holder + layout, not the per-process slot integer: ranks vote on
     identity, and each process's pool minted its own slots.
     """
-    return (c.name, c.holder.name, tuple(c.local.shape), str(c.local.dtype))
+    return (
+        candidate.parameter_name,
+        candidate.weight_node.name,
+        tuple(candidate.device_standin.shape),
+        str(candidate.device_standin.dtype),
+    )
 
 
-def _groups_to_sync(plan: list[OffloadCandidate], placeholder_examples: Mapping[str, Any]) -> dict[int, Any]:
+def _collect_candidate_sync_groups(
+    candidates: list[OffloadCandidate], placeholder_examples: Mapping[str, Any]
+) -> dict[int, Any]:
     """Process groups this rank must enter, even if collect found nothing there.
 
     Scanning the graph inputs -- not just the plan -- is what keeps a rank
     that skipped every weight on a mesh from walking past the collective its
     peers are waiting on.
     """
-    groups: dict[int, Any] = {}
+    process_groups_by_id: dict[int, Any] = {}
     for obj in placeholder_examples.values():
-        pg = mesh_group(obj)
-        if pg is not None:
-            groups[id(pg)] = pg
-    for c in plan:
-        if c.group is not None:
-            groups[id(c.group)] = c.group
-    return groups
+        process_group = parameter_mesh_group(obj)
+        if process_group is not None:
+            process_groups_by_id[id(process_group)] = process_group
+    for candidate in candidates:
+        if candidate.process_group is not None:
+            process_groups_by_id[id(candidate.process_group)] = candidate.process_group
+    return process_groups_by_id
 
 
-def _align_across_ranks(
-    plan: list[OffloadCandidate], placeholder_examples: Mapping[str, Any], skipped: Counter
+def _intersect_rank_candidates(
+    candidates: list[OffloadCandidate], placeholder_examples: Mapping[str, Any], skip_counts: Counter
 ) -> list[OffloadCandidate]:
     """Keep the candidates every rank in each shard group also planned.
 
@@ -77,54 +84,54 @@ def _align_across_ranks(
     (unsharded ``nn.Parameter``) does not vote.
     """
     if not (dist.is_available() and dist.is_initialized()):
-        return plan
+        return candidates
 
-    groups = _groups_to_sync(plan, placeholder_examples)
-    if not groups:
-        return plan
+    process_groups_by_id = _collect_candidate_sync_groups(candidates=candidates, placeholder_examples=placeholder_examples)
+    if not process_groups_by_id:
+        return candidates
 
-    by_group: dict[int, list[OffloadCandidate]] = {gid: [] for gid in groups}
-    for c in plan:
-        if c.group is not None and id(c.group) in by_group:
-            by_group[id(c.group)].append(c)
+    candidates_by_group: dict[int, list[OffloadCandidate]] = {group_id: [] for group_id in process_groups_by_id}
+    for candidate in candidates:
+        if candidate.process_group is not None and id(candidate.process_group) in candidates_by_group:
+            candidates_by_group[id(candidate.process_group)].append(candidate)
 
-    keep: set[int] = set()
-    for gid, pg in groups.items():
-        cands = by_group[gid]
-        keys = [_candidate_key(c) for c in cands]
-        world = dist.get_world_size(pg)
-        gathered: list[Any] = [None] * world
-        dist.all_gather_object(gathered, keys, group=pg)
-        common = Counter(keys)
-        for peer in gathered:
-            common &= Counter(peer or [])
-        remaining = common
-        dropped = 0
-        for c, key in zip(cands, keys):
-            if remaining[key] > 0:
-                remaining[key] -= 1
-                keep.add(id(c))
+    kept_candidate_ids: set[int] = set()
+    for group_id, process_group in process_groups_by_id.items():
+        group_candidates = candidates_by_group[group_id]
+        candidate_keys = [_candidate_key(candidate) for candidate in group_candidates]
+        world_size = dist.get_world_size(process_group)
+        keys_by_rank: list[Any] = [None] * world_size
+        dist.all_gather_object(keys_by_rank, candidate_keys, group=process_group)
+        shared_key_counts = Counter(candidate_keys)
+        for peer_candidate_keys in keys_by_rank:
+            shared_key_counts &= Counter(peer_candidate_keys or [])
+        remaining_key_counts = shared_key_counts
+        dropped_count = 0
+        for candidate, candidate_key in zip(group_candidates, candidate_keys):
+            if remaining_key_counts[candidate_key] > 0:
+                remaining_key_counts[candidate_key] -= 1
+                kept_candidate_ids.add(id(candidate))
             else:
-                dropped += 1
-        if dropped:
-            skipped["not planned by every rank in the shard group"] += dropped
+                dropped_count += 1
+        if dropped_count:
+            skip_counts["not planned by every rank in the shard group"] += dropped_count
             magi_logger.warning(
                 "host offload: dropping %d weight(s) not planned by every rank in a %d-rank group; keeping %d",
-                dropped,
-                world,
-                len(cands) - dropped,
+                dropped_count,
+                world_size,
+                len(group_candidates) - dropped_count,
             )
 
-    return [c for c in plan if c.group is None or id(c) in keep]
+    return [candidate for candidate in candidates if candidate.process_group is None or id(candidate) in kept_candidate_ids]
 
 
-def _describe(skipped: Counter) -> str:
-    if not skipped:
+def _format_skip_reasons(skip_counts: Counter) -> str:
+    if not skip_counts:
         return "no candidate was skipped"
-    return "skipped: " + ", ".join(f"{n}x {why}" for why, n in skipped.most_common())
+    return "skipped: " + ", ".join(f"{skip_count}x {skip_reason}" for skip_reason, skip_count in skip_counts.most_common())
 
 
-def bind_weights_to_host(graph: fx.GraphModule, example_inputs: Sequence[Any] | None, source: WeightSource) -> int:
+def bind_host_slots_to_graph(graph: fx.GraphModule, example_inputs: Sequence[Any] | None, source: WeightSource) -> int:
     """Tag already-parked weights on the graph so a later splice can load them.
 
     A weight reaches the pool only through host-first materialization.  This
@@ -136,30 +143,32 @@ def bind_weights_to_host(graph: fx.GraphModule, example_inputs: Sequence[Any] | 
     placeholders = graph.graph.find_nodes(op="placeholder")
     placeholder_examples: Mapping[str, Any] = dict(zip((n.name for n in placeholders), example_inputs or ()))
 
-    plan, skipped = source.collect(graph, placeholder_examples)
+    candidates, skip_counts = source.collect_candidates(graph=graph, placeholder_examples=placeholder_examples)
 
     # Before the empty check, so every rank still enters each of its groups.
-    plan = _align_across_ranks(plan, placeholder_examples, skipped)
-    if not plan:
-        magi_logger.info("host offload: nothing to offload (%s)", _describe(skipped))
+    agreed_candidates = _intersect_rank_candidates(
+        candidates=candidates, placeholder_examples=placeholder_examples, skip_counts=skip_counts
+    )
+    if not agreed_candidates:
+        magi_logger.info("host offload: nothing to offload (%s)", _format_skip_reasons(skip_counts))
         return 0
 
-    for c in plan:
-        mark_host_slot(c.holder, c.slot)
-        if c.tag is not None:
-            mark_host_offloaded(c.tag)
+    for candidate in agreed_candidates:
+        mark_host_slot(candidate.weight_node, candidate.host_slot)
+        if candidate.offload_tag_node is not None:
+            mark_host_offloaded(candidate.offload_tag_node)
 
-    sizes = sorted(c.nbytes for c in plan)
+    weight_sizes_bytes = sorted(candidate.weight_bytes for candidate in agreed_candidates)
     magi_logger.info(
         "host offload: %d weight(s) bound to host slots, %.1f MiB; " "sizes %.1f / %.1f / %.1f MiB (min/median/max); %s",
-        len(plan),
-        sum(c.nbytes for c in plan) / 2**20,
-        sizes[0] / 2**20,
-        sizes[len(sizes) // 2] / 2**20,
-        sizes[-1] / 2**20,
-        _describe(skipped),
+        len(agreed_candidates),
+        sum(candidate.weight_bytes for candidate in agreed_candidates) / 2**20,
+        weight_sizes_bytes[0] / 2**20,
+        weight_sizes_bytes[len(weight_sizes_bytes) // 2] / 2**20,
+        weight_sizes_bytes[-1] / 2**20,
+        _format_skip_reasons(skip_counts),
     )
-    return len(plan)
+    return len(agreed_candidates)
 
 
 def insert_h2d_loads(graph: fx.GraphModule) -> int:
@@ -167,19 +176,22 @@ def insert_h2d_loads(graph: fx.GraphModule) -> int:
 
     Returns how many load nodes were inserted.
     """
-    order = {n: i for i, n in enumerate(graph.graph.nodes)}
-    holders = [n for n in graph.graph.nodes if host_slot(n) is not None]
-    inserted = sum(_splice_load(graph, h, host_slot(h), order) for h in holders)
+    node_indices = {n: i for i, n in enumerate(graph.graph.nodes)}
+    weight_nodes = [n for n in graph.graph.nodes if host_slot(n) is not None]
+    inserted_load_count = sum(
+        _insert_weight_load(graph=graph, weight_node=h, host_slot=host_slot(h), node_indices=node_indices)
+        for h in weight_nodes
+    )
 
-    if inserted:
+    if inserted_load_count:
         graph.graph.lint()
         graph.recompile()
-    magi_logger.info("host offload: inserted %d h2d_load node(s) into the graph", inserted)
-    return inserted
+    magi_logger.info("host offload: inserted %d h2d_load node(s) into the graph", inserted_load_count)
+    return inserted_load_count
 
 
-def _splice_load(graph: fx.GraphModule, holder: fx.Node, slot: int, order) -> int:
-    """Insert a load for ``holder`` in front of its first reader and re-point its readers at it.
+def _insert_weight_load(graph: fx.GraphModule, weight_node: fx.Node, host_slot: int, node_indices) -> int:
+    """Insert a load for ``weight_node`` in front of its first reader and re-point its readers at it.
 
     The load has to sit above every reader, so whatever the graph does to the
     weight still runs on the device; the reorder pass is what places it properly.
@@ -187,18 +199,18 @@ def _splice_load(graph: fx.GraphModule, holder: fx.Node, slot: int, order) -> in
     from ..runtime.h2d_op import H2D_LOAD
     from ..runtime.host_weights import get_global_host_weight_store
 
-    readers = list(holder.users)
+    readers = list(weight_node.users)
     if not readers:
         return 0
-    anchor = min(readers, key=lambda n: order.get(n, len(order)))
-    example = holder.meta.get("example_value")
-    with graph.graph.inserting_before(anchor):
-        load = graph.graph.call_function(H2D_LOAD, (holder, slot))
-        load.meta["example_value"] = example
-        wait = graph.graph.call_function(_WAIT, (load,))
-        wait.meta["example_value"] = example
+    first_reader = min(readers, key=lambda n: node_indices.get(n, len(node_indices)))
+    example_value = weight_node.meta.get("example_value")
+    with graph.graph.inserting_before(first_reader):
+        load = graph.graph.call_function(H2D_LOAD, (weight_node, host_slot))
+        load.meta["example_value"] = example_value
+        wait = graph.graph.call_function(_WAIT_TENSOR_OP, (load,))
+        wait.meta["example_value"] = example_value
     # Everything that read the (now storage-free) weight reads the loaded copy
     # instead -- except the load itself, which still needs it.
-    holder.replace_all_uses_with(wait, delete_user_cb=lambda user: user is not load)
-    get_global_host_weight_store().mark_claimed(slot)
+    weight_node.replace_all_uses_with(wait, delete_user_cb=lambda user: user is not load)
+    get_global_host_weight_store().mark_claimed(host_slot)
     return 1

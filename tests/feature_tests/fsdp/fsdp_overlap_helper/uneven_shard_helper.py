@@ -131,7 +131,7 @@ def _agree(value) -> bool:
     return all(v == seen[0] for v in seen)
 
 
-def _pipeline(gm, *, transport: str) -> None:
+def _apply_weight_pipeline(gm, *, transport: str) -> None:
     """``WeightPipeline.run`` with host offload off, inlined.
 
     Lower, bind, retarget what bound -- the order is what decides transport per
@@ -155,7 +155,7 @@ def _check_transport(mesh, rows: int, *, n: int, cols: int, say) -> bool:
 
     reset_registry()  # each check accounts for its own windows
     gm = _build_graph(mesh, [rows] * n, cols)
-    _pipeline(gm, transport="copy_engine")
+    _apply_weight_pipeline(gm, transport="copy_engine")
     targets = _gather_targets(gm)
     ok = _agree(targets)
     say(f"UNEVEN_TRANSPORT rows={rows} agree={ok} targets={targets}")
@@ -200,7 +200,7 @@ def _check_mixed(mesh, *, even_rows: int, uneven_rows: int, cols: int, say) -> b
 
     reset_registry()
     gm = _build_graph(mesh, [even_rows, uneven_rows, even_rows, uneven_rows], cols)
-    _pipeline(gm, transport="copy_engine")
+    _apply_weight_pipeline(gm, transport="copy_engine")
     targets = _gather_targets(gm)
     ok = _agree(targets) and targets == {"ce": 2, "nccl": 2}
     say(f"UNEVEN_MIXED agree={ok} targets={targets}")
@@ -216,9 +216,9 @@ def main() -> None:
     rank = int(os.environ.get("RANK", "0"))
     torch.cuda.set_device(rank % torch.cuda.device_count())
     dist.init_process_group("nccl")
-    world = dist.get_world_size()
-    assert world >= 2, "an uneven Shard(0) needs at least 2 ranks to be uneven"
-    mesh = init_device_mesh("cuda", (world,))
+    world_size = dist.get_world_size()
+    assert world_size >= 2, "an uneven Shard(0) needs at least 2 ranks to be uneven"
+    mesh = init_device_mesh("cuda", (world_size,))
 
     def say(msg: str) -> None:
         if rank == 0:
@@ -226,7 +226,7 @@ def main() -> None:
 
     # world+1 rows never divides by world (for world >= 2), so the last rank owns 1 row
     # where the others own 2.  world*2 rows is the even control.
-    uneven_rows, even_rows = world + 1, world * 2
+    uneven_rows, even_rows = world_size + 1, world_size * 2
 
     ok = _check_transport(mesh, even_rows, n=args.n_weights, cols=args.cols, say=say)
     ok &= _check_transport(mesh, uneven_rows, n=args.n_weights, cols=args.cols, say=say)

@@ -24,11 +24,11 @@ from torch.distributed.tensor import DTensor, Shard
 
 from magi_compiler.utils import magi_logger
 
-from ..snode_utils import AG
+from ..snode_utils import ALL_GATHER_OP
 from .node_meta import mark_weight_ag
 
 # The functional collectives we lower a SimpleFSDP weight gather into.
-_WAIT = torch.ops._c10d_functional.wait_tensor.default
+_WAIT_TENSOR_OP = torch.ops._c10d_functional.wait_tensor.default
 _PAD = torch.ops.aten.constant_pad_nd.default
 _SLICE = torch.ops.aten.slice.Tensor
 _TO_COPY = torch.ops.aten._to_copy.default
@@ -143,7 +143,7 @@ def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
         mesh = spec.mesh
         try:
             group_name = mesh._dim_group_names[0]
-            world = int(mesh.size(0))
+            group_size = int(mesh.size(0))
         except Exception as exc:  # pragma: no cover - defensive
             magi_logger.warning("FSDP lowering skip %s: cannot resolve group/world (%s)", node.name, exc)
             skipped += 1
@@ -153,7 +153,7 @@ def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
         local = in_dt._local_tensor  # FakeTensor with this rank's shard shape
         F = int(full.shape[0])
         L = int(local.shape[0])
-        chunk = math.ceil(F / world)
+        chunk = math.ceil(F / group_size)
 
         # forward_dtype: cast the local shard before the gather (matches torchtitan).
         fwd_dtype = _forward_dtype(node)
@@ -172,7 +172,7 @@ def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
                 cur.meta["example_value"] = local.to(fwd_dtype)
                 cur_dtype = fwd_dtype
 
-        if world == 1 and multi_rank:
+        if group_size == 1 and multi_rank:
             to_local.replace_all_uses_with(cur)
             graph.graph.erase_node(to_local)
             graph.graph.erase_node(node)
@@ -193,15 +193,15 @@ def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
                 padded.meta["example_value"] = local.new_empty((chunk, *local.shape[1:]), dtype=cur_dtype)
                 cur = padded
 
-            ag = graph.graph.call_function(AG, (cur, world, group_name))
-            ag.meta["example_value"] = local.new_empty((world * chunk, *local.shape[1:]), dtype=cur_dtype)
-            mark_weight_ag(ag, uneven=world * chunk != F)
+            ag = graph.graph.call_function(ALL_GATHER_OP, (cur, group_size, group_name))
+            ag.meta["example_value"] = local.new_empty((group_size * chunk, *local.shape[1:]), dtype=cur_dtype)
+            mark_weight_ag(ag, uneven=group_size * chunk != F)
 
-            wait = graph.graph.call_function(_WAIT, (ag,))
-            wait.meta["example_value"] = local.new_empty((world * chunk, *local.shape[1:]), dtype=cur_dtype)
+            wait = graph.graph.call_function(_WAIT_TENSOR_OP, (ag,))
+            wait.meta["example_value"] = local.new_empty((group_size * chunk, *local.shape[1:]), dtype=cur_dtype)
 
             result = wait
-            if world * chunk != F:
+            if group_size * chunk != F:
                 sliced = graph.graph.call_function(_SLICE, (wait, 0, 0, F))
                 sliced.meta["example_value"] = local.new_empty((F, *local.shape[1:]), dtype=cur_dtype)
                 result = sliced

@@ -38,25 +38,22 @@ from .slot_table import collect_host_slot_table, match_host_slot_tables, refresh
 class OffloadCache:
     """Host-slot sidecar: match, remap, replay residents, wrap a loaded graph.
 
-    ``_remap`` is the one piece of session state.  ``None`` means bake:
-    ``load`` misses while offload is on, and ``save`` may write a sidecar.
-    A dict means replay: ``load`` wraps the artifact, ``save`` / ``store``
-    must not rewrite slot integers.  Offload off is a no-op: load and store
-    stay allowed, remap stays ``None``, and ``bind`` is never called.
+    ``_cached_to_current_slots`` is None until a sidecar matches.
+    Replay wraps the artifact with that mapping and forbids rewriting its slot space.
     """
 
     def __init__(self, enabled: bool):
         self.enabled = enabled
         self.host_slots_path: Path | None = None
-        self._slot_table: dict[int, dict[str, Any]] = {}
-        self._remap: dict[int, int] | None = None
+        self._graph_slot_table: dict[int, dict[str, Any]] = {}
+        self._cached_to_current_slots: dict[int, int] | None = None
 
-    def initialize(self, cache_dir: Path) -> None:
+    def reset_for_cache_directory(self, cache_dir: Path) -> None:
         self.host_slots_path = cache_dir / "host_slots.py"
-        self._slot_table = {}
-        self._remap = None
+        self._graph_slot_table = {}
+        self._cached_to_current_slots = None
 
-    def bind(self, graph: fx.GraphModule) -> str | None:
+    def prepare_graph_replay(self, graph: fx.GraphModule) -> str | None:
         """Match the sidecar to ``graph``'s bound weights.
 
         Returns None when the compile indices are safe to replay, and otherwise
@@ -65,70 +62,76 @@ class OffloadCache:
         """
         from ..runtime.host_weights import get_global_host_weight_store
 
-        self._slot_table = collect_host_slot_table(graph)
-        self._remap = None
-        sidecar = self._load_sidecar()
-        remap = None if sidecar is None else match_host_slot_tables(sidecar, self._slot_table)
-        if remap is None:
-            reason = (
+        self._graph_slot_table = collect_host_slot_table(graph)
+        self._cached_to_current_slots = None
+        cached_slots = self._load_sidecar()
+        cached_to_current_slots = (
+            None if cached_slots is None else match_host_slot_tables(cached_slots, self._graph_slot_table)
+        )
+        if cached_to_current_slots is None:
+            cache_miss_reason = (
                 "offload host_slots sidecar missing"
-                if sidecar is None
+                if cached_slots is None
                 else "offload host_slots sidecar does not match this process's bound weights"
             )
-            magi_logger.info("host offload: %s; compile cache will miss and bake a new one", reason)
-            return reason
-        current_slots = [remap[baked] for baked, info in sidecar.items() if info.get("resident")]
-        if current_slots:
-            get_global_host_weight_store().make_resident_many(current_slots)
-        self._remap = remap
-        magi_logger.info("host offload: compile cache reusable (%d slot(s) remapped)", len(remap))
+            magi_logger.info("host offload: %s; compile cache will miss and bake a new one", cache_miss_reason)
+            return cache_miss_reason
+        resident_slots_to_restore = [
+            cached_to_current_slots[cached_slot]
+            for cached_slot, slot_metadata in cached_slots.items()
+            if slot_metadata.get("resident")
+        ]
+        if resident_slots_to_restore:
+            get_global_host_weight_store().make_weights_resident(resident_slots_to_restore)
+        self._cached_to_current_slots = cached_to_current_slots
+        magi_logger.info("host offload: compile cache reusable (%d slot(s) remapped)", len(cached_to_current_slots))
         return None
 
-    def allows_load(self) -> bool:
+    def can_replay_artifact(self) -> bool:
         """False only when offload is on and the sidecar has not matched."""
-        return (not self.enabled) or self._remap is not None
+        return (not self.enabled) or self._cached_to_current_slots is not None
 
-    def allows_store(self) -> bool:
+    def can_store_artifact(self) -> bool:
         """False on replay: a freshly compiled graph would bake this process's slots."""
-        return self._remap is None
+        return self._cached_to_current_slots is None
 
-    def wrap_loaded(self, compiled: Callable) -> Callable:
-        remap = self._remap
-        if remap is None:
-            return compiled
+    def wrap_with_slot_remap(self, compiled_fn: Callable) -> Callable:
+        cached_to_current_slots = self._cached_to_current_slots
+        if cached_to_current_slots is None:
+            return compiled_fn
 
-        def wrapped(*args, __fn=compiled, __remap=remap):
+        def run_with_slot_remap(*args, __compiled_fn=compiled_fn, __slot_remap=cached_to_current_slots):
             from ..runtime.slot_remap import using_slot_remap
 
-            with using_slot_remap(__remap):
-                return __fn(*args)
+            with using_slot_remap(__slot_remap):
+                return __compiled_fn(*args)
 
-        return wrapped
+        return run_with_slot_remap
 
-    def save(self) -> None:
+    def save_slot_sidecar(self) -> None:
         if not self.enabled or self.host_slots_path is None:
             return
-        if self._remap is not None:
+        if self._cached_to_current_slots is not None:
             # Replay: artifacts on disk still use the baked slot space.  Rewriting
             # the sidecar with this process's integers would desync the next load.
             return
-        table = refresh_resident_flags(self._slot_table)
+        slot_table = refresh_resident_flags(self._graph_slot_table)
         printer = pprint.PrettyPrinter(indent=4)
-        self.host_slots_path.write_text(printer.pformat(table))
+        self.host_slots_path.write_text(printer.pformat(slot_table))
 
     def _load_sidecar(self) -> dict[int, dict] | None:
         if self.host_slots_path is None or not self.host_slots_path.exists():
             return None
         try:
-            raw = ast.literal_eval(self.host_slots_path.read_text())
+            sidecar_data = ast.literal_eval(self.host_slots_path.read_text())
         except (OSError, SyntaxError, ValueError) as exc:
             magi_logger.warning("host offload: failed to parse host_slots sidecar (%s); treating as cache miss", exc)
             return None
-        if not isinstance(raw, dict):
+        if not isinstance(sidecar_data, dict):
             magi_logger.warning("host offload: host_slots sidecar is not a dict; treating as cache miss")
             return None
         try:
-            return {int(k): dict(v) for k, v in raw.items()}
+            return {int(k): dict(v) for k, v in sidecar_data.items()}
         except (TypeError, ValueError) as exc:
             magi_logger.warning("host offload: host_slots sidecar has invalid entries (%s); treating as cache miss", exc)
             return None

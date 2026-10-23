@@ -95,7 +95,7 @@ def main() -> None:
 
     dist.init_process_group("cpu:gloo,cuda:nccl")
     rank = dist.get_rank()
-    world = dist.get_world_size()
+    world_size = dist.get_world_size()
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", rank)))
     dev = torch.cuda.current_device()
     torch.manual_seed(0)
@@ -106,11 +106,11 @@ def main() -> None:
     os.environ.setdefault("MAGI_LOGGING_LEVEL", "INFO")
 
     if rank == 0:
-        print(f"E2E_CONFIG world={world} cost_mode={args.cost_mode}", flush=True)
+        print(f"E2E_CONFIG world={world_size} cost_mode={args.cost_mode}", flush=True)
 
     from torchtitan.experiments.simple_fsdp.simple_fsdp import data_parallel
 
-    mesh = init_device_mesh("cuda", (world,))
+    mesh = init_device_mesh("cuda", (world_size,))
 
     # --- eager reference (plain replicated weights) ---
     hidden = args.hidden
@@ -155,7 +155,7 @@ def main() -> None:
     # confirm every rank agrees (no rank-divergent hang/output)
     ok_t = torch.tensor([1 if ok else 0], device=dev)
     dist.all_reduce(ok_t)
-    all_ok = int(ok_t.item()) == world
+    all_ok = int(ok_t.item()) == world_size
 
     if rank == 0:
         print(f"E2E_NUMERIC rel={rel:.5f} ok={ok}", flush=True)

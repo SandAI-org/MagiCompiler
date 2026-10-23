@@ -77,7 +77,7 @@ def log(msg: str, rank: int) -> None:
 
 
 @torch.no_grad()
-def _fill_shards(model: nn.Module, ref: nn.Module, rank: int, world: int) -> float:
+def _fill_shards_from_reference(model: nn.Module, ref: nn.Module, rank: int, world_size: int) -> float:
     """Write this rank's slice of ``ref`` into each local shard.  Returns its MiB.
 
     Stands in for the checkpoint loader: what matters is that it writes wherever
@@ -98,14 +98,14 @@ def _fill_shards(model: nn.Module, ref: nn.Module, rank: int, world: int) -> flo
 def _count_restored_unclaimed(store) -> list[str]:
     """Record every weight the compile restores because no graph load claimed it."""
     restored: list[str] = []
-    restore_unclaimed = store.restore_unclaimed
+    restore_unclaimed_weights = store.restore_unclaimed_weights
 
     def _recording_restore_unclaimed(slots):
-        names = restore_unclaimed(slots)
+        names = restore_unclaimed_weights(slots)
         restored.extend(names)
         return names
 
-    store.restore_unclaimed = _recording_restore_unclaimed
+    store.restore_unclaimed_weights = _recording_restore_unclaimed
     return restored
 
 
@@ -135,18 +135,18 @@ def main() -> None:
 
     dist.init_process_group("cpu:gloo,cuda:nccl")
     rank = dist.get_rank()
-    world = dist.get_world_size()
+    world_size = dist.get_world_size()
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", rank)))
     dev = torch.cuda.current_device()
     torch.manual_seed(0)
     os.environ.setdefault("MAGI_LOGGING_LEVEL", "INFO")
 
     if rank == 0:
-        print(f"OFFLOAD_CONFIG world={world} bucket_mode={args.bucket_mode} host_first=True", flush=True)
+        print(f"OFFLOAD_CONFIG world={world_size} bucket_mode={args.bucket_mode} host_first=True", flush=True)
 
     from torchtitan.experiments.simple_fsdp.simple_fsdp import data_parallel
 
-    mesh = init_device_mesh("cuda", (world,))
+    mesh = init_device_mesh("cuda", (world_size,))
 
     hidden = args.hidden
     ref = TinyModel(hidden, n_layers=args.n_layers).to(dev).to(torch.bfloat16)
@@ -183,10 +183,10 @@ def main() -> None:
     # The delta, not the absolute peak: what is under test is what
     # materializing and filling the model costs, and the process is holding
     # unrelated tensors (the input, the eager reference output) either way.
-    base = torch.cuda.memory_allocated()
+    allocation_baseline_bytes = torch.cuda.memory_allocated()
     model.to_empty(device=torch.device("cuda", dev))
-    weights_mib = _fill_shards(model, ref, rank, world)
-    peak_mib = (torch.cuda.max_memory_allocated() - base) / 2**20
+    weights_mib = _fill_shards_from_reference(model, ref, rank, world_size)
+    peak_mib = (torch.cuda.max_memory_allocated() - allocation_baseline_bytes) / 2**20
 
     log(f"OFFLOAD_LOAD peak_mib={peak_mib:.2f} weights_mib={weights_mib:.2f}", rank)
 
@@ -199,12 +199,12 @@ def main() -> None:
 
     if rank == 0:
         print(
-            f"OFFLOAD_FREED mib={get_global_host_weight_store().offloaded_bytes() / 2**20:.2f} shards={get_global_host_weight_store().num_bound()} "
+            f"OFFLOAD_FREED mib={get_global_host_weight_store().offloaded_bytes() / 2**20:.2f} shards={get_global_host_weight_store().weight_count()} "
             f"promoted_mib={get_global_host_weight_store().resident_bytes() / 2**20:.2f} "
             f"restored_unclaimed={len(restored_unclaimed)}",
             flush=True,
         )
-        if get_global_host_weight_store().num_bound() == 0:
+        if get_global_host_weight_store().weight_count() == 0:
             # Offload tags what the redistribute lowering exposed, so zero shards
             # means the lowering found nothing -- which is a property of the
             # installed SimpleFSDP, not of this run.  Say so explicitly: a numeric
@@ -212,24 +212,24 @@ def main() -> None:
             print("OFFLOAD_SKIPPED reason=no_weight_gather_lowered", flush=True)
         print("OFFLOAD_COMPILED", flush=True)
 
-    out_f = out.float()
-    ref_f = eager_out.float()
-    rel = ((out_f - ref_f).norm() / (ref_f.norm() + 1e-6)).item()
-    ok = bool(torch.isfinite(out_f).all().item()) and rel < 5e-2
+    output_fp32 = out.float()
+    reference_fp32 = eager_out.float()
+    relative_error = ((output_fp32 - reference_fp32).norm() / (reference_fp32.norm() + 1e-6)).item()
+    is_output_correct = bool(torch.isfinite(output_fp32).all().item()) and relative_error < 5e-2
 
     # A second call: the host pool must still back the compiled artifact, and the
     # loads must be idempotent (nothing consumed the host copy on the first pass).
     with torch.no_grad():
-        again = compiled(x)
+        repeated_output = compiled(x)
         torch.cuda.synchronize()
-    ok = ok and bool(torch.allclose(again.float(), out_f, atol=1e-3))
+    is_output_correct = is_output_correct and bool(torch.allclose(repeated_output.float(), output_fp32, atol=1e-3))
 
-    ok_t = torch.tensor([1 if ok else 0], device=dev)
-    dist.all_reduce(ok_t)
-    all_ok = int(ok_t.item()) == world
+    correctness_vote = torch.tensor([1 if is_output_correct else 0], device=dev)
+    dist.all_reduce(correctness_vote)
+    all_ok = int(correctness_vote.item()) == world_size
 
     if rank == 0:
-        print(f"OFFLOAD_NUMERIC rel={rel:.5f} ok={ok}", flush=True)
+        print(f"OFFLOAD_NUMERIC rel={relative_error:.5f} ok={is_output_correct}", flush=True)
         print("OFFLOAD_PASS" if all_ok else "OFFLOAD_FAIL", flush=True)
 
     dist.barrier()

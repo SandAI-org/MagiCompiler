@@ -84,9 +84,9 @@ class HostMemPool:
         numel = 1
         for d in shape:
             numel *= d
-        return self._carve(numel=numel, dtype=dtype).view(shape)
+        return self._allocate_slab_region(numel=numel, dtype=dtype).view(shape)
 
-    def _carve(self, numel: int, dtype: torch.dtype) -> torch.Tensor:
+    def _allocate_slab_region(self, numel: int, dtype: torch.dtype) -> torch.Tensor:
         align_numel = max(1, self._align_bytes // dtype.itemsize)
         padded_numel = (numel + align_numel - 1) // align_numel * align_numel
 
@@ -94,9 +94,9 @@ class HostMemPool:
             if slab.storage.dtype is not dtype:
                 continue
             if slab.used_numel + padded_numel <= slab.storage.numel():
-                offset = slab.used_numel
+                offset_numel = slab.used_numel
                 slab.used_numel += padded_numel
-                return slab.storage[offset : offset + numel]
+                return slab.storage[offset_numel : offset_numel + numel]
 
         storage = torch.empty(
             max(padded_numel, self._slab_bytes // dtype.itemsize), dtype=dtype, device="cpu", pin_memory=self._pinned

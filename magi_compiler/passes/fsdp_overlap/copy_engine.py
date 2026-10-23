@@ -28,7 +28,7 @@ import torch.fx as fx
 
 from magi_compiler.utils import magi_logger
 
-from ..snode_utils import AG
+from ..snode_utils import ALL_GATHER_OP
 from .node_meta import is_ce_bound, is_uneven_shard, is_weight_ag, mark_ce_bound
 
 
@@ -48,7 +48,7 @@ def copy_engine_weight_candidates(graph: fx.GraphModule) -> list[tuple[fx.Node, 
     """
     candidates: list[tuple[fx.Node, fx.Node]] = []
     for node in graph.graph.nodes:
-        if node.op != "call_function" or node.target is not AG:
+        if node.op != "call_function" or node.target is not ALL_GATHER_OP:
             continue
         if not is_weight_ag(node) or is_uneven_shard(node):
             continue
@@ -86,7 +86,7 @@ def rewrite_weight_ag_to_copy_engine(graph: fx.GraphModule) -> int:
     rewritten = 0
     skipped = 0
     for node in graph.graph.nodes:
-        if node.op != "call_function" or node.target is not AG:
+        if node.op != "call_function" or node.target is not ALL_GATHER_OP:
             continue
         if not is_weight_ag(node):
             continue

@@ -41,7 +41,9 @@ analytical.
 The op->time table (``self._table``) is keyed by STRUCTURAL identity
 (op + input shapes/dtypes, ``_structural_key``) -- not the per-node name -- so
 isomorphic ops across layers share one measurement: O(#distinct kernels), not
-O(#nodes).  ``summary()`` dumps the table (DEBUG).
+O(#nodes).  A hooked extern is keyed by its replay inputs (``_replay_key``), so a
+hook that canonicalizes rank-local shapes yields one key on every rank.
+``summary()`` dumps the table (DEBUG).
 
 Extern measurement is ShapeEnv-isolated so it is safe on the dynamic base
 compile; ``benchmark_fused_nodes`` would specialize the dynamic dim, so fused
@@ -49,6 +51,7 @@ Triton stays analytical while free symbols exist.
 """
 
 import dataclasses
+import hashlib
 from typing import Any, Optional
 
 import torch
@@ -276,8 +279,8 @@ def _realize_arg(v):
     return v
 
 
-def _extern_replay_fn(snode: ExternKernelSchedulerNode):
-    """A callable that runs this extern's aten op on rebuilt inputs, or None.
+def _extern_replay_inputs(snode: ExternKernelSchedulerNode) -> tuple[Any, tuple, dict] | None:
+    """``(target, args, kwargs)`` this extern replays with, or None.
 
     Replay inputs: generic ``_realize_arg``, then an optional same-signature
     hook (``materialize_inputs``) that rebuilds value-consistent metadata.
@@ -290,6 +293,40 @@ def _extern_replay_fn(snode: ExternKernelSchedulerNode):
     args = tuple(_realize_arg(a) for a in fx_node.args)
     kwargs = {k: _realize_arg(v) for k, v in fx_node.kwargs.items()}
     args, kwargs = apply_materialize_inputs(get_materialize_inputs_hook(_op_name(target)), args, kwargs)
+    return target, args, kwargs
+
+
+def _value_signature(value) -> Any:
+    """Floating tensors are noise (shape/dtype only); integer tensors are metadata
+    that can steer a collective, so their bytes count too."""
+    if isinstance(value, torch.Tensor):
+        meta = (tuple(value.shape), str(value.dtype))
+        return meta if value.is_floating_point() else meta + (hashlib.sha1(value.cpu().numpy().tobytes()).hexdigest(),)
+    if isinstance(value, (list, tuple)):
+        return tuple(_value_signature(v) for v in value)
+    return value
+
+
+def _replay_key(snode: BaseSchedulerNode) -> tuple | None:
+    """Key from the inputs a hooked extern replays with, or None (no hook / unbuildable)."""
+    origin = _fx_node_of(snode.node) if isinstance(snode, ExternKernelSchedulerNode) else None
+    if origin is None or get_materialize_inputs_hook(_op_name(origin.target)) is None:
+        return None
+    try:
+        with _shapeenv_sandbox(), _suppress_guards():
+            target, args, kwargs = _extern_replay_inputs(snode)
+            return ("replay", _op_name(target), _value_signature((args, sorted(kwargs.items()))))
+    except Exception as exc:  # noqa: BLE001
+        magi_logger.debug("replay key unavailable for %s: %s", snode.get_name(), exc)
+        return None
+
+
+def _extern_replay_fn(snode: ExternKernelSchedulerNode):
+    """A callable that runs this extern's aten op on rebuilt inputs, or None."""
+    inputs = _extern_replay_inputs(snode)
+    if inputs is None:
+        return None
+    target, args, kwargs = inputs
 
     # Replay eagerly, decoupled from the enclosing compile:
     # * dynamo.disable: an op whose impl contains torch.compile'd regions would
@@ -313,11 +350,11 @@ def _argument_bytes(snode: BaseSchedulerNode) -> int:
     if origin is None:
         return 0
     nbytes = 0
-    for ev in _iter_tensor_metas((*origin.args, *origin.kwargs.values())):
+    for example_value in _iter_tensor_metas((*origin.args, *origin.kwargs.values())):
         numel = 1
-        for s in _static(ev.shape):
+        for s in _static(example_value.shape):
             numel *= s[1] if isinstance(s, tuple) else s
-        nbytes += numel * ev.dtype.itemsize
+        nbytes += numel * example_value.dtype.itemsize
     return nbytes
 
 
@@ -327,15 +364,15 @@ Observed replay failures were about 100x low; this is not a strict timing bound.
 """
 
 
-def _warn_if_implausible(snode: BaseSchedulerNode, ns: float) -> None:
+def _warn_below_memory_time_floor(snode: BaseSchedulerNode, ns: float) -> None:
     """Warn on suspicious replay timing without changing the estimate.
     Value-dependent work may need materialize_inputs to avoid benchmarking an early exit.
     """
     from torch._inductor.utils import get_gpu_dram_gbps
 
     nbytes = _argument_bytes(snode)
-    gbps = max(1.0, float(get_gpu_dram_gbps()))
-    floor_ns = nbytes / gbps  # bytes / (GB/s) == ns
+    dram_bandwidth_gbps = max(1.0, float(get_gpu_dram_gbps()))
+    floor_ns = nbytes / dram_bandwidth_gbps  # bytes / (GB/s) == ns
     if floor_ns <= 0.0 or ns >= floor_ns * _DRAM_FLOOR_SLACK:
         return
     magi_logger.warning(
@@ -345,7 +382,7 @@ def _warn_if_implausible(snode: BaseSchedulerNode, ns: float) -> None:
         ns / 1e3,
         nbytes / 2**20,
         floor_ns / 1e3,
-        gbps,
+        dram_bandwidth_gbps,
     )
 
 
@@ -410,7 +447,7 @@ def _extern_has_internal_collective(snode: BaseSchedulerNode) -> bool:
 
 
 # ---- collective (weight all-gather) benchmarking --------------------------
-_WAIT = torch.ops._c10d_functional.wait_tensor.default
+_WAIT_TENSOR_OP = torch.ops._c10d_functional.wait_tensor.default
 
 
 def _leaf_collective(snode: BaseSchedulerNode) -> ir.ExternKernel | None:
@@ -426,10 +463,10 @@ def _collective_spec(node: ir.ExternKernel):
     """(op_overload, group_name, group_size, [(shape, dtype, device), ...]) for a
     collective IR node, or None if it isn't a benchmarkable all-gather."""
     # TODO: support more graph collectives than AG / AG_COALESCED.
-    from magi_compiler.passes.snode_utils import AG, AG_COALESCED
+    from magi_compiler.passes.snode_utils import ALL_GATHER_OP, COALESCED_ALL_GATHER_OP
 
     op = node.op_overload
-    if op not in (AG, AG_COALESCED):
+    if op not in (ALL_GATHER_OP, COALESCED_ALL_GATHER_OP):
         return None
     group_name = node.constant_args[-1]  # (..., group_size, group_name)
     from torch.distributed.distributed_c10d import _get_group_size_by_name
@@ -495,8 +532,8 @@ def _ce_ag_launch_wait(snode: BaseSchedulerNode):
 
     if is_ce_ag_coalesced_ir(node):
         op = CE_ALL_GATHER_COALESCED
-        return (lambda: op(shards, group_size, group_name)), lambda outs: [_WAIT(o) for o in outs]
-    return (lambda: CE_ALL_GATHER(shards[0], group_size, group_name)), _WAIT
+        return (lambda: op(shards, group_size, group_name)), lambda outs: [_WAIT_TENSOR_OP(o) for o in outs]
+    return (lambda: CE_ALL_GATHER(shards[0], group_size, group_name)), _WAIT_TENSOR_OP
 
 
 def _measure_ce_ag(snode: BaseSchedulerNode) -> float:
@@ -537,13 +574,13 @@ def _nccl_launch_wait(snode: BaseSchedulerNode):
     spec = _collective_spec(node) if node is not None else None
     if spec is None:
         return None
-    from magi_compiler.passes.snode_utils import AG_COALESCED
+    from magi_compiler.passes.snode_utils import COALESCED_ALL_GATHER_OP
 
     op, group_name, group_size, specs = spec
     ins = [torch.empty(shape, dtype=dt, device=dev) for shape, dt, dev in specs]
-    if op is AG_COALESCED:
-        return (lambda: op(ins, group_size, group_name), lambda outs: [_WAIT(o) for o in outs])
-    return (lambda: op(ins[0], group_size, group_name)), _WAIT
+    if op is COALESCED_ALL_GATHER_OP:
+        return (lambda: op(ins, group_size, group_name), lambda outs: [_WAIT_TENSOR_OP(o) for o in outs])
+    return (lambda: op(ins[0], group_size, group_name)), _WAIT_TENSOR_OP
 
 
 def _measure_collective_op(snode: BaseSchedulerNode) -> float:
@@ -571,7 +608,7 @@ class ProfilingRuntimeEstimator:
         # Kept OFF ProfileEntry: snodes hold unpicklable FakeTensors and the entry
         # is pickled into the fx-graph cache key.
         self._key_snode: dict = {}
-        self._count_reuse = True
+        self._replay_keys: dict = {}  # structural -> table key; replay inputs are full-size
 
     def __deepcopy__(self, memo):
         # Config serialization deepcopies the pass list; return a clean instance.
@@ -610,12 +647,12 @@ class ProfilingRuntimeEstimator:
 
         if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() <= 1:
             return self._measure_deferred_locally()
-        world = dist.get_world_size()
+        world_size = dist.get_world_size()
         group = get_cpu_gloo_group()
 
         keys = sorted(self._table.keys(), key=repr)
         key_reprs = [repr(k) for k in keys]
-        all_key_reprs: list = [None] * world
+        all_key_reprs: list = [None] * world_size
         dist.all_gather_object(all_key_reprs, key_reprs, group=group)
 
         sets = [set(kr or []) for kr in all_key_reprs]
@@ -624,7 +661,7 @@ class ProfilingRuntimeEstimator:
         # measuring a collective when one rank has no snode (keeps prior ns without
         # issuing NCCL) desyncs the rest.
         has_snode_reprs = {repr(k) for k in self._key_snode}
-        all_has: list = [None] * world
+        all_has: list = [None] * world_size
         dist.all_gather_object(all_has, list(has_snode_reprs), group=group)
         measurable_reprs = shared_reprs.intersection(*(set(h or []) for h in all_has))
 
@@ -656,9 +693,9 @@ class ProfilingRuntimeEstimator:
                 measured_here.add(k)
             dist.barrier(group=group)
 
-        gathered: list = [None] * world
+        gathered: list = [None] * world_size
         dist.all_gather_object(gathered, local_ns, group=group)
-        gathered_measured: list = [None] * world
+        gathered_measured: list = [None] * world_size
         dist.all_gather_object(gathered_measured, list(measured_here), group=group)
         merged: dict = {}
         for d in gathered:
@@ -683,7 +720,7 @@ class ProfilingRuntimeEstimator:
             # collective / internal-collective ops to analytical (solo replay hangs).
             snode = self._key_snode.get(k)
             if snode is not None and _needs_lockstep_measure(snode):
-                ns = analytical_ns(snode)
+                ns = analytical_runtime_ns(snode)
                 if ns != e.ns:
                     n += 1
                 e.ns = ns
@@ -692,20 +729,20 @@ class ProfilingRuntimeEstimator:
         return n
 
     def _measure_deferred_locally(self) -> int:
-        n = 0
-        for k, snode in self._key_snode.items():
-            e = self._table.get(k)
-            if e is None:
+        changed_entry_count = 0
+        for profile_key, snode in self._key_snode.items():
+            entry = self._table.get(profile_key)
+            if entry is None:
                 continue
-            ns, ok = self._measure_one(snode)
-            if not ok:
+            ns, was_measured = self._measure_one(snode)
+            if not was_measured:
                 continue
-            e.measured = True
-            if ns != e.ns:
-                e.ns = ns
-                n += 1
+            entry.measured = True
+            if ns != entry.ns:
+                entry.ns = ns
+                changed_entry_count += 1
         self._key_snode.clear()
-        return n
+        return changed_entry_count
 
     def _measure_one(self, snode: BaseSchedulerNode) -> tuple[float, bool]:
         """Lockstep-safe single measurement (fixed iters for anything containing a
@@ -720,13 +757,13 @@ class ProfilingRuntimeEstimator:
                 fixed = _extern_has_internal_collective(snode)
                 with _shapeenv_sandbox(), _suppress_guards():
                     ns = _measure_extern(snode, fixed_iters=fixed)
-                _warn_if_implausible(snode, ns)
+                _warn_below_memory_time_floor(snode=snode, ns=ns)
                 self.n_measured += 1
                 return ns, True
             return self._measure(snode), True
         except BaseException as exc:  # noqa: BLE001
             magi_logger.warning("warm/sync measure fell back to analytical for %s: %s", snode.get_name(), exc)
-            return analytical_ns(snode), False
+            return analytical_runtime_ns(snode), False
 
     def summary(self) -> str:
         """One line per distinct op + a machine-parseable ``ESTLINE`` tag
@@ -740,10 +777,10 @@ class ProfilingRuntimeEstimator:
         one forward.
         """
         lines = []
-        totals: dict[str, float] = {}
+        total_ns_by_kind: dict[str, float] = {}
         calls_by_kind: dict[str, int] = {}
         for e in self._table.values():
-            totals[e.kind] = totals.get(e.kind, 0.0) + e.ns * (e.reuse_count + 1)
+            total_ns_by_kind[e.kind] = total_ns_by_kind.get(e.kind, 0.0) + e.ns * (e.reuse_count + 1)
             calls_by_kind[e.kind] = calls_by_kind.get(e.kind, 0) + e.reuse_count + 1
         for e in sorted(self._table.values(), key=lambda e: -e.ns * (e.reuse_count + 1)):
             calls = e.reuse_count + 1  # first encounter + reuses
@@ -753,36 +790,35 @@ class ProfilingRuntimeEstimator:
             lines.append(f"  [{e.kind:10}] {e.label:<48} {per_us:9.2f}us/call x{calls:<4} " f"= {total_us:11.2f}us  ({meas})")
             # grep-friendly: ESTLINE|kind|label|per_call_us|calls|total_us|measured
             lines.append(f"  ESTLINE|{e.kind}|{e.label}|{per_us:.3f}|{calls}|{total_us:.3f}|{meas}")
-        totals_str = ", ".join(
-            f"{kind}={ns / 1e6:.1f}ms over {calls_by_kind[kind]} call(s)" for kind, ns in sorted(totals.items())
+        totals_summary = ", ".join(
+            f"{kind}={ns / 1e6:.1f}ms over {calls_by_kind[kind]} call(s)" for kind, ns in sorted(total_ns_by_kind.items())
         )
         return (
             f"profile table: {len(self._table)} distinct ops, "
             f"{self.n_measured} measured, {self.n_cache_hits} reuses; "
-            f"cumulative estimate {totals_str}\n" + "\n".join(lines)
+            f"cumulative estimate {totals_summary}\n" + "\n".join(lines)
         )
 
-    def requery(self, snode: BaseSchedulerNode) -> float:
+    def estimate_without_reuse_count(self, snode: BaseSchedulerNode) -> float:
         """``self(snode)`` without counting it as a reuse: for re-reading a cost
         that ``warm_and_sync`` may have changed, so ``summary()`` still reports
         one call per snode."""
-        self._count_reuse = False
-        try:
-            return self(snode)
-        finally:
-            self._count_reuse = True
+        return self._estimate_runtime_ns(snode=snode, count_reuse=False)
 
-    def _reuse(self, entry: ProfileEntry) -> float:
-        if self._count_reuse:
+    def _cached_runtime_ns(self, entry: ProfileEntry, *, count_reuse: bool) -> float:
+        if count_reuse:
             entry.reuse_count += 1
             self.n_cache_hits += 1
         return entry.ns
 
     def __call__(self, snode: BaseSchedulerNode) -> float:
+        return self._estimate_runtime_ns(snode=snode, count_reuse=True)
+
+    def _estimate_runtime_ns(self, snode: BaseSchedulerNode, *, count_reuse: bool) -> float:
         # A wait_tensor kernel itself takes ~0 time (the collective's cost is
         # attributed to the launch); keep it analytical (returns 0).
         if contains_wait(snode) and not contains_collective(snode):
-            return analytical_ns(snode)
+            return analytical_runtime_ns(snode)
 
         # A load is never replayed: in sync mode that would issue H2D copies in lockstep.
         from magi_compiler.passes.weight_offload.schedule.h2d_snode import is_h2d_load
@@ -794,13 +830,13 @@ class ProfilingRuntimeEstimator:
             node = _leaf_ce_ag(snode)
             spec = _ce_ag_spec(node)
             if spec is None:
-                return analytical_ns(snode)
+                return analytical_runtime_ns(snode)
             shapes, dtype, group_size, _gn = spec
             ckey = ("ce_ag", group_size, shapes, str(dtype))
             entry = self._table.get(ckey)
             if entry is not None:
-                return self._reuse(entry)
-            ns = analytical_ns(snode)
+                return self._cached_runtime_ns(entry=entry, count_reuse=count_reuse)
+            ns = analytical_runtime_ns(snode)
             self._table[ckey] = ProfileEntry(ns=ns, kind="ce_ag", label=_ce_ag_label(snode), measured=False)
             if self._sync_across_ranks:
                 self._key_snode[ckey] = snode
@@ -815,13 +851,13 @@ class ProfilingRuntimeEstimator:
             cnode = _leaf_collective(snode)
             spec = _collective_spec(cnode) if cnode is not None else None
             if spec is None:
-                return analytical_ns(snode)  # non-AG / unparseable -> old behaviour
+                return analytical_runtime_ns(snode)  # non-AG / unparseable -> old behaviour
             op, _group_name, group_size, specs = spec
             ckey = ("collective", str(op), group_size, tuple((tuple(shape), str(dt)) for shape, dt, _dev in specs))
             entry = self._table.get(ckey)
             if entry is not None:
-                return self._reuse(entry)
-            ns = analytical_ns(snode)  # Inductor static estimate as the seed
+                return self._cached_runtime_ns(entry=entry, count_reuse=count_reuse)
+            ns = analytical_runtime_ns(snode)  # Inductor static estimate as the seed
             self._table[ckey] = ProfileEntry(ns=ns, kind="collective", label=_collective_label(snode), measured=False)
             if self._sync_across_ranks:
                 self._key_snode[ckey] = snode  # warm_and_sync -> real measured override
@@ -838,14 +874,14 @@ class ProfilingRuntimeEstimator:
         # benchmark_fused_nodes is unsafe here; eager-replay of the original
         # aten.sin/add/... would time the unfused launches, not the fused kernel.
         if not is_extern and _graph_has_free_symbols():
-            return analytical_ns(snode)
+            return analytical_runtime_ns(snode)
 
         # op -> time table: profile a distinct key once, reuse afterwards.
-        key = _structural_key(snode)
+        key = self._table_key(snode)
         if key is not None:
             entry = self._table.get(key)
             if entry is not None:
-                return self._reuse(entry)
+                return self._cached_runtime_ns(entry=entry, count_reuse=count_reuse)
 
         # Extern with an INTERNAL collective (CP attention / MoE): in sync mode,
         # never measure it here -- the warm-up runs per-rank without barriers, and
@@ -853,7 +889,7 @@ class ProfilingRuntimeEstimator:
         # internal NCCL op -> count mismatch -> hang.  Seed analytical + stash the
         # snode; warm_and_sync re-measures it in rank-lockstep (fixed iters).
         if is_extern and self._sync_across_ranks and _extern_has_internal_collective(snode):
-            ns = analytical_ns(snode)
+            ns = analytical_runtime_ns(snode)
             if key is not None:
                 self._table[key] = ProfileEntry(ns=ns, kind="extern", label=_snode_label(snode), measured=False)
                 self._key_snode[key] = snode
@@ -865,10 +901,10 @@ class ProfilingRuntimeEstimator:
         try:
             ns = self._measure_extern_safe(snode) if is_extern else self._measure(snode)
             if is_extern:
-                _warn_if_implausible(snode, ns)
+                _warn_below_memory_time_floor(snode=snode, ns=ns)
         except BaseException as exc:  # noqa: BLE001
             magi_logger.debug("Profiling estimator fell back to analytical for %s: %s", snode.get_name(), exc)
-            ns = analytical_ns(snode)
+            ns = analytical_runtime_ns(snode)
             measured = False
 
         if key is not None:
@@ -881,6 +917,12 @@ class ProfilingRuntimeEstimator:
                 "profile[%s] %s -> %.2fus%s", kind, label, ns / 1e3, "" if measured else " (analytical fallback)"
             )
         return ns
+
+    def _table_key(self, snode: BaseSchedulerNode) -> tuple | None:
+        key = _structural_key(snode)
+        if key is not None and key not in self._replay_keys:
+            self._replay_keys[key] = _replay_key(snode) or key
+        return self._replay_keys.get(key)
 
     def _measure_extern_safe(self, snode: BaseSchedulerNode) -> float:
         with _shapeenv_sandbox(), _suppress_guards():
@@ -907,7 +949,7 @@ class ProfilingRuntimeEstimator:
             return ms * 1e6
         except Exception as exc:  # noqa: BLE001
             magi_logger.debug("Profiling estimator fell back to analytical for %s: %s", snode.get_name(), exc)
-            return analytical_ns(snode)
+            return analytical_runtime_ns(snode)
 
 
 def _needs_lockstep_measure(snode: BaseSchedulerNode) -> bool:
@@ -919,7 +961,7 @@ def _needs_lockstep_measure(snode: BaseSchedulerNode) -> bool:
     return isinstance(snode, ExternKernelSchedulerNode) and _extern_has_internal_collective(snode)
 
 
-def analytical_ns(snode: BaseSchedulerNode) -> float:
+def analytical_runtime_ns(snode: BaseSchedulerNode) -> float:
     """Inductor's static estimate, or 0 for a node it cannot estimate."""
     try:
         return snode.get_estimated_runtime()

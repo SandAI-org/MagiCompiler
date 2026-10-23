@@ -34,7 +34,7 @@ actually matters is checked directly: the collective sequence of the FINAL sched
 is all_gathered and compared across ranks.
 
 With ``--modes-only`` (>=2 ranks, gloo, no CUDA / no compile): drive
-``rank_sync.negotiate_mode`` directly with synthetic per-rank inputs and assert it returns
+``rank_sync.negotiate_placement_mode`` directly with synthetic per-rank inputs and assert it returns
 the expected mode for each rung of the ladder (slot / pinned / abort).
 
 With ``--copy-engine``: the same shape, but the gathers are
@@ -79,14 +79,14 @@ from magi_compiler.passes.overlap import rank_sync  # noqa: E402
 
 
 def _mode_ladder_selfcheck(rank: int) -> bool:
-    """Assert every rung of ``negotiate_mode``'s ladder, with rank 1 feeding the
+    """Assert every rung of ``negotiate_placement_mode``'s ladder, with rank 1 feeding the
     divergent input.  All ranks walk the cases in the same order, so the symmetric
     all_gather inside each call stays lockstep."""
-    negotiate = rank_sync.negotiate_mode
+    negotiate = rank_sync.negotiate_placement_mode
     odd = rank == 1
     ag, other = (True, "ag", (8, 8)), (False, "cp", (4,))
     cases = [
-        # (expected mode, weight-AG count, skeleton kinds, costs_ok)
+        # (expected mode, weight-AG count, collective signatures, is_profiling_valid)
         ("slot", 2, [ag, other, ag], True),
         ("pinned", 2, [ag, other, ag] if odd else [ag, ag, other], True),
         ("abort", 3 if odd else 2, [ag, other, ag], True),
@@ -94,8 +94,8 @@ def _mode_ladder_selfcheck(rank: int) -> bool:
         ("abort", 2, [ag, other, ag], not odd),
     ]
     ok = True
-    for expected, n_ag, kinds, costs_ok in cases:
-        got = negotiate(n_anchors=n_ag, skel_kinds=kinds, costs_ok=costs_ok)[0]
+    for expected, n_ag, signatures, is_profiling_valid in cases:
+        got = negotiate(candidate_count=n_ag, collective_signatures=signatures, is_profiling_valid=is_profiling_valid)[0]
         ok = ok and got == expected
         print(f"REORDER_MODE_CASE rank={rank} expected={expected} got={got}", flush=True)
     return ok
@@ -123,15 +123,15 @@ def main() -> None:
 
     dist.init_process_group("cpu:gloo,cuda:nccl")
     rank = dist.get_rank()
-    world = dist.get_world_size()
+    world_size = dist.get_world_size()
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", rank)))
     dev = torch.cuda.current_device()
     grp = dist.group.WORLD.group_name
     torch.manual_seed(0)
 
-    _AG = torch.ops._c10d_functional.all_gather_into_tensor.default
+    _ALL_GATHER_OP = torch.ops._c10d_functional.all_gather_into_tensor.default
     _AR = torch.ops._c10d_functional.all_reduce.default
-    _WAIT = torch.ops._c10d_functional.wait_tensor.default
+    _WAIT_TENSOR_OP = torch.ops._c10d_functional.wait_tensor.default
 
     H = 512
     N_CE_LAYERS = 3
@@ -142,11 +142,11 @@ def main() -> None:
 
     def fn(x, w0, shard):
         y = (x @ w0).relu()  # upstream compute the gather can hide behind
-        y = _WAIT(_AR(y, "sum", grp))  # non-weight collective the gather must hop
+        y = _WAIT_TENSOR_OP(_AR(y, "sum", grp))  # non-weight collective the gather must hop
         if extra_op:
             y = y.sin()  # rank1-only node -> graphs differ across ranks
-        g = _WAIT(_AG(shard, world, grp))  # weight all-gather + wait
-        gathered = g.reshape(world * H, H)[:H]  # use the gathered weight
+        g = _WAIT_TENSOR_OP(_ALL_GATHER_OP(shard, world_size, grp))  # weight all-gather + wait
+        gathered = g.reshape(world_size * H, H)[:H]  # use the gathered weight
         return y @ gathered
 
     ce_shards: list = []
@@ -165,11 +165,11 @@ def main() -> None:
 
         def fn(x, w0, shards):  # noqa: F811 - deliberately replaces the NCCL variant
             y = (x @ w0).relu()
-            y = _WAIT(_AR(y, "sum", grp))
+            y = _WAIT_TENSOR_OP(_AR(y, "sum", grp))
             acc = None
             for i, sh in enumerate(shards):
-                g = _WAIT(CE_ALL_GATHER(sh, world, grp))
-                z = y @ g.reshape(world * H, H)[:H]
+                g = _WAIT_TENSOR_OP(CE_ALL_GATHER(sh, world_size, grp))
+                z = y @ g.reshape(world_size * H, H)[:H]
                 acc = z if acc is None else acc + z
             return acc
 
@@ -178,11 +178,11 @@ def main() -> None:
             check is a real cross-transport comparison rather than the copy
             engine grading its own homework."""
             y = (x @ w0).relu()
-            y = _WAIT(_AR(y, "sum", grp))
+            y = _WAIT_TENSOR_OP(_AR(y, "sum", grp))
             acc = None
             for sh in shards:
-                g = _WAIT(_AG(sh, world, grp))
-                z = y @ g.reshape(world * H, H)[:H]
+                g = _WAIT_TENSOR_OP(_ALL_GATHER_OP(sh, world_size, grp))
+                z = y @ g.reshape(world_size * H, H)[:H]
                 acc = z if acc is None else acc + z
             return acc
 
@@ -191,16 +191,16 @@ def main() -> None:
     skeletons: list = []  # collective sequence of every schedule the pass returned
     orig_call = FsdpOverlapReorder.__call__
 
-    orig_negotiate = rank_sync.negotiate_mode
+    orig_negotiate = rank_sync.negotiate_placement_mode
 
-    def spy_negotiate(*a, **kw):
-        result = orig_negotiate(*a, **kw)
+    def spy_negotiate(*args, **kwargs):
+        result = orig_negotiate(*args, **kwargs)
         if result[0] == "slot":
             calls["slot_mode"] = True
             print(f"REORDER_SLOT rank={rank}", flush=True)
         return result
 
-    rank_sync.negotiate_mode = spy_negotiate
+    rank_sync.negotiate_placement_mode = spy_negotiate
 
     def spy(self, snodes):
         calls["n"] += 1
@@ -220,7 +220,7 @@ def main() -> None:
             return 1e7  # 10ms, far more than the whole graph's compute
         return estimate_op_runtime(snode)
 
-    reorder = FsdpOverlapReorder(comm_overlap_window_margin_ns=5000.0, cost_fn=greedy_cost if args.copy_engine else None)
+    reorder = FsdpOverlapReorder(comm_overlap_window_margin_ns=5000.0, runtime_ns_fn=greedy_cost if args.copy_engine else None)
     prev_flag = inductor_config.reorder_for_compute_comm_overlap
     prev_passes = inductor_config.reorder_for_compute_comm_overlap_passes
     prev_cache = inductor_config.force_disable_caches
@@ -241,7 +241,7 @@ def main() -> None:
         inductor_config.reorder_for_compute_comm_overlap_passes = prev_passes
         inductor_config.force_disable_caches = prev_cache
         FsdpOverlapReorder.__call__ = orig_call
-        rank_sync.negotiate_mode = orig_negotiate
+        rank_sync.negotiate_placement_mode = orig_negotiate
 
     finite = bool(torch.isfinite(out).all().item())
     rel = ((out.float() - eager.float()).norm() / (eager.float().norm() + 1e-6)).item()
@@ -250,7 +250,7 @@ def main() -> None:
     # THE invariant: whatever each rank decided, the collective sequence of the
     # schedules it emitted must be identical on every rank -- that (not identical
     # absolute placement) is what keeps NCCL's positional matching intact.
-    peer_skeletons: list = [None] * world
+    peer_skeletons: list = [None] * world_size
     dist.all_gather_object(peer_skeletons, skeletons)
     skeleton_ok = all(s == peer_skeletons[0] for s in peer_skeletons[1:])
 
@@ -260,7 +260,7 @@ def main() -> None:
         ok_local = ok_local and calls["gathers"] >= N_CE_LAYERS
     t = torch.tensor([1 if ok_local else 0], device=dev)
     dist.all_reduce(t)
-    all_ok = int(t.item()) == world
+    all_ok = int(t.item()) == world_size
 
     if rank == 0:
         print(f"REORDER_CALLED gathers={calls['gathers']}", flush=True)

@@ -51,8 +51,8 @@ from torch._inductor.utils import contains_collective
 from magi_compiler.profiling import ProfilingRuntimeEstimator
 from magi_compiler.profiling.runtime_estimator import ProfileEntry, _measure_collective_op
 
-_AG = torch.ops._c10d_functional.all_gather_into_tensor.default
-_WAIT = torch.ops._c10d_functional.wait_tensor.default
+_ALL_GATHER_OP = torch.ops._c10d_functional.all_gather_into_tensor.default
+_WAIT_TENSOR_OP = torch.ops._c10d_functional.wait_tensor.default
 
 
 class _CaptureColl:
@@ -72,7 +72,7 @@ def _real_allgather_ns(shard, world, grp_name, iters=20, warmup=5):
     """Independent rank-lockstep CUDA-event timing of all_gather(+wait)."""
 
     def fn():
-        _WAIT(_AG(shard, world, grp_name))
+        _WAIT_TENSOR_OP(_ALL_GATHER_OP(shard, world, grp_name))
 
     for _ in range(warmup):
         fn()
@@ -111,7 +111,7 @@ def main() -> None:
     inductor_config.force_disable_caches = True
     try:
         torch._dynamo.reset()
-        torch.compile(lambda s: _WAIT(_AG(s, world, grp_name)), dynamic=False)(shard)
+        torch.compile(lambda s: _WAIT_TENSOR_OP(_ALL_GATHER_OP(s, world, grp_name)), dynamic=False)(shard)
         torch.cuda.synchronize()
     finally:
         (

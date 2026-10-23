@@ -25,25 +25,25 @@ import torch.fx as fx
 
 # On the node that produces a weight's shard: the host-pool slot its bytes were
 # moved to.  Set by binding only.
-HOST_SLOT = "magi_host_offload_slot"
+HOST_SLOT_META_KEY = "magi_host_offload_slot"
 
 # Local bucket planning separates gathers by this tag; rank 0's adopted plan may mix them.
 # Kept under ``meta["custom"]``, the field AOT preserves into scheduler-node origins.
-HOST_OFFLOADED = "magi_host_offloaded"
+HOST_OFFLOADED_META_KEY = "magi_host_offloaded"
 
 
 def host_slot(node: fx.Node) -> int | None:
     """The host-pool slot of the shard this node produces, or None."""
-    return node.meta.get(HOST_SLOT)
+    return node.meta.get(HOST_SLOT_META_KEY)
 
 
 def is_host_offloaded(node: fx.Node) -> bool:
-    return bool((node.meta.get("custom") or {}).get(HOST_OFFLOADED))
+    return bool((node.meta.get("custom") or {}).get(HOST_OFFLOADED_META_KEY))
 
 
 def mark_host_slot(node: fx.Node, slot: int) -> None:
-    node.meta[HOST_SLOT] = slot
+    node.meta[HOST_SLOT_META_KEY] = slot
 
 
 def mark_host_offloaded(node: fx.Node) -> None:
-    node.meta["custom"] = {**(node.meta.get("custom") or {}), HOST_OFFLOADED: True}
+    node.meta["custom"] = {**(node.meta.get("custom") or {}), HOST_OFFLOADED_META_KEY: True}

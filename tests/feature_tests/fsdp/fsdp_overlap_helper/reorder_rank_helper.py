@@ -36,7 +36,7 @@ from magi_compiler.passes.fsdp_overlap import reorder  # noqa: E402
 from magi_compiler.passes.overlap import rank_sync  # noqa: E402
 
 
-class _IR:
+class FakeCollectiveIR:
     op_overload = "fake.op"
     origins = None
 
@@ -44,16 +44,16 @@ class _IR:
         return [8, 8]
 
 
-class _Snode:
+class FakeSnode:
     """Enough of a schedule node for the graph index and the skeleton walk."""
 
     snodes = None
     unmet_dependencies = ()
 
-    def __init__(self, name: str, gather: bool) -> None:
+    def __init__(self, name: str, is_gather: bool) -> None:
         self.name = name
-        self.gather = gather
-        self.node = _IR()
+        self.is_gather = is_gather
+        self.node = FakeCollectiveIR()
 
     def get_name(self) -> str:
         return self.name
@@ -65,17 +65,22 @@ class _Snode:
 def _check_rank_without_gathers_negotiates() -> bool:
     rank = dist.get_rank()
     seen: dict = {}
-    real_negotiate = rank_sync.negotiate_mode
+    real_negotiate = rank_sync.negotiate_placement_mode
 
-    def negotiate(n_anchors, skel_kinds, costs_ok=True, who="FSDP overlap"):
-        mode, group, world = real_negotiate(n_anchors=n_anchors, skel_kinds=skel_kinds, costs_ok=costs_ok, who=who)
+    def negotiate(candidate_count, collective_signatures, is_profiling_valid=True, pass_name="FSDP overlap"):
+        mode, group, world_size = real_negotiate(
+            candidate_count=candidate_count,
+            collective_signatures=collective_signatures,
+            is_profiling_valid=is_profiling_valid,
+            pass_name=pass_name,
+        )
         seen["mode"] = mode
-        return mode, group, world
+        return mode, group, world_size
 
-    snodes = [_Snode("buf0", gather=rank == 0), _Snode("buf1", gather=False)]
-    gathers = lambda order: [s for s in order if s.gather]  # noqa: E731
-    with patch.object(reorder, "weight_gathers", gathers), patch.object(rank_sync, "negotiate_mode", negotiate):
-        out = reorder.FsdpOverlapReorder(cost_fn=lambda s: 0.0)(list(snodes))
+    snodes = [FakeSnode("buf0", is_gather=rank == 0), FakeSnode("buf1", is_gather=False)]
+    gathers = lambda order: [s for s in order if s.is_gather]  # noqa: E731
+    with patch.object(reorder, "weight_gathers", gathers), patch.object(rank_sync, "negotiate_placement_mode", negotiate):
+        out = reorder.FsdpOverlapReorder(runtime_ns_fn=lambda s: 0.0)(list(snodes))
 
     unchanged = out == snodes
     ok = seen.get("mode") == "abort" and unchanged

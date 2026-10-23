@@ -37,14 +37,14 @@ import torch._C._distributed_c10d as _c10d
 from magi_compiler.cuda.event_work import EventWork
 
 from .host_weights import get_global_host_weight_store
-from .slot_remap import resolve_slot
+from .slot_remap import resolve_runtime_host_slot
 
-_LIB = torch.library.Library("magi", "FRAGMENT")
-_SCHEMA = "h2d_load(Tensor shard, int slot) -> Tensor"
+_H2D_OP_LIBRARY = torch.library.Library("magi", "FRAGMENT")
+_H2D_LOAD_SCHEMA = "h2d_load(Tensor shard, int slot) -> Tensor"
 
 
 @lru_cache(maxsize=1)
-def h2d_stream() -> torch.cuda.Stream:
+def get_h2d_stream() -> torch.cuda.Stream:
     """The one stream every offloaded weight load is submitted on.
 
     A single stream serializes the loads, which is what the reorder pass assumes
@@ -54,12 +54,12 @@ def h2d_stream() -> torch.cuda.Stream:
     return torch.cuda.Stream()
 
 
-def _check_shard(shard: torch.Tensor, slot: int) -> None:
+def _validate_weight_standin(shard: torch.Tensor, slot: int) -> None:
     store = get_global_host_weight_store()
-    copy_source = store.source(slot)
+    copy_source = store.copy_source(slot)
     if tuple(shard.shape) != tuple(copy_source.shape) or shard.dtype != copy_source.dtype:
         raise RuntimeError(
-            f"magi::h2d_load slot {slot} ({store.name_of(slot)!r}) is "
+            f"magi::h2d_load slot {slot} ({store.parameter_name(slot)!r}) is "
             f"{tuple(copy_source.shape)} {copy_source.dtype}, but the graph asked for "
             f"{tuple(shard.shape)} {shard.dtype}. The compiled artifact's slot "
             "ids do not match this process's host weight store."
@@ -68,33 +68,33 @@ def _check_shard(shard: torch.Tensor, slot: int) -> None:
 
 def _h2d_load(shard: torch.Tensor, slot: int) -> torch.Tensor:
     # Resident slots copy from the device; other slots copy from pinned host storage.
-    slot = resolve_slot(slot)
-    _check_shard(shard, slot)
+    slot = resolve_runtime_host_slot(slot)
+    _validate_weight_standin(shard=shard, slot=slot)
     store = get_global_host_weight_store()
-    copy_source = store.source(slot)
+    copy_source = store.copy_source(slot)
     # Allocate on the consuming compute stream;
     # record_stream below prevents reuse while the H2D stream is still writing.
-    out = torch.empty(copy_source.shape, dtype=copy_source.dtype, device=shard.device)
+    loaded_weight = torch.empty(copy_source.shape, dtype=copy_source.dtype, device=shard.device)
 
     if store.is_resident(slot):
         # D2D runs on the compute stream without a Work; wait_tensor is then a no-op.
         # Keep a separate output: Inductor may reuse a fallback output's storage,
         # so aliasing the parameter would let a later kernel overwrite its weights.
-        out.copy_(copy_source)
-        return out
+        loaded_weight.copy_(copy_source)
+        return loaded_weight
 
-    stream = h2d_stream()
-    # out may reuse a block the compute stream freed before its kernel finishes;
+    copy_stream = get_h2d_stream()
+    # loaded_weight may reuse a block the compute stream freed before its kernel finishes;
     # the H2D stream must wait for the compute stream before writing it.
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        out.copy_(copy_source, non_blocking=True)
-        event = torch.cuda.Event()
-        event.record(stream)
-    out.record_stream(stream)
+    copy_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(copy_stream):
+        loaded_weight.copy_(copy_source, non_blocking=True)
+        load_done_event = torch.cuda.Event()
+        load_done_event.record(copy_stream)
+    loaded_weight.record_stream(copy_stream)
     # The registry takes ownership of the Work.
-    _c10d._register_work(out, EventWork(event))
-    return out
+    _c10d._register_work(loaded_weight, EventWork(load_done_event))
+    return loaded_weight
 
 
 def _h2d_load_meta(shard: torch.Tensor, slot: int) -> torch.Tensor:
@@ -111,14 +111,14 @@ def _h2d_load_bwd(ctx, grad: torch.Tensor):
     )
 
 
-def _register() -> None:
-    _LIB.define(_SCHEMA)
-    _LIB.impl("h2d_load", _h2d_load, "CUDA")
-    _LIB.impl("h2d_load", _h2d_load_meta, "Meta")
-    torch.library.register_autograd("magi::h2d_load", _h2d_load_bwd, lib=_LIB)
+def _register_h2d_load_op() -> None:
+    _H2D_OP_LIBRARY.define(_H2D_LOAD_SCHEMA)
+    _H2D_OP_LIBRARY.impl("h2d_load", _h2d_load, "CUDA")
+    _H2D_OP_LIBRARY.impl("h2d_load", _h2d_load_meta, "Meta")
+    torch.library.register_autograd("magi::h2d_load", _h2d_load_bwd, lib=_H2D_OP_LIBRARY)
 
 
-_register()
+_register_h2d_load_op()
 
 # Importing this module is what makes the op exist, so this is always bound.
 H2D_LOAD = torch.ops.magi.h2d_load.default

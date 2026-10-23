@@ -14,10 +14,11 @@
 
 """Device memory held by transfer buffers, over the snode index space.
 
-A buffer is live over the closed range ``[start, last_user]``: ``rebuild``
-inserts a group *before* the node at its launch index, so that node already sees
-the new buffer while the earlier buffer's ``last_user`` still reads the old one.
-Two ranges therefore overlap iff ``earlier.last_user_index >= later.start``.
+A buffer is live over the closed range ``[start_index, last_user_index]``:
+``rebuild_node_order`` inserts a task's moving nodes *before* the node at its
+launch index, so that node already sees the new buffer while the earlier
+buffer's last user still reads the old one.  Two ranges therefore overlap iff
+``earlier.last_user_index >= later.start_index``.
 """
 
 from __future__ import annotations
@@ -25,70 +26,77 @@ from __future__ import annotations
 from bisect import insort
 
 
-class InflightMap:
-    """Occupancy of an in-flight byte budget."""
+class InflightMemoryBudget:
+    """Occupancy of an in-flight byte budget by closed live ranges."""
 
-    def __init__(self, budget: int) -> None:
-        self.budget = budget
-        self._deltas: list[tuple[int, int]] = []
+    def __init__(self, budget_bytes: int) -> None:
+        self.budget_bytes = budget_bytes
+        # (index, +bytes) where a range starts, (last_user_index + 1, -bytes) where it ends; kept sorted.
+        self._byte_delta_events: list[tuple[int, int]] = []
 
-    def add(self, start: int, last_user: int, nbytes: int) -> None:
-        insort(self._deltas, (start, nbytes))
-        insort(self._deltas, (last_user + 1, -nbytes))
+    def reserve_live_range(self, start_index: int, last_user_index: int, transfer_bytes: int) -> None:
+        insort(self._byte_delta_events, (start_index, transfer_bytes))
+        insort(self._byte_delta_events, (last_user_index + 1, -transfer_bytes))
 
-    def remove(self, start: int, last_user: int, nbytes: int) -> None:
-        self._deltas.remove((start, nbytes))
-        self._deltas.remove((last_user + 1, -nbytes))
+    def release_live_range(self, start_index: int, last_user_index: int, transfer_bytes: int) -> None:
+        self._byte_delta_events.remove((start_index, transfer_bytes))
+        self._byte_delta_events.remove((last_user_index + 1, -transfer_bytes))
 
-    def earliest_start(self, last_user: int, nbytes: int) -> int:
-        """Earliest index where ``[i, last_user]`` still fits ``nbytes`` in the budget."""
-        room = self.budget - nbytes
-        blocked = -1
-        occupied = 0
-        prev = 0
-        for idx, delta in self._deltas:
-            if prev > last_user:
+    def earliest_start_index(self, last_user_index: int, transfer_bytes: int) -> int:
+        """Earliest index ``i`` where ``[i, last_user_index]`` still fits ``transfer_bytes`` in the budget."""
+        remaining_bytes = self.budget_bytes - transfer_bytes
+        last_blocked_index = -1
+        occupied_bytes = 0
+        previous_index = 0
+        for event_index, delta_bytes in self._byte_delta_events:
+            if previous_index > last_user_index:
                 break
-            if occupied > room and prev < idx:
-                blocked = max(blocked, min(idx - 1, last_user))
-            occupied += delta
-            prev = idx
-        return blocked + 1
+            if occupied_bytes > remaining_bytes and previous_index < event_index:
+                last_blocked_index = max(last_blocked_index, min(event_index - 1, last_user_index))
+            occupied_bytes += delta_bytes
+            previous_index = event_index
+        return last_blocked_index + 1
 
 
-def live_starts(tasks, targets, index_of) -> dict:
-    """Where each buffer still on the resource comes alive; ones off the bus never do."""
-    return {t.anchor: targets.get(t.anchor, index_of[t.anchor]) for t in tasks if t.uses_transfer_bus}
+def inflight_peak_bytes_and_index(tasks, start_index_by_anchor) -> tuple[int, int]:
+    """Peak live bytes and the index where it is reached.
 
-
-def peak_point(tasks, starts) -> tuple[int, int]:
-    events: list[tuple[int, int]] = []
-    for t in tasks:
-        at = starts.get(t.anchor)
-        if at is not None:
-            events.append((at, t.nbytes))
-            events.append((t.last_user_index, -t.nbytes))
-    events.sort(key=lambda ev: (ev[0], ev[1] < 0))
-    peak = live = where = 0
-    for idx, delta in events:
-        live += delta
-        if live > peak:
-            peak, where = live, idx
-    return peak, where
-
-
-def inflight_peak(tasks, starts) -> int:
-    return peak_point(tasks, starts)[0]
-
-
-def peak_with(tasks, starts, permanent_anchors) -> int:
-    permanent = sum(t.nbytes for t in tasks if t.anchor in permanent_anchors)
-    return permanent + inflight_peak(tasks, starts)
-
-
-def device_peak(tasks, targets, index_of) -> int:
-    """Peak transfer storage, including resident weights and their separate D2D outputs.
-    Unlike the H2D in-flight budget, this report counts resident output lifetimes too.
+    ``start_index_by_anchor`` maps an anchor to where its buffer comes alive; a
+    task without an entry is not counted.
     """
-    starts = {t.anchor: targets.get(t.anchor, index_of[t.anchor]) for t in tasks}
-    return peak_with(tasks, starts, {t.anchor for t in tasks if not t.uses_transfer_bus})
+    byte_delta_events: list[tuple[int, int]] = []
+    for task in tasks:
+        start_index = start_index_by_anchor.get(task.anchor)
+        if start_index is not None:
+            byte_delta_events.append((start_index, task.transfer_bytes))
+            byte_delta_events.append((task.last_user_index, -task.transfer_bytes))
+    # At one index, starts count before ends: the ranges are closed.
+    byte_delta_events.sort(key=lambda event: (event[0], event[1] < 0))
+    peak_bytes = live_bytes = peak_index = 0
+    for event_index, delta_bytes in byte_delta_events:
+        live_bytes += delta_bytes
+        if live_bytes > peak_bytes:
+            peak_bytes, peak_index = live_bytes, event_index
+    return peak_bytes, peak_index
+
+
+def inflight_peak_bytes(tasks, start_index_by_anchor) -> int:
+    peak_bytes, _ = inflight_peak_bytes_and_index(tasks, start_index_by_anchor)
+    return peak_bytes
+
+
+def peak_bytes_with_resident_weights(tasks, start_index_by_anchor, resident_anchors) -> int:
+    """In-flight peak plus the resident weights, which hold their bytes for the whole graph."""
+    resident_bytes = sum(t.transfer_bytes for t in tasks if t.anchor in resident_anchors)
+    return resident_bytes + inflight_peak_bytes(tasks, start_index_by_anchor)
+
+
+def weight_storage_peak_bytes(tasks, launch_index_by_anchor, original_index_by_node, resident_anchors) -> int:
+    """Peak transfer storage, including resident weights and their separate D2D outputs.
+
+    Unlike the H2D in-flight budget, this counts resident output lifetimes too;
+    a task without a launch index runs at its original position.  Only weight
+    storage, not the device's total memory.
+    """
+    start_index_by_anchor = {t.anchor: launch_index_by_anchor.get(t.anchor, original_index_by_node[t.anchor]) for t in tasks}
+    return peak_bytes_with_resident_weights(tasks, start_index_by_anchor, resident_anchors)

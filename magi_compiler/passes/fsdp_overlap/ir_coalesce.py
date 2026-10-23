@@ -44,7 +44,7 @@ from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
 from ..overlap import SnodeGraph
-from ..snode_utils import AG, AG_COALESCED, ce_ag_ops, ir_node_bytes, iter_ir_nodes
+from ..snode_utils import ALL_GATHER_OP, COALESCED_ALL_GATHER_OP, ce_ag_ops, ir_node_bytes, iter_ir_nodes
 
 
 @dataclass(frozen=True)
@@ -52,64 +52,64 @@ class GatherInfo:
     """What bucketing needs to know about one single-output weight gather."""
 
     group_name: str
-    world: int
+    world_size: int
     dtype: torch.dtype
     shard_bytes: int  # bytes this rank contributes
-    kind: str = "nccl"  # "nccl" | "ce": which op, and which IR shape (see module docstring)
+    transport: str = "nccl"  # "nccl" | "ce": which op, and which IR shape (see module docstring)
 
 
-def gather_info(snode: BaseSchedulerNode) -> GatherInfo | None:
+def parse_single_gather(snode: BaseSchedulerNode) -> GatherInfo | None:
     """``GatherInfo`` for a single-weight NCCL or copy-engine gather launch, else None.
 
     Coalesced gathers and anything grouped are not candidates: this module only
     knows how to merge the one-weight form.
     """
     node = snode.node
-    if isinstance(node, ir._CollectiveKernel) and node.op_overload is AG:
+    if isinstance(node, ir._CollectiveKernel) and node.op_overload is ALL_GATHER_OP:
         if not isinstance(node.layout, ir.Layout):
             return None
-        kind = "nccl"
+        transport = "nccl"
     elif isinstance(node, ir.FallbackKernel) and node.op_overload is not None and node.op_overload is ce_ag_ops()[0]:
-        kind = "ce"
+        transport = "ce"
     else:
         return None
     if len(node.inputs) != 1:
         return None
     try:
-        world, group_name = node.constant_args
-        world = int(world)
+        world_size, group_name = node.constant_args
+        world_size = int(world_size)
     except (TypeError, ValueError):
         return None
-    inp = node.inputs[0]
+    input_ir = node.inputs[0]
     # Candidates are listed before the skeleton exchange, so an unsized input must not raise.
-    if not isinstance(inp.maybe_get_layout(), ir.Layout):
+    if not isinstance(input_ir.maybe_get_layout(), ir.Layout):
         return None
-    return GatherInfo(str(group_name), world, inp.get_dtype(), ir_node_bytes(inp), kind)
+    return GatherInfo(str(group_name), world_size, input_ir.get_dtype(), ir_node_bytes(input_ir), transport)
 
 
-def _launch_group(
+def _collect_merge_nodes(
     graph: SnodeGraph, members: list[BaseSchedulerNode]
 ) -> tuple[list[BaseSchedulerNode], set[BaseSchedulerNode]]:
-    """``(prep, moving)``: the members' shard prep, and every snode that moves with their packed launch."""
-    prep = graph.prep_chain(members)
-    moving = set(members) | set(prep) | {u for m in members for u in graph.unpacks_of(m)}
-    return prep, moving
+    """``(prep_nodes, merge_nodes)``: the members' shard prep, and every snode that moves with their packed launch."""
+    prep_nodes = graph.movable_prep_nodes(members)
+    merge_nodes = set(members) | set(prep_nodes) | {u for m in members for u in graph.unpacks_of(m)}
+    return prep_nodes, merge_nodes
 
 
 @dataclass
-class Placement:
+class CoalescePlacement:
     """Where a bucket's launch goes, and which shard prep has to move up to it."""
 
-    at: int  # index in the ORIGINAL order the launch is inserted in front of
-    hoisted: list[BaseSchedulerNode]  # prep snodes at or after ``at``, program order
+    launch_index: int  # index in the ORIGINAL order the launch is inserted in front of
+    hoisted_prep_nodes: list[BaseSchedulerNode]  # prep snodes at or after ``launch_index``, program order
 
 
-def coalesce_placement(order: list[BaseSchedulerNode], members: list[BaseSchedulerNode]) -> Placement | None:
-    """Where the packed launch of ``members`` can go, or None if nowhere (see ``_placement``)."""
-    return _placement(SnodeGraph(order), members)
+def coalesce_placement(order: list[BaseSchedulerNode], members: list[BaseSchedulerNode]) -> CoalescePlacement | None:
+    """Where the packed launch of ``members`` can go, or None if nowhere (see ``_find_coalesce_placement``)."""
+    return _find_coalesce_placement(SnodeGraph(order), members)
 
 
-def _placement(graph: SnodeGraph, members: list[BaseSchedulerNode]) -> Placement | None:
+def _find_coalesce_placement(graph: SnodeGraph, members: list[BaseSchedulerNode]) -> CoalescePlacement | None:
     """Where the packed launch of ``members`` can go, or None if nowhere.
 
     The launch has to follow every member's input and precede every member's
@@ -120,48 +120,54 @@ def _placement(graph: SnodeGraph, members: list[BaseSchedulerNode]) -> Placement
     pass moves with a gather.  Prep that already runs above the launch stays
     put: moving a producer down could put it under one of its other readers.
     """
-    prep, moving = _launch_group(graph, members)
-    index_of = graph.index_of
-    at = min(index_of[m] for m in members)
-    at = max(at, graph.earliest_legal_index(moving))
+    prep_nodes, merge_nodes = _collect_merge_nodes(graph, members)
+    original_index_by_node = graph.original_index_by_node
+    launch_index = min(original_index_by_node[m] for m in members)
+    launch_index = max(launch_index, graph.earliest_legal_index(merge_nodes))
     waits = [w for m in members for w in graph.waits_of(m)]
-    if len(waits) < len(members) or at > min(index_of[w] for w in waits):
+    if len(waits) < len(members) or launch_index > min(original_index_by_node[w] for w in waits):
         return None
-    return Placement(at=at, hoisted=[p for p in prep if index_of[p] >= at])
+    hoisted_prep_nodes = [p for p in prep_nodes if original_index_by_node[p] >= launch_index]
+    return CoalescePlacement(launch_index=launch_index, hoisted_prep_nodes=hoisted_prep_nodes)
 
 
-def _explain_placement(graph: SnodeGraph, members: list[BaseSchedulerNode]) -> str:
-    """Why ``_placement`` found no index: each member's position, its waits, and the latest producer."""
-    _, moving = _launch_group(graph, members)
-    index_of, buf_to_snode = graph.index_of, graph.buf_to_snode
-    parts = []
+def _format_placement_constraints(graph: SnodeGraph, members: list[BaseSchedulerNode]) -> str:
+    """Why ``_find_coalesce_placement`` found no index: each member's position, its waits, and the latest producer."""
+    _, merge_nodes = _collect_merge_nodes(graph, members)
+    original_index_by_node, producer_by_buffer = graph.original_index_by_node, graph.producer_by_buffer
+    member_descriptions = []
     for m in members:
-        unpacks = graph.unpacks_of(m)
-        waits = graph.waits_of(m)
-        parts.append(
-            f"{m.get_name()}@{index_of[m]} unpacks={[index_of[u] for u in unpacks]} waits={[index_of[w] for w in waits]}"
-        )
-    floors = {s: graph.earliest_legal_index(group=[s], skip=moving) for s in moving}
-    latest = max(moving, key=floors.__getitem__)
-    floor = floors[latest]
-    culprit = [
-        f"{buf_to_snode[d.name].get_name()}@{index_of[buf_to_snode[d.name]]}"
-        for d in latest.unmet_dependencies
-        if not _is_fake_dep(d) and d.name in buf_to_snode and buf_to_snode[d.name] not in moving
+        unpack_indices = [original_index_by_node[u] for u in graph.unpacks_of(m)]
+        wait_indices = [original_index_by_node[w] for w in graph.waits_of(m)]
+        member_descriptions.append(f"{m.get_name()}@{original_index_by_node[m]} unpacks={unpack_indices} waits={wait_indices}")
+    lower_index_by_node = {
+        node: graph.earliest_legal_index(moving_nodes=[node], ignored_producers=merge_nodes) for node in merge_nodes
+    }
+    limiting_node = max(merge_nodes, key=lower_index_by_node.__getitem__)
+    launch_floor = lower_index_by_node[limiting_node]
+    blocking_producers = [
+        f"{producer_by_buffer[d.name].get_name()}@{original_index_by_node[producer_by_buffer[d.name]]}"
+        for d in limiting_node.unmet_dependencies
+        if not _is_fake_dep(d) and d.name in producer_by_buffer and producer_by_buffer[d.name] not in merge_nodes
     ]
-    return f"members [{'; '.join(parts)}]; launch floor {floor} from {latest.get_name()} reading {culprit}"
+    return (
+        f"members [{'; '.join(member_descriptions)}]; launch floor {launch_floor} "
+        f"from {limiting_node.get_name()} reading {blocking_producers}"
+    )
 
 
-def _reordered(order, removed, placement: Placement, block) -> list[BaseSchedulerNode]:
+def _insert_coalesced_block(order, removed, placement: CoalescePlacement, block) -> list[BaseSchedulerNode]:
     """``order`` without ``removed``, with the hoisted prep and then ``block`` at the placement."""
-    removed, hoisted = set(removed), set(placement.hoisted)
-    index_of = {s: i for i, s in enumerate(order)}
-    rest = [s for s in order if s not in removed and s not in hoisted]
-    cut = sum(1 for s in rest if index_of[s] < placement.at)
-    return rest[:cut] + placement.hoisted + list(block) + rest[cut:]
+    removed, hoisted = set(removed), set(placement.hoisted_prep_nodes)
+    original_index_by_node = {s: i for i, s in enumerate(order)}
+    remaining_nodes = [s for s in order if s not in removed and s not in hoisted]
+    insert_position = sum(1 for s in remaining_nodes if original_index_by_node[s] < placement.launch_index)
+    return remaining_nodes[:insert_position] + placement.hoisted_prep_nodes + list(block) + remaining_nodes[insert_position:]
 
 
-def simulate_coalesce(order: list[BaseSchedulerNode], members: list[BaseSchedulerNode]) -> list[BaseSchedulerNode] | None:
+def simulate_coalesced_order(
+    order: list[BaseSchedulerNode], members: list[BaseSchedulerNode]
+) -> list[BaseSchedulerNode] | None:
     """The order ``coalesce_all_gathers`` would produce, with the members standing
     in for the packed launch and its unpacks; None if the merge is not legal.
 
@@ -170,12 +176,12 @@ def simulate_coalesce(order: list[BaseSchedulerNode], members: list[BaseSchedule
     whole sequence of merges before touching any IR.
     """
     graph = SnodeGraph(order)
-    members = sorted(members, key=graph.index_of.__getitem__)
-    placement = _placement(graph, members)
+    members = sorted(members, key=graph.original_index_by_node.__getitem__)
+    placement = _find_coalesce_placement(graph, members)
     if placement is None:
         return None
     unpacks = [u for m in members for u in graph.unpacks_of(m)]
-    return _reordered(order, [*members, *unpacks], placement, [*members, *unpacks])
+    return _insert_coalesced_block(order, [*members, *unpacks], placement, [*members, *unpacks])
 
 
 def ir_coalesce_supported() -> bool:
@@ -194,48 +200,51 @@ def ir_coalesce_supported() -> bool:
         return False
 
 
-def _as_kernel_input(x: ir.IRNode) -> ir.IRNode:
+def _as_kernel_input(input_ir: ir.IRNode) -> ir.IRNode:
     """Wrap an already-realized kernel input so ``realize_input`` takes it as is.
 
     A bare ``Buffer`` is not something lowering ever hands ``realize_input``,
     and it answers one with ``copy_input`` -- a fresh buffer that nothing
     schedules, which the wrapper then reads before it exists.
     """
-    if isinstance(x, (ir.StorageBox, ir.TensorBox)):
-        return x
-    if isinstance(x, ir.ReinterpretView):
-        data = x.data if isinstance(x.data, (ir.StorageBox, ir.TensorBox)) else ir.StorageBox(x.data)
-        return ir.ReinterpretView(data=data, layout=x.layout)
-    if isinstance(x, ir.Buffer):
-        return ir.StorageBox(x)
-    raise ValueError(f"unsupported all-gather input {type(x).__name__}")
+    if isinstance(input_ir, (ir.StorageBox, ir.TensorBox)):
+        return input_ir
+    if isinstance(input_ir, ir.ReinterpretView):
+        if isinstance(input_ir.data, (ir.StorageBox, ir.TensorBox)):
+            input_buffer = input_ir.data
+        else:
+            input_buffer = ir.StorageBox(input_ir.data)
+        return ir.ReinterpretView(data=input_buffer, layout=input_ir.layout)
+    if isinstance(input_ir, ir.Buffer):
+        return ir.StorageBox(input_ir)
+    raise ValueError(f"unsupported all-gather input {type(input_ir).__name__}")
 
 
-def _replace_ir(orig: ir.Buffer, new: ir.Buffer) -> None:
-    """Give ``new`` the names and list slots of ``orig`` (see module docstring)."""
+def _replace_ir_preserving_names(old_ir: ir.Buffer, replacement_ir: ir.Buffer) -> None:
+    """Give ``replacement_ir`` the names and list slots of ``old_ir`` (see module docstring)."""
     graph = V.graph
-    new_buf, orig_buf = new.get_name(), orig.get_name()
-    new_op, orig_op = new.get_operation_name(), orig.get_operation_name()
+    generated_buffer_name, old_buffer_name = replacement_ir.get_name(), old_ir.get_name()
+    generated_operation_name, old_operation_name = replacement_ir.get_operation_name(), old_ir.get_operation_name()
 
-    del graph.name_to_buffer[new_buf]
-    new.name = orig_buf
-    del graph.name_to_op[new_op]
-    new.operation_name = orig_op
+    del graph.name_to_buffer[generated_buffer_name]
+    replacement_ir.name = old_buffer_name
+    del graph.name_to_op[generated_operation_name]
+    replacement_ir.operation_name = old_operation_name
 
-    graph.buffers.remove(new)
-    graph.buffers[graph.buffers.index(orig)] = new
-    graph.name_to_buffer[orig_buf] = new
-    graph.operations.remove(new)
-    graph.operations[graph.operations.index(orig)] = new
-    graph.name_to_op[orig_op] = new
+    graph.buffers.remove(replacement_ir)
+    graph.buffers[graph.buffers.index(old_ir)] = replacement_ir
+    graph.name_to_buffer[old_buffer_name] = replacement_ir
+    graph.operations.remove(replacement_ir)
+    graph.operations[graph.operations.index(old_ir)] = replacement_ir
+    graph.name_to_op[old_operation_name] = replacement_ir
 
-    if new_buf in graph.unaligned_buffers:
-        graph.unaligned_buffers.discard(new_buf)
-        graph.unaligned_buffers.add(orig_buf)
+    if generated_buffer_name in graph.unaligned_buffers:
+        graph.unaligned_buffers.discard(generated_buffer_name)
+        graph.unaligned_buffers.add(old_buffer_name)
 
 
-def _repoint_inputs(snodes, old: ir.Buffer, new: ir.Buffer) -> None:
-    """Swap ``old`` for ``new`` wherever an extern kernel holds it as an input.
+def _replace_input_references(snodes, old_ir: ir.Buffer, replacement_ir: ir.Buffer) -> None:
+    """Swap ``old_ir`` for ``replacement_ir`` wherever an extern kernel holds it as an input.
 
     Codegen only needs the name, which is unchanged, but a stale object left in
     ``inputs`` answers ``isinstance`` questions -- ``_WaitKernel`` asks one to
@@ -245,27 +254,27 @@ def _repoint_inputs(snodes, old: ir.Buffer, new: ir.Buffer) -> None:
         for node in iter_ir_nodes(s):
             if not isinstance(node, ir.ExternKernel):
                 continue
-            for j, inp in enumerate(node.inputs):
-                if inp is old:
-                    node.inputs[j] = new
-                elif isinstance(inp, ir.ReinterpretView) and inp.data is old:
-                    inp.data = new
-                elif isinstance(inp, ir.StorageBox) and inp.data is old:
-                    inp.data = new
+            for j, input_ir in enumerate(node.inputs):
+                if input_ir is old_ir:
+                    node.inputs[j] = replacement_ir
+                elif isinstance(input_ir, ir.ReinterpretView) and input_ir.data is old_ir:
+                    input_ir.data = replacement_ir
+                elif isinstance(input_ir, ir.StorageBox) and input_ir.data is old_ir:
+                    input_ir.data = replacement_ir
 
 
-def _rename_for_mutations(scheduler, olds, new_snode) -> None:
+def _update_mutation_dependencies(scheduler, old_snodes, new_snode) -> None:
     """Carry mutation renames the replaced snodes' reads were given at init."""
-    renames = {}
-    for old in olds:
-        for dep in itertools.chain(old.read_writes.reads, old.unmet_dependencies):
-            real = scheduler.mutation_real_name.get(dep.name)
-            if real is not None:
-                renames[real] = dep.name
-    if not renames:
+    renamed_name_by_original_name = {}
+    for old_snode in old_snodes:
+        for dep in itertools.chain(old_snode.read_writes.reads, old_snode.unmet_dependencies):
+            original_buffer_name = scheduler.mutation_real_name.get(dep.name)
+            if original_buffer_name is not None:
+                renamed_name_by_original_name[original_buffer_name] = dep.name
+    if not renamed_name_by_original_name:
         return
-    new_snode.unmet_dependencies = OrderedSet(d.rename(renames) for d in new_snode.unmet_dependencies)
-    new_snode.read_writes.reads = OrderedSet(d.rename(renames) for d in new_snode.read_writes.reads)
+    new_snode.unmet_dependencies = OrderedSet(d.rename(renamed_name_by_original_name) for d in new_snode.unmet_dependencies)
+    new_snode.read_writes.reads = OrderedSet(d.rename(renamed_name_by_original_name) for d in new_snode.read_writes.reads)
 
 
 def refresh_memory_planning(nodes: list[BaseSchedulerNode]) -> None:
@@ -279,122 +288,127 @@ def refresh_memory_planning(nodes: list[BaseSchedulerNode]) -> None:
 def coalesce_all_gathers(
     order: list[BaseSchedulerNode], members: list[BaseSchedulerNode]
 ) -> tuple[list[BaseSchedulerNode], BaseSchedulerNode, list[BaseSchedulerNode]]:
-    """Merge ``members`` (>= 2 single-weight gathers of one kind, group and dtype) into one.
+    """Merge ``members`` (>= 2 single-weight gathers of one transport, group and dtype) into one.
 
-    Returns ``(new_order, packed, unpacks)``: ``new_order`` is a fresh list --
-    ``order`` itself is not mutated -- with the members (and, for copy-engine
-    gathers, their unpacks) replaced by the packed launch followed by one
-    ``MultiOutput`` per member, in member order.  Raises ``ValueError`` when the
-    merge is not legal; the caller is expected to have checked
-    ``coalesce_placement`` and ``gather_info`` first, so on a multi-rank run a
-    raise here is a divergence and must not be swallowed rank-locally.
+    Returns ``(new_order, coalesced_snode, output_snodes)``: ``new_order`` is a
+    fresh list -- ``order`` itself is not mutated -- with the members (and, for
+    copy-engine gathers, their unpacks) replaced by the coalesced launch followed
+    by one ``MultiOutput`` per member, in member order.  Raises ``ValueError``
+    when the merge is not legal; the caller is expected to have checked
+    ``coalesce_placement`` and ``parse_single_gather`` first, so on a multi-rank
+    run a raise here is a divergence and must not be swallowed rank-locally.
     """
     if len(members) < 2:
         raise ValueError("a bucket needs at least two gathers")
     graph = SnodeGraph(order)
-    members = sorted(members, key=graph.index_of.__getitem__)
-    infos = [gather_info(m) for m in members]
-    if any(i is None for i in infos):
+    members = sorted(members, key=graph.original_index_by_node.__getitem__)
+    gather_infos = [parse_single_gather(m) for m in members]
+    if any(info is None for info in gather_infos):
         raise ValueError("every member must be a single-weight all-gather")
-    if len({(i.kind, i.group_name, i.world, i.dtype) for i in infos}) != 1:
-        raise ValueError("members span more than one (kind, group, world, dtype)")
-    placement = _placement(graph, members)
+    if len({(info.transport, info.group_name, info.world_size, info.dtype) for info in gather_infos}) != 1:
+        raise ValueError("members span more than one (transport, group, world size, dtype)")
+    placement = _find_coalesce_placement(graph, members)
     if placement is None:
         raise ValueError(
-            "no index follows every member's input and precedes every member's wait: " + _explain_placement(graph, members)
+            "no index follows every member's input and precedes every member's wait: "
+            + _format_placement_constraints(graph, members)
         )
 
-    ce = infos[0].kind == "ce"
+    uses_copy_engine = gather_infos[0].transport == "ce"
     scheduler = members[0].scheduler
-    launches = [m.node for m in members]
-    world, group_name = launches[0].constant_args
-    if ce:
+    launch_ir_nodes = [m.node for m in members]
+    world_size, group_name = launch_ir_nodes[0].constant_args
+    if uses_copy_engine:
         # The names to keep are the unpacks': waits and readers hang off them.
-        keep_snodes = []
+        output_snodes_to_preserve = []
         for m in members:
             unpacks = graph.unpacks_of(m)
             if len(unpacks) != 1:
                 raise ValueError(f"copy-engine gather {m.get_name()} has {len(unpacks)} unpacks, expected one")
-            keep_snodes.append(unpacks[0])
-        op = ce_ag_ops()[1]
+            output_snodes_to_preserve.append(unpacks[0])
+        coalesced_op = ce_ag_ops()[1]
     else:
-        keep_snodes = list(members)
-        op = AG_COALESCED
-    olds = [k.node for k in keep_snodes]
+        output_snodes_to_preserve = list(members)
+        coalesced_op = COALESCED_ALL_GATHER_OP
+    old_output_ir_nodes = [s.node for s in output_snodes_to_preserve]
 
     # ``process_kernel`` consults the FX node being lowered for unbacked-symbol
     # bindings; lowering is long over, and a gather introduces no new symbols.
-    stand_in = torch.fx.Graph().call_function(op, ())
-    n_buffers = len(V.graph.buffers)
-    inputs = [_as_kernel_input(o.inputs[0]) for o in launches]
-    with V.set_current_node(stand_in):
-        if ce:
-            unpacks_ir = list(ir.FallbackKernel.create(op, inputs, world, group_name))
+    lowering_fx_node = torch.fx.Graph().call_function(coalesced_op, ())
+    buffer_count_before = len(V.graph.buffers)
+    inputs = [_as_kernel_input(launch.inputs[0]) for launch in launch_ir_nodes]
+    with V.set_current_node(lowering_fx_node):
+        if uses_copy_engine:
+            output_ir_nodes = list(ir.FallbackKernel.create(coalesced_op, inputs, world_size, group_name))
         else:
-            unpacks_ir = ir._CollectiveKernel.create_out_of_place(op, inputs, world, group_name)
-    assert isinstance(unpacks_ir, list) and len(unpacks_ir) == len(olds)
-    packed_ir = unpacks_ir[0].inputs[0]
-    if packed_ir.get_name() in scheduler.name_to_buf or packed_ir.get_operation_name() in scheduler.name_to_node:
-        raise ValueError(f"the coalesced gather was named {packed_ir.get_name()}, which is already in use")
-    # Anything beyond the packed launch and its unpacks is a buffer lowering
+            output_ir_nodes = ir._CollectiveKernel.create_out_of_place(coalesced_op, inputs, world_size, group_name)
+    assert isinstance(output_ir_nodes, list) and len(output_ir_nodes) == len(old_output_ir_nodes)
+    coalesced_ir = output_ir_nodes[0].inputs[0]
+    if coalesced_ir.get_name() in scheduler.name_to_buf or coalesced_ir.get_operation_name() in scheduler.name_to_node:
+        raise ValueError(f"the coalesced gather was named {coalesced_ir.get_name()}, which is already in use")
+    # Anything beyond the coalesced launch and its unpacks is a buffer lowering
     # made on the side (a copy of an input) that no scheduler node will run.
-    if len(V.graph.buffers) != n_buffers + 1 + len(olds):
+    if len(V.graph.buffers) != buffer_count_before + 1 + len(old_output_ir_nodes):
         raise ValueError("building the coalesced gather registered buffers it cannot schedule")
-    if [i.get_name() for i in packed_ir.inputs] != [o.inputs[0].get_name() for o in launches]:
+    if [i.get_name() for i in coalesced_ir.inputs] != [launch.inputs[0].get_name() for launch in launch_ir_nodes]:
         raise ValueError("the coalesced gather does not read the members' own inputs")
-    packed_ir.origins = OrderedSet(o for launch in launches for o in launch.origins)
+    coalesced_ir.origins = OrderedSet(o for launch in launch_ir_nodes for o in launch.origins)
 
-    for old, mo in zip(olds, unpacks_ir):
-        if tuple(old.get_size()) != tuple(mo.get_size()) or old.get_dtype() != mo.get_dtype():
-            raise ValueError(f"coalesced output {mo.get_size()} does not match {old.get_name()} {old.get_size()}")
-        mo.origins = OrderedSet(old.origins)
-        _replace_ir(old, mo)
+    for old_output_ir, new_output_ir in zip(old_output_ir_nodes, output_ir_nodes):
+        same_shape = tuple(old_output_ir.get_size()) == tuple(new_output_ir.get_size())
+        if not same_shape or old_output_ir.get_dtype() != new_output_ir.get_dtype():
+            raise ValueError(
+                f"coalesced output {new_output_ir.get_size()} does not match "
+                f"{old_output_ir.get_name()} {old_output_ir.get_size()}"
+            )
+        new_output_ir.origins = OrderedSet(old_output_ir.origins)
+        _replace_ir_preserving_names(old_output_ir, new_output_ir)
     # A copy-engine member's own launch stays in ``V.graph.buffers`` / ``operations``,
     # unscheduled: Inductor names a new node after the lists' lengths, so shrinking
     # them would hand a later merge a name already in use.
 
-    packed = scheduler.create_scheduler_node(packed_ir)
-    _rename_for_mutations(scheduler, members, packed)
-    packed.ancestors = OrderedSet(a for m in members for a in m.ancestors)
-    packed.min_order = min(m.min_order for m in members)
-    packed.max_order = packed.min_order
-    scheduler.name_to_node[packed.get_name()] = packed
-    scheduler.name_to_fused_node[packed.get_name()] = packed
-    for buf in packed.get_outputs():
+    coalesced_snode = scheduler.create_scheduler_node(coalesced_ir)
+    _update_mutation_dependencies(scheduler, members, coalesced_snode)
+    coalesced_snode.ancestors = OrderedSet(a for m in members for a in m.ancestors)
+    coalesced_snode.min_order = min(m.min_order for m in members)
+    coalesced_snode.max_order = coalesced_snode.min_order
+    scheduler.name_to_node[coalesced_snode.get_name()] = coalesced_snode
+    scheduler.name_to_fused_node[coalesced_snode.get_name()] = coalesced_snode
+    for buf in coalesced_snode.get_outputs():
         scheduler.name_to_buf[buf.get_name()] = buf
-    if ce:
+    if uses_copy_engine:
         for m in members:
             for out in m.get_outputs():
                 scheduler.name_to_buf.pop(out.get_name(), None)
 
-    unpacks: list[BaseSchedulerNode] = []
-    for kept, mo in zip(keep_snodes, unpacks_ir):
-        unpack = scheduler.create_scheduler_node(mo)
-        unpack.ancestors = OrderedSet(kept.ancestors) | OrderedSet([packed.get_name()])
-        unpack.min_order = kept.min_order
-        unpack.max_order = kept.max_order
-        scheduler.name_to_node[unpack.get_name()] = unpack
-        scheduler.name_to_fused_node[unpack.get_name()] = unpack
-        for new_out, old_out in zip(unpack.get_outputs(), kept.get_outputs()):
+    output_snodes: list[BaseSchedulerNode] = []
+    for preserved_output_snode, new_output_ir in zip(output_snodes_to_preserve, output_ir_nodes):
+        output_snode = scheduler.create_scheduler_node(new_output_ir)
+        output_snode.ancestors = OrderedSet(preserved_output_snode.ancestors) | OrderedSet([coalesced_snode.get_name()])
+        output_snode.min_order = preserved_output_snode.min_order
+        output_snode.max_order = preserved_output_snode.max_order
+        scheduler.name_to_node[output_snode.get_name()] = output_snode
+        scheduler.name_to_fused_node[output_snode.get_name()] = output_snode
+        for new_out, old_out in zip(output_snode.get_outputs(), preserved_output_snode.get_outputs()):
             new_out.users = list(old_out.users)
             scheduler.name_to_buf[old_out.get_name()] = new_out
-        unpacks.append(unpack)
+        output_snodes.append(output_snode)
 
-    packed_buf = packed.get_outputs()[0]
-    packed_buf.users = [NodeUser(u, can_inplace=False) for u in unpacks]
+    coalesced_buf = coalesced_snode.get_outputs()[0]
+    coalesced_buf.users = [NodeUser(u, can_inplace=False) for u in output_snodes]
 
     member_set = set(members)
-    for dep in packed.unmet_dependencies:
+    for dep in coalesced_snode.unmet_dependencies:
         buf = scheduler.name_to_buf.get(dep.name)
         if buf is None:
             continue
         users = [u for u in buf.users if u.node not in member_set]
-        users.append(NodeUser(packed, can_inplace=False))
+        users.append(NodeUser(coalesced_snode, can_inplace=False))
         buf.users = users
 
-    removed = [*members, *keep_snodes] if ce else members
-    new_order = _reordered(order, removed, placement, [packed, *unpacks])
-    others = [s for s in new_order if s is not packed and s not in unpacks]
-    for old, mo in zip(olds, unpacks_ir):
-        _repoint_inputs(others, old, mo)
-    return new_order, packed, unpacks
+    removed = [*members, *output_snodes_to_preserve] if uses_copy_engine else members
+    new_order = _insert_coalesced_block(order, removed, placement, [coalesced_snode, *output_snodes])
+    remaining_snodes = [s for s in new_order if s is not coalesced_snode and s not in output_snodes]
+    for old_output_ir, new_output_ir in zip(old_output_ir_nodes, output_ir_nodes):
+        _replace_input_references(remaining_snodes, old_output_ir, new_output_ir)
+    return new_order, coalesced_snode, output_snodes

@@ -27,9 +27,9 @@ import torch.fx as fx
 import torch.nn as nn
 
 
-def slot_identity(info: Mapping[str, Any]) -> tuple:
+def slot_identity(slot_metadata: Mapping[str, Any]) -> tuple:
     """Name + layout: what a peer process can match without sharing slot ints."""
-    return (info["name"], tuple(info["shape"]), str(info["dtype"]))
+    return (slot_metadata["name"], tuple(slot_metadata["shape"]), str(slot_metadata["dtype"]))
 
 
 def collect_host_slot_table(module: nn.Module) -> dict[int, dict[str, Any]]:
@@ -42,55 +42,58 @@ def collect_host_slot_table(module: nn.Module) -> dict[int, dict[str, Any]]:
     from ..runtime.host_weights import get_global_host_weight_store
 
     store = get_global_host_weight_store()
-    table: dict[int, dict[str, Any]] = {}
+    slot_table: dict[int, dict[str, Any]] = {}
     for _, child in module.named_modules():
         if not isinstance(child, fx.GraphModule):
             continue
         for node in child.graph.nodes:
             slot = host_slot(node)
-            if slot is None or slot in table:
+            if slot is None or slot in slot_table:
                 continue
-            host = store.get(slot)
-            table[int(slot)] = {
-                "name": store.name_of(slot),
-                "shape": tuple(int(d) for d in host.shape),
-                "dtype": str(host.dtype),
+            host_buffer = store.host_buffer(slot)
+            slot_table[int(slot)] = {
+                "name": store.parameter_name(slot),
+                "shape": tuple(int(d) for d in host_buffer.shape),
+                "dtype": str(host_buffer.dtype),
                 "nbytes": int(store.slot_bytes(slot)),
                 "resident": bool(store.is_resident(slot)),
             }
-    return table
+    return slot_table
 
 
-def _index_by_identity(table: Mapping[int, Mapping[str, Any]]) -> dict[tuple, int] | None:
+def _slot_by_weight_identity(slot_table: Mapping[int, Mapping[str, Any]]) -> dict[tuple, int] | None:
     """``identity -> slot``, or None if two slots share an identity."""
-    by_id: dict[tuple, int] = {}
-    for slot, info in table.items():
-        ident = slot_identity(info)
-        if ident in by_id:
+    slots_by_identity: dict[tuple, int] = {}
+    for slot, slot_metadata in slot_table.items():
+        weight_identity = slot_identity(slot_metadata)
+        if weight_identity in slots_by_identity:
             return None
-        by_id[ident] = int(slot)
-    return by_id
+        slots_by_identity[weight_identity] = int(slot)
+    return slots_by_identity
 
 
 def match_host_slot_tables(
-    sidecar: Mapping[int, Mapping[str, Any]], current: Mapping[int, Mapping[str, Any]]
+    cached_slots: Mapping[int, Mapping[str, Any]], current_slots: Mapping[int, Mapping[str, Any]]
 ) -> dict[int, int] | None:
     """Baked slot -> current slot, or None if the identity sets differ.
 
     A mismatch is a cache miss: the artifact's loads are not the weights this
     process bound, so replaying it would copy the wrong bytes.
     """
-    baked_by_id = _index_by_identity(sidecar)
-    current_by_id = _index_by_identity(current)
-    if baked_by_id is None or current_by_id is None:
+    cached_slot_by_identity = _slot_by_weight_identity(cached_slots)
+    current_slot_by_identity = _slot_by_weight_identity(current_slots)
+    if cached_slot_by_identity is None or current_slot_by_identity is None:
         return None
-    if set(baked_by_id) != set(current_by_id):
+    if set(cached_slot_by_identity) != set(current_slot_by_identity):
         return None
-    return {baked: current_by_id[ident] for ident, baked in baked_by_id.items()}
+    return {
+        cached_slot: current_slot_by_identity[weight_identity]
+        for weight_identity, cached_slot in cached_slot_by_identity.items()
+    }
 
 
-def refresh_resident_flags(table: Mapping[int, Mapping[str, Any]]) -> dict[int, dict[str, Any]]:
-    """Copy ``table`` with ``resident`` taken from the live pool.
+def refresh_resident_flags(slot_table: Mapping[int, Mapping[str, Any]]) -> dict[int, dict[str, Any]]:
+    """Copy ``slot_table`` with ``resident`` taken from the live pool.
 
     Placement promotes slots during Inductor compile, after the table was first
     collected.  The sidecar must record that final set so a cache hit can
@@ -99,4 +102,7 @@ def refresh_resident_flags(table: Mapping[int, Mapping[str, Any]]) -> dict[int, 
     from ..runtime.host_weights import get_global_host_weight_store
 
     store = get_global_host_weight_store()
-    return {int(slot): {**dict(info), "resident": bool(store.is_resident(int(slot)))} for slot, info in table.items()}
+    return {
+        int(slot): {**dict(slot_metadata), "resident": bool(store.is_resident(int(slot)))}
+        for slot, slot_metadata in slot_table.items()
+    }

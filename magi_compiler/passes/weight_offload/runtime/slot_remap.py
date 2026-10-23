@@ -17,7 +17,7 @@
 A cached kernel bakes the slot integers the compiling process minted.  A later
 process replays it under ``using_slot_remap`` (see the ``host_slots.py``
 sidecar next to the piecewise cache) rather than compiling the loads again, and
-``magi::h2d_load`` translates every slot through ``resolve_slot``.
+``magi::h2d_load`` translates every slot through ``resolve_runtime_host_slot``.
 """
 
 from __future__ import annotations
@@ -28,16 +28,16 @@ from typing import Iterator
 
 # Installed only around a loaded compiled graph, so two models in one process
 # cannot clobber each other.
-_SLOT_REMAP: ContextVar[dict[int, int] | None] = ContextVar("magi_host_slot_remap", default=None)
+_ACTIVE_SLOT_REMAP: ContextVar[dict[int, int] | None] = ContextVar("magi_host_slot_remap", default=None)
 
 
-def resolve_slot(slot: int) -> int:
+def resolve_runtime_host_slot(slot: int) -> int:
     """Translate a baked artifact slot onto this process's pool.
 
     Identity when no remap is installed -- compile-time loads and a cache miss
     both mint and bake the same integers.
     """
-    remap = _SLOT_REMAP.get()
+    remap = _ACTIVE_SLOT_REMAP.get()
     if remap is None:
         return slot
     try:
@@ -52,8 +52,8 @@ def resolve_slot(slot: int) -> int:
 @contextmanager
 def using_slot_remap(remap: dict[int, int] | None) -> Iterator[None]:
     """Install ``baked -> current`` for the duration of a loaded compiled graph."""
-    token = _SLOT_REMAP.set(remap)
+    token = _ACTIVE_SLOT_REMAP.set(remap)
     try:
         yield
     finally:
-        _SLOT_REMAP.reset(token)
+        _ACTIVE_SLOT_REMAP.reset(token)

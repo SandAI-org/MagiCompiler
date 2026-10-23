@@ -29,7 +29,7 @@ import torch
 import torch.fx as fx
 from torch.distributed.tensor import DTensor
 
-from ...snode_utils import AG
+from ...snode_utils import ALL_GATHER_OP
 from ..runtime.h2d_op import H2D_LOAD
 
 aten = torch.ops.aten
@@ -65,13 +65,13 @@ def _is_prep(node: fx.Node) -> bool:
     return False
 
 
-def _param_name(node: fx.Node) -> str:
+def _parameter_name_from_node(node: fx.Node) -> str:
     raw = str(node.target or node.name or "?")
     parts = [p for p in raw.strip("_").split("_") if p and p not in ("L", "self", "modules", "parameters", "parameter")]
     return ".".join(parts) or raw
 
 
-def _resolve(graph: fx.GraphModule, node: fx.Node, placeholder_examples: Mapping[str, Any]) -> Any:
+def _resolve_node_value(graph: fx.GraphModule, node: fx.Node, placeholder_examples: Mapping[str, Any]) -> Any:
     """The live object a placeholder or get_attr stands for, or None."""
     if node.op == "placeholder":
         return placeholder_examples.get(node.name)
@@ -85,7 +85,7 @@ def _resolve(graph: fx.GraphModule, node: fx.Node, placeholder_examples: Mapping
     return None
 
 
-def mesh_group(param: object):
+def parameter_mesh_group(param: object):
     """Binder agreement uses the DTensor's group, selecting dim 0 for a multi-dim mesh.
     Non-DTensor inputs do not vote; group lookup errors propagate.
     """
@@ -99,26 +99,26 @@ def mesh_group(param: object):
 class OffloadCandidate:
     """One weight whose bytes could live in host memory."""
 
-    holder: fx.Node  # the node whose output is the weight; the load goes right after it
-    local: Any  # the live stand-in the slot is keyed on
-    name: str  # the parameter it came from, for the placement logs
-    nbytes: int
-    slot: int  # host-pool slot from adopt
-    tag: fx.Node | None = None  # node to mark offloaded, so later passes can tell
-    group: Any = None  # ProcessGroup of the DTensor mesh; None = no cross-rank vote
+    weight_node: fx.Node  # the node whose output is the weight; the load goes right after it
+    device_standin: Any  # the live stand-in the slot is keyed on
+    parameter_name: str  # the parameter it came from, for the placement logs
+    weight_bytes: int
+    host_slot: int  # host-pool slot from bind_host_buffer
+    offload_tag_node: fx.Node | None = None  # node to mark offloaded, so later passes can tell
+    process_group: Any = None  # ProcessGroup of the DTensor mesh; None = no cross-rank vote
 
 
 class WeightSource(Protocol):
     """How to find offloadable weights in one flavour of graph."""
 
-    def collect(
+    def collect_candidates(
         self, graph: fx.GraphModule, placeholder_examples: Mapping[str, Any]
     ) -> tuple[list[OffloadCandidate], Counter]:
-        """Every candidate, plus a tally of why the rest were passed over."""
+        """Every candidate, plus counts of why other weights were skipped."""
 
 
-def parked_slot(local: Any) -> tuple[int | None, str | None]:
-    """The host-pool slot for ``local``, or ``(None, why)`` if it cannot be loaded.
+def lookup_host_slot(device_standin: Any) -> tuple[int | None, str | None]:
+    """The host-pool slot for ``device_standin``, or ``(None, skip_reason)`` if it cannot be loaded.
 
     A weight reaches the pool only through host-first materialization, which
     already applied the size floor.  Collect never copies a resident shard off
@@ -126,55 +126,55 @@ def parked_slot(local: Any) -> tuple[int | None, str | None]:
     """
     from ..runtime.host_weights import get_global_host_weight_store
 
-    if not isinstance(local, torch.Tensor):
+    if not isinstance(device_standin, torch.Tensor):
         return None, "graph input is not a tensor"
-    slot = get_global_host_weight_store().slot_of(local)
-    if slot is None:
+    host_slot = get_global_host_weight_store().slot_for_tensor(device_standin)
+    if host_slot is None:
         return None, "weight was not materialized in host memory"
-    return slot, None
+    return host_slot, None
 
 
 @dataclass
 class PlainParamSource(WeightSource):
     """Discover registered Parameters behind placeholders and get_attr nodes."""
 
-    def collect(
+    def collect_candidates(
         self, graph: fx.GraphModule, placeholder_examples: Mapping[str, Any]
     ) -> tuple[list[OffloadCandidate], Counter]:
         from ..runtime.host_weights import get_global_host_weight_store
 
         candidates: list[OffloadCandidate] = []
-        skipped: Counter = Counter()
+        skip_counts: Counter = Counter()
 
         for node in graph.graph.nodes:
             if node.op not in ("placeholder", "get_attr"):
                 continue
-            live = _resolve(graph=graph, node=node, placeholder_examples=placeholder_examples)
-            if live is None:
+            parameter_value = _resolve_node_value(graph=graph, node=node, placeholder_examples=placeholder_examples)
+            if parameter_value is None:
                 continue
-            if not isinstance(live, torch.nn.Parameter):
+            if not isinstance(parameter_value, torch.nn.Parameter):
                 # Activations and buffers are graph inputs too; only weights are
                 # worth moving, because only they are the same every forward.
                 continue
             if not node.users:
                 continue
 
-            slot, why = parked_slot(live)
-            if why is not None:
-                skipped[why] += 1
+            host_slot, skip_reason = lookup_host_slot(parameter_value)
+            if skip_reason is not None:
+                skip_counts[skip_reason] += 1
                 continue
             # Each placeholder needs a load, even when tied weights share one host slot.
             candidates.append(
                 OffloadCandidate(
-                    holder=node,
-                    local=live,
-                    name=_param_name(node),
-                    nbytes=get_global_host_weight_store().slot_bytes(slot),
-                    tag=None,
-                    slot=slot,
+                    weight_node=node,
+                    device_standin=parameter_value,
+                    parameter_name=_parameter_name_from_node(node),
+                    weight_bytes=get_global_host_weight_store().slot_bytes(host_slot),
+                    offload_tag_node=None,
+                    host_slot=host_slot,
                 )
             )
-        return candidates, skipped
+        return candidates, skip_counts
 
 
 def _is_to_local(node: fx.Node) -> bool:
@@ -184,25 +184,25 @@ def _is_to_local(node: fx.Node) -> bool:
     return isinstance(owner, fx.Node) and owner.op in ("placeholder", "get_attr")
 
 
-def _find_shard_holder(node: fx.Node) -> fx.Node | None:
-    q: deque[fx.Node] = deque([node])
-    seen: set[fx.Node] = set()
-    while q:
-        n = q.popleft()
-        if n in seen:
+def _find_input_to_local(node: fx.Node) -> fx.Node | None:
+    pending_nodes: deque[fx.Node] = deque([node])
+    visited_nodes: set[fx.Node] = set()
+    while pending_nodes:
+        node_to_visit = pending_nodes.popleft()
+        if node_to_visit in visited_nodes:
             continue
-        seen.add(n)
-        if _is_to_local(n):
-            return n
-        if _is_prep(n):
-            q.extend(n.all_input_nodes)
+        visited_nodes.add(node_to_visit)
+        if _is_to_local(node_to_visit):
+            return node_to_visit
+        if _is_prep(node_to_visit):
+            pending_nodes.extend(node_to_visit.all_input_nodes)
     return None
 
 
-def shard_holder(gather: fx.Node) -> fx.Node | None:
+def find_weight_node(gather: fx.Node) -> fx.Node | None:
     """Find the parameter's to_local through preparation, including dtype casts and shard padding."""
     for inp in gather.all_input_nodes:
-        found = _find_shard_holder(inp)
+        found = _find_input_to_local(inp)
         if found is not None:
             return found
     return None
@@ -217,21 +217,21 @@ def _is_local_extraction(node: fx.Node) -> bool:
 
 def _feeds_a_weight_gather(node: fx.Node) -> bool:
     """Find a downstream gather through preparation, H2D loads, and waits."""
-    q: deque[fx.Node] = deque(node.users)
-    seen: set[fx.Node] = set()
-    while q:
-        user = q.popleft()
-        if user in seen:
+    pending_users: deque[fx.Node] = deque(node.users)
+    visited_users: set[fx.Node] = set()
+    while pending_users:
+        user = pending_users.popleft()
+        if user in visited_users:
             continue
-        seen.add(user)
-        if user.op == "call_function" and user.target is AG:
+        visited_users.add(user)
+        if user.op == "call_function" and user.target is ALL_GATHER_OP:
             return True
         if _is_prep(user) or (user.op == "call_function" and _function_key(user.target) in _LOAD_OR_WAIT):
-            q.extend(user.users)
+            pending_users.extend(user.users)
     return False
 
 
-def _weight_behind(to_local: fx.Node) -> fx.Node | None:
+def _find_parameter_source(to_local: fx.Node) -> fx.Node | None:
     """The placeholder or get_attr a ``to_local`` reads, through its redistribute."""
     src = to_local.args[0] if to_local.args else None
     if not isinstance(src, fx.Node):
@@ -246,28 +246,30 @@ def _weight_behind(to_local: fx.Node) -> fx.Node | None:
     return src
 
 
-def _shard_candidate(*, holder, source, param, skipped, tag=None) -> OffloadCandidate | None:
+def _build_shard_candidate(
+    *, weight_node, parameter_node, parameter_value, skip_counts, offload_tag_node=None
+) -> OffloadCandidate | None:
     from ..runtime.host_weights import get_global_host_weight_store
 
     # Only weights.  An activation that happens to be a DTensor changes every
     # forward, so parking it would serve stale bytes that no later check notices.
-    if not isinstance(param, torch.nn.Parameter):
-        skipped["graph input is not a parameter"] += 1
+    if not isinstance(parameter_value, torch.nn.Parameter):
+        skip_counts["graph input is not a parameter"] += 1
         return None
-    local = param._local_tensor if isinstance(param, DTensor) else None
+    local_standin = parameter_value._local_tensor if isinstance(parameter_value, DTensor) else None
     # Reuse the adopted slot; each compiled graph still needs its own load.
-    slot, why = parked_slot(local=local)
-    if why is not None:
-        skipped[why] += 1
+    host_slot, skip_reason = lookup_host_slot(device_standin=local_standin)
+    if skip_reason is not None:
+        skip_counts[skip_reason] += 1
         return None
     return OffloadCandidate(
-        holder=holder,
-        local=local,
-        name=_param_name(source),
-        nbytes=get_global_host_weight_store().slot_bytes(slot),
-        tag=tag,
-        slot=slot,
-        group=mesh_group(param),
+        weight_node=weight_node,
+        device_standin=local_standin,
+        parameter_name=_parameter_name_from_node(parameter_node),
+        weight_bytes=get_global_host_weight_store().slot_bytes(host_slot),
+        offload_tag_node=offload_tag_node,
+        host_slot=host_slot,
+        process_group=parameter_mesh_group(parameter_value),
     )
 
 
@@ -280,55 +282,71 @@ class FsdpShardSource(WeightSource):
     Local bucket planning separates offloaded and resident gathers;
     rank 0's adopted plan may mix them on another rank."""
 
-    def collect(
+    def collect_candidates(
         self, graph: fx.GraphModule, placeholder_examples: Mapping[str, Any]
     ) -> tuple[list[OffloadCandidate], Counter]:
         from magi_compiler.passes.fsdp_overlap.node_meta import is_weight_ag
 
         candidates: list[OffloadCandidate] = []
-        skipped: Counter = Counter()
-        seen: set[fx.Node] = set()
+        skip_counts: Counter = Counter()
+        seen_weight_nodes: set[fx.Node] = set()
 
         for node in graph.graph.nodes:
             if node.op != "call_function" or not is_weight_ag(node):
                 continue
-            if node.target is not AG:
+            if node.target is not ALL_GATHER_OP:
                 continue
-            holder = shard_holder(node)
-            if holder is None:
-                skipped["gather does not reach a to_local(parameter)"] += 1
+            weight_node = find_weight_node(node)
+            if weight_node is None:
+                skip_counts["gather does not reach a to_local(parameter)"] += 1
                 continue
-            param = _resolve(graph=graph, node=holder.args[0], placeholder_examples=placeholder_examples)
-            if param is None:
-                skipped["graph input has no live parameter behind it"] += 1
+            parameter_value = _resolve_node_value(
+                graph=graph, node=weight_node.args[0], placeholder_examples=placeholder_examples
+            )
+            if parameter_value is None:
+                skip_counts["graph input has no live parameter behind it"] += 1
                 continue
 
             # Deduplicate by holder: distinct holders need separate loads of a shared slot.
-            if holder in seen:
-                skipped["gather shares a holder with an earlier weight"] += 1
+            if weight_node in seen_weight_nodes:
+                skip_counts["gather shares a holder with an earlier weight"] += 1
                 continue
-            candidate = _shard_candidate(holder=holder, source=holder.args[0], param=param, skipped=skipped, tag=node)
+            candidate = _build_shard_candidate(
+                weight_node=weight_node,
+                parameter_node=weight_node.args[0],
+                parameter_value=parameter_value,
+                skip_counts=skip_counts,
+                offload_tag_node=node,
+            )
             if candidate is not None:
-                seen.add(holder)
+                seen_weight_nodes.add(weight_node)
                 candidates.append(candidate)
 
-        self._collect_ungathered(graph, placeholder_examples, candidates, skipped, seen)
-        return candidates, skipped
+        self._append_ungathered_candidates(
+            graph=graph,
+            placeholder_examples=placeholder_examples,
+            candidates=candidates,
+            skip_counts=skip_counts,
+            seen_weight_nodes=seen_weight_nodes,
+        )
+        return candidates, skip_counts
 
     @staticmethod
-    def _collect_ungathered(graph, placeholder_examples, candidates, skipped, seen) -> None:
+    def _append_ungathered_candidates(graph, placeholder_examples, candidates, skip_counts, seen_weight_nodes) -> None:
         """Collect weight holders without downstream gathers, including replicated weights."""
         for node in graph.graph.nodes:
-            if node in seen or not _is_local_extraction(node) or not node.users:
+            if node in seen_weight_nodes or not _is_local_extraction(node) or not node.users:
                 continue
-            src = _weight_behind(node)
-            if src is None or _feeds_a_weight_gather(node):
+            parameter_node = _find_parameter_source(node)
+            if parameter_node is None or _feeds_a_weight_gather(node):
                 continue
-            param = _resolve(graph=graph, node=src, placeholder_examples=placeholder_examples)
-            if not isinstance(param, DTensor):
+            parameter_value = _resolve_node_value(graph=graph, node=parameter_node, placeholder_examples=placeholder_examples)
+            if not isinstance(parameter_value, DTensor):
                 continue
             # This holder feeds no weight gather to tag for bucket planning.
-            candidate = _shard_candidate(holder=node, source=src, param=param, skipped=skipped)
+            candidate = _build_shard_candidate(
+                weight_node=node, parameter_node=parameter_node, parameter_value=parameter_value, skip_counts=skip_counts
+            )
             if candidate is not None:
-                seen.add(node)
+                seen_weight_nodes.add(node)
                 candidates.append(candidate)

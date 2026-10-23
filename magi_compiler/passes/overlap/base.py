@@ -19,20 +19,26 @@ calls it with the scheduler-node order and takes back whatever it returns, and
 does NOT repair that order -- it must be topological.  A subclass says which
 transfers exist and how to place them; this class owns the rest:
 
-    wants -> plan -> place -> rebuild + validate -> agree -> on_commit -> report
+    has_transfer_candidates -> build_transfer_tasks -> assign_launch_indices
+    -> rebuild_node_order + is_topological_order -> can_commit_order -> on_commit -> log_reorder_summary
 
-``plan`` returning ``None`` leaves the graph untouched.  ``ctx`` is a per-call
-dict the hooks pass state through, so nothing call-specific lives on the pass
-object (which Inductor deep-copies into its cache key).
+``build_transfer_tasks`` returning ``None`` leaves the graph untouched.
+``assign_launch_indices`` returns the placement, anchor -> launch index; the
+tasks themselves stay inputs.  What one hook hands a later one lives in a fresh
+``call_state_type`` instance per call, never on the pass object, which Inductor
+deep-copies into its cache key.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Mapping
 
 from torch._inductor.scheduler import BaseSchedulerNode
 
 from magi_compiler.utils import magi_logger
 
-from .cost import CostView, default_cost_fn
+from .cost import CostView, default_runtime_ns_fn
 from .graph import SnodeGraph
 from .task import TransferTask
 
@@ -41,59 +47,79 @@ DEFAULT_WINDOW_MARGIN_NS = 5_000.0
 launch latency so the wait rarely stalls."""
 
 
+@dataclass
+class OverlapCallState:
+    """State one call's hooks share.  A pass subclasses it with the fields its
+    hooks set and read, and names the subclass in ``call_state_type``."""
+
+
 class OverlapPass:
-    """Callable reorder pass; subclass and implement ``wants``, ``plan``, ``place``."""
+    """Callable reorder pass; subclass and implement ``has_transfer_candidates``,
+    ``build_transfer_tasks`` and ``assign_launch_indices``."""
 
-    name = "overlap reorder"  # log prefix
+    log_prefix = "overlap reorder"
+    call_state_type: type[OverlapCallState] = OverlapCallState
 
-    def __init__(self, cost_fn=None) -> None:
+    def __init__(self, runtime_ns_fn=None) -> None:
         # snode -> ns.  Normally the SnodeCostTable filled by the SnodeCostProfile
         # pass ahead of this one; Inductor's estimate_op_runtime when run alone.
-        self._cost_fn = cost_fn if cost_fn is not None else default_cost_fn()
+        self._runtime_ns_fn = runtime_ns_fn if runtime_ns_fn is not None else default_runtime_ns_fn()
 
     # -- the template -------------------------------------------------------
     def __call__(self, snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         order = list(snodes)
-        if not self.wants(order):
+        if not self.has_transfer_candidates(order):
             return order
         graph = SnodeGraph(order)
-        cost = CostView(self._cost_fn)
-        ctx: dict = {}
-        tasks = self.plan(graph, cost, ctx)
+        cost = CostView(self._runtime_ns_fn)
+        call_state = self.call_state_type()
+        tasks = self.build_transfer_tasks(graph, cost, call_state)
         if tasks is None:
             return order
-        self.place(graph, cost, tasks, ctx)
+        launch_index_by_anchor = self.assign_launch_indices(graph, cost, tasks, call_state)
 
-        new_order = graph.rebuild(tasks)
-        ok = graph.validate(new_order)
-        if not ok:
-            magi_logger.warning("%s: rebuilt order failed validation; leaving graph unchanged", self.name)
-        committed = self.agree(ok, ctx)
+        new_order = graph.rebuild_node_order(tasks, launch_index_by_anchor)
+        is_order_valid = graph.is_topological_order(new_order)
+        if not is_order_valid:
+            magi_logger.warning("%s: rebuilt order failed validation; leaving graph unchanged", self.log_prefix)
+        committed = self.can_commit_order(is_order_valid, call_state)
         if committed:
-            self.on_commit(graph, tasks, ctx)
+            self.on_commit(graph, tasks, call_state)
             order[:] = new_order
-        self.report(graph, cost, tasks, committed, ctx)
+        self.log_reorder_summary(graph, cost, tasks, launch_index_by_anchor, committed, call_state)
         return order
 
     # -- hooks ----------------------------------------------------------------
-    def wants(self, order: list[BaseSchedulerNode]) -> bool:
+    def has_transfer_candidates(self, order: list[BaseSchedulerNode]) -> bool:
         """Cheap check that the graph holds anything this pass moves."""
         raise NotImplementedError
 
-    def plan(self, graph: SnodeGraph, cost: CostView, ctx: dict) -> list[TransferTask] | None:
+    def build_transfer_tasks(
+        self, graph: SnodeGraph, cost: CostView, call_state: OverlapCallState
+    ) -> list[TransferTask] | None:
         """One task per transfer, in program order; ``None`` to leave the graph alone."""
         raise NotImplementedError
 
-    def place(self, graph: SnodeGraph, cost: CostView, tasks: list[TransferTask], ctx: dict) -> None:
-        """Set ``launch_index`` on every task that moves."""
+    def assign_launch_indices(
+        self, graph: SnodeGraph, cost: CostView, tasks: list[TransferTask], call_state: OverlapCallState
+    ) -> Mapping[BaseSchedulerNode, int]:
+        """Each moving task's launch index, keyed by anchor; a task without one stays put."""
         raise NotImplementedError
 
-    def agree(self, ok: bool, ctx: dict) -> bool:
-        """Whether to commit a rebuilt order this rank found valid (``ok``)."""
-        return ok
+    def can_commit_order(self, is_order_valid: bool, call_state: OverlapCallState) -> bool:
+        """Whether to commit the rebuilt order; by default, exactly when this rank found it valid."""
+        return is_order_valid
 
-    def on_commit(self, graph: SnodeGraph, tasks: list[TransferTask], ctx: dict) -> None:
+    def on_commit(self, graph: SnodeGraph, tasks: list[TransferTask], call_state: OverlapCallState) -> None:
         """Side effects that may only happen once the new order is committed."""
 
-    def report(self, graph: SnodeGraph, cost: CostView, tasks: list[TransferTask], committed: bool, ctx: dict) -> None:
+    def log_reorder_summary(
+        self,
+        graph: SnodeGraph,
+        cost: CostView,
+        tasks: list[TransferTask],
+        launch_index_by_anchor: Mapping[BaseSchedulerNode, int],
+        committed: bool,
+        call_state: OverlapCallState,
+    ) -> None:
         """Log what was done."""

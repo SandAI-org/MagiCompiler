@@ -17,7 +17,7 @@
 Every task has a duration (``required_overlap_ns``), a release
 (``earliest_launch_index``) and a deadline, one stream runs them back to back,
 and a task should start as LATE as that allows so its buffer lives briefly.
-``alap_schedule`` solves that on the time axis (the compute prefix sum), where
+``schedule_transfers_alap`` solves that on the time axis (the compute prefix sum), where
 a long kernel's leftover time is simply there for the next task.
 
 A task's ``deadline_index`` is the first index its transfer has to be done by,
@@ -28,9 +28,10 @@ wait, a gather at its own position.
 from __future__ import annotations
 
 from bisect import bisect_right
+from typing import Mapping
 
-from .memory import InflightMap
-from .task import TransferTask
+from .memory import InflightMemoryBudget
+from .task import ScheduleResult, TransferTask
 
 
 def unhoisted_index(task: TransferTask) -> int:
@@ -38,7 +39,7 @@ def unhoisted_index(task: TransferTask) -> int:
     return max(task.earliest_launch_index, task.deadline_index - 1)
 
 
-def latest_finish(active: list[TransferTask], prefix: list[float]) -> dict:
+def latest_finish_times_ns(active_tasks: list[TransferTask], compute_prefix_ns: list[float]) -> dict:
     """Per task, the last instant its transfer may end and still keep order.
 
     Walked back from the last deadline: a transfer may not finish later than
@@ -47,86 +48,103 @@ def latest_finish(active: list[TransferTask], prefix: list[float]) -> dict:
     the resource is free, which is early, and then sit in memory until its
     deadline -- the resource gains nothing and the in-flight budget pays for it.
     """
-    limit = float("inf")
-    out: dict = {}
-    for task in reversed(active):
-        limit = min(prefix[task.deadline_index], limit)
-        out[task.anchor] = limit
-        limit -= task.required_overlap_ns
-    return out
+    finish_limit_ns = float("inf")
+    finish_ns_by_anchor: dict = {}
+    for task in reversed(active_tasks):
+        finish_limit_ns = min(compute_prefix_ns[task.deadline_index], finish_limit_ns)
+        finish_ns_by_anchor[task.anchor] = finish_limit_ns
+        finish_limit_ns -= task.required_overlap_ns
+    return finish_ns_by_anchor
 
 
-def issue_index(prefix: list[float], t_start: float, lo: int, deadline: int, emitted: int) -> int:
-    """Latest snode whose compute prefix still reaches ``t_start``.
+def latest_legal_launch_index(
+    compute_prefix_ns: list[float],
+    transfer_start_ns: float,
+    earliest_index: int,
+    deadline_index: int,
+    previous_launch_index: int,
+) -> int:
+    """Latest snode whose compute prefix still reaches ``transfer_start_ns``.
 
-    Clamped into ``[lo, deadline)`` -- a transfer must follow its producers and
-    precede its own deadline -- and never before the task placed ahead of it,
-    which holds an earlier slot, so the stream issues the transfers in the order
-    the resource was scheduled to run them.
+    Clamped into ``[earliest_index, deadline_index)`` -- a transfer must follow
+    its producers and precede its own deadline -- and never before the task
+    placed ahead of it, which holds an earlier slot, so the stream issues the
+    transfers in the order the resource was scheduled to run them.
     """
-    hi = max(lo, deadline - 1)
-    at = bisect_right(prefix, t_start, lo, max(lo + 1, deadline)) - 1
-    return min(hi, max(lo, emitted, at))
+    latest_index = max(earliest_index, deadline_index - 1)
+    search_end = max(earliest_index + 1, deadline_index)
+    launch_index = bisect_right(compute_prefix_ns, transfer_start_ns, earliest_index, search_end) - 1
+    return min(latest_index, max(earliest_index, previous_launch_index, launch_index))
 
 
-def alap_schedule(tasks: list[TransferTask], prefix: list[float], index_of: dict, budget: float) -> dict:
-    """Place transfers that use the bus in deadline order on one serial resource.
+def schedule_transfers_alap(
+    tasks: list[TransferTask],
+    compute_prefix_ns: list[float],
+    original_index_by_node: dict,
+    inflight_budget_bytes: float,
+    *,
+    off_bus_anchors: frozenset = frozenset(),
+) -> ScheduleResult:
+    """Place transfers in deadline order on one serial resource, each as late as possible.
 
-    Reserve each such task's unhoisted live range before moving any task.
+    Reserve each task's unhoisted live range before moving any task.
     A backward pass computes latest finishes;
     a forward pass places launches within dependency, bus and live-byte limits.
-    Tasks off the bus stay put and use no bus time or in-flight budget.
-    Fill launch_index, unhidden_transfer_ns and budget_bound;
-    return anchor-to-launch-index for the tasks on the bus."""
-    live = InflightMap(budget)
-    for task in tasks:
-        if not task.uses_transfer_bus:
-            task.unhidden_transfer_ns = 0.0
-            task.launch_index = None
-            task.budget_bound = False
-        else:
-            live.add(unhoisted_index(task), task.last_user_index, task.nbytes)
+    Tasks whose anchor is in ``off_bus_anchors`` stay put and use no bus time or in-flight budget."""
+    tasks_on_bus = [t for t in tasks if t.anchor not in off_bus_anchors]
+    inflight_memory = InflightMemoryBudget(inflight_budget_bytes)
+    for task in tasks_on_bus:
+        inflight_memory.reserve_live_range(unhoisted_index(task), task.last_user_index, task.transfer_bytes)
 
-    active = sorted((t for t in tasks if t.uses_transfer_bus), key=lambda t: (t.deadline_index, index_of[t.anchor]))
-    finish = latest_finish(active, prefix)
+    tasks_by_deadline = sorted(tasks_on_bus, key=lambda t: (t.deadline_index, original_index_by_node[t.anchor]))
+    finish_ns_by_anchor = latest_finish_times_ns(tasks_by_deadline, compute_prefix_ns)
 
-    targets: dict = {}
-    bus_end = 0.0
-    emitted = -1
-    for task in active:
-        live.remove(unhoisted_index(task), task.last_user_index, task.nbytes)
-        floor = live.earliest_start(task.last_user_index, task.nbytes)
-        lo = max(task.earliest_launch_index, floor)
+    launch_index_by_anchor: dict = {}
+    unhidden_ns_by_anchor: dict = {}
+    inflight_budget_limited_anchors: set = set()
+    bus_available_ns = 0.0
+    previous_launch_index = -1
+    for task in tasks_by_deadline:
+        inflight_memory.release_live_range(unhoisted_index(task), task.last_user_index, task.transfer_bytes)
+        memory_lower_index = inflight_memory.earliest_start_index(task.last_user_index, task.transfer_bytes)
+        earliest_launch_index = max(task.earliest_launch_index, memory_lower_index)
 
         # As late as the deadlines allow, but never before the task is legal to
         # issue; it starts once the resource is free as well.
-        t_issue = max(prefix[lo], finish[task.anchor] - task.required_overlap_ns)
-        t_start = max(t_issue, bus_end)
-        bus_end = t_start + task.required_overlap_ns
-        task.unhidden_transfer_ns = max(0.0, bus_end - prefix[task.deadline_index])
+        release_ns = compute_prefix_ns[earliest_launch_index]
+        requested_start_ns = max(release_ns, finish_ns_by_anchor[task.anchor] - task.required_overlap_ns)
+        transfer_start_ns = max(requested_start_ns, bus_available_ns)
+        bus_available_ns = transfer_start_ns + task.required_overlap_ns
+        unhidden_ns = max(0.0, bus_available_ns - compute_prefix_ns[task.deadline_index])
+        unhidden_ns_by_anchor[task.anchor] = unhidden_ns
         # The in-flight floor is the limit only when relaxing it would have
         # started the transfer sooner; otherwise the resource was full regardless.
-        task.budget_bound = (
-            task.unhidden_transfer_ns > 0
-            and prefix[lo] > prefix[task.earliest_launch_index]
-            and prefix[lo] > t_start - task.required_overlap_ns
+        inflight_floor_delayed_release = release_ns > compute_prefix_ns[task.earliest_launch_index]
+        if unhidden_ns > 0 and inflight_floor_delayed_release and release_ns > transfer_start_ns - task.required_overlap_ns:
+            inflight_budget_limited_anchors.add(task.anchor)
+
+        launch_index = latest_legal_launch_index(
+            compute_prefix_ns, transfer_start_ns, earliest_launch_index, task.deadline_index, previous_launch_index
         )
+        launch_index_by_anchor[task.anchor] = launch_index
+        previous_launch_index = launch_index
+        inflight_memory.reserve_live_range(launch_index, task.last_user_index, task.transfer_bytes)
+    return ScheduleResult(
+        launch_index_by_anchor=launch_index_by_anchor,
+        unhidden_ns_by_anchor=unhidden_ns_by_anchor,
+        inflight_budget_limited_anchors=frozenset(inflight_budget_limited_anchors),
+    )
 
-        at = issue_index(prefix, t_start, lo, task.deadline_index, emitted)
-        task.launch_index = at
-        targets[task.anchor] = at
-        emitted = at
-        live.add(at, task.last_user_index, task.nbytes)
-    return targets
 
-
-def enforce_monotone(tasks: list[TransferTask]) -> None:
-    """Clamp launch indices non-decreasing in program order, so cost jitter or
-    same-slot per-rank indices cannot swap two transfers on one stream."""
-    running = -1
+def enforce_launch_order(tasks: list[TransferTask], launch_index_by_anchor: Mapping) -> dict:
+    """Clamp launch indices non-decreasing in program order (``tasks`` order), so cost
+    jitter or same-slot per-rank indices cannot swap two transfers on one stream."""
+    ordered_launch_index_by_anchor: dict = {}
+    previous_launch_index = -1
     for task in tasks:
-        if task.launch_index is None:
+        launch_index = launch_index_by_anchor.get(task.anchor)
+        if launch_index is None:
             continue
-        if task.launch_index < running:
-            task.launch_index = running
-        running = task.launch_index
+        previous_launch_index = max(launch_index, previous_launch_index)
+        ordered_launch_index_by_anchor[task.anchor] = previous_launch_index
+    return ordered_launch_index_by_anchor

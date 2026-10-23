@@ -28,7 +28,7 @@ def is_h2d_load(snode: BaseSchedulerNode) -> bool:
     return any(isinstance(node, ir.ExternKernel) and node.op_overload is H2D_LOAD for node in iter_ir_nodes(snode))
 
 
-def slot_of(load: BaseSchedulerNode) -> int:
+def host_slot_of_load(load: BaseSchedulerNode) -> int:
     """The host-pool slot a load pulls.
 
     Inductor flattens a custom op's non-tensor arguments into ``constant_args``,

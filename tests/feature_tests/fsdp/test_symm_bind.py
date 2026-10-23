@@ -36,8 +36,8 @@ import torch.fx as fx
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
-_AG = torch.ops._c10d_functional.all_gather_into_tensor.default
-_WAIT = torch.ops._c10d_functional.wait_tensor.default
+_ALL_GATHER_OP = torch.ops._c10d_functional.all_gather_into_tensor.default
+_WAIT_TENSOR_OP = torch.ops._c10d_functional.wait_tensor.default
 _TO_COPY = torch.ops.aten._to_copy.default
 
 
@@ -118,24 +118,24 @@ def _graph(params: list, *, derive: str | None = None, uneven: bool = False, ext
         if derive == "cast":
             cur = g.call_function(_TO_COPY, (cur,), {"dtype": torch.float32})
             cur.meta["example_value"] = local.to(torch.float32)
-        ag = g.call_function(_AG, (cur, 1, "dummy_group"))
+        ag = g.call_function(_ALL_GATHER_OP, (cur, 1, "dummy_group"))
         ag.meta["example_value"] = local.new_empty(local.shape)  # world size 1
         mark_weight_ag(ag, uneven=uneven)
-        outs.append(g.call_function(_WAIT, (ag,)))
+        outs.append(g.call_function(_WAIT_TENSOR_OP, (ag,)))
     g.output(tuple(outs))
     return fx.GraphModule(torch.nn.Module(), g), examples
 
 
-def _bind(gm, examples, **kw):
+def _bind(gm, examples, **kwargs):
     """Binding on its own, standing in for what the backend does around it."""
     from magi_compiler.passes.fsdp_overlap import copy_engine_weight_candidates
     from magi_compiler.symm_mem import bind_graph_weights
 
     names = (n.name for n in gm.graph.find_nodes(op="placeholder"))
-    return bind_graph_weights(gm, copy_engine_weight_candidates(gm), dict(zip(names, examples)), **kw)
+    return bind_graph_weights(gm, copy_engine_weight_candidates(gm), dict(zip(names, examples)), **kwargs)
 
 
-def _pipeline(gm, examples, *, transport="copy_engine") -> int:
+def _apply_weight_pipeline(gm, examples, *, transport="copy_engine") -> int:
     """``WeightPipeline.run`` with host offload off, inlined.
 
     Lower, bind, retarget what bound -- one gather per weight; bucketing happens
@@ -504,9 +504,9 @@ def test_bound_weights_are_retargeted_one_gather_each(mesh_1rank):
     from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER
 
     gm, examples = _graph([_param(mesh_1rank) for _ in range(4)])
-    assert _pipeline(gm, examples) == 4
+    assert _apply_weight_pipeline(gm, examples) == 4
     assert len([x for x in gm.graph.nodes if x.target is CE_ALL_GATHER]) == 4
-    assert not [x for x in gm.graph.nodes if x.target is _AG]
+    assert not [x for x in gm.graph.nodes if x.target is _ALL_GATHER_OP]
 
 
 @requires_cuda
@@ -516,12 +516,12 @@ def test_an_unbound_weight_alone_stays_on_nccl(mesh_1rank):
     from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER
 
     gm, examples = _graph([_param(mesh_1rank) for _ in range(4)])
-    gathers = [n for n in gm.graph.nodes if n.target is _AG]
+    gathers = [n for n in gm.graph.nodes if n.target is _ALL_GATHER_OP]
     gathers[1].meta[UNEVEN_SHARD] = True
 
-    assert _pipeline(gm, examples) == 3
+    assert _apply_weight_pipeline(gm, examples) == 3
     assert len([n for n in gm.graph.nodes if n.target is CE_ALL_GATHER]) == 3
-    assert len([n for n in gm.graph.nodes if n.target is _AG]) == 1  # the uneven one, on NCCL
+    assert len([n for n in gm.graph.nodes if n.target is _ALL_GATHER_OP]) == 1  # the uneven one, on NCCL
 
 
 @requires_cuda
@@ -530,6 +530,6 @@ def test_nccl_transport_binds_nothing(mesh_1rank):
     from magi_compiler.symm_mem import registered_buffers
 
     gm, examples = _graph([_param(mesh_1rank) for _ in range(2)])
-    _pipeline(gm, examples, transport="nccl")
+    _apply_weight_pipeline(gm, examples, transport="nccl")
 
     assert registered_buffers() == []
