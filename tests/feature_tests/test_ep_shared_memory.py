@@ -20,8 +20,9 @@ shared-memory file from local_rank=0 and has ALL ranks map it.  With expert
 parallelism (EP > 1), each rank holds a different expert shard; sharing one
 mmap means the last writer's data overwrites everyone else's views.
 
-Fix: when ep_size > 1, the caller passes per_rank=True so each rank writes
-its OWN shared-memory file, preserving expert shard diversity.
+Fix: weights are compared one by one (per-weight fingerprints across the ranks
+of a host); only the identical ones share a file, each rank keeps its own
+expert shard.
 
 These tests use torch.multiprocessing.spawn with 2 workers and the gloo
 backend to reproduce the exact multi-rank scenario without a real model.
@@ -36,7 +37,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 
-from magi_compiler._api import _compute_weights_fingerprint, _materialize_shm_weights
+from magi_compiler._api import _materialize_shm_weights, _param_fingerprint, _rank_identical_params
 
 
 class FakeExpertBlock(nn.Module):
@@ -58,12 +59,21 @@ def _group_params(module: nn.Module) -> dict[torch.dtype, list[tuple[str, torch.
 
 
 def _run_materialize(model, local_rank, shared_dir, per_rank):
-    """Call production _materialize_shm_weights with env patched to use tmpdir."""
+    """Call production _materialize_shm_weights with env patched to use tmpdir.
+
+    per_rank=True keeps every weight per rank, False shares all of them, None shares what the ranks hold identically.
+    """
     grouped = _group_params(model)
+    if per_rank is None:
+        shared, dtypes = _rank_identical_params(grouped)
+    else:
+        shared = set() if per_rank else {name for params in grouped.values() for name, _ in params}
+        dtypes = [] if per_rank else sorted(grouped, key=str)
     with patch("magi_compiler.utils.envs.MAGI_SHARED_BIN_PATH", shared_dir), patch(
         "magi_compiler._api.pin_memory_in_place", lambda t: t
     ):
-        _materialize_shm_weights(model, grouped, local_rank=local_rank, per_rank=per_rank)
+        _materialize_shm_weights(model, grouped, local_rank, shared, dtypes)
+    return shared
 
 
 # ───────────────────────────────────────────────────────────────
@@ -111,9 +121,61 @@ def _worker_fix_verified(rank, world_size, shared_dir, seed_per_rank, result_fil
     dist.destroy_process_group()
 
 
+class FakeMoEBlock(nn.Module):
+    """A dense weight every EP rank shares, an expert shard each rank owns, and a dense weight of another dtype."""
+
+    def __init__(self, rank: int):
+        super().__init__()
+        torch.manual_seed(0)
+        self.dense = nn.Parameter(torch.randn(64, 96, dtype=torch.bfloat16))
+        self.norm = nn.Parameter(torch.randn(96))
+        torch.manual_seed(1000 + rank)
+        self.expert_weight = nn.Parameter(torch.randn(4, 64, dtype=torch.bfloat16))
+
+
+def _worker_mixed(rank, world_size, shared_dir, result_file):
+    """Auto-detect: the dense weights share one file, each rank keeps its own experts."""
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "29503"
+    os.environ["LOCAL_RANK"] = str(rank)
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+    model = FakeMoEBlock(rank)
+    original = {k: v.clone() for k, v in model.state_dict().items()}
+    shared = _run_materialize(model, local_rank=rank, shared_dir=shared_dir, per_rank=None)
+
+    after = model.state_dict()
+    dist.barrier()  # rank 0 removes the file after the last barrier inside
+    torch.save(
+        {
+            "shared": sorted(shared),
+            "matches_own": all(torch.equal(after[k], original[k]) for k in original),
+            "buffers": sorted((str(b.dtype), b.numel()) for b in model._magi_giant_buffers),
+            "leftover": sorted(os.listdir(shared_dir)),
+        },
+        f"{result_file}_{rank}.pt",
+    )
+    dist.destroy_process_group()
+
+
 # ───────────────────────────────────────────────────────────────
 #  Tests
 # ───────────────────────────────────────────────────────────────
+
+
+def test_only_rank_identical_weights_are_shared():
+    world_size = 2
+    with tempfile.TemporaryDirectory() as tmpdir, tempfile.TemporaryDirectory() as shared_dir:
+        result_file = os.path.join(tmpdir, "result")
+        mp.spawn(_worker_mixed, args=(world_size, shared_dir, result_file), nprocs=world_size, join=True)
+
+        for r in range(world_size):
+            got = torch.load(f"{result_file}_{r}.pt", weights_only=True)
+            assert got["shared"] == ["dense", "norm"], got
+            assert got["matches_own"], f"rank {r} lost its own weights"
+            # One per-rank bf16 buffer (experts), one shared buffer per dtype (dense bf16, norm fp32).
+            assert got["buffers"] == sorted([("torch.bfloat16", 4 * 64), ("torch.bfloat16", 64 * 96), ("torch.float32", 96)])
+            assert got["leftover"] == [], got
 
 
 def test_shared_memory_overwrites_ep_shards():
@@ -171,13 +233,6 @@ def test_ep_fix_preserves_per_rank_shards():
 # ───────────────────────────────────────────────────────────────
 
 
-def _group_params_for_fp(module):
-    grouped = {}
-    for name, param in module.named_parameters():
-        grouped.setdefault(param.dtype, []).append((name, param.data))
-    return grouped
-
-
 def test_fingerprint_identical_models():
     """Two models with the same seed produce the same fingerprint."""
     torch.manual_seed(42)
@@ -185,9 +240,7 @@ def test_fingerprint_identical_models():
     torch.manual_seed(42)
     m2 = FakeExpertBlock(num_experts=4, dim=8)
 
-    fp1 = _compute_weights_fingerprint(_group_params_for_fp(m1))
-    fp2 = _compute_weights_fingerprint(_group_params_for_fp(m2))
-    assert fp1 == fp2, "Identical models should have identical fingerprints"
+    assert _param_fingerprint(m1.expert_weight.data) == _param_fingerprint(m2.expert_weight.data)
 
 
 def test_fingerprint_different_models():
@@ -197,30 +250,25 @@ def test_fingerprint_different_models():
     torch.manual_seed(123)
     m2 = FakeExpertBlock(num_experts=4, dim=8)
 
-    fp1 = _compute_weights_fingerprint(_group_params_for_fp(m1))
-    fp2 = _compute_weights_fingerprint(_group_params_for_fp(m2))
-    assert fp1 != fp2, "Models with different weights should have different fingerprints"
-
-
-def test_fingerprint_is_deterministic():
-    """Calling fingerprint twice on the same model gives the same result."""
-    torch.manual_seed(42)
-    m = FakeExpertBlock(num_experts=4, dim=8)
-    g = _group_params_for_fp(m)
-
-    fp1 = _compute_weights_fingerprint(g)
-    fp2 = _compute_weights_fingerprint(g)
-    assert fp1 == fp2, "Fingerprint should be deterministic"
+    assert _param_fingerprint(m1.expert_weight.data) != _param_fingerprint(m2.expert_weight.data)
 
 
 def test_fingerprint_detects_single_element_change():
-    """Changing one element in one parameter changes the fingerprint."""
+    """Changing one element changes the fingerprint (small tensors are hashed whole)."""
     torch.manual_seed(42)
-    m1 = FakeExpertBlock(num_experts=4, dim=8)
-    torch.manual_seed(42)
-    m2 = FakeExpertBlock(num_experts=4, dim=8)
-    m2.expert_weight.data[0, 0] += 1.0
+    w = torch.randn(4, 8, dtype=torch.bfloat16)
+    changed = w.clone()
+    changed[2, 3] += 1.0
 
-    fp1 = _compute_weights_fingerprint(_group_params_for_fp(m1))
-    fp2 = _compute_weights_fingerprint(_group_params_for_fp(m2))
-    assert fp1 != fp2, "Single element change should be detected"
+    assert _param_fingerprint(w) != _param_fingerprint(changed)
+
+
+def test_fingerprint_samples_the_middle_of_large_tensors():
+    """Large tensors equal at both ends but different in between still differ."""
+    a = torch.zeros(1 << 20, dtype=torch.bfloat16)
+    b = a.clone()
+    b[1000:-1000] = 1.0
+
+    assert _param_fingerprint(a) != _param_fingerprint(b)
+    assert _param_fingerprint(a) == _param_fingerprint(a.clone())
+    assert _param_fingerprint(a) != _param_fingerprint(a.view(1024, 1024))
