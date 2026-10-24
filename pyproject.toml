@@ -11,6 +11,15 @@ authors = [
 license = "Apache-2.0"
 readme = "README.md"
 requires-python = ">=3.12"
+# Runtime dependencies (mirror of requirements.txt).
+# graphviz is a Python binding; the `dot` binary is a system dependency
+# (sudo apt update && sudo apt install graphviz).
+dependencies = [
+    "depyf",
+    "graphviz",
+    "pydantic-settings",
+    "seaborn",
+]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
@@ -19,6 +28,25 @@ classifiers = [
 [project.urls]
 "Homepage" = "https://github.com/SandAI-org/MagiCompiler/"
 "Bug Tracker" = "https://github.com/SandAI-org/MagiCompiler/issues"
+
+[project.optional-dependencies]
+# Test-only dependencies (mirror of requirements-test.txt).
+# torch, triton, torchvision are intentionally NOT listed: they must be
+# pre-installed (e.g. via NVIDIA NGC base image) because their versions
+# are tightly coupled to each other and to the CUDA toolkit.
+test = [
+    "diffusers==0.32.2",
+    "fairscale",
+    # Pin filelock < 3.19: versions >= 3.19 call unlink() in _release() before
+    # flock(LOCK_UN), which raises FileNotFoundError on Docker overlayfs/FUSE.
+    # See: https://github.com/tox-dev/filelock/issues/494
+    "filelock<3.19",
+    "ninja",
+    "pytest",
+    "timm==1.0.15",
+    "torchtitan==0.2.0",
+    "transformers==4.48.3",
+]
 
 [tool.isort]
 profile = "black"
