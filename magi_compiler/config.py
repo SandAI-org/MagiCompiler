@@ -217,6 +217,8 @@ class OffloadConfig(BaseModel):
             "Host-first materialization loads checkpoints into pinned memory; "
             "handoff temporarily allocates one CUDA shard. "
             "A host-built unsharded model parks eligible weights on its first CUDA move. "
+            "Load checkpoints before that move; meta-built models load after to_empty and before handoff. "
+            "load_state_dict after handoff is rejected, including through a parent module. "
             "Finish dtype conversion before parking -- before that first CUDA move, or before to_empty "
             "for a meta-built model (e.g. model.half().cuda(), not model.cuda().half()); "
             "parked weights keep their dtype, and later dtype or combined device+dtype casts are unsupported. "

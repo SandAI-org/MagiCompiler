@@ -32,12 +32,17 @@ Weights are parked in the dtype they have at that moment and stay in it.
 Supported later calls are pure device moves (``.cuda()``, ``.cpu()``, ``.to(device)``).
 A cast that visibly changes a handed-over stand-in's dtype is refused; anything
 else, e.g. ``.to(device, dtype)``, is unsupported and not reliably detected.
+
+Load checkpoints before the first CUDA move of a host-built model, or between
+to_empty and handoff for a meta-built model. After handoff, load_state_dict is
+refused before it writes any parameters or buffers, including through a parent.
+Custom loaders that write tensors directly must also finish before handoff.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import partial
+from functools import lru_cache, partial, wraps
 from typing import Literal, Sequence
 
 import torch
@@ -470,12 +475,33 @@ def _materialize_host_weights(module: nn.Module, fn, recurse: bool, *, min_weigh
     return result
 
 
+@lru_cache(maxsize=1)
+def _install_checkpoint_load_guard() -> None:
+    load_state_dict = nn.Module.load_state_dict
+
+    @wraps(load_state_dict)
+    def load_state_dict_before_handoff(self: nn.Module, state_dict, strict: bool = True, assign: bool = False):
+        store = get_global_host_weight_store()
+        for name, parameter in self.named_parameters():
+            if store.slot_for_tensor(_local_weight_tensor(parameter)) is not None:
+                raise RuntimeError(
+                    f"host offload: cannot load a checkpoint into {type(self).__name__}.{name} after host handoff. "
+                    "Load checkpoints before the first CUDA move of a host-built model, or after to_empty "
+                    "and before handoff for a meta-built model. Recreate the model to load different weights."
+                )
+        return load_state_dict(self, state_dict, strict=strict, assign=assign)
+
+    # Parent loads bypass child.load_state_dict; child pre-hooks run after earlier siblings were written.
+    nn.Module.load_state_dict = load_state_dict_before_handoff
+
+
 def install_host_first_hooks(instance: nn.Module, *, min_weight_bytes: int) -> None:
     """Install host-first allocation and residency-aware moves once per module.
     Finish dtype conversion before parking; see the module's dtype contract."""
     state = get_or_create_offload_state(instance)
     if state.hooks_installed:
         return
+    _install_checkpoint_load_guard()
     state.min_weight_bytes = min_weight_bytes
     instance._apply = _apply_with_host_offload.__get__(instance, type(instance))
     state.hooks_installed = True
