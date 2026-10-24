@@ -692,6 +692,18 @@ def _intra_op_threads(num_threads: int):
         torch.set_num_threads(previous)
 
 
+def _split_shared(
+    grouped_params: dict[torch.dtype, list[tuple[str, torch.Tensor]]], shared: Collection[str]
+) -> tuple[dict[torch.dtype, list[tuple[str, torch.Tensor]]], dict[torch.dtype, list[tuple[str, torch.Tensor]]]]:
+    """*grouped_params* split by dtype into the params this rank keeps (own) and those named in *shared* (common)."""
+    own: dict[torch.dtype, list[tuple[str, torch.Tensor]]] = {}
+    common: dict[torch.dtype, list[tuple[str, torch.Tensor]]] = {}
+    for dtype, param_list in grouped_params.items():
+        for name, tensor in param_list:
+            (common if name in shared else own).setdefault(dtype, []).append((name, tensor))
+    return own, common
+
+
 def _materialize_shm_weights(
     module: nn.Module,
     grouped_params: dict[torch.dtype, list[tuple[str, torch.Tensor]]],
@@ -712,12 +724,9 @@ def _materialize_shm_weights(
     """
     cls_name = module.__class__.__name__
     buffers: list[torch.Tensor] = []
-    own: dict[torch.dtype, list[tuple[str, torch.Tensor]]] = {}
-    common: dict[torch.dtype, list[tuple[str, torch.Tensor]]] = {}
-    for dtype, param_list in grouped_params.items():
-        for name, tensor in param_list:
-            (common if name in shared else own).setdefault(dtype, []).append((name, tensor))
-    # Only ``own``/``common`` may still reference the old tensors, or replacing them would not free them.
+    # Only ``own``/``common`` may still reference the old tensors, or replacing them would not free them. A loop
+    # here instead of _split_shared would leave its ``param_list`` holding the last dtype's old tensors.
+    own, common = _split_shared(grouped_params, shared)
     grouped_params.clear()
     if missing := set(common) - set(shared_dtypes):
         raise ValueError(f"[offload] shared weights of dtypes {sorted(map(str, missing))} are not in shared_dtypes")

@@ -30,6 +30,7 @@ backend to reproduce the exact multi-rank scenario without a real model.
 
 import os
 import tempfile
+import weakref
 from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -173,9 +174,57 @@ def _worker_mixed(rank, world_size, shared_dir, result_file, port="29503", hosts
     dist.destroy_process_group()
 
 
+class FakeTwoWeightBlock(nn.Module):
+    """Two weights of one dtype, so both land in one per-rank buffer."""
+
+    def __init__(self, rank: int):
+        super().__init__()
+        torch.manual_seed(rank)
+        self.up = nn.Parameter(torch.randn(64, 96, dtype=torch.bfloat16))
+        self.down = nn.Parameter(torch.randn(96, 64, dtype=torch.bfloat16))
+
+
+def _worker_frees_replaced(rank, world_size, shared_dir, result_file):
+    """Count the weights a per-rank buffer replaced that are still alive when it is pinned."""
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "29504"
+    os.environ["LOCAL_RANK"] = str(rank)
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+    model = FakeTwoWeightBlock(rank)
+    grouped = _group_params(model)
+    replaced = [weakref.ref(t) for params in grouped.values() for _, t in params]
+    alive_at_pin = []
+
+    def pin(t):
+        alive_at_pin.append(sum(ref() is not None for ref in replaced))
+        return t
+
+    with patch("magi_compiler.utils.envs.MAGI_SHARED_BIN_PATH", shared_dir), patch(
+        "magi_compiler._api.pin_memory_in_place", pin
+    ):
+        _materialize_shm_weights(model, grouped, rank, (), ())
+
+    torch.save({"alive_at_pin": alive_at_pin}, f"{result_file}_{rank}.pt")
+    dist.destroy_process_group()
+
+
 # ───────────────────────────────────────────────────────────────
 #  Tests
 # ───────────────────────────────────────────────────────────────
+
+
+def test_per_rank_copy_frees_each_weight_it_replaces():
+    """A replaced weight that stays referenced keeps its memory: with 8 ranks per host, a per-rank copy that frees
+    nothing doubles the host's CPU weights while it runs (400B PP3 over a 512 GiB pod)."""
+    world_size = 2
+    with tempfile.TemporaryDirectory() as tmpdir, tempfile.TemporaryDirectory() as shared_dir:
+        result_file = os.path.join(tmpdir, "result")
+        mp.spawn(_worker_frees_replaced, args=(world_size, shared_dir, result_file), nprocs=world_size, join=True)
+
+        for r in range(world_size):
+            got = torch.load(f"{result_file}_{r}.pt", weights_only=True)
+            assert got["alive_at_pin"] == [0], f"rank {r}: {got}"
 
 
 def test_only_rank_identical_weights_are_shared():
