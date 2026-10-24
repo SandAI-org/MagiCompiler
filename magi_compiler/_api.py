@@ -17,7 +17,9 @@ import gc
 import hashlib
 import inspect
 import os
+import shutil
 import socket
+import time
 from collections.abc import Collection, Sequence
 from contextlib import contextmanager
 from typing import Callable
@@ -597,14 +599,23 @@ def _create_empty_shm(shm_path: str, total_numel: int, dtype: torch.dtype) -> to
     return torch.from_file(shm_path, shared=True, size=total_numel, dtype=dtype, device="cpu")
 
 
+#: Free space a host's shared-memory directory must keep on top of the weights it shares.
+_SHM_HEADROOM_BYTES = 256 << 20
+
+
+def _as_bytes(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.reshape(-1).view(torch.uint8)
+
+
 def _param_fingerprint(tensor: torch.Tensor) -> bytes:
     """Shape, dtype and up to 4 KiB of *tensor*'s bytes, spread evenly over it (both ends included).
 
     Small tensors are hashed whole. Large ones are told apart when they differ throughout (e.g. two EP ranks'
-    experts), not when they differ only in bytes between the samples.
+    experts), not when they differ only in bytes between the samples: :func:`_materialize_shm_weights` compares
+    the shared weights byte for byte, so a collision only costs a per-rank copy.
     """
     h = hashlib.sha256(f"{tuple(tensor.shape)},{tensor.dtype}".encode())
-    data = tensor.reshape(-1).view(torch.uint8)
+    data = _as_bytes(tensor)
     if data.numel() > 4096:
         data = data[torch.linspace(0, data.numel() - 1, 4096, dtype=torch.float64).long()]
     h.update(data.numpy().tobytes())
@@ -617,7 +628,8 @@ def _rank_identical_params(
     """Params every rank on this host holds identically (by fingerprint), and the dtypes any host shares.
 
     Every rank must call this together. The dtype list is the same on every rank, so all of them run the same
-    barriers in :func:`_materialize_shm_weights`. Nothing is shared without a gloo group or on a host with one rank.
+    barriers in :func:`_materialize_shm_weights`. Nothing is shared without a gloo group, on a host with one rank,
+    or on a host whose shared-memory directory cannot hold the shared weights: writing past a full tmpfs is SIGBUS.
     """
     from magi_compiler.utils.dist_utils import get_cpu_gloo_group
 
@@ -626,18 +638,58 @@ def _rank_identical_params(
         magi_logger.warning('[offload] gloo group unavailable, keeping every weight per rank (safe default)')
         return set(), []
 
-    local = {name: (t.dtype, _param_fingerprint(t)) for params in grouped_params.values() for name, t in params}
+    local = {
+        name: (t.dtype, _param_fingerprint(t), t.numel() * t.element_size())
+        for params in grouped_params.values()
+        for name, t in params
+    }
+    free = shutil.disk_usage(envs.MAGI_SHARED_BIN_PATH).free
     gathered: list = [None] * dist.get_world_size()
-    dist.all_gather_object(gathered, (socket.gethostname(), local), group=group)
+    dist.all_gather_object(gathered, (socket.gethostname(), free, local), group=group)
     hosts: dict[str, list[dict]] = {}
-    for host, prints in gathered:
+    host_free: dict[str, int] = {}
+    for host, rank_free, prints in gathered:
         hosts.setdefault(host, []).append(prints)
+        host_free[host] = min(rank_free, host_free.get(host, rank_free))
     shared = {
         host: {name for name, fp in peers[0].items() if all(p.get(name) == fp for p in peers[1:])} if len(peers) > 1 else set()
         for host, peers in hosts.items()
     }
+    me = socket.gethostname()
+    for host, names in shared.items():
+        need = sum(hosts[host][0][name][2] for name in names)
+        if names and need + _SHM_HEADROOM_BYTES > host_free[host]:
+            if host == me:
+                magi_logger.warning(
+                    '[offload] %s has %.1f GiB free, sharing needs %.1f GiB: keeping every weight per rank',
+                    envs.MAGI_SHARED_BIN_PATH,
+                    host_free[host] / 2**30,
+                    need / 2**30,
+                )
+            shared[host] = set()
     dtypes = {hosts[host][0][name][0] for host, names in shared.items() for name in names}
-    return shared[socket.gethostname()], sorted(dtypes, key=str)
+    return shared[me], sorted(dtypes, key=str)
+
+
+def _pin_per_rank(
+    module: nn.Module, grouped_params: dict[torch.dtype, list[tuple[str, torch.Tensor]]], buffers: list[torch.Tensor]
+) -> None:
+    """Move each dtype of *grouped_params* into one plain pinned buffer of this rank's own."""
+    for dtype, param_list in grouped_params.items():
+        giant = torch.empty(sum(t.numel() for _, t in param_list), dtype=dtype, device="cpu")
+        _stream_copy_and_replace(module, giant, param_list)
+        pin_memory_in_place(giant)
+        buffers.append(giant)
+
+
+@contextmanager
+def _intra_op_threads(num_threads: int):
+    previous = torch.get_num_threads()
+    torch.set_num_threads(num_threads)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
 
 
 def _materialize_shm_weights(
@@ -655,6 +707,8 @@ def _materialize_shm_weights(
     Params named in *shared* are identical on every rank of this host (e.g. the dense weights under expert
     parallelism): local rank 0 writes them into one mmap per dtype and every rank maps it. The rest (e.g. each EP
     rank's experts) get a plain pinned tensor per dtype on each rank. Every rank must pass the same *shared_dtypes*.
+    The other ranks compare the mapped weights byte for byte with their own and keep their own copy of any that
+    differ, so a fingerprint collision never swaps a rank's weights for local rank 0's.
     """
     cls_name = module.__class__.__name__
     buffers: list[torch.Tensor] = []
@@ -668,12 +722,11 @@ def _materialize_shm_weights(
     if missing := set(common) - set(shared_dtypes):
         raise ValueError(f"[offload] shared weights of dtypes {sorted(map(str, missing))} are not in shared_dtypes")
 
-    for dtype, param_list in own.items():
-        giant = torch.empty(sum(t.numel() for _, t in param_list), dtype=dtype, device="cpu")
-        _stream_copy_and_replace(module, giant, param_list)
-        pin_memory_in_place(giant)
-        buffers.append(giant)
+    _pin_per_rank(module, own, buffers)
     dist.barrier()
+    differing: dict[torch.dtype, list[tuple[str, torch.Tensor]]] = {}
+    compare_threads = max(1, len(os.sched_getaffinity(0)) // int(os.environ.get("LOCAL_WORLD_SIZE", 1)))
+    compared_bytes, compare_seconds = 0, 0.0
     for dtype in shared_dtypes:
         # Sorted by name, so every rank lays the file out the same way.
         param_list = sorted(common.pop(dtype, []), key=lambda item: item[0])
@@ -685,8 +738,15 @@ def _materialize_shm_weights(
         dist.barrier()
         if local_rank != 0 and param_list:
             giant = torch.from_file(path, shared=True, size=total_numel, dtype=dtype, device="cpu")
-            for name, view in _split_flat_to_params(giant, param_list).items():
-                _assign_param(module, name, view)
+            start = time.perf_counter()
+            with _intra_op_threads(compare_threads):
+                for (name, tensor), view in zip(param_list, _split_flat_to_params(giant, param_list).values()):
+                    if torch.equal(_as_bytes(view), _as_bytes(tensor)):
+                        _assign_param(module, name, view)
+                    else:
+                        differing.setdefault(dtype, []).append((name, tensor))
+            compare_seconds += time.perf_counter() - start
+            compared_bytes += giant.numel() * giant.element_size()
             param_list.clear()
         if total_numel:
             pin_memory_in_place(giant)
@@ -694,6 +754,19 @@ def _materialize_shm_weights(
         dist.barrier()
         if local_rank == 0 and os.path.exists(path):
             os.remove(path)
+
+    if compared_bytes:
+        magi_logger.info(
+            '[offload] compared %.1f GiB of shared weights with local rank 0 in %.1f s',
+            compared_bytes / 2**30,
+            compare_seconds,
+        )
+    if differing:
+        names = [name for params in differing.values() for name, _ in params]
+        magi_logger.warning(
+            '[offload] %d weights differ from local rank 0\'s, keeping them per rank: %s', len(names), names[:5]
+        )
+        _pin_per_rank(module, differing, buffers)
 
     module._magi_giant_buffers = buffers
     gc.collect()
