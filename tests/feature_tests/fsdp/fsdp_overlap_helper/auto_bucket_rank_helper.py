@@ -41,7 +41,8 @@ os.environ.setdefault("MAGI_LOGGING_LEVEL", "info")
 import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
 
-from magi_compiler.passes.fsdp_overlap.auto_bucket import FsdpAutoBucket  # noqa: E402
+from magi_compiler.passes.fsdp_overlap.auto_bucket import FsdpAutoBucket, GatherCandidate  # noqa: E402
+from magi_compiler.passes.fsdp_overlap.ir_coalesce import GatherInfo  # noqa: E402
 from magi_compiler.passes.transfer_overlap import rank_sync  # noqa: E402
 
 
@@ -84,21 +85,21 @@ def _check_candidate_negotiation() -> bool:
     n_cands = 1 if rank == 0 else 2
 
     def candidates(order):
-        return list(order[:n_cands])
+        return [GatherCandidate(snode=node, info=GatherInfo("test", 2, torch.float32, 256)) for node in order[:n_cands]]
 
     seen: dict = {}
     real_negotiate = rank_sync.negotiate_placement_mode
 
     def negotiate(candidate_count, collective_signatures, is_profiling_valid=True, pass_name="FSDP overlap"):
-        mode, group, world_size = real_negotiate(
+        consensus = real_negotiate(
             candidate_count=candidate_count,
             collective_signatures=collective_signatures,
             is_profiling_valid=is_profiling_valid,
             pass_name=pass_name,
         )
-        seen["mode"] = mode
+        seen["mode"] = consensus.placement_mode
         seen["n"] = candidate_count
-        return mode, group, world_size
+        return consensus
 
     with patch.object(FsdpAutoBucket, "_collect_candidates", staticmethod(candidates)), patch.object(
         rank_sync, "negotiate_placement_mode", negotiate
@@ -115,7 +116,8 @@ def _check_candidate_negotiation() -> bool:
 def _check_slot_consensus() -> bool:
     rank, world_size = dist.get_rank(), dist.get_world_size()
     g0, x, g1, g2 = (_SlotSnode(n) for n in ("g0", "x", "g1", "g2"))
-    order, gather_candidates, skeleton = [g0, x, g1, g2], [g0, g1, g2], [g0, x, g1, g2]
+    order, skeleton = [g0, x, g1, g2], [g0, x, g1, g2]
+    gather_candidates = [GatherCandidate(snode=node, info=GatherInfo("test", 2, torch.float32, 256)) for node in (g0, g1, g2)]
     before_x, after_x = [g0, g1, x, g2], [x, g0, g1, g2]
 
     cases = [
@@ -131,7 +133,7 @@ def _check_slot_consensus() -> bool:
         with patch.object(FsdpAutoBucket, "_simulate_bucket_merges", staticmethod(lambda order, buckets, m=merged: m)):
             p = FsdpAutoBucket(runtime_ns_fn=lambda s: 0.0)
             # Every rank adopts rank 0's plan, even when its own plan differs.
-            buckets = [[g0, g1]] if rank == 0 or same_plan else []
+            buckets = [gather_candidates[:2]] if rank == 0 or same_plan else []
             out = p._adopt_rank_zero_buckets(
                 is_local_plan_valid=True,
                 buckets=buckets,
@@ -142,7 +144,7 @@ def _check_slot_consensus() -> bool:
                 skeleton_nodes=skeleton,
             )
         adoption_status = "unbucketed" if out is None else "applied"
-        if out is not None and [[s.name for s in b] for b in out] != [["g0", "g1"]]:
+        if out is not None and [[candidate.snode.name for candidate in bucket] for bucket in out] != [["g0", "g1"]]:
             adoption_status = f"wrong:{out}"
         ok = ok and adoption_status == expected
         print(f"SLOT_CASE rank={rank} case={name} expected={expected} got={adoption_status}", flush=True)

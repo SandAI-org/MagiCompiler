@@ -34,7 +34,8 @@ this.
 from __future__ import annotations
 
 import bisect
-from typing import Mapping
+from dataclasses import dataclass
+from typing import Literal, Mapping
 
 import torch
 import torch.distributed as dist
@@ -85,10 +86,17 @@ def gather_rank_objects(local_object, sync_group, world_size: int) -> list:
     return objects_by_rank
 
 
+@dataclass(frozen=True)
+class PlacementConsensus:
+    placement_mode: Literal["slot", "pinned", "abort"]
+    sync_group: dist.ProcessGroup | None
+    world_size: int
+
+
 def negotiate_placement_mode(
     candidate_count: int, collective_signatures, is_profiling_valid: bool = True, pass_name: str = "FSDP overlap"
-) -> tuple[str, object, int]:
-    """Return (placement_mode, sync_group, world_size) with a rank-identical placement policy.
+) -> PlacementConsensus:
+    """Agree on the placement policy and the process group used by later exchanges.
 
     Matching collective skeletons use consensus slots; differing skeletons pin
     transfers between their existing neighbors. Candidate-count or pricing
@@ -108,7 +116,7 @@ def negotiate_placement_mode(
             "unchanged on every rank (overlap OFF).",
             failed_ranks,
         )
-        return "abort", sync_group, world_size
+        return PlacementConsensus(placement_mode="abort", sync_group=sync_group, world_size=world_size)
 
     counts_by_rank = [(count, len(signatures)) for count, signatures in zip(candidate_counts, signatures_by_rank)]
     if any(count != candidate_counts[0] for count in candidate_counts[1:]):
@@ -117,16 +125,16 @@ def negotiate_placement_mode(
             "leaving the graph unchanged (overlap OFF).",
             counts_by_rank,
         )
-        return "abort", sync_group, world_size
+        return PlacementConsensus(placement_mode="abort", sync_group=sync_group, world_size=world_size)
     if all(signatures == signatures_by_rank[0] for signatures in signatures_by_rank[1:]):
-        return "slot", sync_group, world_size
+        return PlacementConsensus(placement_mode="slot", sync_group=sync_group, world_size=world_size)
     magi_logger.warning(
         pass_name + " reorder: collective skeletons differ ((n_weight_gathers, n_collectives) per rank: %s). "
         "Continuing in PINNED mode: gathers keep their position relative to every NCCL-issuing snode "
         "(no hop over CP / EP kernels).",
         counts_by_rank,
     )
-    return "pinned", sync_group, world_size
+    return PlacementConsensus(placement_mode="pinned", sync_group=sync_group, world_size=world_size)
 
 
 def all_ranks_agree(local_vote: bool, sync_group, world_size: int) -> bool:

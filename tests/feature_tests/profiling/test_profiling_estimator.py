@@ -900,3 +900,45 @@ def test_ce_ag_sync_mode_defers_the_measurement_to_warm_and_sync(ce_measure_call
     (entry,) = est.table.values()
     assert not entry.measured
     assert list(est._key_snode) == list(est.table), "snode not stashed for warm_and_sync"
+
+
+@pytest.mark.parametrize("transport", ["ce", "nccl"])
+@pytest.mark.parametrize("sync_across_ranks", [False, True])
+def test_collective_requery_preserves_measurement_policy_and_reuse_counts(monkeypatch, transport, sync_across_ranks):
+    """A cost refresh must neither count reuse nor measure an NCCL or deferred collective locally."""
+    snode = object()
+    launch = object()
+    local_measurements = []
+    monkeypatch.setattr(re_mod, "contains_wait", lambda node: False)
+    monkeypatch.setattr(re_mod, "_is_multi_output_unpack", lambda node: False)
+    from magi_compiler.passes import snode_utils
+
+    monkeypatch.setattr(snode_utils, "is_h2d_load", lambda node: False)
+    monkeypatch.setattr(re_mod, "contains_collective", lambda node: transport == "nccl")
+    monkeypatch.setattr(re_mod, "_leaf_ce_ag", lambda node: launch if transport == "ce" else None)
+    monkeypatch.setattr(re_mod, "_leaf_collective", lambda node: launch)
+    monkeypatch.setattr(re_mod, "_ce_ag_spec", lambda node: (((8, 4),), torch.bfloat16, 2, "group"))
+    monkeypatch.setattr(
+        re_mod, "_collective_spec", lambda node: ("all_gather", "group", 2, [((8, 4), torch.bfloat16, "cuda")])
+    )
+    monkeypatch.setattr(re_mod, "analytical_runtime_ns", lambda node: 111.0)
+
+    def measure_local(node):
+        local_measurements.append(node)
+        return 222.0
+
+    monkeypatch.setattr(re_mod, "_measure_ce_ag", measure_local)
+    estimator = ProfilingRuntimeEstimator()
+    estimator._sync_across_ranks = sync_across_ranks
+    expected_ns = 222.0 if transport == "ce" and not sync_across_ranks else 111.0
+    assert estimator(snode) == expected_ns
+    (entry,) = estimator.table.values()
+    assert entry.measured == (transport == "ce" and not sync_across_ranks)
+    assert list(estimator._key_snode.values()) == ([snode] if sync_across_ranks else [])
+
+    entry.ns = 333.0  # A completed warm_and_sync can replace the seed before the refresh.
+    assert estimator.estimate_without_reuse_count(snode) == 333.0
+    assert (entry.reuse_count, estimator.n_cache_hits) == (0, 0)
+    assert estimator(snode) == 333.0
+    assert (entry.reuse_count, estimator.n_cache_hits) == (1, 1)
+    assert local_measurements == ([snode] if transport == "ce" and not sync_across_ranks else [])

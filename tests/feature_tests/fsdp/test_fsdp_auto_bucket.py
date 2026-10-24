@@ -148,10 +148,9 @@ def test_each_process_group_gets_its_own_fit(monkeypatch):
     dense = [_Gather("dense", 8, mib, 3.9, 44.0) for mib in (22.5, 15.0, 144.0, 9.0, 36.0)]
     expert = [_Gather("expert", 1, mib, 0.32, 10.0) for mib in (1920.0, 960.0)]
     gather_candidates = dense + expert
-    monkeypatch.setattr(auto_bucket, "parse_single_gather", lambda s: s.info)
 
     params = auto_bucket.FsdpAutoBucket(runtime_ns_fn=lambda s: s.ns)._fit_bucket_params(
-        gather_candidates, CostView(lambda s: s.ns)
+        [auto_bucket.GatherCandidate(snode=s, info=s.info) for s in gather_candidates], CostView(lambda s: s.ns)
     )
 
     assert set(params) == {("nccl", "dense", 8), ("nccl", "expert", 1)}
@@ -163,6 +162,36 @@ def test_each_process_group_gets_its_own_fit(monkeypatch):
 
     _, pooled_beta = fit_gather_cost_model([(s.info.shard_bytes * s.info.world_size, s.ns) for s in gather_candidates])
     assert pooled_beta < 0.2 * params[("nccl", "dense", 8)].beta_ns_per_byte, "pooled, the copies set beta for all"
+
+
+def test_candidate_metadata_is_reused_after_collection(monkeypatch):
+    """Planning and reporting must not reparse IR that coalescing may already have replaced."""
+    from types import SimpleNamespace
+
+    from magi_compiler.passes.fsdp_overlap import auto_bucket
+    from magi_compiler.passes.fsdp_overlap.ir_coalesce import GatherInfo
+    from magi_compiler.passes.transfer_overlap import CostView
+
+    gathers = [SimpleNamespace(node=SimpleNamespace(origins=()), ns=1000.0) for _ in range(2)]
+    unsupported = object()
+    parse_calls = []
+
+    def parse_once(snode):
+        assert all(snode is not previous for previous in parse_calls)
+        parse_calls.append(snode)
+        return None if snode is unsupported else GatherInfo("group", 2, torch.bfloat16, 1024)
+
+    monkeypatch.setattr(auto_bucket, "weight_gathers", lambda order: order)
+    monkeypatch.setattr(auto_bucket, "parse_single_gather", parse_once)
+    candidates = auto_bucket.FsdpAutoBucket._collect_candidates([*gathers, unsupported])
+    bucket_pass = auto_bucket.FsdpAutoBucket()
+    params = bucket_pass._fit_bucket_params(candidates=candidates, cost=CostView(lambda snode: snode.ns))
+    partitions = bucket_pass._partition_compatible_gathers(candidates)
+    assert len(partitions) == 1 and [candidate.snode for candidate in partitions[0]] == gathers
+    for gather in gathers:
+        gather.node = None
+    bucket_pass._log_bucket_summary(params_by_cost_model=params, buckets=[candidates], candidate_count=2)
+    assert len(parse_calls) == 3
 
 
 @pytest.mark.parametrize(

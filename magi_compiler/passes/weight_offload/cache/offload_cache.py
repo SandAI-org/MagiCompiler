@@ -26,13 +26,18 @@ import ast
 import pprint
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 import torch.fx as fx
 
 from magi_compiler.utils import magi_logger
 
-from .slot_table import collect_host_slot_table, match_host_slot_tables, refresh_resident_flags
+from .slot_table import (
+    HostSlotMetadata,
+    collect_host_slot_table,
+    match_host_slot_tables,
+    parse_host_slot_table,
+    refresh_resident_flags,
+)
 
 
 class OffloadCache:
@@ -45,7 +50,7 @@ class OffloadCache:
     def __init__(self, enabled: bool):
         self.enabled = enabled
         self.host_slots_path: Path | None = None
-        self._graph_slot_table: dict[int, dict[str, Any]] = {}
+        self._graph_slot_table: dict[int, HostSlotMetadata] = {}
         self._cached_to_current_slots: dict[int, int] | None = None
 
     def initialize(self, cache_dir: Path) -> None:
@@ -79,7 +84,7 @@ class OffloadCache:
         resident_slots_to_restore = [
             cached_to_current_slots[cached_slot]
             for cached_slot, slot_metadata in cached_slots.items()
-            if slot_metadata.get("resident")
+            if slot_metadata["resident"]
         ]
         if resident_slots_to_restore:
             get_global_host_weight_store().make_weights_resident(resident_slots_to_restore)
@@ -119,7 +124,7 @@ class OffloadCache:
         printer = pprint.PrettyPrinter(indent=4)
         self.host_slots_path.write_text(printer.pformat(slot_table))
 
-    def _load_sidecar(self) -> dict[int, dict] | None:
+    def _load_sidecar(self) -> dict[int, HostSlotMetadata] | None:
         if self.host_slots_path is None or not self.host_slots_path.exists():
             return None
         try:
@@ -131,7 +136,7 @@ class OffloadCache:
             magi_logger.warning("host offload: host_slots sidecar is not a dict; treating as cache miss")
             return None
         try:
-            return {int(k): dict(v) for k, v in sidecar_data.items()}
-        except (TypeError, ValueError) as exc:
+            return parse_host_slot_table(sidecar_data)
+        except (KeyError, TypeError, ValueError) as exc:
             magi_logger.warning("host offload: host_slots sidecar has invalid entries (%s); treating as cache miss", exc)
             return None

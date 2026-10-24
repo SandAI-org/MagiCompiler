@@ -110,15 +110,20 @@ def ir_node_bytes(node: ir.IRNode) -> int:
     return numel * node.get_dtype().itemsize
 
 
+def is_h2d_load(snode: BaseSchedulerNode) -> bool:
+    """Recognize the fallback op; rank-private H2D loads stay outside the collective skeleton."""
+    # Deferred: weight_offload's package initialization imports these shared helpers.
+    from .weight_offload.runtime.h2d_op import H2D_LOAD
+
+    return any(isinstance(node, ir.ExternKernel) and node.op_overload is H2D_LOAD for node in iter_ir_nodes(snode))
+
+
 def is_compute(snode: BaseSchedulerNode) -> bool:
     """True if this snode's runtime is compute a transfer can hide behind.
 
     A weight load is excluded along with comm: counting a PCIe
     transfer as compute would spend the same microseconds hiding two transfers.
     """
-    # Imported per call: weight_offload's package init imports this module.
-    from .weight_offload.schedule.h2d_snode import is_h2d_load
-
     return not issues_comm(snode) and not is_h2d_load(snode) and not contains_wait(snode)
 
 

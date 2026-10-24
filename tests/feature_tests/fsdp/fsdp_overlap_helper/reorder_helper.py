@@ -95,7 +95,9 @@ def _mode_ladder_selfcheck(rank: int) -> bool:
     ]
     ok = True
     for expected, n_ag, signatures, is_profiling_valid in cases:
-        got = negotiate(candidate_count=n_ag, collective_signatures=signatures, is_profiling_valid=is_profiling_valid)[0]
+        got = negotiate(
+            candidate_count=n_ag, collective_signatures=signatures, is_profiling_valid=is_profiling_valid
+        ).placement_mode
         ok = ok and got == expected
         print(f"REORDER_MODE_CASE rank={rank} expected={expected} got={got}", flush=True)
     return ok
@@ -195,7 +197,7 @@ def main() -> None:
 
     def spy_negotiate(*args, **kwargs):
         result = orig_negotiate(*args, **kwargs)
-        if result[0] == "slot":
+        if result.placement_mode == "slot":
             calls["slot_mode"] = True
             print(f"REORDER_SLOT rank={rank}", flush=True)
         return result
