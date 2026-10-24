@@ -290,8 +290,8 @@ def test_align_propagates_a_failed_group_collective(monkeypatch):
 
 def test_pinned_reservation_failure_is_not_downgraded(monkeypatch):
     """A failed pinned reservation must raise instead of returning pageable storage."""
+    from magi_compiler.passes.weight_offload.runtime.host_memory_pool import HostMemPool
     from magi_compiler.passes.weight_offload.runtime.host_weights import HostWeightStore
-    from magi_compiler.passes.weight_offload.runtime.pool import HostMemPool
 
     original_empty = torch.empty
     failure = RuntimeError("pinned allocation failed")
@@ -985,14 +985,67 @@ def _registered_parameter(module: torch.nn.Module, name: str = "weight"):
 
 
 def _install_host_first_hooks(instance, *, min_shard_mib=0.0):
-    from magi_compiler.config import get_compile_config
     from magi_compiler.passes.weight_offload import install_host_first_hooks
 
-    conf = get_compile_config().model_copy(deep=True)
-    conf.offload_config.graph_weight_offload = True
-    conf.offload_config.offload_min_shard_mib = min_shard_mib
-    install_host_first_hooks(instance, conf)
+    install_host_first_hooks(instance=instance, min_weight_bytes=int(min_shard_mib * 1024 * 1024))
     return instance
+
+
+def test_host_first_uses_the_current_class_apply_after_installation():
+    """A sharding owner may replace the module class after hooks are installed."""
+
+    class UpdatedLinear(torch.nn.Linear):
+        def _apply(self, fn, recurse=True):
+            self.class_apply_calls += 1
+            return super()._apply(fn, recurse=recurse)
+
+    module = _install_host_first_hooks(torch.nn.Linear(4, 4, bias=False))
+    module.__class__ = UpdatedLinear
+    module.class_apply_calls = 0
+    module.double()
+
+    assert module.class_apply_calls == 1
+    assert module.weight.dtype is torch.float64
+
+
+@requires_cuda
+def test_host_first_installation_and_parking_decision_are_not_repeated():
+    """Reinstallation must preserve the threshold, and a later CUDA move must not reselect weights."""
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
+
+    module = _install_host_first_hooks(torch.nn.Linear(4, 4, bias=False), min_shard_mib=1.0)
+    _install_host_first_hooks(module, min_shard_mib=0.0)
+    module.cuda()
+    assert get_global_host_weight_store().slot_for_tensor(module.weight) is None
+
+    module.cpu()
+    module.weight = torch.nn.Parameter(torch.ones(1024, 1024))
+    module.cuda()
+    assert get_global_host_weight_store().slot_for_tensor(module.weight) is None
+    torch.testing.assert_close(module.weight, torch.ones_like(module.weight))
+
+
+@requires_cuda
+def test_empty_handoff_completes_after_all_parked_weights_are_reclaimed():
+    """An external reader may reclaim every parked weight; handoff must still finish exactly once."""
+    from magi_compiler.passes.weight_offload.weight_lifecycle import (
+        get_offload_state,
+        handoff_host_weights_if_pending,
+        is_handoff_complete,
+    )
+
+    module = _install_host_first_hooks(torch.nn.Linear(4, 4, bias=False, device="meta"))
+    assert not is_handoff_complete(module)
+    module.to_empty(device="cuda")
+    assert get_offload_state(module).handoff_status == "pending"
+
+    # Bypass the instance hook, as an eager sibling does for a shared parameter.
+    type(module)._apply(module, lambda tensor: torch.empty_like(tensor, device="cuda"))
+    assert handoff_host_weights_if_pending(module) == 0
+    assert is_handoff_complete(module)
+    assert get_offload_state(module).host_slots == ()
+    assert handoff_host_weights_if_pending(module) == 0
+    assert module.weight.untyped_storage().nbytes() > 0
 
 
 class _TiedWeightModule(torch.nn.Module):
@@ -1147,6 +1200,7 @@ def test_graph_weight_offload_refuses_aot_before_parking_anything():
     """AOT replay cannot remap baked host slots, so the combination must fail at compile setup."""
     from magi_compiler import magi_compile
     from magi_compiler.config import CompileMode
+    from magi_compiler.passes.weight_offload.weight_lifecycle import get_offload_state
 
     def patch(cfg):
         cfg.compile_mode = CompileMode.MAGI_COMPILE
@@ -1157,13 +1211,14 @@ def test_graph_weight_offload_refuses_aot_before_parking_anything():
     module = _CompiledWeightModule(rows=256, cols=64)
     with pytest.raises(ValueError, match="does not support aot=True"):
         magi_compile(module, config_patch=patch, dynamic_arg_dims={"x": 0})
-    assert not getattr(module, "_magi_host_first_installed", False)
+    assert get_offload_state(module) is None
 
 
 def test_graph_weight_offload_refuses_split_graphs_before_parking_anything():
     """Each piecewise subgraph spends the residency budget again, so a split compile must fail at setup."""
     from magi_compiler import magi_compile
     from magi_compiler.config import CompileMode
+    from magi_compiler.passes.weight_offload.weight_lifecycle import get_offload_state
 
     def patch(cfg):
         cfg.compile_mode = CompileMode.MAGI_COMPILE
@@ -1174,7 +1229,7 @@ def test_graph_weight_offload_refuses_split_graphs_before_parking_anything():
     module = _CompiledWeightModule(rows=256, cols=64)
     with pytest.raises(ValueError, match="requires disable_graph_split=True"):
         magi_compile(module, config_patch=patch, dynamic_arg_dims={"x": 0})
-    assert not getattr(module, "_magi_host_first_installed", False)
+    assert get_offload_state(module) is None
 
 
 @requires_cuda
@@ -1265,8 +1320,8 @@ def test_host_first_materializes_hands_off_and_binds_the_compiled_subtree(dist_1
         get_global_host_weight_store,
         insert_h2d_loads,
     )
-    from magi_compiler.passes.weight_offload.host_first import handoff_host_weights_if_pending
     from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
+    from magi_compiler.passes.weight_offload.weight_lifecycle import handoff_host_weights_if_pending
 
     root = _shard_on_meta(dist_1rank, rows=256, cols=64)
     _install_host_first_hooks(root.inner)
@@ -1313,7 +1368,7 @@ def test_a_tied_shard_lands_on_one_slot(dist_1rank):
     ``swap_tensors`` rewrites the object rather than the registration, so that
     single pass lands on both names at no extra cost.
     """
-    from magi_compiler.passes.weight_offload.host_first import handoff_host_weights_if_pending
+    from magi_compiler.passes.weight_offload.weight_lifecycle import handoff_host_weights_if_pending
 
     root = _tied_on_meta(dist_1rank, rows=256, cols=64)
     _install_host_first_hooks(root.inner)
@@ -1329,7 +1384,7 @@ def test_handoff_fails_rather_than_re_register_a_weight_it_cannot_swap(dist_1ran
     """A weight swap_tensors refuses must stop the handoff: re-registering it would break its identity."""
     import weakref
 
-    from magi_compiler.passes.weight_offload.host_first import handoff_host_weights_if_pending
+    from magi_compiler.passes.weight_offload.weight_lifecycle import handoff_host_weights_if_pending
 
     root = _tied_on_meta(dist_1rank, rows=256, cols=64)
     _install_host_first_hooks(root.inner)
@@ -1350,7 +1405,7 @@ def test_handoff_preserves_a_weight_shared_with_the_eager_subtree(dist_1rank, ea
     reserves host bytes which eager then replaces before handoff.
     """
     from magi_compiler.passes.weight_offload import get_global_host_weight_store
-    from magi_compiler.passes.weight_offload.host_first import handoff_host_weights_if_pending
+    from magi_compiler.passes.weight_offload.weight_lifecycle import handoff_host_weights_if_pending
 
     root = _tied_across_the_boundary(dist_1rank, rows=256, cols=64, eager_first=eager_first)
     _install_host_first_hooks(root.inner)
@@ -1668,7 +1723,7 @@ def _reference_materialized_layout(cls, memory_format=None) -> tuple[int, ...]:
 def test_plain_parameter_keeps_the_layout_to_empty_would_give_it(model_cls, memory_format):
     """Decline non-contiguous weights: flat host reservations cannot preserve their layout."""
     from magi_compiler.passes.weight_offload import get_global_host_weight_store
-    from magi_compiler.passes.weight_offload.host_first import handoff_host_weights_if_pending
+    from magi_compiler.passes.weight_offload.weight_lifecycle import handoff_host_weights_if_pending
 
     expected = _reference_materialized_layout(model_cls, memory_format=memory_format)
     with torch.device("meta"):
@@ -1694,8 +1749,8 @@ def test_plain_parameter_keeps_the_layout_to_empty_would_give_it(model_cls, memo
 def test_plain_host_first_materializes_hands_off_and_binds_the_compiled_subtree():
     """Materialize on the host, hand off once, reuse the slots in FX, then restore."""
     from magi_compiler.passes.weight_offload import get_global_host_weight_store
-    from magi_compiler.passes.weight_offload.host_first import handoff_host_weights_if_pending
     from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
+    from magi_compiler.passes.weight_offload.weight_lifecycle import handoff_host_weights_if_pending
 
     root = _make_meta_module_tree()
     _install_host_first_hooks(root.inner)

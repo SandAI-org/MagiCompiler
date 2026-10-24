@@ -21,21 +21,20 @@ splice, the placement pass -- is written once against that.
 
 Layout, in the order a compile meets it:
 
-* ``host_first``  -- model build: weights materialize in pinned host memory.
+* ``weight_lifecycle`` -- model materialization, host handoff, and device residency.
 * ``graph/``      -- FX weight pipeline: bind parked weights, splice loads in.
 * ``schedule/``   -- Inductor scheduler pass: place each load, buy residency.
 * ``cache/``      -- host-slot sidecar next to the piecewise compile cache.
 * ``runtime/``    -- what the compiled graph calls: host weight slots, the pinned slab pool, ``magi::h2d_load``.
-* ``residency``   -- device moves of a compiled module: free / re-promote its promoted shards.
 """
 
 from .cache.offload_cache import OffloadCache
 from .graph.bind import bind_host_slots_to_graph, insert_h2d_loads
 from .graph.weight_source import FsdpShardSource, PlainParamSource
-from .host_first import handoff_host_weights_if_pending, install_host_first_hooks
 from .node_meta import is_host_offloaded
 from .runtime.host_weights import get_global_host_weight_store
 from .schedule.h2d_reorder import H2dLoadReorder
+from .weight_lifecycle import handoff_host_weights_if_pending, install_host_first_hooks
 
 __all__ = [
     "bind_host_slots_to_graph",

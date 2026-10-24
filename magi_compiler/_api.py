@@ -282,7 +282,9 @@ def _magi_compile_bound_method(
             )
         from magi_compiler.passes.weight_offload import install_host_first_hooks
 
-        install_host_first_hooks(instance=instance, conf=conf)
+        install_host_first_hooks(
+            instance=instance, min_weight_bytes=int(conf.offload_config.offload_min_shard_mib * 1024 * 1024)
+        )
 
     old_method = getattr(instance, method_name)
 
