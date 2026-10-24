@@ -216,5 +216,5 @@ def _insert_weight_load(graph: fx.GraphModule, weight_node: fx.Node, host_slot: 
     # Everything that read the (now storage-free) weight reads the loaded copy
     # instead -- except the load itself, which still needs it.
     weight_node.replace_all_uses_with(wait, delete_user_cb=lambda user: user is not load)
-    get_global_host_weight_store().mark_claimed(host_slot)
+    get_global_host_weight_store().mark_slot_with_h2d_load(host_slot)
     return 1

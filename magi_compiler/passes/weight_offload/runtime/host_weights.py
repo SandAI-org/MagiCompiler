@@ -68,7 +68,7 @@ class HostWeightStore:
         # shard, so the object stays alive and its id stays unique even after
         # its CUDA storage is gone.
         self._slot_by_tensor_id: dict[int, int] = {}
-        self._claimed_slots: set[int] = set()
+        self._slots_with_h2d_load: set[int] = set()
         self._resident_slots: set[int] = set()
         self._bandwidth_bytes_per_ns: float | None = None
 
@@ -77,7 +77,7 @@ class HostWeightStore:
         self._weights_by_slot.clear()
         self._pool.reset()
         self._resident_slots.clear()
-        self._claimed_slots.clear()
+        self._slots_with_h2d_load.clear()
         self._slot_by_tensor_id.clear()
         self._bandwidth_bytes_per_ns = None
 
@@ -156,6 +156,17 @@ class HostWeightStore:
         entry = self._weight_for_slot(slot)
         return entry.device_standin if slot in self._resident_slots else entry.host_buffer
 
+    def validated_copy_source(self, *, shard: torch.Tensor, slot: int) -> torch.Tensor:
+        copy_source = self.copy_source(slot)
+        if tuple(shard.shape) != tuple(copy_source.shape) or shard.dtype != copy_source.dtype:
+            raise RuntimeError(
+                f"magi::h2d_load slot {slot} ({self.parameter_name(slot)!r}) is "
+                f"{tuple(copy_source.shape)} {copy_source.dtype}, but the graph asked for "
+                f"{tuple(shard.shape)} {shard.dtype}. The compiled artifact's slot "
+                "ids do not match this process's host weight store."
+            )
+        return copy_source
+
     def make_weight_resident(self, slot: int) -> int:
         """Put a shard back on the device.  Returns the bytes this cost (0 if already there)."""
         return self.make_weights_resident([slot])
@@ -203,21 +214,20 @@ class HostWeightStore:
     def is_resident(self, slot: int) -> bool:
         return slot in self._resident_slots
 
-    def mark_claimed(self, slot: int) -> None:
-        """Record that a graph now carries a load for this slot."""
-        self._claimed_slots.add(slot)
+    def mark_slot_with_h2d_load(self, slot: int) -> None:
+        """Record that a graph now carries an H2D load for this slot."""
+        self._slots_with_h2d_load.add(slot)
 
-    def restore_unclaimed_weights(self, slots: Sequence[int]) -> list[str]:
-        """Restore the unclaimed, nonresident ``slots`` before graph execution; return their names.
-        This prevents readers without an inserted load from accessing empty storage. Only the
-        compiling graph's slots: another model's are unclaimed until its own compile binds them."""
-        unclaimed_slots = [
-            slot for slot in dict.fromkeys(slots) if slot not in self._claimed_slots and slot not in self._resident_slots
+    def restore_weights_without_h2d_load(self, slots: Sequence[int]) -> list[str]:
+        """Restore nonresident weights without H2D loads before execution; return their names.
+        Only pass the compiling graph's slots: other models may not have compiled yet."""
+        slots_to_restore = [
+            slot for slot in dict.fromkeys(slots) if slot not in self._slots_with_h2d_load and slot not in self._resident_slots
         ]
-        if not unclaimed_slots:
+        if not slots_to_restore:
             return []
-        self.make_weights_resident(unclaimed_slots)
-        return [self._weights_by_slot[slot].parameter_name or f"slot {slot}" for slot in unclaimed_slots]
+        self.make_weights_resident(slots_to_restore)
+        return [self._weights_by_slot[slot].parameter_name or f"slot {slot}" for slot in slots_to_restore]
 
     def slot_bytes(self, slot: int) -> int:
         return self._weight_for_slot(slot).nbytes

@@ -51,7 +51,7 @@ from ...transfer_overlap import (
 from .h2d_snode import host_slot_of_load, is_h2d_load, load_bytes
 
 _MAX_BUDGET_SPLIT_ROUNDS = 5
-"""Times ``_choose_load_schedule`` may grow the in-flight budget out of the residency one."""
+"""Times ``assign_launch_indices`` may grow the in-flight budget out of the residency one."""
 
 _DENSITY_SEARCH_STEPS = 8
 """Bisection steps for the target bus density; 8 lands within 0.4% of it."""
@@ -121,47 +121,6 @@ class H2dLoadReorder(OverlapPass):
     def build_transfer_tasks(
         self, graph: SnodeGraph, cost: CostView, call_state: H2dLoadCallState
     ) -> list[H2dLoadTask] | None:
-        return self._build_load_tasks(graph) or None
-
-    def assign_launch_indices(
-        self, graph: SnodeGraph, cost: CostView, tasks: list[H2dLoadTask], call_state: H2dLoadCallState
-    ) -> dict:
-        load_schedule = self._choose_load_schedule(
-            tasks=tasks,
-            original_index_by_node=graph.original_index_by_node,
-            compute_prefix_ns=cost.compute_prefix_ns(graph.order),
-        )
-        call_state.load_schedule = load_schedule
-        return load_schedule.schedule_result.launch_index_by_anchor
-
-    def on_commit(self, graph: SnodeGraph, tasks: list[H2dLoadTask], call_state: H2dLoadCallState) -> None:
-        resident_anchors = call_state.load_schedule.resident_anchors
-        call_state.promoted_bytes = self._make_selected_weights_resident(tasks=tasks, resident_anchors=resident_anchors)
-
-    def log_reorder_summary(
-        self,
-        graph: SnodeGraph,
-        cost: CostView,
-        tasks: list[H2dLoadTask],
-        launch_index_by_anchor: dict,
-        committed: bool,
-        call_state: H2dLoadCallState,
-    ) -> None:
-        if committed:
-            self._log_load_schedule(
-                tasks=tasks,
-                load_schedule=call_state.load_schedule,
-                original_index_by_node=graph.original_index_by_node,
-                promoted_bytes=call_state.promoted_bytes,
-            )
-
-    # -- planning ---------------------------------------------------------
-    @staticmethod
-    def _load_nodes_and_waits(load, graph: SnodeGraph) -> tuple[list, list]:
-        """The load plus the ``MultiOutput`` unpack its result reaches readers through, and the waits guarding it."""
-        return [load, *graph.unpacks_of(load)], graph.waits_of(load)
-
-    def _build_load_tasks(self, graph: SnodeGraph) -> list[H2dLoadTask]:
         original_index_by_node = graph.original_index_by_node
         tasks: list[H2dLoadTask] = []
         for load in (s for s in graph.order if is_h2d_load(s)):
@@ -183,7 +142,104 @@ class H2dLoadReorder(OverlapPass):
                     transfer_bytes=transfer_bytes,
                 )
             )
-        return tasks
+        return tasks or None
+
+    def assign_launch_indices(
+        self, graph: SnodeGraph, cost: CostView, tasks: list[H2dLoadTask], call_state: H2dLoadCallState
+    ) -> dict:
+        original_index_by_node = graph.original_index_by_node
+        compute_prefix_ns = cost.compute_prefix_ns(graph.order)
+        best_schedule: LoadSchedule | None = None
+        for resident_budget_bytes, inflight_budget_bytes in self._iter_budget_splits(tasks):
+            resident_anchors = self._search_resident_weights(
+                tasks=tasks, compute_prefix_ns=compute_prefix_ns, resident_budget_bytes=resident_budget_bytes
+            )
+            schedule_result = schedule_transfers_alap(
+                tasks, compute_prefix_ns, original_index_by_node, inflight_budget_bytes, off_bus_anchors=resident_anchors
+            )
+            total_unhidden_ns = schedule_result.total_unhidden_ns
+            if best_schedule is None or total_unhidden_ns < best_schedule.schedule_result.total_unhidden_ns - 1e-9:
+                best_schedule = LoadSchedule(
+                    resident_anchors=resident_anchors,
+                    inflight_budget_bytes=inflight_budget_bytes,
+                    schedule_result=schedule_result,
+                )
+            # Only an in-flight shortage is worth buying more in-flight room for;
+            # if the bus itself is full, taking bytes off residency makes it worse.
+            if total_unhidden_ns <= 0 or not schedule_result.inflight_budget_limited_anchors:
+                break
+        assert best_schedule is not None  # _iter_budget_splits always yields at least once
+        call_state.load_schedule = best_schedule
+        return best_schedule.schedule_result.launch_index_by_anchor
+
+    def on_commit(self, graph: SnodeGraph, tasks: list[H2dLoadTask], call_state: H2dLoadCallState) -> None:
+        resident_anchors = call_state.load_schedule.resident_anchors
+        call_state.promoted_bytes = self._make_selected_weights_resident(tasks=tasks, resident_anchors=resident_anchors)
+
+    def log_reorder_summary(
+        self,
+        graph: SnodeGraph,
+        cost: CostView,
+        tasks: list[H2dLoadTask],
+        launch_index_by_anchor: dict,
+        committed: bool,
+        call_state: H2dLoadCallState,
+    ) -> None:
+        if not committed:
+            return
+        load_schedule = call_state.load_schedule
+        original_index_by_node = graph.original_index_by_node
+        schedule_result = load_schedule.schedule_result
+        launch_index_by_anchor = schedule_result.launch_index_by_anchor
+        inflight_budget_bytes = load_schedule.inflight_budget_bytes
+        resident_anchors = load_schedule.resident_anchors
+
+        peak_inflight_bytes = inflight_peak_bytes(tasks, launch_index_by_anchor)
+        hoisted_load_count = sum(
+            1 for load, launch_index in launch_index_by_anchor.items() if launch_index != original_index_by_node[load]
+        )
+        bus_transfer_bytes = sum(p.transfer_bytes for p in tasks if p.anchor not in resident_anchors)
+        # graph.order is already reordered; deadlines still index the original order.
+        original_order = list(original_index_by_node)
+        overlap_capacity_bytes = self._overlap_capacity_bytes(
+            tasks=tasks, compute_prefix_ns=cost.compute_prefix_ns(original_order)
+        )
+        uncovered_bytes = bus_transfer_bytes - overlap_capacity_bytes
+        if uncovered_bytes > 0 and schedule_result.total_unhidden_ns > 0:
+            magi_logger.warning(
+                "h2d load reorder: estimated transfer coverage deficit=%.1f MiB (%.1fms); consider more residency",
+                uncovered_bytes / 2**20,
+                uncovered_bytes / self.bandwidth_bytes_per_ns / 1e6,
+            )
+        peak_weight_storage_bytes = weight_storage_peak_bytes(
+            tasks, launch_index_by_anchor, original_index_by_node, resident_anchors
+        )
+        magi_logger.info(
+            "h2d load reorder: promoted %.1f MiB; resident loads=%d; bus=%.1f MiB at %.1f GB/s; "
+            "Hoisted %d/%d load(s); in-flight peak %.1f MiB of the %.0f MiB budget; "
+            "device-weight peak=%.1f MiB; exposed=%.1fms (budget-bound=%.1fms)",
+            call_state.promoted_bytes / 2**20,
+            len(resident_anchors),
+            bus_transfer_bytes / 2**20,
+            self.bandwidth_bytes_per_ns,
+            hoisted_load_count,
+            len(tasks),
+            peak_inflight_bytes / 2**20,
+            inflight_budget_bytes / 2**20,
+            peak_weight_storage_bytes / 2**20,
+            schedule_result.total_unhidden_ns / 1e6,
+            schedule_result.inflight_budget_limited_unhidden_ns / 1e6,
+        )
+        assert peak_inflight_bytes <= inflight_budget_bytes, (
+            f"h2d load reorder: in-flight peak {peak_inflight_bytes} B exceeds "
+            f"the {inflight_budget_bytes} B budget it was placed under"
+        )
+
+    # -- planning ---------------------------------------------------------
+    @staticmethod
+    def _load_nodes_and_waits(load, graph: SnodeGraph) -> tuple[list, list]:
+        """The load plus the ``MultiOutput`` unpack its result reaches readers through, and the waits guarding it."""
+        return [load, *graph.unpacks_of(load)], graph.waits_of(load)
 
     # -- scheduling --------------------------------------------------------
     def _effective_inflight_budget_bytes(self, tasks) -> int:
@@ -233,37 +289,6 @@ class H2dLoadReorder(OverlapPass):
             if inflight_budget_bytes >= weight_budget_bytes or largest_load_bytes <= 0:
                 return
             inflight_budget_bytes = min(weight_budget_bytes, inflight_budget_bytes + largest_load_bytes)
-
-    def _choose_load_schedule(self, tasks, original_index_by_node, compute_prefix_ns) -> LoadSchedule:
-        """Buy the residency the step cannot overlap, then place what is left.
-        Resident loads stay in place and consume neither bus time nor in-flight budget."""
-        best_schedule: LoadSchedule | None = None
-        for resident_budget_bytes, inflight_budget_bytes in self._iter_budget_splits(tasks):
-            resident_anchors = self._search_resident_weights(
-                tasks=tasks, compute_prefix_ns=compute_prefix_ns, resident_budget_bytes=resident_budget_bytes
-            )
-            schedule_result = schedule_transfers_alap(
-                tasks, compute_prefix_ns, original_index_by_node, inflight_budget_bytes, off_bus_anchors=resident_anchors
-            )
-            total_unhidden_ns = schedule_result.total_unhidden_ns
-            if best_schedule is None or total_unhidden_ns < best_schedule.schedule_result.total_unhidden_ns - 1e-9:
-                best_schedule = LoadSchedule(
-                    resident_anchors=resident_anchors,
-                    inflight_budget_bytes=inflight_budget_bytes,
-                    schedule_result=schedule_result,
-                )
-            # Only an in-flight shortage is worth buying more in-flight room for;
-            # if the bus itself is full, taking bytes off residency makes it worse.
-            if total_unhidden_ns <= 0 or not schedule_result.inflight_budget_limited_anchors:
-                break
-        assert best_schedule is not None  # _budget_splits always yields at least once
-        self._log_overlap_shortfall(
-            total_load_bytes=sum(p.transfer_bytes for p in tasks),
-            overlap_capacity_bytes=self._overlap_capacity_bytes(tasks=tasks, compute_prefix_ns=compute_prefix_ns),
-            resident_bytes=sum(p.transfer_bytes for p in tasks if p.anchor in best_schedule.resident_anchors),
-            unhidden_ns=best_schedule.schedule_result.total_unhidden_ns,
-        )
-        return best_schedule
 
     def _select_resident_for_density(
         self, tasks, compute_prefix_ns, resident_budget_bytes, trial_density
@@ -345,50 +370,3 @@ class H2dLoadReorder(OverlapPass):
 
         resident_slots = [p.host_slot for p in tasks if p.anchor in resident_anchors]
         return get_global_host_weight_store().make_weights_resident(resident_slots)
-
-    # -- reporting --------------------------------------------------------
-    def _log_load_schedule(self, tasks, load_schedule: LoadSchedule, original_index_by_node, promoted_bytes) -> None:
-        schedule_result = load_schedule.schedule_result
-        launch_index_by_anchor = schedule_result.launch_index_by_anchor
-        inflight_budget_bytes = load_schedule.inflight_budget_bytes
-        resident_anchors = load_schedule.resident_anchors
-
-        peak_inflight_bytes = inflight_peak_bytes(tasks, launch_index_by_anchor)
-        hoisted_load_count = sum(
-            1 for load, launch_index in launch_index_by_anchor.items() if launch_index != original_index_by_node[load]
-        )
-        bus_transfer_bytes = sum(p.transfer_bytes for p in tasks if p.anchor not in resident_anchors)
-        peak_weight_storage_bytes = weight_storage_peak_bytes(
-            tasks, launch_index_by_anchor, original_index_by_node, resident_anchors
-        )
-        magi_logger.info(
-            "h2d load reorder: promoted %.1f MiB; resident loads=%d; bus=%.1f MiB at %.1f GB/s; "
-            "Hoisted %d/%d load(s); in-flight peak %.1f MiB of the %.0f MiB budget; "
-            "device-weight peak=%.1f MiB; exposed=%.1fms (budget-bound=%.1fms)",
-            promoted_bytes / 2**20,
-            len(resident_anchors),
-            bus_transfer_bytes / 2**20,
-            self.bandwidth_bytes_per_ns,
-            hoisted_load_count,
-            len(tasks),
-            peak_inflight_bytes / 2**20,
-            inflight_budget_bytes / 2**20,
-            peak_weight_storage_bytes / 2**20,
-            schedule_result.total_unhidden_ns / 1e6,
-            schedule_result.inflight_budget_limited_unhidden_ns / 1e6,
-        )
-        assert peak_inflight_bytes <= inflight_budget_bytes, (
-            f"h2d load reorder: in-flight peak {peak_inflight_bytes} B exceeds "
-            f"the {inflight_budget_bytes} B budget it was placed under"
-        )
-
-    def _log_overlap_shortfall(self, total_load_bytes, overlap_capacity_bytes, resident_bytes, unhidden_ns) -> None:
-        """Warn when estimated compute coverage cannot hide the remaining transfers."""
-        uncovered_bytes = total_load_bytes - resident_bytes - overlap_capacity_bytes
-        if uncovered_bytes <= 0 or unhidden_ns <= 0:
-            return
-        magi_logger.warning(
-            "h2d load reorder: estimated transfer coverage deficit=%.1f MiB (%.1fms); consider more residency",
-            uncovered_bytes / 2**20,
-            uncovered_bytes / self.bandwidth_bytes_per_ns / 1e6,
-        )

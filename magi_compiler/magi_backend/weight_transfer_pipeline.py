@@ -155,7 +155,7 @@ def _validate_weight_transfer_config(
         )
 
 
-def _restore_unclaimed_weights(example_inputs) -> None:
+def _restore_weights_without_h2d_load(example_inputs) -> None:
     """Restore this graph's parked weights that the offload rewrite left without loads."""
     # Other models' slots must stay parked until their own graphs compile.
     store = get_global_host_weight_store()
@@ -169,7 +169,7 @@ def _restore_unclaimed_weights(example_inputs) -> None:
             input_host_slots.append(host_slot)
     # Exclude bytes made resident by other calls or passes.
     resident_bytes_before = store.resident_bytes()
-    restored_weight_names = store.restore_unclaimed_weights(input_host_slots)
+    restored_weight_names = store.restore_weights_without_h2d_load(input_host_slots)
     if not restored_weight_names:
         return
     restored_bytes = store.resident_bytes() - resident_bytes_before
@@ -215,22 +215,22 @@ class WeightTransferPipeline:
                 self._fsdp_config.transport,
                 self._fsdp_config.bucket_mode,
             )
-        loads_inserted = self._bind_weights(graph, example_inputs)
+        h2d_loads_inserted = self._rewrite_weight_transfers(graph=graph, example_inputs=example_inputs)
         passes = build_transfer_overlap_passes(
             fsdp_config=self._fsdp_config,
             offload_config=self._offload_config,
-            loads_inserted=loads_inserted,
+            loads_inserted=h2d_loads_inserted,
             default_passes=default_passes,
         )
         if self._offload_config.graph_weight_offload:
             # The compilation interpreter runs next and must not read storage-free weights.
-            _restore_unclaimed_weights(example_inputs)
+            _restore_weights_without_h2d_load(example_inputs)
         if passes is not None:
             _allow_reorder_without_process_group()
         return passes
 
-    def _bind_weights(self, graph: fx.GraphModule, example_inputs) -> bool:
-        """Bind weights for copy-engine gathers or for host offload; True when loads were spliced in."""
+    def _rewrite_weight_transfers(self, graph: fx.GraphModule, example_inputs) -> bool:
+        """Rewrite copy-engine gathers or host-offload transfers; return True when H2D loads were inserted."""
         fsdp_config = self._fsdp_config
         if fsdp_config.enable_fsdp and fsdp_config.transport == "copy_engine":
             bind_weights_for_copy_engine(

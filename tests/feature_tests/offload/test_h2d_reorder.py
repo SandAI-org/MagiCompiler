@@ -33,7 +33,7 @@ import torch
 from torch._inductor import ir
 
 from magi_compiler.passes.transfer_overlap import CostView, SnodeGraph, memory, scheduler
-from magi_compiler.passes.weight_offload.schedule.h2d_reorder import H2dLoadReorder, H2dLoadTask
+from magi_compiler.passes.weight_offload.schedule.h2d_reorder import H2dLoadCallState, H2dLoadReorder, H2dLoadTask
 
 BYTES_PER_MIB = 1 << 20
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="promotion moves real bytes")
@@ -204,9 +204,11 @@ def test_two_loads_do_not_spend_the_same_compute():
     ]
     graph = SnodeGraph(order)
     p = H2dLoadReorder(bandwidth_bytes_per_ns=10.0, window_margin_ns=0.0, max_inflight_bytes=12 * BYTES_PER_MIB)
-    tasks = p._build_load_tasks(graph)
-    compute_prefix_ns = CostView(lambda s: s.runtime_ns).compute_prefix_ns(order)
-    schedule_result = p._choose_load_schedule(tasks, graph.original_index_by_node, compute_prefix_ns).schedule_result
+    cost = CostView(lambda s: s.runtime_ns)
+    call_state = H2dLoadCallState()
+    tasks = p.build_transfer_tasks(graph=graph, cost=cost, call_state=call_state)
+    p.assign_launch_indices(graph=graph, cost=cost, tasks=tasks, call_state=call_state)
+    schedule_result = call_state.load_schedule.schedule_result
     unhidden_ns_by_anchor = schedule_result.unhidden_ns_by_anchor
 
     assert len(tasks) == 2
@@ -303,7 +305,10 @@ def test_inflight_budget_preserves_the_unhoisted_floor(configured_mib, expected_
     """
     order = _two_conflicting_loads()
     p = H2dLoadReorder(bandwidth_bytes_per_ns=10.0, max_inflight_bytes=configured_mib * BYTES_PER_MIB)
-    assert p._effective_inflight_budget_bytes(p._build_load_tasks(SnodeGraph(order))) == expected_mib * BYTES_PER_MIB
+    tasks = p.build_transfer_tasks(
+        graph=SnodeGraph(order), cost=CostView(lambda s: s.runtime_ns), call_state=H2dLoadCallState()
+    )
+    assert p._effective_inflight_budget_bytes(tasks) == expected_mib * BYTES_PER_MIB
 
     out = _reordered_node_names(order, max_inflight_bytes=configured_mib * BYTES_PER_MIB)
     assert out.index("ld0") < out.index("w0") and out.index("ld1") < out.index("w1")
@@ -453,7 +458,7 @@ def test_last_user_is_the_consumer_not_the_wait():
     graph = SnodeGraph(order)
     tasks = H2dLoadReorder(
         bandwidth_bytes_per_ns=10.0, window_margin_ns=0.0, runtime_ns_fn=lambda s: s.runtime_ns
-    )._build_load_tasks(graph)
+    ).build_transfer_tasks(graph=graph, cost=CostView(lambda s: s.runtime_ns), call_state=H2dLoadCallState())
     assert len(tasks) == 1
     assert tasks[0].deadline_index == graph.original_index_by_node[order[2]]
     assert tasks[0].last_user_index == graph.original_index_by_node[order[3]]

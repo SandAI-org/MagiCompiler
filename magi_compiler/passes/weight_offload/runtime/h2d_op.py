@@ -54,24 +54,11 @@ def get_h2d_stream() -> torch.cuda.Stream:
     return torch.cuda.Stream()
 
 
-def _validate_weight_standin(shard: torch.Tensor, slot: int) -> None:
-    store = get_global_host_weight_store()
-    copy_source = store.copy_source(slot)
-    if tuple(shard.shape) != tuple(copy_source.shape) or shard.dtype != copy_source.dtype:
-        raise RuntimeError(
-            f"magi::h2d_load slot {slot} ({store.parameter_name(slot)!r}) is "
-            f"{tuple(copy_source.shape)} {copy_source.dtype}, but the graph asked for "
-            f"{tuple(shard.shape)} {shard.dtype}. The compiled artifact's slot "
-            "ids do not match this process's host weight store."
-        )
-
-
 def _h2d_load(shard: torch.Tensor, slot: int) -> torch.Tensor:
     # Resident slots copy from the device; other slots copy from pinned host storage.
     slot = resolve_runtime_host_slot(slot)
-    _validate_weight_standin(shard=shard, slot=slot)
     store = get_global_host_weight_store()
-    copy_source = store.copy_source(slot)
+    copy_source = store.validated_copy_source(shard=shard, slot=slot)
     # Allocate on the consuming compute stream;
     # record_stream below prevents reuse while the H2D stream is still writing.
     loaded_weight = torch.empty(copy_source.shape, dtype=copy_source.dtype, device=shard.device)
