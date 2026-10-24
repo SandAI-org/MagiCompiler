@@ -1196,6 +1196,102 @@ def test_a_host_built_module_parks_on_its_first_move_and_moves_the_rest_with_tor
     torch.testing.assert_close(module.big.weight.detach().cpu(), expected)
 
 
+@requires_cuda
+@pytest.mark.parametrize("assign", [False, True], ids=["copy", "assign"])
+@pytest.mark.parametrize("load_target", ["parent", "compiled", "leaf"])
+@pytest.mark.parametrize("resident", [False, True], ids=["offloaded", "resident"])
+def test_checkpoint_load_after_handoff_is_rejected_before_any_write(assign, load_target, resident):
+    """A reload must neither write empty stand-ins nor replace bindings or stale their host copies.
+    Parent loads must fail before touching earlier siblings or the parent's own buffers."""
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
+
+    torch.manual_seed(0)
+    root = torch.nn.Module()
+    root.register_buffer("scale", torch.ones(1, device="cuda"))
+    root.eager = torch.nn.Linear(4, 4, bias=False, device="cuda")
+    root.compiled = _install_host_first_hooks(_CompiledWeightModule(rows=256, cols=64), min_shard_mib=0.01)
+    root.compiled.cuda()
+    store = get_global_host_weight_store()
+    standin = root.compiled.big.weight
+    slot = store.slot_for_tensor(standin)
+    expected_host_weight = store.host_buffer(slot).clone()
+    if resident:
+        store.make_weight_resident(slot)
+    parameters_before = dict(root.named_parameters())
+    expected_eager_weight = root.eager.weight.detach().clone()
+    expected_small_weight = root.compiled.small.weight.detach().clone()
+    target = {"parent": root, "compiled": root.compiled, "leaf": root.compiled.big}[load_target]
+    checkpoint = {name: torch.full(tensor.shape, 17.0, dtype=tensor.dtype) for name, tensor in target.state_dict().items()}
+
+    with pytest.raises(RuntimeError, match="cannot load a checkpoint.*after host handoff"):
+        target.load_state_dict(checkpoint, assign=assign)
+
+    assert all(parameter is parameters_before[name] for name, parameter in root.named_parameters())
+    assert store.slot_for_tensor(root.compiled.big.weight) == slot
+    assert store.is_resident(slot) == resident
+    torch.testing.assert_close(store.host_buffer(slot), expected_host_weight)
+    torch.testing.assert_close(root.eager.weight, expected_eager_weight)
+    torch.testing.assert_close(root.compiled.small.weight, expected_small_weight)
+    torch.testing.assert_close(root.scale, torch.ones_like(root.scale))
+    if resident:
+        torch.testing.assert_close(standin.cpu(), expected_host_weight)
+    else:
+        assert standin.untyped_storage().nbytes() == 0
+
+    # An unrelated module remains reloadable while the same process owns offloaded weights.
+    root.eager.load_state_dict({"weight": torch.full((4, 4), 23.0)}, assign=assign)
+    torch.testing.assert_close(root.eager.weight, torch.full_like(root.eager.weight, 23.0))
+
+
+@requires_cuda
+@pytest.mark.usefixtures("no_process_group")
+@pytest.mark.parametrize(
+    "initial_device,assign",
+    [
+        pytest.param("cpu", False, id="host-copy"),
+        pytest.param("cpu", True, id="host-assign"),
+        pytest.param("meta", False, id="meta-copy"),
+    ],
+)
+def test_checkpoint_load_before_handoff_reaches_compiled_execution(initial_device, assign):
+    """Loading before a host-built CUDA move or into pending meta-built storage must preserve the checkpoint."""
+    from magi_compiler import magi_compile
+    from magi_compiler.config import CompileMode, CudaGraphMode
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
+
+    def patch(cfg):
+        cfg.compile_mode = CompileMode.MAGI_COMPILE
+        cfg.cudagraph_mode = CudaGraphMode.NONE
+        cfg.disable_graph_split = True
+        cfg.fsdp_config.cost_mode = "analytical"
+        cfg.offload_config.graph_weight_offload = True
+        cfg.offload_config.offload_min_shard_mib = 0.01
+        cfg.offload_config.offload_h2d_bandwidth_gbps = 48.0
+        return cfg
+
+    torch.manual_seed(0)
+    reference = _CompiledWeightModule(rows=256, cols=64).eval()
+    checkpoint = {name: tensor.clone() for name, tensor in reference.state_dict().items()}
+    with torch.device(initial_device):
+        module = _CompiledWeightModule(rows=256, cols=64).eval()
+    module = magi_compile(module, config_patch=patch, dynamic_arg_dims={"x": 0})
+    if initial_device == "meta":
+        module.to_empty(device="cuda")
+    module.load_state_dict(checkpoint, assign=assign)
+    if initial_device == "cpu":
+        module.cuda()
+    inputs = torch.randn(8, 64, device="cuda")
+    reference.cuda()
+    with torch.no_grad():
+        expected = reference(inputs)
+        torch.testing.assert_close(module(inputs), expected)
+        torch.testing.assert_close(module(inputs), expected)
+    store = get_global_host_weight_store()
+    slot = store.slot_for_tensor(module.big.weight)
+    assert slot is not None and module.big.weight.untyped_storage().nbytes() == 0
+    torch.testing.assert_close(store.host_buffer(slot), checkpoint["big.weight"])
+
+
 def test_graph_weight_offload_refuses_aot_before_parking_anything():
     """AOT replay cannot remap baked host slots, so the combination must fail at compile setup."""
     from magi_compiler import magi_compile
