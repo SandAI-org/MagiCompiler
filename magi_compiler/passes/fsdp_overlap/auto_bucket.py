@@ -55,6 +55,12 @@ DEFAULT_OVERHEAD_RATIOS = {"nccl": 0.1, "ce": 0.5}
 """Launch share per transport (``GatherInfo.transport``) when ``overhead_ratio`` is not set."""
 
 
+@dataclass(frozen=True)
+class GatherCandidate:
+    snode: BaseSchedulerNode
+    info: GatherInfo
+
+
 # -- the pure planning problem ----------------------------------------------
 @dataclass(frozen=True)
 class GatherMember:
@@ -178,17 +184,18 @@ class FsdpAutoBucket:
             # including one that found nothing to merge. Returning here skips the
             # all_gather and blocks whichever ranks do enter it.
             collective_indices, collective_signatures = rank_sync.collective_skeleton(order)
-            placement_mode, sync_group, world_size = rank_sync.negotiate_placement_mode(
+            consensus = rank_sync.negotiate_placement_mode(
                 candidate_count=len(candidates),
                 collective_signatures=collective_signatures,
                 is_profiling_valid=cost.is_profiling_valid,
                 pass_name=self.log_prefix,
             )
-            if placement_mode != "slot":
+            sync_group, world_size = consensus.sync_group, consensus.world_size
+            if consensus.placement_mode != "slot":
                 magi_logger.warning(
                     "%s: per-rank collective skeletons cannot be matched (mode=%s); leaving every weight gather unbucketed",
                     self.log_prefix,
-                    placement_mode,
+                    consensus.placement_mode,
                 )
                 return snodes
             skeleton_nodes = [order[i] for i in collective_indices]
@@ -229,9 +236,11 @@ class FsdpAutoBucket:
             return snodes
 
         for members in buckets:
-            gathered_bytes = sum(parse_single_gather(m).shard_bytes * parse_single_gather(m).world_size for m in members)
-            params = params_by_cost_model[self._cost_model_key(parse_single_gather(members[0]))]
-            order, coalesced_snode, output_snodes = ir_coalesce.coalesce_all_gathers(order, members)
+            gathered_bytes = sum(member.info.shard_bytes * member.info.world_size for member in members)
+            params = params_by_cost_model[self._cost_model_key(members[0].info)]
+            order, coalesced_snode, output_snodes = ir_coalesce.coalesce_all_gathers(
+                order=order, members=[member.snode for member in members]
+            )
             self._record_coalesced_costs(coalesced_snode, output_snodes, gathered_bytes, params)
         snodes[:] = order
         ir_coalesce.refresh_memory_planning(snodes)
@@ -240,42 +249,46 @@ class FsdpAutoBucket:
 
     # -- candidates -----------------------------------------------------------
     @staticmethod
-    def _collect_candidates(order: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+    def _collect_candidates(order: list[BaseSchedulerNode]) -> list[GatherCandidate]:
         """The weight gathers (see ``snode_utils.weight_gathers``) in the single-weight form this pass can merge."""
-        return [s for s in weight_gathers(order) if parse_single_gather(s) is not None]
+        candidates = []
+        for snode in weight_gathers(order):
+            info = parse_single_gather(snode)
+            if info is not None:
+                candidates.append(GatherCandidate(snode=snode, info=info))
+        return candidates
 
     @staticmethod
     def _bucket_compatibility_key(snode: BaseSchedulerNode, info: GatherInfo) -> tuple:
         is_offloaded = any(is_host_offloaded(o) for o in snode.node.origins or ())
         return (info.transport, info.dtype, is_offloaded)
 
-    def _partition_compatible_gathers(self, candidates: list[BaseSchedulerNode]) -> list[list[BaseSchedulerNode]]:
+    def _partition_compatible_gathers(self, candidates: list[GatherCandidate]) -> list[list[GatherCandidate]]:
         """Split into runs of consecutive gathers on one group, then each run by
         (transport, dtype, host-offloaded); a partition need not be contiguous within its run.
 
         Transport and dtype because one launch is one op.  Host offload only
         because a resident member would wait for its bucket-mates' host loads.
         """
-        group_runs: list[list[BaseSchedulerNode]] = []
+        group_runs: list[list[GatherCandidate]] = []
         previous_group_name = object()
-        for s in candidates:
-            info = parse_single_gather(s)
-            if info.group_name != previous_group_name:
+        for candidate in candidates:
+            if candidate.info.group_name != previous_group_name:
                 group_runs.append([])
-                previous_group_name = info.group_name
-            group_runs[-1].append(s)
-        compatible_runs: list[list[BaseSchedulerNode]] = []
+                previous_group_name = candidate.info.group_name
+            group_runs[-1].append(candidate)
+        compatible_runs: list[list[GatherCandidate]] = []
         for group_run in group_runs:
-            gathers_by_compatibility: dict[tuple, list[BaseSchedulerNode]] = {}
-            for s in group_run:
-                compatibility_key = self._bucket_compatibility_key(s, parse_single_gather(s))
-                gathers_by_compatibility.setdefault(compatibility_key, []).append(s)
+            gathers_by_compatibility: dict[tuple, list[GatherCandidate]] = {}
+            for candidate in group_run:
+                compatibility_key = self._bucket_compatibility_key(snode=candidate.snode, info=candidate.info)
+                gathers_by_compatibility.setdefault(compatibility_key, []).append(candidate)
             compatible_runs.extend(gathers_by_compatibility.values())
         return compatible_runs
 
     # -- planning -------------------------------------------------------------
-    def _build_gather_member(self, snode, graph: SnodeGraph) -> GatherMember | None:
-        info = parse_single_gather(snode)
+    def _build_gather_member(self, candidate: GatherCandidate, graph: SnodeGraph) -> GatherMember | None:
+        snode, info = candidate.snode, candidate.info
         earliest_launch_index = graph.earliest_legal_index({snode, *graph.movable_prep_nodes([snode])})
         waits = graph.waits_of(snode)
         if not waits:
@@ -292,7 +305,9 @@ class FsdpAutoBucket:
     def _cost_model_key(info: GatherInfo) -> tuple[str, str, int]:
         return (info.transport, info.group_name, info.world_size)
 
-    def _fit_bucket_params(self, candidates, cost: CostView) -> dict[tuple[str, str, int], BucketPlanParams]:
+    def _fit_bucket_params(
+        self, candidates: list[GatherCandidate], cost: CostView
+    ) -> dict[tuple[str, str, int], BucketPlanParams]:
         """One fit per (transport, process group), and one ratio per transport.
 
         Per transport because a copy-engine gather's fixed and per-byte costs are
@@ -302,9 +317,9 @@ class FsdpAutoBucket:
         samples pull ``beta`` down by an order of magnitude for every other gather.
         """
         samples_by_cost_model: dict[tuple[str, str, int], list[tuple[float, float]]] = {}
-        for s in candidates:
-            info = parse_single_gather(s)
-            sample = (info.shard_bytes * info.world_size, cost(s))
+        for candidate in candidates:
+            info = candidate.info
+            sample = (info.shard_bytes * info.world_size, cost(candidate.snode))
             samples_by_cost_model.setdefault(self._cost_model_key(info), []).append(sample)
         params_by_cost_model = {}
         for cost_model_key, fit_samples in samples_by_cost_model.items():
@@ -322,27 +337,33 @@ class FsdpAutoBucket:
             )
         return params_by_cost_model
 
-    def _plan_local_buckets(self, order, candidates, cost: CostView):
+    def _plan_local_buckets(
+        self, order: list[BaseSchedulerNode], candidates: list[GatherCandidate], cost: CostView
+    ) -> tuple[list[list[GatherCandidate]], dict[tuple[str, str, int], BucketPlanParams]]:
         graph = SnodeGraph(order)
         params_by_cost_model = self._fit_bucket_params(candidates, cost)
-        buckets: list[list[BaseSchedulerNode]] = []
+        buckets: list[list[GatherCandidate]] = []
         for compatible_run in self._partition_compatible_gathers(candidates):
-            params = params_by_cost_model[self._cost_model_key(parse_single_gather(compatible_run[0]))]
-            candidate_members = [(s, self._build_gather_member(snode=s, graph=graph)) for s in compatible_run]
+            params = params_by_cost_model[self._cost_model_key(compatible_run[0].info)]
+            candidate_members = [
+                (candidate, self._build_gather_member(candidate=candidate, graph=graph)) for candidate in compatible_run
+            ]
             schedulable_members = [(s, m) for s, m in candidate_members if m is not None]
             if len(schedulable_members) < 2:
                 continue
-            gather_nodes = [s for s, _ in schedulable_members]
+            schedulable_candidates = [candidate for candidate, _ in schedulable_members]
             members = [m for _, m in schedulable_members]
             for segment_start, segment_end in plan_bucket_segments(members, params):
                 if segment_end - segment_start >= 2:
-                    buckets.append(gather_nodes[segment_start:segment_end])
+                    buckets.append(schedulable_candidates[segment_start:segment_end])
 
         # Merge in sequence on a stand-in order: each merge moves shard prep,
         # and the next merge must still be legal after it.
         simulated_order, legal_buckets = order, []
         for members in buckets:
-            next_order = ir_coalesce.simulate_coalesced_order(simulated_order, members)
+            next_order = ir_coalesce.simulate_coalesced_order(
+                order=simulated_order, members=[member.snode for member in members]
+            )
             if next_order is None:
                 continue
             simulated_order = next_order
@@ -352,18 +373,25 @@ class FsdpAutoBucket:
         return legal_buckets, params_by_cost_model
 
     def _adopt_rank_zero_buckets(
-        self, is_local_plan_valid: bool, buckets, order, candidates, sync_group, world_size: int, skeleton_nodes
-    ):
-        """Rank 0's buckets, as this rank's snodes, once every rank has found them legal; None to leave the graph alone.
+        self,
+        is_local_plan_valid: bool,
+        buckets: list[list[GatherCandidate]],
+        order: list[BaseSchedulerNode],
+        candidates: list[GatherCandidate],
+        sync_group: dist.ProcessGroup | None,
+        world_size: int,
+        skeleton_nodes: list[BaseSchedulerNode],
+    ) -> list[list[GatherCandidate]] | None:
+        """Rank 0's buckets, as this rank's candidates, once every rank has found them legal; None to leave the graph alone.
 
         Every rank must also merge into the same collective order (see the module docstring).
         """
         if world_size <= 1:
             return buckets if is_local_plan_valid else None
-        candidate_index_by_node = {s: i for i, s in enumerate(candidates)}
+        candidate_index_by_node = {candidate.snode: index for index, candidate in enumerate(candidates)}
         local_bucket_indices = None
         if is_local_plan_valid:
-            local_bucket_indices = [[candidate_index_by_node[s] for s in bucket] for bucket in buckets]
+            local_bucket_indices = [[candidate_index_by_node[candidate.snode] for candidate in bucket] for bucket in buckets]
         rank_plans = rank_sync.gather_rank_objects((is_local_plan_valid, local_bucket_indices), sync_group, world_size)
         failed_ranks = [rank for rank, (is_valid, _) in enumerate(rank_plans) if not is_valid]
         if failed_ranks:
@@ -428,17 +456,19 @@ class FsdpAutoBucket:
         return hashlib.sha256(repr(merged_collective_indices).encode()).hexdigest()
 
     @staticmethod
-    def _simulate_bucket_merges(order, buckets):
+    def _simulate_bucket_merges(
+        order: list[BaseSchedulerNode], buckets: list[list[GatherCandidate]]
+    ) -> list[BaseSchedulerNode] | None:
         """``order`` with ``buckets`` merged in sequence (members as stand-ins, see
         ``_plan_local_buckets``); None if not legal here.  Touches no IR."""
         simulated_order = order
         for members in buckets:
-            gather_infos = [parse_single_gather(m) for m in members]
-            if any(info is None for info in gather_infos):
-                return None
+            gather_infos = [member.info for member in members]
             if len({(i.transport, i.group_name, i.world_size, i.dtype) for i in gather_infos}) != 1:
                 return None
-            simulated_order = ir_coalesce.simulate_coalesced_order(simulated_order, members)
+            simulated_order = ir_coalesce.simulate_coalesced_order(
+                order=simulated_order, members=[member.snode for member in members]
+            )
             if simulated_order is None:
                 return None
         return simulated_order if SnodeGraph(order).is_topological_order(simulated_order) else None
@@ -455,9 +485,9 @@ class FsdpAutoBucket:
             self._runtime_ns_fn.record_runtime_ns(snode=output_snode, runtime_ns=0.0)
 
     def _log_bucket_summary(
-        self, params_by_cost_model: dict, buckets: list[list[BaseSchedulerNode]], candidate_count: int
+        self, params_by_cost_model: dict, buckets: list[list[GatherCandidate]], candidate_count: int
     ) -> None:
-        bucket_shard_bytes = sorted(sum(parse_single_gather(s).shard_bytes for s in b) for b in buckets) or [0]
+        bucket_shard_bytes = sorted(sum(member.info.shard_bytes for member in bucket) for bucket in buckets) or [0]
         bucket_sizes_mib = [shard_bytes / 2**20 for shard_bytes in bucket_shard_bytes]
         launch_count = candidate_count - sum(len(b) for b in buckets) + len(buckets)
         magi_logger.info(

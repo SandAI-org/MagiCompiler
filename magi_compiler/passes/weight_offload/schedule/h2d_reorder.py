@@ -35,6 +35,7 @@ from torch._inductor.scheduler import BaseSchedulerNode
 
 from magi_compiler.utils import magi_logger
 
+from ...snode_utils import is_h2d_load
 from ...transfer_overlap import (
     DEFAULT_WINDOW_MARGIN_NS,
     CostView,
@@ -48,7 +49,7 @@ from ...transfer_overlap import (
     unhoisted_index,
     weight_storage_peak_bytes,
 )
-from .h2d_snode import host_slot_of_load, is_h2d_load, load_bytes
+from .h2d_snode import host_slot_of_load, load_bytes
 
 _MAX_BUDGET_SPLIT_ROUNDS = 5
 """Times ``assign_launch_indices`` may grow the in-flight budget out of the residency one."""

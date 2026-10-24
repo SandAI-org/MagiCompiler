@@ -68,14 +68,14 @@ def _check_rank_without_gathers_negotiates() -> bool:
     real_negotiate = rank_sync.negotiate_placement_mode
 
     def negotiate(candidate_count, collective_signatures, is_profiling_valid=True, pass_name="FSDP overlap"):
-        mode, group, world_size = real_negotiate(
+        consensus = real_negotiate(
             candidate_count=candidate_count,
             collective_signatures=collective_signatures,
             is_profiling_valid=is_profiling_valid,
             pass_name=pass_name,
         )
-        seen["mode"] = mode
-        return mode, group, world_size
+        seen["mode"] = consensus.placement_mode
+        return consensus
 
     snodes = [FakeSnode("buf0", is_gather=rank == 0), FakeSnode("buf1", is_gather=False)]
     gathers = lambda order: [s for s in order if s.is_gather]  # noqa: E731

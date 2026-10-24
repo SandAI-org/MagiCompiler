@@ -52,6 +52,7 @@ Triton stays analytical while free symbols exist.
 
 import dataclasses
 import hashlib
+from collections.abc import Callable
 from typing import Any, Optional
 
 import torch
@@ -811,6 +812,29 @@ class ProfilingRuntimeEstimator:
             self.n_cache_hits += 1
         return entry.ns
 
+    def _estimate_collective_runtime_ns(
+        self,
+        snode: BaseSchedulerNode,
+        *,
+        key: tuple,
+        kind: str,
+        label_fn: Callable[[BaseSchedulerNode], str],
+        count_reuse: bool,
+        measure_local_runtime_ns: Callable[[BaseSchedulerNode], float] | None = None,
+    ) -> float:
+        entry = self._table.get(key)
+        if entry is not None:
+            return self._cached_runtime_ns(entry=entry, count_reuse=count_reuse)
+        entry = ProfileEntry(ns=analytical_runtime_ns(snode), kind=kind, label=label_fn(snode), measured=False)
+        self._table[key] = entry
+        if self._sync_across_ranks:
+            self._key_snode[key] = snode  # warm_and_sync replaces the analytical seed in rank-lockstep.
+        elif measure_local_runtime_ns is not None:
+            entry.ns = measure_local_runtime_ns(snode)
+            entry.measured = True
+            self.n_measured += 1
+        return entry.ns
+
     def __call__(self, snode: BaseSchedulerNode) -> float:
         return self._estimate_runtime_ns(snode=snode, count_reuse=True)
 
@@ -821,31 +845,26 @@ class ProfilingRuntimeEstimator:
             return analytical_runtime_ns(snode)
 
         # A load is never replayed: in sync mode that would issue H2D copies in lockstep.
-        from magi_compiler.passes.weight_offload.schedule.h2d_snode import is_h2d_load
+        from magi_compiler.passes.snode_utils import is_h2d_load
 
         if _is_multi_output_unpack(snode) or is_h2d_load(snode):
             return 0.0
 
-        if _leaf_ce_ag(snode) is not None:
-            node = _leaf_ce_ag(snode)
-            spec = _ce_ag_spec(node)
+        ce_gather = _leaf_ce_ag(snode)
+        if ce_gather is not None:
+            spec = _ce_ag_spec(ce_gather)
             if spec is None:
                 return analytical_runtime_ns(snode)
             shapes, dtype, group_size, _gn = spec
             ckey = ("ce_ag", group_size, shapes, str(dtype))
-            entry = self._table.get(ckey)
-            if entry is not None:
-                return self._cached_runtime_ns(entry=entry, count_reuse=count_reuse)
-            ns = analytical_runtime_ns(snode)
-            self._table[ckey] = ProfileEntry(ns=ns, kind="ce_ag", label=_ce_ag_label(snode), measured=False)
-            if self._sync_across_ranks:
-                self._key_snode[ckey] = snode
-            else:
-                ns = _measure_ce_ag(snode)
-                self._table[ckey].ns = ns
-                self._table[ckey].measured = True
-                self.n_measured += 1
-            return ns
+            return self._estimate_collective_runtime_ns(
+                snode=snode,
+                key=ckey,
+                kind="ce_ag",
+                label_fn=_ce_ag_label,
+                count_reuse=count_reuse,
+                measure_local_runtime_ns=_measure_ce_ag,
+            )
 
         if contains_collective(snode):
             cnode = _leaf_collective(snode)
@@ -854,14 +873,10 @@ class ProfilingRuntimeEstimator:
                 return analytical_runtime_ns(snode)  # non-AG / unparseable -> old behaviour
             op, _group_name, group_size, specs = spec
             ckey = ("collective", str(op), group_size, tuple((tuple(shape), str(dt)) for shape, dt, _dev in specs))
-            entry = self._table.get(ckey)
-            if entry is not None:
-                return self._cached_runtime_ns(entry=entry, count_reuse=count_reuse)
-            ns = analytical_runtime_ns(snode)  # Inductor static estimate as the seed
-            self._table[ckey] = ProfileEntry(ns=ns, kind="collective", label=_collective_label(snode), measured=False)
-            if self._sync_across_ranks:
-                self._key_snode[ckey] = snode  # warm_and_sync -> real measured override
-            return ns
+            # NCCL stays analytical outside profile_sync; only CE supports local measurement here.
+            return self._estimate_collective_runtime_ns(
+                snode=snode, key=ckey, kind="collective", label_fn=_collective_label, count_reuse=count_reuse
+            )
 
         is_extern = isinstance(snode, ExternKernelSchedulerNode)
 

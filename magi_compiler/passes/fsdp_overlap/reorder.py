@@ -91,17 +91,17 @@ class FsdpOverlapReorder(OverlapPass):
         order, original_index_by_node = graph.order, graph.original_index_by_node
         launches = weight_gathers(order)
         collective_indices, collective_signatures = rank_sync.collective_skeleton(order)
-        placement_mode, sync_group, world_size = rank_sync.negotiate_placement_mode(
+        consensus = rank_sync.negotiate_placement_mode(
             candidate_count=len(launches),
             collective_signatures=collective_signatures,
             is_profiling_valid=cost.is_profiling_valid,
         )
         call_state.launches = launches
         call_state.collective_indices = collective_indices
-        call_state.placement_mode = placement_mode
-        call_state.sync_group = sync_group
-        call_state.world_size = world_size
-        if placement_mode == "abort":
+        call_state.placement_mode = consensus.placement_mode
+        call_state.sync_group = consensus.sync_group
+        call_state.world_size = consensus.world_size
+        if consensus.placement_mode == "abort":
             return None
 
         tasks: list[TransferTask] = []
@@ -111,7 +111,7 @@ class FsdpOverlapReorder(OverlapPass):
                 continue
             transfer_duration_ns = cost(launch)
             earliest_launch_index = graph.earliest_legal_index(moving_nodes)
-            if placement_mode == "pinned":
+            if consensus.placement_mode == "pinned":
                 # No skeleton to negotiate against: keep the AG between the same two
                 # NCCL-issuing snodes it already sat between.
                 earliest_launch_index = rank_sync.launch_floor_after_collectives(

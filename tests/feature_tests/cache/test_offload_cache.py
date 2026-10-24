@@ -74,6 +74,43 @@ def test_slot_identity_uses_name_and_layout():
     assert slot_identity(_slot_metadata("w", (2, 2))) != slot_identity(_slot_metadata("w", (2, 3)))
 
 
+@pytest.mark.parametrize(
+    "sidecar",
+    [
+        {0: {"name": "w"}},
+        {0: _slot_metadata("w", None)},
+        {0: _slot_metadata("w", (2, -1))},
+        {0: _slot_metadata("w", (2, 2), dtype=None)},
+        {0: _slot_metadata("w", (2, 2), nbytes="32")},
+        {0: _slot_metadata("w", (2, 2), resident="False")},
+        {0: _slot_metadata("w", (2, 2)), "0": _slot_metadata("other", (2, 2))},
+    ],
+    ids=[
+        "missing-field",
+        "missing-shape",
+        "negative-dimension",
+        "invalid-dtype",
+        "invalid-bytes",
+        "invalid-resident",
+        "duplicate-slot",
+    ],
+)
+def test_invalid_sidecar_entries_are_cache_misses(tmp_path, sidecar):
+    """Malformed fields must miss before slot matching or restoring any resident storage."""
+    cache = _make_offload_cache(tmp_path)
+    cache.host_slots_path.write_text(repr(sidecar))
+    assert cache.prepare_graph_replay(fx.symbolic_trace(nn.Identity())) == "offload host_slots sidecar missing"
+    assert not cache.can_replay_artifact()
+
+
+def test_sidecar_normalizes_slot_ids_and_shapes_at_load(tmp_path):
+    cache = _make_offload_cache(tmp_path)
+    metadata = _slot_metadata("w", [2, 2])
+    del metadata["resident"]
+    cache.host_slots_path.write_text(repr({"7": metadata}))
+    assert cache._load_sidecar() == {7: _slot_metadata("w", (2, 2))}
+
+
 @requires_cuda
 def test_collect_and_refresh_read_the_live_pool():
     from magi_compiler.passes.weight_offload import get_global_host_weight_store

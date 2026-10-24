@@ -30,9 +30,8 @@ from torch._inductor.scheduler import BaseSchedulerNode
 from magi_compiler.profiling.runtime_estimator import analytical_runtime_ns
 from magi_compiler.utils import magi_logger
 
-from .snode_utils import is_all_gather_launch, is_compute, issues_comm
+from .snode_utils import is_all_gather_launch, is_compute, is_h2d_load, issues_comm
 from .transfer_overlap import rank_sync
-from .weight_offload.schedule.h2d_snode import is_h2d_load
 
 
 def _should_record_cost(snode: BaseSchedulerNode) -> bool:

@@ -21,18 +21,47 @@ process can remap those integers onto the slots it minted.
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Mapping, TypedDict
 
 import torch.fx as fx
 import torch.nn as nn
 
 
-def slot_identity(slot_metadata: Mapping[str, Any]) -> tuple:
+class HostSlotMetadata(TypedDict):
+    name: str
+    shape: tuple[int, ...]
+    dtype: str
+    nbytes: int
+    resident: bool
+
+
+def parse_host_slot_table(serialized_slots: dict) -> dict[int, HostSlotMetadata]:
+    """Normalize the literal sidecar at the file boundary; invalid entries raise a cache-miss error."""
+    slot_table: dict[int, HostSlotMetadata] = {}
+    for serialized_slot, metadata in serialized_slots.items():
+        if not isinstance(serialized_slot, (int, str)) or not isinstance(metadata, dict):
+            raise ValueError("each host slot must map an integer id to a metadata dict")
+        slot = int(serialized_slot)
+        if slot < 0 or slot in slot_table:
+            raise ValueError(f"invalid or duplicate host slot {slot}")
+        name, shape, dtype = metadata["name"], metadata["shape"], metadata["dtype"]
+        nbytes, resident = metadata["nbytes"], metadata.get("resident", False)
+        if not isinstance(name, str) or not isinstance(dtype, str):
+            raise ValueError(f"host slot {slot} name and dtype must be strings")
+        if not isinstance(shape, (tuple, list)) or any(type(dim) is not int or dim < 0 for dim in shape):
+            raise ValueError(f"host slot {slot} shape must contain nonnegative integers")
+        if type(nbytes) is not int or nbytes < 0 or not isinstance(resident, bool):
+            raise ValueError(f"host slot {slot} needs a nonnegative byte count and a boolean resident flag")
+        slot_table[slot] = HostSlotMetadata(name=name, shape=tuple(shape), dtype=dtype, nbytes=nbytes, resident=resident)
+    return slot_table
+
+
+def slot_identity(slot_metadata: HostSlotMetadata) -> tuple[str, tuple[int, ...], str]:
     """Name + layout: what a peer process can match without sharing slot ints."""
-    return (slot_metadata["name"], tuple(slot_metadata["shape"]), str(slot_metadata["dtype"]))
+    return (slot_metadata["name"], slot_metadata["shape"], slot_metadata["dtype"])
 
 
-def collect_host_slot_table(module: nn.Module) -> dict[int, dict[str, Any]]:
+def collect_host_slot_table(module: nn.Module) -> dict[int, HostSlotMetadata]:
     """Every host-offload slot tagged on ``module``'s FX graphs, keyed by slot.
 
     Walks child GraphModules as well: after a split the tags live on the
@@ -42,7 +71,7 @@ def collect_host_slot_table(module: nn.Module) -> dict[int, dict[str, Any]]:
     from ..runtime.host_weights import get_global_host_weight_store
 
     store = get_global_host_weight_store()
-    slot_table: dict[int, dict[str, Any]] = {}
+    slot_table: dict[int, HostSlotMetadata] = {}
     for _, child in module.named_modules():
         if not isinstance(child, fx.GraphModule):
             continue
@@ -61,19 +90,19 @@ def collect_host_slot_table(module: nn.Module) -> dict[int, dict[str, Any]]:
     return slot_table
 
 
-def _slot_by_weight_identity(slot_table: Mapping[int, Mapping[str, Any]]) -> dict[tuple, int] | None:
+def _slot_by_weight_identity(slot_table: Mapping[int, HostSlotMetadata]) -> dict[tuple, int] | None:
     """``identity -> slot``, or None if two slots share an identity."""
     slot_by_weight_identity: dict[tuple, int] = {}
     for slot, slot_metadata in slot_table.items():
         weight_identity = slot_identity(slot_metadata)
         if weight_identity in slot_by_weight_identity:
             return None
-        slot_by_weight_identity[weight_identity] = int(slot)
+        slot_by_weight_identity[weight_identity] = slot
     return slot_by_weight_identity
 
 
 def match_host_slot_tables(
-    cached_slots: Mapping[int, Mapping[str, Any]], current_slots: Mapping[int, Mapping[str, Any]]
+    cached_slots: Mapping[int, HostSlotMetadata], current_slots: Mapping[int, HostSlotMetadata]
 ) -> dict[int, int] | None:
     """Baked slot -> current slot, or None if the identity sets differ.
 
@@ -92,7 +121,7 @@ def match_host_slot_tables(
     }
 
 
-def refresh_resident_flags(slot_table: Mapping[int, Mapping[str, Any]]) -> dict[int, dict[str, Any]]:
+def refresh_resident_flags(slot_table: Mapping[int, HostSlotMetadata]) -> dict[int, HostSlotMetadata]:
     """Copy ``slot_table`` with ``resident`` taken from the live pool.
 
     Placement promotes slots during Inductor compile, after the table was first
@@ -102,7 +131,4 @@ def refresh_resident_flags(slot_table: Mapping[int, Mapping[str, Any]]) -> dict[
     from ..runtime.host_weights import get_global_host_weight_store
 
     store = get_global_host_weight_store()
-    return {
-        int(slot): {**dict(slot_metadata), "resident": bool(store.is_resident(int(slot)))}
-        for slot, slot_metadata in slot_table.items()
-    }
+    return {slot: {**slot_metadata, "resident": store.is_resident(slot)} for slot, slot_metadata in slot_table.items()}

@@ -12,20 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Recognize H2D loads, which provide no compute window for hiding transfers, and read what they move."""
+"""Read the host slot and transfer size of H2D load scheduler nodes."""
 
 from __future__ import annotations
 
-from torch._inductor import ir
 from torch._inductor.scheduler import BaseSchedulerNode
 
-from ...snode_utils import ir_node_bytes, is_multi_output, iter_ir_nodes
-from ..runtime.h2d_op import H2D_LOAD
-
-
-def is_h2d_load(snode: BaseSchedulerNode) -> bool:
-    """Recognize the fallback op; rank-private H2D loads stay outside the collective skeleton."""
-    return any(isinstance(node, ir.ExternKernel) and node.op_overload is H2D_LOAD for node in iter_ir_nodes(snode))
+from ...snode_utils import ir_node_bytes, is_multi_output
 
 
 def host_slot_of_load(load: BaseSchedulerNode) -> int:

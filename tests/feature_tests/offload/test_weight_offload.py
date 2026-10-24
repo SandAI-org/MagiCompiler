@@ -1431,9 +1431,8 @@ def test_handoff_preserves_a_weight_shared_with_the_eager_subtree(dist_1rank, ea
 def test_storage_freed_shard_survives_a_real_inductor_compile(dist_1rank):
     """An empty CUDA stand-in must survive Inductor input handling and repeated execution.
     Each load returns a separate filled buffer; it does not fill the stand-in."""
-    from magi_compiler.passes.snode_utils import is_compute
+    from magi_compiler.passes.snode_utils import is_compute, is_h2d_load
     from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
-    from magi_compiler.passes.weight_offload.schedule.h2d_snode import is_h2d_load
 
     seen = {"loads": 0, "compute_misclassified": 0}
 
