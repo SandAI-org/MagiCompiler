@@ -60,7 +60,7 @@ def _local_weight_tensor(param: torch.Tensor) -> torch.Tensor:
 
 def _is_offloadable(param: object) -> bool:
     """Must agree with the weight sources: plain Parameters or single Shard(0)/Replicate DTensors.
-    ``restore_unclaimed_weights`` restores parked weights that no graph loads."""
+    ``restore_weights_without_h2d_load`` restores parked weights that no graph loads."""
     if isinstance(param, DTensor):
         placements = param.placements
         if len(placements) != 1:

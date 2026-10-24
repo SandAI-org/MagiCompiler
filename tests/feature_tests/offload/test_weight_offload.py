@@ -389,11 +389,9 @@ def test_adopt_refuses_a_device_tensor_that_still_holds_bytes():
 
 
 @requires_cuda
-def test_unclaimed_shards_are_handed_back_to_the_device():
-    """Restore the graph's parked weights without loads, leaving claimed ones offloaded.
-
-    The pool also holds models that have not compiled yet; their weights are unclaimed
-    only because their graph does not exist, and must not land on the device.
+def test_weights_without_h2d_load_are_restored_to_device():
+    """Restore only this graph's weights without H2D loads; keep weights with loads offloaded.
+    Other models' weights must stay parked until their graphs compile.
     """
     from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
@@ -404,15 +402,15 @@ def test_unclaimed_shards_are_handed_back_to_the_device():
     loaded_slot = _park_weight_in_host_store(loaded, name="kept")
     orphan_slot = _park_weight_in_host_store(orphan, name="orphan")
     other_slot = _park_weight_in_host_store(other_model, name="other model")
-    get_global_host_weight_store().mark_claimed(loaded_slot)
+    get_global_host_weight_store().mark_slot_with_h2d_load(loaded_slot)
 
-    assert get_global_host_weight_store().restore_unclaimed_weights([loaded_slot, orphan_slot]) == ["orphan"]
+    assert get_global_host_weight_store().restore_weights_without_h2d_load([loaded_slot, orphan_slot]) == ["orphan"]
     assert not get_global_host_weight_store().is_resident(loaded_slot), "a shard the graph loads must stay in host memory"
     assert get_global_host_weight_store().is_resident(orphan_slot)
     assert not get_global_host_weight_store().is_resident(other_slot), "another model's weight is not this graph's to restore"
     torch.testing.assert_close(orphan, expected)
     assert (
-        get_global_host_weight_store().restore_unclaimed_weights([orphan_slot]) == []
+        get_global_host_weight_store().restore_weights_without_h2d_load([orphan_slot]) == []
     ), "already-restored shards must not be reported twice"
 
 

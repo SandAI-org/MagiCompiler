@@ -95,17 +95,17 @@ def _fill_shards_from_reference(model: nn.Module, ref: nn.Module, rank: int, wor
     return nbytes / 2**20
 
 
-def _count_restored_unclaimed(store) -> list[str]:
-    """Record every weight the compile restores because no graph load claimed it."""
+def _record_weights_restored_without_h2d_load(store) -> list[str]:
+    """Record weights restored during compilation because they have no H2D loads."""
     restored: list[str] = []
-    restore_unclaimed_weights = store.restore_unclaimed_weights
+    restore_weights_without_h2d_load = store.restore_weights_without_h2d_load
 
-    def _recording_restore_unclaimed(slots):
-        names = restore_unclaimed_weights(slots)
+    def _restore_and_record_weight_names(slots):
+        names = restore_weights_without_h2d_load(slots)
         restored.extend(names)
         return names
 
-    store.restore_unclaimed_weights = _recording_restore_unclaimed
+    store.restore_weights_without_h2d_load = _restore_and_record_weight_names
     return restored
 
 
@@ -192,7 +192,7 @@ def main() -> None:
 
     from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
-    restored_unclaimed = _count_restored_unclaimed(get_global_host_weight_store())
+    restored_weight_names = _record_weights_restored_without_h2d_load(get_global_host_weight_store())
     with torch.no_grad():
         out = compiled(x)
         torch.cuda.synchronize()
@@ -201,7 +201,7 @@ def main() -> None:
         print(
             f"OFFLOAD_FREED mib={get_global_host_weight_store().offloaded_bytes() / 2**20:.2f} shards={get_global_host_weight_store().weight_count()} "
             f"promoted_mib={get_global_host_weight_store().resident_bytes() / 2**20:.2f} "
-            f"restored_unclaimed={len(restored_unclaimed)}",
+            f"restored_unclaimed={len(restored_weight_names)}",
             flush=True,
         )
         if get_global_host_weight_store().weight_count() == 0:
