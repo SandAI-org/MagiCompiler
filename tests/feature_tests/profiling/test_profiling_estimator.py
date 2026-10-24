@@ -277,12 +277,8 @@ def _make_fake_extern_snode():
 
 
 @pytest.mark.parametrize("sync", [True, False])
-def test_internal_collective_extern_not_measured_in_sync_warmup(monkeypatch, sync):
-    """An extern registered via ``register_materialize_inputs`` must NOT be measured
-    by __call__ in sync mode (the warm-up runs per-rank without barriers; the
-    adaptive benchmarker would issue rank-dependent numbers of the internal NCCL op
-    -> hang).  It is seeded analytical + stashed for warm_and_sync.  In non-sync
-    mode the normal measurement path still runs."""
+def test_internal_collective_extern_not_measured_in_local_warmup(monkeypatch, sync):
+    """Local warm-up must not replay a collective; only synchronized profiling may re-measure it."""
     from magi_compiler.profiling import register_materialize_inputs
     from magi_compiler.profiling.materialize_inputs import _INTERNAL_COLLECTIVE_OPS, _MATERIALIZE_INPUT_HOOKS
 
@@ -290,22 +286,20 @@ def test_internal_collective_extern_not_measured_in_sync_warmup(monkeypatch, syn
 
     def _boom(*args, **kwargs):
         measured["called"] = True
-        raise AssertionError("must not be measured in sync warm-up")
+        raise AssertionError("must not replay an internal collective during local warm-up")
 
     register_materialize_inputs("aten::mm")
     monkeypatch.setattr(re_mod, "_measure_extern", _boom)
     try:
         est = ProfilingRuntimeEstimator()
         est._sync_across_ranks = sync
-        ns = est(_make_fake_extern_snode())
-        assert ns == 123.0  # analytical seed (sync) / analytical fallback after _boom (non-sync)
+        snode = _make_fake_extern_snode()
+        assert est(snode) == 123.0
+        assert est(snode) == 123.0
         [entry] = est.table.values()
         assert entry.measured is False and entry.kind == "extern"
-        if sync:
-            assert measured["called"] is False  # deferred to warm_and_sync
-            assert len(est._key_snode) == 1  # stashed for lockstep re-measurement
-        else:
-            assert measured["called"] is True  # non-sync: measurement path still taken
+        assert measured["called"] is False
+        assert len(est._key_snode) == int(sync)
     finally:
         _MATERIALIZE_INPUT_HOOKS.pop("aten::mm", None)
         _INTERNAL_COLLECTIVE_OPS.discard("aten::mm")

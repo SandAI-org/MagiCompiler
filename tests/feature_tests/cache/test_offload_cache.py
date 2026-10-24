@@ -162,6 +162,33 @@ def _make_offload_cache(tmp_path: Path) -> OffloadCache:
     return cache
 
 
+@pytest.mark.parametrize("replace_fails", [False, True])
+def test_sidecar_replacement_preserves_old_contents_until_commit(tmp_path, monkeypatch, replace_fails):
+    """A failed sidecar update must leave the previous file intact and remove the temporary file."""
+    cache = _make_offload_cache(tmp_path)
+    previous_contents = repr({7: _slot_metadata("previous_weight", (2, 2))})
+    cache.host_slots_path.write_text(previous_contents)
+    replace_path = Path.replace
+
+    def inspect_replacement(source, destination):
+        assert source.parent == destination.parent
+        assert ast.literal_eval(source.read_text()) == {}
+        assert destination.read_text() == previous_contents
+        if replace_fails:
+            raise OSError("simulated replacement failure")
+        return replace_path(source, destination)
+
+    monkeypatch.setattr(Path, "replace", inspect_replacement)
+    if replace_fails:
+        with pytest.raises(OSError, match="simulated replacement failure"):
+            cache.save_slot_sidecar()
+        assert cache.host_slots_path.read_text() == previous_contents
+    else:
+        cache.save_slot_sidecar()
+        assert ast.literal_eval(cache.host_slots_path.read_text()) == {}
+    assert list(tmp_path.iterdir()) == [cache.host_slots_path]
+
+
 def _make_offload_manager(tmp_path: Path) -> CompilerManager:
     conf = CompileConfig()
     conf.offload_config.graph_weight_offload = True
@@ -192,7 +219,10 @@ def _park_test_weight(name: str = "w", shape=(8, 8)):
 
 
 @requires_cuda
-def test_bind_matches_sidecar_and_replays_resident(tmp_path: Path):
+@pytest.mark.parametrize("peer_sidecar_miss", [False, True])
+def test_residents_restore_only_after_all_required_sidecars_match(tmp_path: Path, monkeypatch, peer_sidecar_miss):
+    """A peer's miss must veto residency restoration and slot remapping even when this sidecar matches."""
+    from magi_compiler.passes.transfer_overlap import rank_sync
     from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
     slot, device_standin = _park_test_weight()
@@ -208,11 +238,17 @@ def test_bind_matches_sidecar_and_replays_resident(tmp_path: Path):
     cache = _make_offload_cache(tmp_path)
     cache.host_slots_path.write_text(repr(sidecar))
 
-    assert cache.prepare_graph_replay(_make_slot_tagged_graph(slot)) is None
-    assert cache.can_replay_artifact()
-    assert not cache.can_store_artifact()
-    assert cache._cached_to_current_slots == {99: slot}
-    assert get_global_host_weight_store().is_resident(slot)
+    def any_rank_missed(local_miss):
+        assert not local_miss
+        return peer_sidecar_miss
+
+    monkeypatch.setattr(rank_sync, "any_rank_has_flag", any_rank_missed)
+    reason = cache.prepare_graph_replay(_make_slot_tagged_graph(slot), sync_across_ranks=True)
+    assert (reason is not None) == peer_sidecar_miss
+    assert cache.can_replay_artifact() == (not peer_sidecar_miss)
+    assert cache.can_store_artifact() == peer_sidecar_miss
+    assert cache._cached_to_current_slots == (None if peer_sidecar_miss else {99: slot})
+    assert get_global_host_weight_store().is_resident(slot) == (not peer_sidecar_miss)
 
 
 @requires_cuda
@@ -382,8 +418,9 @@ def test_bind_miss_raises_when_assert_cache_hit(tmp_path: Path):
 
 
 @requires_cuda
-def test_offload_cache_reuse_across_processes(tmp_path: Path):
-    """Bake in one process, replay in another under assert_cache_hit."""
+@pytest.mark.parametrize("sidecar_failure", [None, "missing", "mismatch"])
+def test_offload_cache_reuse_across_processes(tmp_path: Path, sidecar_failure: str | None):
+    """A sidecar miss must rebuild residency despite warm Torch caches, then allow artifact replay."""
     helper_path = Path(__file__).parent / "cache_reuse_helper" / "offload_cache_reuse_helper.py"
     cache_root = tmp_path / "cache"
     cold_run_report_path = tmp_path / "bake.json"
@@ -404,6 +441,30 @@ def test_offload_cache_reuse_across_processes(tmp_path: Path):
     assert sidecars, "bake must persist host_slots.py next to subgraph_indices.py"
     sidecar = ast.literal_eval(sidecars[0].read_text())
     assert sidecar, "bake must record at least one offloaded weight"
+    assert any(metadata["resident"] for metadata in sidecar.values())
+    cold_run_report = json.loads(cold_run_report_path.read_text())
+    assert cold_run_report["resident_bytes"] > 0
+
+    if sidecar_failure is not None:
+        if sidecar_failure == "missing":
+            sidecars[0].unlink()
+        else:
+            mismatched_sidecar = {slot: {**metadata, "name": "different_weight"} for slot, metadata in sidecar.items()}
+            sidecars[0].write_text(repr(mismatched_sidecar))
+        rebuild_report_path = tmp_path / "rebuild.json"
+        rebuild_result = subprocess.run(
+            [sys.executable, str(helper_path), "--output", str(rebuild_report_path)], env=env, capture_output=True, text=True
+        )
+        assert (
+            rebuild_result.returncode == 0
+        ), f"rebuild failed\nstdout:\n{rebuild_result.stdout}\nstderr:\n{rebuild_result.stderr}"
+        rebuild_report = json.loads(rebuild_report_path.read_text())
+        assert rebuild_report["resident_bytes"] == cold_run_report["resident_bytes"]
+        assert rebuild_report["fx_graph_cache_hits"] == 0
+        assert rebuild_report["autograd_cache_hits"] == 0
+        assert rebuild_report["fx_graph_cache_misses"] > 0
+        rebuilt_sidecar = ast.literal_eval(sidecars[0].read_text())
+        assert rebuilt_sidecar == sidecar
 
     verify_env = {**env, "MAGI_COMPILE_ASSERT_CACHE_HIT": "1"}
     replay_result = subprocess.run(
@@ -416,9 +477,60 @@ def test_offload_cache_reuse_across_processes(tmp_path: Path):
         "verify should have remapped the sidecar and loaded the artifact\n" f"stderr:\n{replay_result.stderr}"
     )
 
-    cold_run_report = json.loads(cold_run_report_path.read_text())
     replay_report = json.loads(replay_report_path.read_text())
+    assert replay_report["resident_bytes"] == cold_run_report["resident_bytes"]
     assert cold_run_report["weight_count"] >= 1
     assert replay_report["weight_count"] == cold_run_report["weight_count"]
     assert replay_report["shape"] == cold_run_report["shape"]
     assert abs(cold_run_report["sum"] - replay_report["sum"]) < 1e-2
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+@pytest.mark.parametrize("sidecar_failure", ["missing", "corrupt"])
+def test_fsdp_sidecar_miss_recompiles_every_rank(tmp_path: Path, sidecar_failure: str):
+    """One rank's sidecar failure must recompile all FSDP ranks and produce reusable artifacts."""
+    helper_path = Path(__file__).parent / "cache_reuse_helper" / "offload_cache_reuse_helper.py"
+    cache_root = tmp_path / "cache"
+    env = {**os.environ, "MAGI_LOGGING_LEVEL": "info", "MAGI_COMPILE_CACHE_ROOT_DIR": str(cache_root)}
+
+    def run_phase(phase: str, *, assert_cache_hit: bool = False) -> list[dict]:
+        phase_env = {**env, "MAGI_COMPILE_ASSERT_CACHE_HIT": str(int(assert_cache_hit))}
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
+                "--standalone",
+                "--nproc-per-node=2",
+                str(helper_path),
+                "--fsdp",
+                "--output",
+                str(tmp_path / f"{phase}.json"),
+            ],
+            env=phase_env,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert result.returncode == 0, f"{phase} failed\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        return [json.loads((tmp_path / f"{phase}.rank{rank}.json").read_text()) for rank in range(2)]
+
+    cold_reports = run_phase("cold")
+    assert all(report["weight_count"] > 0 and report["artifacts_saved"] > 0 for report in cold_reports)
+    [rank1_sidecar] = cache_root.glob("magi_cache/*_rank_1_*/**/host_slots.py")
+    if sidecar_failure == "missing":
+        rank1_sidecar.unlink()
+    else:
+        rank1_sidecar.write_text("{0: {'name':")
+
+    rebuilt_reports = run_phase("rebuilt")
+    for report in rebuilt_reports:
+        assert report["inductor_compiles"] > 0 and report["artifacts_saved"] > 0
+        assert report["fx_graph_cache_misses"] > 0
+        assert report["fx_graph_cache_hits"] == report["autograd_cache_hits"] == 0
+
+    replay_reports = run_phase("replay", assert_cache_hit=True)
+    for cold, rebuilt, replay in zip(cold_reports, rebuilt_reports, replay_reports):
+        assert replay["inductor_compiles"] == 0
+        assert replay["resident_bytes"] == rebuilt["resident_bytes"] == cold["resident_bytes"] > 0
+        assert rebuilt["sum"] == replay["sum"] == cold["sum"]

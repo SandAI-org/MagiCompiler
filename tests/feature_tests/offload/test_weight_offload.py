@@ -24,7 +24,7 @@ Three layers, tested separately because they fail in different ways:
   gather ends up reading the loaded copy rather than the freed shard.
 
 FSDP cases use a per-test 1-rank process group and device mesh. Plain-parameter
-cases explicitly require no process group. Runtime and integration cases need CUDA.
+cases also cover compilation by only one rank. Runtime and integration cases need CUDA.
 """
 
 import os
@@ -113,8 +113,8 @@ def _scheduler_passes_worker(rank: int, world_size: int, port: str, out_dir: str
         dist.destroy_process_group()
 
 
-def test_every_rank_profiles_once_any_rank_inserted_a_load(tmp_path):
-    """Synchronized profiling is a collective: a rank without loads must still install it."""
+def test_plain_param_scheduler_only_profiles_ranks_with_loads(tmp_path):
+    """Plain-parameter profiling must not involve ranks without local loads."""
     import json
     import socket
 
@@ -126,8 +126,73 @@ def test_every_rank_profiles_once_any_rank_inserted_a_load(tmp_path):
     mp.spawn(_scheduler_passes_worker, args=(2, port, str(tmp_path)), nprocs=2, join=True)
 
     with_loads, without_loads = (json.loads((tmp_path / f"{rank}.json").read_text()) for rank in range(2))
-    assert with_loads[:1] == without_loads[:1] == ["SnodeCostProfile"]
-    assert "H2dLoadReorder" in with_loads and "H2dLoadReorder" not in without_loads
+    assert with_loads[:1] == ["SnodeCostProfile"]
+    assert "H2dLoadReorder" in with_loads
+    assert without_loads == []
+
+
+class _RankLocalOffloadNet(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(256, 256, bias=False, dtype=torch.bfloat16)
+
+    def forward(self, inputs):
+        return self.linear(inputs)
+
+
+def _rank0_offload_worker(rank: int, world_size: int, port: str, cache_dir: str, cost_mode: str) -> None:
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from magi_compiler import magi_compile
+    from magi_compiler.config import CudaGraphMode
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = port
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size, timeout=timedelta(seconds=60))
+    try:
+        if rank == 0:
+
+            def configure_offload(config):
+                config.cache_root_dir = cache_dir
+                config.offload_config.graph_weight_offload = True
+                config.offload_config.offload_min_shard_mib = 0.0
+                config.offload_config.offload_h2d_bandwidth_gbps = 20.0
+                config.cudagraph_mode = CudaGraphMode.NONE
+                config.disable_graph_split = True
+                config.fsdp_config.cost_mode = cost_mode
+                return config
+
+            torch.manual_seed(2026)
+            model = _RankLocalOffloadNet()
+            reference_weight = model.linear.weight.detach().clone().cuda()
+            inputs = torch.randn(4, 256, device="cuda", dtype=torch.bfloat16)
+            model = magi_compile(model, dynamic_arg_dims={"inputs": 0}, config_patch=configure_offload)
+            model.cuda()
+            with torch.no_grad():
+                expected = torch.nn.functional.linear(inputs, reference_weight)
+                torch.testing.assert_close(model(inputs), expected)
+                torch.testing.assert_close(model(inputs), expected)
+        # Rank 1 never compiles: it waits here for rank 0's local work to finish.
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+@pytest.mark.parametrize("cost_mode", ["profile_sync", "analytical"])
+def test_plain_param_offload_compiles_on_rank0_only(tmp_path, cost_mode):
+    """An initialized WORLD must not make local offload compilation wait for another rank to compile."""
+    import socket
+
+    import torch.multiprocessing as mp
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = str(listener.getsockname()[1])
+    mp.spawn(_rank0_offload_worker, args=(2, port, str(tmp_path), cost_mode), nprocs=2, join=True)
 
 
 @requires_cuda

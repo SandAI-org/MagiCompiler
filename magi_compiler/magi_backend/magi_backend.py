@@ -16,8 +16,9 @@ import ast
 import dataclasses
 import pprint
 import time
+import uuid
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -103,9 +104,21 @@ class CompilerManager:
         """Provide compilation context for the duration of compilation to set
         any torch global properties we want to scope to a single Inductor
         compilation (e.g. pass context)."""
-        with observe_lifecycle_context("pass_context", runtime_shape=runtime_shape, subgraph_index=graph_index):
-            with pass_context(runtime_shape, graph_index):
-                yield
+        torch_cache_context = nullcontext()
+        if not self.offload_cache.can_replay_artifact():
+            from torch.compiler import config as compiler_config
+
+            # Without a matching sidecar, scheduling must rebuild residency.
+            # A fresh AOT/FX key forces compilation while preserving artifact export.
+            torch_cache_context = compiler_config.patch(
+                cache_key_tag=f"{compiler_config.cache_key_tag}:offload:{uuid.uuid4().hex}"
+            )
+        with (
+            torch_cache_context,
+            observe_lifecycle_context("pass_context", runtime_shape=runtime_shape, subgraph_index=graph_index),
+            pass_context(runtime_shape, graph_index),
+        ):
+            yield
 
     def initialize_cache(self, cache_dir: Path):
         """
@@ -175,7 +188,9 @@ class CompilerManager:
         """
         if self.disable_cache:
             return
-        reason = self.offload_cache.prepare_graph_replay(graph)
+        reason = self.offload_cache.prepare_graph_replay(
+            graph, sync_across_ranks=self.compile_config.fsdp_config.enable_fsdp and self.compile_config.disable_graph_split
+        )
         if reason is not None:
             self.cache.clear()
             self._remaining_restart_skips = {}

@@ -23,9 +23,11 @@ spaces under one sidecar.
 from __future__ import annotations
 
 import ast
+import os
 import pprint
 from collections.abc import Callable
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 import torch.fx as fx
 
@@ -58,7 +60,7 @@ class OffloadCache:
         self._graph_slot_table = {}
         self._cached_to_current_slots = None
 
-    def prepare_graph_replay(self, graph: fx.GraphModule) -> str | None:
+    def prepare_graph_replay(self, graph: fx.GraphModule, *, sync_across_ranks: bool = False) -> str | None:
         """Match the sidecar to ``graph``'s bound weights.
 
         Returns None when the compile indices are safe to replay, and otherwise
@@ -73,12 +75,20 @@ class OffloadCache:
         cached_to_current_slots = (
             None if cached_slots is None else match_host_slot_tables(cached_slots, self._graph_slot_table)
         )
+        cache_miss_reason = None
         if cached_to_current_slots is None:
             cache_miss_reason = (
                 "offload host_slots sidecar missing"
                 if cached_slots is None
                 else "offload host_slots sidecar does not match this process's bound weights"
             )
+        if sync_across_ranks:
+            from ...transfer_overlap import rank_sync
+
+            # Decide before restoring residents or installing a remap: a peer may need fresh scheduling.
+            if rank_sync.any_rank_has_flag(cache_miss_reason is not None):
+                cache_miss_reason = cache_miss_reason or "offload host_slots sidecar missed on another rank"
+        if cache_miss_reason is not None:
             magi_logger.info("host offload: %s; compile cache will miss and bake a new one", cache_miss_reason)
             return cache_miss_reason
         resident_slots_to_restore = [
@@ -122,7 +132,17 @@ class OffloadCache:
             return
         slot_table = refresh_resident_flags(self._graph_slot_table)
         printer = pprint.PrettyPrinter(indent=4)
-        self.host_slots_path.write_text(printer.pformat(slot_table))
+        # Same-directory replacement keeps readers from observing a partially written sidecar.
+        temporary_file = NamedTemporaryFile(mode="w", dir=self.host_slots_path.parent, prefix=".host_slots.", delete=False)
+        temporary_path = Path(temporary_file.name)
+        try:
+            with temporary_file:
+                temporary_file.write(printer.pformat(slot_table))
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+            temporary_path.replace(self.host_slots_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
     def _load_sidecar(self) -> dict[int, HostSlotMetadata] | None:
         if self.host_slots_path is None or not self.host_slots_path.exists():
