@@ -44,7 +44,6 @@ class CompileMode(Enum):
 class CudaGraphMode(Enum):
     """
     Constants for the cudagraph mode in CompileConfig.
-    Different from the CUDAGraphMode for llm, PIECEWISE and FULL modes are enough for diffusion models.
 
     NONE: No cudagraph is used.
     PIECEWISE: Cudagraph is used for piecewise compilation.
@@ -210,6 +209,57 @@ class OffloadConfig(BaseModel):
             "Env var: MAGI_COMPILE_OFFLOAD_CONFIG__FORCE_PER_RANK_WEIGHTS (1/0/true/false)."
         ),
     )
+    graph_weight_offload: bool = Field(
+        False,
+        description=(
+            "Compile-time CPU weight offload for SimpleFSDP (transport='nccl') and unsharded nn.Parameter models. "
+            "Inference only: run under torch.no_grad() or torch.inference_mode(); a graph that needs the "
+            "offloaded weights' gradients fails to compile. "
+            "Requires compile_mode=MAGI_COMPILE, disable_graph_split=True and cudagraph_mode=NONE; "
+            "mutually exclusive with model_cpu_offload and aot. "
+            "Host-first materialization loads checkpoints into pinned memory; "
+            "handoff temporarily allocates one CUDA shard. "
+            "A host-built unsharded model parks eligible weights on its first CUDA move. "
+            "Load checkpoints before that move; meta-built models load after to_empty and before handoff. "
+            "load_state_dict after handoff is rejected, including through a parent module. "
+            "Finish dtype conversion before parking -- before that first CUDA move, or before to_empty "
+            "for a meta-built model (e.g. model.half().cuda(), not model.cuda().half()); "
+            "parked weights keep their dtype, and later dtype or combined device+dtype casts are unsupported. "
+            "The graph loads separate device buffers with magi::h2d_load and schedules transfers to overlap compute. "
+            "See offload_max_device_weight_mib for the residency and in-flight scheduling budget."
+        ),
+    )
+    offload_min_shard_mib: float = Field(
+        1.0,
+        ge=0.0,
+        description=(
+            "Minimum local-shard MiB to offload. Every offloaded weight is its own load, and below "
+            "this its fixed submission cost (~40us of CPU; 1 MiB crosses PCIe in ~20us) rather than "
+            "bandwidth dominates the transfer, so it costs schedule slack and frees almost nothing."
+        ),
+    )
+    offload_max_device_weight_mib: int = Field(
+        0,
+        ge=0,
+        description=(
+            "Per-GPU scheduling budget in MiB, split between residency and in-flight H2D buffers. "
+            "The split aims to reduce exposed transfers. "
+            "The in-flight budget cannot fall below the unhoisted live-buffer peak, even if that exceeds this value. "
+            "Not a total device-memory cap: resident loads still allocate D2D outputs outside the in-flight budget, "
+            "and other graph buffers are not included. "
+            "0 = no residency, with in-flight room for the unhoisted peak plus one largest load."
+        ),
+    )
+    offload_h2d_bandwidth_gbps: float = Field(
+        0.0,
+        ge=0.0,
+        description=(
+            "Override the measured host-to-device bandwidth (GB/s) used to size each load's overlap "
+            "window. 0 = calibrate once per process with a rank-local pinned probe, which does not see "
+            "contention from ranks sharing a host link. Under-estimating is the safe direction: it "
+            "hoists loads further than needed."
+        ),
+    )
 
 
 class FSDPConfig(BaseModel):
@@ -220,25 +270,38 @@ class FSDPConfig(BaseModel):
     enable_fsdp: bool = Field(
         False,
         description=(
-            "Lower SimpleFSDP weight prim_redistribute to explicit collectives, bucket them (bucket_mode), "
+            "Lower SimpleFSDP weight prim_redistribute to explicit collectives, bucket them during scheduling "
+            "(bucket_mode), "
             "and install the latest-safe-launch reorder pass that hoists each all-gather launch just far "
-            "enough upstream for compute to hide it. Requires disable_graph_split=True and cudagraph_mode=NONE."
+            "enough upstream for compute to hide it. Requires cudagraph_mode=NONE. Applies only to graphs compiled "
+            "with disable_graph_split=True; split-graph compiles that share this flag (e.g. a VAE) skip it."
         ),
     )
-    bucket_mode: str = Field(
-        "none",
+    bucket_mode: Literal["none", "auto"] = Field(
+        "auto",
         description=(
-            "'none' = one all_gather + wait per weight; 'coalesced' = one all_gather_into_tensor_coalesced "
-            "per bucket (single launch, N getitems/waits). Buckets are whole-graph, broken only by "
-            "program-order dtype changes and the bucket_size_mib cap."
+            "'none' = one all-gather + wait per weight. 'auto' (default) = small weight gathers are merged "
+            "during Inductor scheduling, from the measured all-gather costs: a gather large enough that its "
+            "launch is at most auto_bucket_overhead_ratio of its time goes alone, and the smaller ones are "
+            "merged with their program-order neighbours until it is. Applies to NCCL and copy-engine "
+            "(transport='copy_engine') gathers alike."
         ),
     )
     bucket_size_mib: int = Field(
-        0,
-        ge=0,
+        0, ge=0, description="bucket_mode='auto': merged local-shard MiB cap (0 = none); a single gather may exceed it."
+    )
+    auto_bucket_overhead_ratio: float | None = Field(
+        None,
+        gt=0.0,
+        lt=1.0,
         description=(
-            "Per-bucket cap on accumulated local-shard MiB for coalesced bucketing. 0 = no cap "
-            "(one bucket per (group, dtype) run)."
+            "bucket_mode='auto': the share of a gather's time its fixed launch cost may take. With the "
+            "measured cost alpha + beta * bytes (fitted per transport and process group), a gather of "
+            "alpha * (1 - ratio) / (ratio * beta) gathered bytes or more goes alone; smaller ones are merged "
+            "with their program-order neighbours until a bucket reaches that size, never past twice it. "
+            "Smaller ratios merge more and allocate more gathered weight early. "
+            "None (default) picks per transport: 0.1 for NCCL gathers and 0.5 for copy-engine gathers. "
+            "A value set here applies to both transports."
         ),
     )
     cost_mode: Literal["profile_sync", "analytical"] = Field(
@@ -259,7 +322,7 @@ class FSDPConfig(BaseModel):
         ),
     )
     comm_overlap_window_scale: float = Field(
-        1.0,
+        1.1,
         ge=1.0,
         description=(
             "Multiplier on each collective's estimated runtime when sizing its compute window "
@@ -446,7 +509,7 @@ def _get_parallel_topology() -> str:
     meta functions and must not share cached artifacts.
 
     Resolution order:
-    1. ``MAGI_COMPILE_TOPOLOGY_KEY`` env var (set by the host framework, e.g. athena)
+    1. ``MAGI_COMPILE_TOPOLOGY_KEY`` env var, supplied by the caller
     2. ``ws{world_size}`` when torch.distributed is initialized
     3. ``ws1`` (single-process default)
     """
@@ -461,9 +524,9 @@ def _get_parallel_topology() -> str:
 def model_rank_dir_name(model_idx: int, model_tag: str | None) -> str:
     """Directory name: ``model_{idx}[_{tag}]_rank_{rank}_{topology}``.
 
-    Topology encodes all parallel dimension sizes via PSM.topology_key().
-    Different topologies produce different tensor strides in custom-op meta
-    functions; without isolation, stale artifacts trigger stride-mismatch assertions.
+    Callers can encode parallel dimensions in ``MAGI_COMPILE_TOPOLOGY_KEY``;
+    otherwise only the distributed world size is used. Topologies that change
+    custom-op tensor strides must not share cached artifacts.
     """
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     topo = _get_parallel_topology()

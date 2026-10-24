@@ -55,6 +55,7 @@ os.environ.setdefault("TORCH_SYMM_MEM_DISABLE_MULTICAST", "1")
 import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
 import torch.nn as nn  # noqa: E402
+from torch._inductor import ir  # noqa: E402
 from torch.distributed.device_mesh import init_device_mesh  # noqa: E402
 
 from magi_compiler import magi_compile  # noqa: E402
@@ -150,6 +151,12 @@ def main() -> None:
     ap.add_argument("--n-layers", type=int, default=6)
     ap.add_argument("--n-tokens", type=int, default=4096)
     ap.add_argument("--transport", default="copy_engine", choices=["nccl", "copy_engine"])
+    ap.add_argument(
+        "--bucket-target-mib",
+        type=float,
+        default=0.0,
+        help="fixed gathered MiB per auto bucket instead of the measured fit (0 = measured)",
+    )
     args = ap.parse_args()
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -161,17 +168,20 @@ def main() -> None:
     mesh = init_device_mesh("cuda", (world,), mesh_dim_names=("dp",))
     os.environ.setdefault("MAGI_LOGGING_LEVEL", "INFO")
 
-    def log(*a):
+    def log(*args):
         if rank == 0:
-            print(*a, flush=True)
+            print(*args, flush=True)
 
     ce = args.transport == "copy_engine"
 
     # -- count the rewrites, without asking the compiled model to confess ----
-    from magi_compiler.passes.fsdp_overlap import lower_and_bucket as _lb
+    # The weight transfer pipeline binds the retarget by name at import, so its module attribute
+    # is the seam to patch (the package's too, for anything resolving it there).
+    import magi_compiler.magi_backend.weight_transfer_pipeline as _weight_transfer_pipeline
+    import magi_compiler.passes.fsdp_overlap as _fsdp_overlap
 
     n_rewritten = 0
-    orig_rewrite = _lb.rewrite_weight_ag_to_copy_engine
+    orig_rewrite = _fsdp_overlap.rewrite_weight_ag_to_copy_engine
 
     def spy_rewrite(graph):
         nonlocal n_rewritten
@@ -179,7 +189,29 @@ def main() -> None:
         n_rewritten += got
         return got
 
-    _lb.rewrite_weight_ag_to_copy_engine = spy_rewrite
+    _fsdp_overlap.rewrite_weight_ag_to_copy_engine = spy_rewrite
+    _weight_transfer_pipeline.rewrite_weight_ag_to_copy_engine = spy_rewrite
+
+    # -- count the scheduler-stage buckets the copy engine launches ---------
+    from magi_compiler.passes.fsdp_overlap.auto_bucket import BucketPlanParams, FsdpAutoBucket
+    from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER_COALESCED
+
+    if args.bucket_target_mib > 0:
+        # Measured gather costs vary run to run; a fixed target makes the merge count a function of the shape.
+        BucketPlanParams.target_gathered_bytes = property(lambda self: args.bucket_target_mib * 2**20)
+
+    n_ce_buckets = 0
+    orig_bucket = FsdpAutoBucket.__call__
+
+    def spy_bucket(self, snodes):
+        nonlocal n_ce_buckets
+        out = orig_bucket(self, snodes)
+        n_ce_buckets += sum(
+            1 for s in out if isinstance(s.node, ir.ExternKernel) and s.node.op_overload is CE_ALL_GATHER_COALESCED
+        )
+        return out
+
+    FsdpAutoBucket.__call__ = spy_bucket
 
     # -- the reference: unsharded, eager, same checkpoint -------------------
     torch.manual_seed(1234)
@@ -212,7 +244,9 @@ def main() -> None:
         out2 = model(x)
         torch.cuda.synchronize()
 
-    _lb.rewrite_weight_ag_to_copy_engine = orig_rewrite
+    _fsdp_overlap.rewrite_weight_ag_to_copy_engine = orig_rewrite
+    _weight_transfer_pipeline.rewrite_weight_ag_to_copy_engine = orig_rewrite
+    FsdpAutoBucket.__call__ = orig_bucket
 
     # (2) placement: the block's shards are in a window, the head's are not.
     # Checked after the first forward, not before it: the weights move during
@@ -232,6 +266,7 @@ def main() -> None:
     expect_rewrites = args.n_layers if ce else 0
     rewrite_ok = n_rewritten == expect_rewrites
     log(f"CHECK rewrite: {n_rewritten}/{expect_rewrites} gathers on magi::ce_all_gather -> {'ok' if rewrite_ok else 'WRONG'}")
+    log(f"CHECK auto buckets: {n_ce_buckets} coalesced copy-engine launch(es)")
 
     def rel(a, b):
         return ((a.float() - b.float()).norm() / (b.float().norm() + 1e-6)).item()

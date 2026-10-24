@@ -28,7 +28,6 @@ anywhere.
 
 from __future__ import annotations
 
-import operator
 import os
 
 import pytest
@@ -37,9 +36,8 @@ import torch.fx as fx
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
-_AG = torch.ops._c10d_functional.all_gather_into_tensor.default
-_AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
-_WAIT = torch.ops._c10d_functional.wait_tensor.default
+_ALL_GATHER_OP = torch.ops._c10d_functional.all_gather_into_tensor.default
+_WAIT_TENSOR_OP = torch.ops._c10d_functional.wait_tensor.default
 _TO_COPY = torch.ops.aten._to_copy.default
 _PAD = torch.ops.aten.constant_pad_nd.default
 
@@ -105,11 +103,11 @@ def _graph_with_gathers(
         elif derive == "pad":
             cur = g.call_function(_PAD, (cur, [0, 0, 0, 2], 0.0))
             cur.meta["example_value"] = local._local_tensor.new_empty((10, 4))
-        ag = g.call_function(_AG, (cur, 1, "dummy_group"))
+        ag = g.call_function(_ALL_GATHER_OP, (cur, 1, "dummy_group"))
         ag.meta["example_value"] = local._local_tensor.new_empty(local._local_tensor.shape)
         if marked:
             mark_weight_ag(ag, uneven=uneven)
-        outs.append(g.call_function(_WAIT, (ag,)))
+        outs.append(g.call_function(_WAIT_TENSOR_OP, (ag,)))
     g.output(tuple(outs))
     return fx.GraphModule(torch.nn.Module(), g)
 
@@ -145,7 +143,7 @@ def test_plain_weight_gathers_are_candidates(mesh_1rank):
     gm = _graph_with_gathers(mesh_1rank, 3)
     candidates = _candidates(gm)
 
-    assert [g for g, _h in candidates] == _gathers(gm, _AG)
+    assert [g for g, _h in candidates] == _gathers(gm, _ALL_GATHER_OP)
     assert all(h.op == "placeholder" for _g, h in candidates)
 
 
@@ -199,12 +197,12 @@ def test_bound_gathers_are_retargeted_and_waits_untouched(mesh_1rank):
     assert _pretend_bound(gm) == 4
     assert rewrite_weight_ag_to_copy_engine(gm) == 4
 
-    assert not _gathers(gm, _AG)
+    assert not _gathers(gm, _ALL_GATHER_OP)
     symm = _gathers(gm, _symm_op())
     assert len(symm) == 4
     # The wait is the load-bearing part of the design: it must be the same stock
     # node, still reading the gather.
-    waits = _gathers(gm, _WAIT)
+    waits = _gathers(gm, _WAIT_TENSOR_OP)
     assert len(waits) == 4
     assert [w.args[0] for w in waits] == symm
 
@@ -230,7 +228,7 @@ def test_an_unbound_gather_is_never_retargeted(mesh_1rank):
 
     gm = _graph_with_gathers(mesh_1rank, 3)  # candidates, but nothing bound them
     assert rewrite_weight_ag_to_copy_engine(gm) == 0
-    assert len(_gathers(gm, _AG)) == 3
+    assert len(_gathers(gm, _ALL_GATHER_OP)) == 3
     assert not _gathers(gm, _symm_op())
 
 
@@ -240,17 +238,17 @@ def test_mixed_graph_splits_by_transport(mesh_1rank):
 
     gm = _graph_with_gathers(mesh_1rank, 2)
     # Splice in one unmarked gather reading a graph input directly.
-    node = _gathers(gm, _AG)[0]
+    node = _gathers(gm, _ALL_GATHER_OP)[0]
     with gm.graph.inserting_before(node):
         other = gm.graph.placeholder("activation")
         other.meta["example_value"] = torch.randn(4, 4, device="cuda")
-        extra = gm.graph.call_function(_AG, (other, 1, "dummy_group"))
+        extra = gm.graph.call_function(_ALL_GATHER_OP, (other, 1, "dummy_group"))
         extra.meta["example_value"] = torch.randn(4, 4, device="cuda")
     gm.graph.lint()
 
     assert _pretend_bound(gm) == 2
     assert rewrite_weight_ag_to_copy_engine(gm) == 2
-    assert len(_gathers(gm, _AG)) == 1
+    assert len(_gathers(gm, _ALL_GATHER_OP)) == 1
     assert len(_gathers(gm, _symm_op())) == 2
 
 
@@ -279,102 +277,6 @@ def test_selection_matches_what_the_lowering_pass_emits(mesh_1rank):
 
     assert _pretend_bound(gm) == 1
     assert rewrite_weight_ag_to_copy_engine(gm) == 1
-    assert not _gathers(gm, _AG)
+    assert not _gathers(gm, _ALL_GATHER_OP)
     symm = _gathers(gm, _symm_op())
-    assert _gathers(gm, _WAIT)[0].args[0] is symm[0]
-
-
-# ---------------------------------------------------------------------------
-# Bucketing carries the mark
-# ---------------------------------------------------------------------------
-@requires_cuda
-def test_a_bucket_of_bound_gathers_is_retargeted(mesh_1rank):
-    """Bucketing runs after binding, so the coalesced node it builds has to inherit
-    the mark from its members or the whole bucket falls back."""
-    from magi_compiler.passes.fsdp_overlap import bucket_weight_all_gather_coalesced, rewrite_weight_ag_to_copy_engine
-    from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER_COALESCED
-
-    gm = _graph_with_gathers(mesh_1rank, 4)
-    _pretend_bound(gm)
-    assert bucket_weight_all_gather_coalesced(gm, bucket_size_bytes=0) == 1
-    assert rewrite_weight_ag_to_copy_engine(gm) == 1
-
-    assert not _gathers(gm, _AG_COALESCED)
-    assert len(_gathers(gm, CE_ALL_GATHER_COALESCED)) == 1
-    assert len(_gathers(gm, _WAIT)) == 4
-
-
-@requires_cuda
-def test_a_bucket_is_all_or_nothing(mesh_1rank):
-    """A bucket is one submission, so it can only go to the copy engine if *every*
-    member is bound -- one unbound member has to keep the whole bucket on NCCL
-    rather than being gathered from an address with no peers."""
-    from magi_compiler.passes.fsdp_overlap import bucket_weight_all_gather_coalesced, rewrite_weight_ag_to_copy_engine
-    from magi_compiler.passes.fsdp_overlap.node_meta import CE_BOUND
-    from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER_COALESCED
-
-    gm = _graph_with_gathers(mesh_1rank, 3)
-    _pretend_bound(gm)
-    _gathers(gm, _AG)[1].meta[CE_BOUND] = False
-
-    # No eligibility filter, so the unbound member lands in the bucket anyway --
-    # the case the propagation exists to catch.
-    assert bucket_weight_all_gather_coalesced(gm, bucket_size_bytes=0) == 1
-    assert rewrite_weight_ag_to_copy_engine(gm) == 0
-    assert len(_gathers(gm, _AG_COALESCED)) == 1
-    assert not _gathers(gm, CE_ALL_GATHER_COALESCED)
-
-
-def _coalesced_graph(mesh, n: int, *, marked: bool = True, bound: bool = True):
-    """One ``all_gather_into_tensor_coalesced`` over ``n`` shards.
-
-    Bucketing normally builds this node, but it is also what a pre-bucketed graph
-    hands the rewrite, so the membership check gets its own graph rather than being
-    reached only through the bucket pass.
-    """
-    from torch.distributed.tensor import Shard, distribute_tensor
-
-    from magi_compiler.passes.fsdp_overlap.node_meta import mark_ce_bound, mark_weight_ag
-
-    g = fx.Graph()
-    locals_ = []
-    for i in range(n):
-        local = distribute_tensor(torch.randn(8, 4, device="cuda", dtype=torch.bfloat16), mesh, [Shard(0)])
-        w = g.placeholder(f"layer_{i}_weight")
-        w.meta["example_value"] = local
-        cur = g.call_method("to_local", (w,))
-        cur.meta["example_value"] = local._local_tensor
-        locals_.append(cur)
-
-    ag = g.call_function(_AG_COALESCED, (locals_, 1, "dummy_group"))
-    ag.meta["example_value"] = [torch.empty(8, 4, device="cuda", dtype=torch.bfloat16) for _ in range(n)]
-    if marked:
-        mark_weight_ag(ag, uneven=False)
-        if bound:
-            mark_ce_bound(ag)
-    outs = []
-    for i in range(n):
-        item = g.call_function(operator.getitem, (ag, i))
-        outs.append(g.call_function(_WAIT, (item,)))
-    g.output(tuple(outs))
-    return fx.GraphModule(torch.nn.Module(), g)
-
-
-@requires_cuda
-def test_a_pre_bucketed_bound_gather_is_retargeted(mesh_1rank):
-    from magi_compiler.passes.fsdp_overlap import rewrite_weight_ag_to_copy_engine
-    from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER_COALESCED
-
-    gm = _coalesced_graph(mesh_1rank, 3)
-    assert rewrite_weight_ag_to_copy_engine(gm) == 1
-    assert not _gathers(gm, _AG_COALESCED)
-    assert len(_gathers(gm, CE_ALL_GATHER_COALESCED)) == 1
-
-
-@requires_cuda
-def test_unmarked_coalesced_stays_on_nccl(mesh_1rank):
-    from magi_compiler.passes.fsdp_overlap import rewrite_weight_ag_to_copy_engine
-
-    gm = _coalesced_graph(mesh_1rank, 2, marked=False)
-    assert rewrite_weight_ag_to_copy_engine(gm) == 0
-    assert len(_gathers(gm, _AG_COALESCED)) == 1
+    assert _gathers(gm, _WAIT_TENSOR_OP)[0].args[0] is symm[0]

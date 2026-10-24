@@ -118,8 +118,8 @@ def _build_method_redistribute_graph(mesh, weight_name, *, forward_dtype=None, d
     return fx.GraphModule(torch.nn.Module(), g)
 
 
-_AG = torch.ops._c10d_functional.all_gather_into_tensor.default
-_WAIT = torch.ops._c10d_functional.wait_tensor.default
+_ALL_GATHER_OP = torch.ops._c10d_functional.all_gather_into_tensor.default
+_WAIT_TENSOR_OP = torch.ops._c10d_functional.wait_tensor.default
 _TO_COPY = torch.ops.aten._to_copy.default
 
 
@@ -136,8 +136,8 @@ def test_lowering_rewrites_shard0_weight(dist_1rank):
 
     assert n == 1, "one Shard(0) weight redistribute should be lowered"
     targets = _targets(gm)
-    assert _AG in targets
-    assert _WAIT in targets
+    assert _ALL_GATHER_OP in targets
+    assert _WAIT_TENSOR_OP in targets
     # the prims are gone, replaced by explicit collectives
     assert prim_redistribute not in targets and prim_to_local not in targets
     # the gather is tagged so the bucketing pass can find it
@@ -156,7 +156,7 @@ def test_lowering_skips_non_weight_input(dist_1rank):
     n = lower_prim_redistribute_to_collectives(gm)
     assert n == 0
     targets = _targets(gm)
-    assert _AG not in targets
+    assert _ALL_GATHER_OP not in targets
     assert prim_redistribute in targets  # untouched
 
 
@@ -169,7 +169,7 @@ def test_lowering_rewrites_method_shaped_redistribute(dist_1rank):
     assert lower_prim_redistribute_to_collectives(gm) == 1
 
     targets = _targets(gm)
-    assert _AG in targets and _WAIT in targets
+    assert _ALL_GATHER_OP in targets and _WAIT_TENSOR_OP in targets
     methods = [n.target for n in gm.graph.nodes if n.op == "call_method"]
     assert "redistribute" not in methods  # consumed; only the to_local of the shard is left
     assert len([x for x in gm.graph.nodes if is_weight_ag(x)]) == 1
@@ -187,8 +187,35 @@ def test_lowering_reads_forward_dtype_from_method_kwargs(dist_1rank):
     cast = [n for n in gm.graph.nodes if n.op == "call_function" and n.target is _TO_COPY]
     assert len(cast) == 1
     assert cast[0].kwargs["dtype"] is torch.float32
-    ag = [n for n in gm.graph.nodes if n.op == "call_function" and n.target is _AG]
+    ag = [n for n in gm.graph.nodes if n.op == "call_function" and n.target is _ALL_GATHER_OP]
     assert ag[0].args[0] is cast[0]  # the gather moves the cast shard, not the stored one
+
+
+@requires_cuda
+def test_a_one_rank_mesh_in_a_multi_rank_job_reads_its_local_shard(dist_1rank, monkeypatch):
+    """Expert parallelism as wide as the job leaves each expert mesh one rank.
+
+    That shard is the whole weight, so there is nothing to gather: the gather would
+    be a device copy of the full weight, priced by the bucketing as if it were a
+    collective.  The cast still runs, and nothing is tagged as a weight gather.
+    """
+    import torch.distributed as dist
+
+    from magi_compiler.passes.fsdp_overlap import is_weight_ag, lower_prim_redistribute_to_collectives
+
+    monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: 8)
+    gm = _build_method_redistribute_graph(dist_1rank, "layer_weight", forward_dtype=torch.float32)
+    assert lower_prim_redistribute_to_collectives(gm) == 0
+
+    targets = _targets(gm)
+    assert _ALL_GATHER_OP not in targets and _WAIT_TENSOR_OP not in targets
+    assert not any(is_weight_ag(n) for n in gm.graph.nodes)
+    methods = [n.target for n in gm.graph.nodes if n.op == "call_method"]
+    assert "redistribute" not in methods and methods.count("to_local") == 1
+
+    (out,) = [n for n in gm.graph.nodes if n.op == "output"][0].args[0]
+    assert out.target is _TO_COPY and out.kwargs["dtype"] is torch.float32
+    assert out.args[0].op == "call_method" and out.args[0].target == "to_local"
 
 
 @requires_cuda
@@ -206,7 +233,7 @@ def test_lowering_records_shard_evenness_on_the_gather(dist_1rank):
     gm = _build_redistribute_graph(dist_1rank, "layer_weight", rows=8)
     assert lower_prim_redistribute_to_collectives(gm) == 1
 
-    ag = [n for n in gm.graph.nodes if n.op == "call_function" and n.target is _AG]
+    ag = [n for n in gm.graph.nodes if n.op == "call_function" and n.target is _ALL_GATHER_OP]
     assert UNEVEN_SHARD in ag[0].meta
     assert ag[0].meta[UNEVEN_SHARD] is False  # 8 rows over a 1-rank mesh
 
@@ -219,7 +246,7 @@ def test_lowering_gather_and_wait_are_separate_nodes(dist_1rank):
 
     gm = _build_redistribute_graph(dist_1rank, "layer_weight")
     lower_prim_redistribute_to_collectives(gm)
-    ag = [n for n in gm.graph.nodes if n.op == "call_function" and n.target is _AG]
-    wait = [n for n in gm.graph.nodes if n.op == "call_function" and n.target is _WAIT]
+    ag = [n for n in gm.graph.nodes if n.op == "call_function" and n.target is _ALL_GATHER_OP]
+    wait = [n for n in gm.graph.nodes if n.op == "call_function" and n.target is _WAIT_TENSOR_OP]
     assert len(ag) == 1 and len(wait) == 1
     assert wait[0].args[0] is ag[0]  # wait consumes the gather's output
