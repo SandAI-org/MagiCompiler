@@ -38,7 +38,6 @@ from magi_compiler.passes.fsdp_overlap import (
     rewrite_weight_ag_to_copy_engine,
 )
 from magi_compiler.passes.snode_cost import SnodeCostProfile, SnodeCostTable
-from magi_compiler.passes.transfer_overlap import rank_sync
 from magi_compiler.passes.weight_offload import (
     FsdpShardSource,
     H2dLoadReorder,
@@ -87,17 +86,14 @@ def build_transfer_overlap_passes(
     ``SnodeCostProfile`` runs first and fills the cost table every later pass reads.
     FSDP replaces Inductor's default reorders; offload alone keeps them for CP/EP overlap.
     """
-    loads_on_any_rank = loads_inserted
-    if offload_config.graph_weight_offload and not fsdp_config.enable_fsdp:
-        # Synchronized profiling is a collective, so a rank without loads still profiles
-        # when a peer has any. Every rank compiling this graph reaches this call.
-        loads_on_any_rank = rank_sync.any_rank_has_flag(loads_inserted)
-    if not (fsdp_config.enable_fsdp or loads_on_any_rank):
-        # Offload requested but nothing bound on any rank.
+    if not (fsdp_config.enable_fsdp or loads_inserted):
         return None
 
     costs = SnodeCostTable()
-    estimator = None if fsdp_config.cost_mode == "analytical" else ProfilingRuntimeEstimator(sync_across_ranks=True)
+    # Plain-parameter models may compile on only one rank of an initialized WORLD.
+    estimator = (
+        None if fsdp_config.cost_mode == "analytical" else ProfilingRuntimeEstimator(sync_across_ranks=fsdp_config.enable_fsdp)
+    )
     passes: list = [SnodeCostProfile(costs, estimator)]
 
     if fsdp_config.enable_fsdp:
