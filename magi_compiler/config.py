@@ -200,10 +200,13 @@ class OffloadConfig(BaseModel):
         None,
         description=(
             "Override for per-rank shared memory mode.  When None (default), "
-            "MagiCompiler auto-detects by comparing weight fingerprints across "
-            "ranks: if all ranks hold identical weights, a single shared mmap is "
-            "used; otherwise each rank writes its own file.  Set to True to force "
-            "per-rank mode (e.g. expert parallelism), or False to force sharing.  "
+            "MagiCompiler compares each weight's fingerprint across the ranks of "
+            "a host: weights identical on all of them (e.g. the dense weights "
+            "under expert parallelism) share one mmap per host if its shared "
+            "memory has room, the rest stay per rank.  Set to True to keep every "
+            "weight per rank, or False to skip the fingerprints and the room check "
+            "and share every weight.  Shared weights that differ from local rank "
+            "0's byte for byte always stay per rank.  "
             "Env var: MAGI_COMPILE_OFFLOAD_CONFIG__FORCE_PER_RANK_WEIGHTS (1/0/true/false)."
         ),
     )

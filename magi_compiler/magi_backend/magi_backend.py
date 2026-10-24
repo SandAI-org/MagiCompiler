@@ -32,7 +32,7 @@ from torch._guards import detect_fake_mode
 import magi_compiler.utils.envs as envs
 from magi_compiler.config import CompileConfig, CompileMode, CudaGraphMode, inductor_compile_config_hash, magi_cache_dump_path
 from magi_compiler.magi_depyf.timeline import observe_lifecycle, observe_lifecycle_context
-from magi_compiler.offload.offload_warpper import OffloadWrapper
+from magi_compiler.offload.offload_warpper import OffloadWrapper, is_python_scalar_input, mark_python_scalar_inputs
 from magi_compiler.passes import CustomJointGraphPartitionFn, FullGraphPassManager, PostGradPassManager, pass_context
 from magi_compiler.utils import compilation_counter, compute_code_hash, compute_graph_hash, compute_hash, magi_logger
 from magi_compiler.utils.visualize import save_fx_graph_visualization
@@ -363,8 +363,9 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         fake_args = self._build_fake_args(args)
         if self.compile_config.offload_config.model_cpu_offload:
             fix_graph_device_placement(self.module)
-            for i, arg in enumerate(fake_args):
-                if isinstance(arg, torch.Tensor):
+            placeholders = [node for node in self.module.graph.nodes if node.op == "placeholder"]
+            for i, (arg, node) in enumerate(zip(fake_args, placeholders, strict=True)):
+                if isinstance(arg, torch.Tensor) and not is_python_scalar_input(node):
                     fake_args[i] = arg.cuda()
 
         with self.fake_mode, enable_python_dispatcher():
@@ -740,6 +741,7 @@ class MagiBackend:
 
         self._init_cache(graph=graph, example_inputs=example_inputs)
 
+        mark_python_scalar_inputs(graph)
         self.full_graph_pass_manager(graph)
 
         split_gm, piecewise_graphs = self._split_graph(graph, example_inputs)

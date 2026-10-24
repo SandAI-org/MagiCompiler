@@ -15,6 +15,7 @@
 from contextlib import contextmanager
 from typing import Type
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -148,6 +149,68 @@ def test_cpu_offload_manual_move(device, mlp_config):
         # 3. Second move (Should not take any effect)
         model.mlp.to(device)
         assert model.mlp.up_proj.weight.device.type == "cpu", "Subsequent .to() calls should not take effect"
+
+
+@torch.library.custom_op("magi_test::add_scalar", mutates_args=())
+def _add_scalar(x: torch.Tensor, value: float) -> torch.Tensor:
+    return x + value
+
+
+@_add_scalar.register_fake
+def _(x, value):
+    return torch.empty_like(x)
+
+
+def create_offload_float_attribute_class():
+    @magi_compile(dynamic_arg_dims={"x": 0})
+    class FloatAttributeModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(8))
+            self.shift = 0.25
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return _add_scalar(x * self.weight, self.shift)
+
+    return FloatAttributeModule
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
+def test_cpu_offload_keeps_python_scalar_inputs_on_cpu():
+    """Dynamo passes an unspecialized Python float as a CPU float64 tensor and reads it back with ``.item()``.
+    Moving it to CUDA with the other inputs failed the compile with ``aten._local_scalar_dense``."""
+    with set_cpu_offload(True):
+        model = create_offload_float_attribute_class()().cuda()
+        x = torch.randn(4, 8, device="cuda")
+        with torch.no_grad():
+            out = model(x)
+        torch.testing.assert_close(out, x * model.weight.detach().cuda() + 0.25)
+
+
+def create_offload_numpy_input_class():
+    @magi_compile(dynamic_arg_dims={"x": 0})
+    class NumpyInputModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(8))
+
+        def forward(self, x: torch.Tensor, offset: np.ndarray) -> torch.Tensor:
+            return x * self.weight + torch.from_numpy(offset).to(x.device)
+
+    return NumpyInputModule
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA support")
+def test_cpu_offload_moves_numpy_inputs_to_cuda():
+    """Dynamo also lifts numpy arrays to CPU tensors, but uses them as tensors: they move to CUDA like any input.
+    Kept on CPU, the compile failed with "Tensor on device cpu is not on the expected device cuda:0"."""
+    with set_cpu_offload(True):
+        model = create_offload_numpy_input_class()().cuda()
+        x = torch.randn(4, 8, device="cuda")
+        offset = np.arange(8, dtype=np.float32)
+        with torch.no_grad():
+            out = model(x, offset)
+        torch.testing.assert_close(out, x * model.weight.detach().cuda() + torch.from_numpy(offset).cuda())
 
 
 @magi_register_custom_op("athena::my_attention", infer_output_meta_fn=["q"], is_subgraph_boundary=True)

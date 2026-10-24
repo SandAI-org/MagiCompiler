@@ -105,7 +105,7 @@ class OffloadExecutor:
 
             # case 1: input tensor
             if not is_weight:
-                if isinstance(arg_val, torch.Tensor):
+                if isinstance(arg_val, torch.Tensor) and not is_python_scalar_input(node):
                     arg_val = arg_val.to("cuda", non_blocking=False)
                 env[node] = arg_val
                 continue
@@ -208,6 +208,34 @@ class OffloadExecutor:
                             tensor_obj.record_stream(self.compute_stream)
                         del env[input_node]
         return None
+
+
+#: Set by ``mark_python_scalar_inputs`` on Dynamo's graph; ``split_module`` copies it onto the split graph.
+_PYTHON_SCALAR_INPUT = "magi_python_scalar_input"
+
+
+def mark_python_scalar_inputs(graph_module: torch.fx.GraphModule) -> None:
+    """Mark the inputs Dynamo lifted from Python scalars: 0-d CPU tensors it only reads back with ``.item()``.
+
+    Offload must leave them on CPU like every non-offloaded run does. They are recognized from the graph, not from
+    Dynamo's ``grapharg`` meta: Dynamo deletes that before an AOT compile reaches the backend, and AOT artifacts do
+    not keep node meta, so ``rebuild_backend`` marks the deserialized graph again. A lifted numpy array is used as a
+    tensor and moves to CUDA with the other inputs.
+    """
+    for node in graph_module.graph.find_nodes(op="placeholder"):
+        example = node.meta.get("example_value")
+        if (
+            isinstance(example, torch.Tensor)
+            and example.ndim == 0
+            and example.device.type == "cpu"
+            and node.users
+            and all(user.op == "call_method" and user.target == "item" for user in node.users)
+        ):
+            node.meta[_PYTHON_SCALAR_INPUT] = True
+
+
+def is_python_scalar_input(node: Node) -> bool:
+    return node.meta.get(_PYTHON_SCALAR_INPUT, False)
 
 
 class OffloadWrapper:
