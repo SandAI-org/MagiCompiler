@@ -12,13 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Park eligible weights in pinned memory on meta to_empty or the first CPU-to-CUDA move.
+"""Manage weight materialization, host handoff, and device residency.
+
+Park eligible weights in pinned memory on meta to_empty or the first CPU-to-CUDA move.
 
 After initialization, handoff installs storage-free CUDA stand-ins before tracing;
 it temporarily allocates one local shard. Tied registrations share a reservation
 and slot. Externally materialized weights stay resident; reclaimed weights are reported.
 Device moves update residency without replacing traced stand-ins. Other tensors
 use the class's _apply; DTensor movement stays with the sharding owner.
+
+Moving a module to the host releases its promoted device copies; moving it back
+restores exactly those copies. Slots are tracked per instance so moving one
+compiled model does not change another model's residency.
 
 Dtype contract: finish every dtype conversion before parking, i.e. before the
 first CUDA move of a host-built model or before ``to_empty`` of a meta-built one.
@@ -30,27 +36,105 @@ else, e.g. ``.to(device, dtype)``, is unsupported and not reliably detected.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from functools import partial
+from typing import Literal, Sequence
+
 import torch
 import torch.nn as nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from magi_compiler.utils import magi_logger
 
-from . import residency
 from .runtime.host_weights import get_global_host_weight_store
 
 _TO_EMPTY_QUALNAME = "Module.to_empty.<locals>.<lambda>"
 """Only ``to_empty`` materializes; dtype casts and other ``_apply`` uses keep torch behavior."""
 
-_HANDOFF_PENDING_ATTR = "_magi_host_first_pending"
-"""Set on an instance whose weights are waiting in host memory for their handoff."""
 
-_PARKED_NAMES_ATTR = "_magi_host_first_parked"
-"""Names ``install_host_first_hooks`` put in host memory, so the handoff can tell a
-weight it was never given from one that was taken back out from under it."""
+@dataclass
+class OffloadState:
+    hooks_installed: bool = False
+    min_weight_bytes: int = 0
+    parking_decided: bool = False
+    handoff_status: Literal["not_started", "pending", "complete"] = "not_started"
+    parked_parameter_names: tuple[str, ...] = ()
+    host_slots: tuple[int, ...] = ()
+    released_slots: tuple[int, ...] = ()
 
-_PARKING_DECIDED_ATTR = "_magi_host_first_settled"
-"""Set once ``to_empty`` or the first move to CUDA decided what to park, even nothing."""
+
+def get_offload_state(instance: object) -> OffloadState | None:
+    # Optional framework extension: ordinary modules and compiled functions have no offload state.
+    return getattr(instance, "_magi_offload_state", None)
+
+
+def get_or_create_offload_state(module: nn.Module) -> OffloadState:
+    state = get_offload_state(module)
+    if state is None:
+        state = OffloadState()
+        module._magi_offload_state = state
+    return state
+
+
+def record_handoff_slots(module: nn.Module, slots: Sequence[int]) -> None:
+    state = get_or_create_offload_state(module)
+    state.host_slots = tuple(slots)
+    state.handoff_status = "complete"
+
+
+def is_handoff_complete(module: nn.Module) -> bool:
+    state = get_offload_state(module)
+    return state is not None and state.handoff_status == "complete"
+
+
+def _collect_subtree_host_slots(module: nn.Module) -> list[int]:
+    # A nested compiled instance may have parked its own weights.
+    host_slots = []
+    for child in module.modules():
+        state = get_offload_state(child)
+        if state is not None:
+            host_slots.extend(state.host_slots)
+    return host_slots
+
+
+def update_residency_for_device_move(
+    *, host_slots: Sequence[int], released_slots: tuple[int, ...], module_name: str, to_host: bool
+) -> tuple[int, ...]:
+    """Apply a device move to the supplied slots; return the slots left released on the host."""
+    if to_host:
+        return _release_resident_weights(host_slots=host_slots, released_slots=released_slots, module_name=module_name)
+    return _restore_released_weights(released_slots=released_slots, module_name=module_name)
+
+
+def _release_resident_weights(
+    *, host_slots: Sequence[int], released_slots: tuple[int, ...], module_name: str
+) -> tuple[int, ...]:
+    store = get_global_host_weight_store()
+    resident_slots = [slot for slot in host_slots if store.is_resident(slot)]
+    if not resident_slots:
+        return released_slots
+    torch.cuda.synchronize()
+    released_bytes = store.release_resident_weights(resident_slots)
+    magi_logger.info(
+        "host offload: %s moved to host; freed %d promoted weight(s) (%.1f MiB) on the device",
+        module_name,
+        len(resident_slots),
+        released_bytes / 2**20,
+    )
+    return released_slots + tuple(resident_slots)
+
+
+def _restore_released_weights(*, released_slots: tuple[int, ...], module_name: str) -> tuple[int, ...]:
+    if not released_slots:
+        return ()
+    restored_bytes = get_global_host_weight_store().make_weights_resident(released_slots)
+    magi_logger.info(
+        "host offload: %s moved to device; promoted %d weight(s) (%.1f MiB) back, the rest load in the graph",
+        module_name,
+        len(released_slots),
+        restored_bytes / 2**20,
+    )
+    return ()
 
 
 def _local_weight_tensor(param: torch.Tensor) -> torch.Tensor:
@@ -106,14 +190,13 @@ def _collect_parked_parameters(module: nn.Module) -> list[tuple[list[str], nn.Pa
     return list(parameters_by_identity.values())
 
 
-def _warn_missing_parked_weights(module: nn.Module, parked_parameters: list[tuple[list[str], nn.Parameter]]) -> None:
+def _warn_missing_parked_weights(
+    module: nn.Module, parked_parameters: list[tuple[list[str], nn.Parameter]], expected_names: tuple[str, ...]
+) -> None:
     """Report weights parked here but re-materialized by an external ``_apply``.
     They remain readable on the device but no longer save offload memory."""
-    expected_names = getattr(module, _PARKED_NAMES_ATTR, None)
     if not expected_names:
         return
-    # Consume the record once; a repeated handoff would otherwise report every name missing.
-    setattr(module, _PARKED_NAMES_ATTR, [])
     parked_names = {_normalize_parameter_name(name) for names, _ in parked_parameters for name in names}
     missing_names = [name for name in expected_names if name not in parked_names]
     if missing_names:
@@ -171,10 +254,6 @@ def _reject_cast_after_handoff(module: nn.Module, fn) -> None:
             )
 
 
-def _manages_device_moves(instance: nn.Module) -> bool:
-    return getattr(instance, _HANDOFF_PENDING_ATTR, False) or residency.is_handoff_complete(instance)
-
-
 def _has_dtensor_parameters(module: nn.Module) -> bool:
     return any(isinstance(p, DTensor) for p in module.parameters())
 
@@ -219,7 +298,7 @@ def _install_weight_standins(module: nn.Module, parked_parameters: list[tuple[li
             )
         )
         handed_off_bytes += host_buffer.numel() * host_buffer.element_size()
-    residency.record_handoff_slots(module=module, slots=host_slots)
+    record_handoff_slots(module=module, slots=host_slots)
     return handed_off_bytes
 
 
@@ -252,139 +331,161 @@ def _park_cpu_parameters(module: nn.Module, min_weight_bytes: int) -> int:
     return len(parked_parameters)
 
 
-def install_host_first_hooks(instance: nn.Module, conf) -> None:
-    """Install per-instance host-first materialization and residency-aware device moves.
+def _call_class_apply(module: nn.Module, fn, recurse: bool):
+    # The class's, looked up per call: the instance's is this wrapper, and a
+    # sharding owner may swap the class after compile-time patching.
+    return type(module)._apply(module, fn, recurse=recurse)
 
-    Redirect eligible CUDA ``to_empty`` allocations to pinned host memory.
-    A host-built plain module parks eligible weights on its first CUDA move.
-    Later device moves release or restore promoted slots. Callers must finish dtype
-    conversion before parking; see the module's dtype contract."""
-    if getattr(instance, "_magi_host_first_installed", False):
+
+def _apply_with_host_offload(self: nn.Module, fn, recurse: bool = True):
+    state: OffloadState = self._magi_offload_state
+    # Meta-built (e.g. SimpleFSDP): to_empty(cuda) puts eligible weights in the pool, handoff pending.
+    if getattr(fn, "__qualname__", "") == _TO_EMPTY_QUALNAME:
+        return _materialize_host_weights(module=self, fn=fn, recurse=recurse, min_weight_bytes=state.min_weight_bytes)
+    # None unless fn is a pure host<->CUDA move: dtype casts and other conversions get None.
+    # Combined device+dtype moves are unsupported once weights are parked (module docstring).
+    target = _probe_move_device(fn)
+    # Decided once per instance. Weights on the host at the first CUDA move are parked: built on
+    # the host, or built on CUDA and moved to the host first. Weights already on CUDA never are.
+    if target is not None and target.type == "cuda" and not state.parking_decided:
+        state.parking_decided = True
+        if _can_park_on_first_cuda_move(self):
+            _park_cpu_parameters(module=self, min_weight_bytes=state.min_weight_bytes)
+    if target is None:
+        _reject_cast_after_handoff(module=self, fn=fn)
+    # Plain torch: not a device move, or no handoff is pending and none ever ran; e.g. a move to
+    # the host before the first CUDA move, or a module already on CUDA at that move.
+    if target is None or state.handoff_status == "not_started":
+        return _call_class_apply(module=self, fn=fn, recurse=recurse)
+    # A device move of a module that owns host slots: hand off first if to_empty left it pending.
+    handoff_host_weights_if_pending(self)
+    state.released_slots = update_residency_for_device_move(
+        host_slots=_collect_subtree_host_slots(self),
+        released_slots=state.released_slots,
+        module_name=type(self).__name__,
+        to_host=target.type == "cpu",
+    )
+    # Sharded: the sharding owner moves its DTensors in place, so nothing else moves here.
+    # Unsharded: the remaining tensors move normally, the stand-ins stay where the pool put them.
+    return (
+        self
+        if _has_dtensor_parameters(self)
+        else _call_class_apply(module=self, fn=_skip_managed_weights(fn), recurse=recurse)
+    )
+
+
+def _select_meta_weight_names(module: nn.Module, *, recurse: bool, min_weight_bytes: int) -> dict[int, str]:
+    # Resolve candidates before _apply starts swapping parameter objects.
+    selected_names_by_param_id = {}
+    materialized_weight_names = []
+    noncontiguous_weight_names = []
+    for name, param in module.named_parameters(recurse=recurse):
+        if not _is_offloadable(param):
+            continue
+        local_weight = _local_weight_tensor(param)
+        # Before the two refusals below, so neither reports a weight that was
+        # never a candidate in the first place.
+        if local_weight.numel() * local_weight.element_size() < min_weight_bytes:
+            continue
+        if not local_weight.is_contiguous():
+            # Flat host reservations and H2D outputs cannot preserve this stride.
+            noncontiguous_weight_names.append(_normalize_parameter_name(name))
+            continue
+        if not local_weight.is_meta:
+            # An eager module may share this already materialized weight;
+            # emptying it at handoff would leave that reader without an H2D load.
+            materialized_weight_names.append(_normalize_parameter_name(name))
+            continue
+        selected_names_by_param_id[id(param)] = _normalize_parameter_name(name)
+
+    if noncontiguous_weight_names:
+        magi_logger.warning(
+            "host offload: %d non-contiguous weight(s) of %s stay on device to preserve layout (%s)",
+            len(noncontiguous_weight_names),
+            type(module).__name__,
+            ", ".join(noncontiguous_weight_names[:8]) + (" ..." if len(noncontiguous_weight_names) > 8 else ""),
+        )
+
+    if materialized_weight_names:
+        magi_logger.warning(
+            "host offload: %d already-materialized weight(s) of %s stay on device for possible external readers (%s)",
+            len(materialized_weight_names),
+            type(module).__name__,
+            ", ".join(materialized_weight_names[:8]) + (" ..." if len(materialized_weight_names) > 8 else ""),
+        )
+
+    return selected_names_by_param_id
+
+
+def _allocate_parameter_storage(
+    tensor: torch.Tensor,
+    *,
+    materialize_tensor,
+    selected_names_by_param_id: dict[int, str],
+    host_buffers_by_param_id: dict[int, torch.Tensor],
+) -> torch.Tensor:
+    name = selected_names_by_param_id.get(id(tensor))
+    if name is None:
+        return materialize_tensor(tensor)
+    host_buffer = host_buffers_by_param_id.get(id(tensor))
+    if host_buffer is None:
+        local_weight = _local_weight_tensor(tensor)
+        host_buffer = get_global_host_weight_store().reserve_host_buffer(
+            shape=local_weight.shape, dtype=local_weight.dtype, parameter_name=name
+        )
+        host_buffers_by_param_id[id(tensor)] = host_buffer
+    return _rebuild_dtensor(param=tensor, local=host_buffer) if isinstance(tensor, DTensor) else host_buffer
+
+
+def _materialize_host_weights(module: nn.Module, fn, recurse: bool, *, min_weight_bytes: int):
+    # fn is to_empty's own empty_like, recognized by qualname above.
+    target = fn(torch.empty(0, device="meta")).device
+    if target.type != "cuda":
+        return _call_class_apply(module=module, fn=fn, recurse=recurse)
+    state: OffloadState = module._magi_offload_state
+    state.parking_decided = True
+    selected_names_by_param_id = _select_meta_weight_names(module=module, recurse=recurse, min_weight_bytes=min_weight_bytes)
+    if not selected_names_by_param_id:
+        return _call_class_apply(module=module, fn=fn, recurse=recurse)
+
+    # _apply visits every tied registration; reuse one host buffer for all of them.
+    host_buffers_by_param_id: dict[int, torch.Tensor] = {}
+    allocate_parameter_storage = partial(
+        _allocate_parameter_storage,
+        materialize_tensor=fn,
+        selected_names_by_param_id=selected_names_by_param_id,
+        host_buffers_by_param_id=host_buffers_by_param_id,
+    )
+    result = _call_class_apply(module=module, fn=allocate_parameter_storage, recurse=recurse)
+    state.handoff_status = "pending"
+    state.parked_parameter_names = tuple(selected_names_by_param_id.values())
+    parked_bytes = sum(buffer.numel() * buffer.element_size() for buffer in host_buffers_by_param_id.values())
+    magi_logger.info(
+        "host offload: %s materialized %d weight(s), %.1f MiB, in pinned host memory for %s",
+        type(module).__name__,
+        len(host_buffers_by_param_id),
+        parked_bytes / 2**20,
+        target,
+    )
+    return result
+
+
+def install_host_first_hooks(instance: nn.Module, *, min_weight_bytes: int) -> None:
+    """Install host-first allocation and residency-aware moves once per module.
+    Finish dtype conversion before parking; see the module's dtype contract."""
+    state = get_or_create_offload_state(instance)
+    if state.hooks_installed:
         return
-    min_weight_bytes = int(conf.offload_config.offload_min_shard_mib * 1024 * 1024)
-
-    def call_class_apply(self, fn, recurse):
-        # The class's, looked up per call: the instance's is this wrapper, and a
-        # sharding owner may swap the class after compile-time patching.
-        return type(self)._apply(self, fn, recurse=recurse)
-
-    def _apply_with_host_offload(self, fn, recurse=True):
-        # Meta-built (e.g. SimpleFSDP): to_empty(cuda) puts eligible weights in the pool, handoff pending.
-        if getattr(fn, "__qualname__", "") == _TO_EMPTY_QUALNAME:
-            return _materialize_host_weights(self=self, fn=fn, recurse=recurse)
-        # None unless fn is a pure host<->CUDA move: dtype casts and other conversions get None.
-        # Combined device+dtype moves are unsupported once weights are parked (module docstring).
-        target = _probe_move_device(fn)
-        # Decided once per instance. Weights on the host at the first CUDA move are parked: built on
-        # the host, or built on CUDA and moved to the host first. Weights already on CUDA never are.
-        if target is not None and target.type == "cuda" and not getattr(self, _PARKING_DECIDED_ATTR, False):
-            setattr(self, _PARKING_DECIDED_ATTR, True)
-            if _can_park_on_first_cuda_move(self):
-                _park_cpu_parameters(module=self, min_weight_bytes=min_weight_bytes)
-        if target is None:
-            _reject_cast_after_handoff(module=self, fn=fn)
-        # Plain torch: not a device move, or no handoff is pending and none ever ran; e.g. a move to
-        # the host before the first CUDA move, or a module already on CUDA at that move.
-        if target is None or not _manages_device_moves(self):
-            return call_class_apply(self=self, fn=fn, recurse=recurse)
-        # A device move of a module that owns host slots: hand off first if to_empty left it pending.
-        handoff_host_weights_if_pending(self)
-        residency.update_residency_for_device_move(module=self, to_host=target.type == "cpu")
-        # Sharded: the sharding owner moves its DTensors in place, so nothing else moves here.
-        # Unsharded: the remaining tensors move normally, the stand-ins stay where the pool put them.
-        return (
-            self
-            if _has_dtensor_parameters(self)
-            else call_class_apply(self=self, fn=_skip_managed_weights(fn), recurse=recurse)
-        )
-
-    def _materialize_host_weights(self, fn, recurse):
-        # fn is to_empty's own empty_like, recognized by qualname above.
-        target = fn(torch.empty(0, device="meta")).device
-        if target.type != "cuda":
-            return call_class_apply(self=self, fn=fn, recurse=recurse)
-        setattr(self, _PARKING_DECIDED_ATTR, True)
-
-        # Resolve candidates before _apply starts swapping parameter objects.
-        selected_names_by_param_id = {}
-        materialized_weight_names = []
-        noncontiguous_weight_names = []
-        for name, param in self.named_parameters(recurse=recurse):
-            if not _is_offloadable(param):
-                continue
-            local_weight = _local_weight_tensor(param)
-            # Before the two refusals below, so neither reports a weight that was
-            # never a candidate in the first place.
-            if local_weight.numel() * local_weight.element_size() < min_weight_bytes:
-                continue
-            if not local_weight.is_contiguous():
-                # Flat host reservations and H2D outputs cannot preserve this stride.
-                noncontiguous_weight_names.append(_normalize_parameter_name(name))
-                continue
-            if not local_weight.is_meta:
-                # An eager module may share this already materialized weight;
-                # emptying it at handoff would leave that reader without an H2D load.
-                materialized_weight_names.append(_normalize_parameter_name(name))
-                continue
-            selected_names_by_param_id[id(param)] = _normalize_parameter_name(name)
-
-        if noncontiguous_weight_names:
-            magi_logger.warning(
-                "host offload: %d non-contiguous weight(s) of %s stay on device to preserve layout (%s)",
-                len(noncontiguous_weight_names),
-                type(self).__name__,
-                ", ".join(noncontiguous_weight_names[:8]) + (" ..." if len(noncontiguous_weight_names) > 8 else ""),
-            )
-
-        if materialized_weight_names:
-            magi_logger.warning(
-                "host offload: %d already-materialized weight(s) of %s stay on device for possible external readers (%s)",
-                len(materialized_weight_names),
-                type(self).__name__,
-                ", ".join(materialized_weight_names[:8]) + (" ..." if len(materialized_weight_names) > 8 else ""),
-            )
-
-        if not selected_names_by_param_id:
-            return call_class_apply(self=self, fn=fn, recurse=recurse)
-
-        parked_sizes_bytes = []
-        # _apply visits every tied registration; reuse one host buffer for all of them.
-        host_buffers_by_param_id: dict[int, torch.Tensor] = {}
-
-        def allocate_parameter_storage(tensor):
-            name = selected_names_by_param_id.get(id(tensor))
-            if name is None:
-                return fn(tensor)
-            host_buffer = host_buffers_by_param_id.get(id(tensor))
-            if host_buffer is None:
-                local_weight = _local_weight_tensor(tensor)
-                host_buffer = get_global_host_weight_store().reserve_host_buffer(
-                    shape=local_weight.shape, dtype=local_weight.dtype, parameter_name=name
-                )
-                host_buffers_by_param_id[id(tensor)] = host_buffer
-                parked_sizes_bytes.append(host_buffer.numel() * host_buffer.element_size())
-            return _rebuild_dtensor(param=tensor, local=host_buffer) if isinstance(tensor, DTensor) else host_buffer
-
-        result = call_class_apply(self=self, fn=allocate_parameter_storage, recurse=recurse)
-        setattr(self, _HANDOFF_PENDING_ATTR, True)
-        setattr(self, _PARKED_NAMES_ATTR, list(selected_names_by_param_id.values()))
-        magi_logger.info(
-            "host offload: %s materialized %d weight(s), %.1f MiB, in pinned host memory for %s",
-            type(self).__name__,
-            len(parked_sizes_bytes),
-            sum(parked_sizes_bytes) / 2**20,
-            target,
-        )
-        return result
-
+    state.min_weight_bytes = min_weight_bytes
     instance._apply = _apply_with_host_offload.__get__(instance, type(instance))
-    instance._magi_host_first_installed = True
+    state.hooks_installed = True
     magi_logger.info("host offload: %s will materialize its offloadable weights in host memory", type(instance).__name__)
 
 
 def handoff_host_weights_if_pending(instance: object) -> int:
     """Complete the handoff for ``instance`` if its weights are still on the host."""
-    if not getattr(instance, _HANDOFF_PENDING_ATTR, False):
+    state = get_offload_state(instance)
+    if state is None or state.handoff_status != "pending":
         return 0
     return handoff_host_weights(instance)
 
@@ -394,11 +495,14 @@ def handoff_host_weights(module: nn.Module) -> int:
 
     Run after checkpoint loading and weight post-processing, but before Dynamo
     traces devices."""
+    state = get_or_create_offload_state(module)
     parked_parameters = _collect_parked_parameters(module)
-    _warn_missing_parked_weights(module=module, parked_parameters=parked_parameters)
+    expected_names = state.parked_parameter_names
+    # Consume the record once; a repeated handoff would otherwise report every name missing.
+    state.parked_parameter_names = ()
+    _warn_missing_parked_weights(module=module, parked_parameters=parked_parameters, expected_names=expected_names)
     if not parked_parameters:
-        setattr(module, _HANDOFF_PENDING_ATTR, False)
-        residency.record_handoff_slots(module=module, slots=())
+        record_handoff_slots(module=module, slots=())
         return 0
 
     # Detach plain Parameters before swap_tensors replaces their host payload.
@@ -406,7 +510,6 @@ def handoff_host_weights(module: nn.Module) -> int:
         module=module,
         parked_parameters=[(names, param, _local_weight_tensor(param).detach()) for names, param in parked_parameters],
     )
-    setattr(module, _HANDOFF_PENDING_ATTR, False)
     magi_logger.info(
         "host offload: handed off %d weight(s), %.1f MiB, for %s; their CUDA stand-ins have no storage",
         len(parked_parameters),

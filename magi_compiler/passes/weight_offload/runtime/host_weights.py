@@ -33,7 +33,7 @@ import torch
 from magi_compiler.utils import magi_logger
 
 from .bandwidth import H2D_PROBE_BYTES, measure_h2d_bandwidth_bytes_per_ns
-from .pool import HostMemPool
+from .host_memory_pool import HostMemPool
 
 
 @dataclass(frozen=True)

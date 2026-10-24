@@ -39,7 +39,7 @@ from dataclasses import dataclass
 import torch
 from torch._inductor import ir
 from torch._inductor.comms import _is_fake_dep
-from torch._inductor.scheduler import BaseSchedulerNode, NodeUser
+from torch._inductor.scheduler import BaseSchedulerNode, NodeUser, Scheduler
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
@@ -285,6 +285,118 @@ def refresh_memory_planning(nodes: list[BaseSchedulerNode]) -> None:
         assign_memory_planning_info_for_scheduler_buffers(nodes, nodes[0].scheduler.name_to_buf)
 
 
+def _create_coalesced_gather_ir(
+    *, graph: SnodeGraph, members: list[BaseSchedulerNode], uses_copy_engine: bool
+) -> tuple[ir.Buffer, list[ir.MultiOutput], list[BaseSchedulerNode]]:
+    """Register the merged launch and outputs in V.graph; return them and the outputs to replace."""
+    scheduler = members[0].scheduler
+    launch_ir_nodes = [m.node for m in members]
+    world_size, group_name = launch_ir_nodes[0].constant_args
+    if uses_copy_engine:
+        # The names to keep are the unpacks': waits and readers hang off them.
+        output_snodes_to_preserve = []
+        for m in members:
+            unpacks = graph.unpacks_of(m)
+            if len(unpacks) != 1:
+                raise ValueError(f"copy-engine gather {m.get_name()} has {len(unpacks)} unpacks, expected one")
+            output_snodes_to_preserve.append(unpacks[0])
+        coalesced_op = ce_ag_ops()[1]
+    else:
+        output_snodes_to_preserve = list(members)
+        coalesced_op = COALESCED_ALL_GATHER_OP
+
+    # ``process_kernel`` consults the FX node being lowered for unbacked-symbol
+    # bindings; lowering is long over, and a gather introduces no new symbols.
+    lowering_fx_node = torch.fx.Graph().call_function(coalesced_op, ())
+    buffer_count_before = len(V.graph.buffers)
+    inputs = [_as_kernel_input(launch.inputs[0]) for launch in launch_ir_nodes]
+    with V.set_current_node(lowering_fx_node):
+        if uses_copy_engine:
+            output_ir_nodes = list(ir.FallbackKernel.create(coalesced_op, inputs, world_size, group_name))
+        else:
+            output_ir_nodes = ir._CollectiveKernel.create_out_of_place(coalesced_op, inputs, world_size, group_name)
+    assert isinstance(output_ir_nodes, list) and len(output_ir_nodes) == len(output_snodes_to_preserve)
+    coalesced_ir = output_ir_nodes[0].inputs[0]
+    if coalesced_ir.get_name() in scheduler.name_to_buf or coalesced_ir.get_operation_name() in scheduler.name_to_node:
+        raise ValueError(f"the coalesced gather was named {coalesced_ir.get_name()}, which is already in use")
+    # Anything beyond the coalesced launch and its unpacks is a buffer lowering
+    # made on the side (a copy of an input) that no scheduler node will run.
+    if len(V.graph.buffers) != buffer_count_before + 1 + len(output_snodes_to_preserve):
+        raise ValueError("building the coalesced gather registered buffers it cannot schedule")
+    if [i.get_name() for i in coalesced_ir.inputs] != [launch.inputs[0].get_name() for launch in launch_ir_nodes]:
+        raise ValueError("the coalesced gather does not read the members' own inputs")
+    coalesced_ir.origins = OrderedSet(o for launch in launch_ir_nodes for o in launch.origins)
+
+    return coalesced_ir, output_ir_nodes, output_snodes_to_preserve
+
+
+def _replace_member_output_ir(*, old_output_ir_nodes: list[ir.Buffer], output_ir_nodes: list[ir.MultiOutput]) -> None:
+    """Replace V.graph output registrations while keeping their names, list positions, and origins."""
+    for old_output_ir, new_output_ir in zip(old_output_ir_nodes, output_ir_nodes):
+        same_shape = tuple(old_output_ir.get_size()) == tuple(new_output_ir.get_size())
+        if not same_shape or old_output_ir.get_dtype() != new_output_ir.get_dtype():
+            raise ValueError(
+                f"coalesced output {new_output_ir.get_size()} does not match "
+                f"{old_output_ir.get_name()} {old_output_ir.get_size()}"
+            )
+        new_output_ir.origins = OrderedSet(old_output_ir.origins)
+        _replace_ir_preserving_names(old_ir=old_output_ir, replacement_ir=new_output_ir)
+    # A copy-engine member's own launch stays in ``V.graph.buffers`` / ``operations``,
+    # unscheduled: Inductor names a new node after the lists' lengths, so shrinking
+    # them would hand a later merge a name already in use.
+
+
+def _register_coalesced_scheduler_nodes(
+    *,
+    scheduler: Scheduler,
+    members: list[BaseSchedulerNode],
+    coalesced_ir: ir.Buffer,
+    output_ir_nodes: list[ir.MultiOutput],
+    output_snodes_to_preserve: list[BaseSchedulerNode],
+) -> tuple[BaseSchedulerNode, list[BaseSchedulerNode]]:
+    """Update scheduler maps, dependencies, and buffer users for the merged launch and outputs."""
+    coalesced_snode = scheduler.create_scheduler_node(coalesced_ir)
+    _update_mutation_dependencies(scheduler=scheduler, old_snodes=members, new_snode=coalesced_snode)
+    coalesced_snode.ancestors = OrderedSet(a for m in members for a in m.ancestors)
+    coalesced_snode.min_order = min(m.min_order for m in members)
+    coalesced_snode.max_order = coalesced_snode.min_order
+    scheduler.name_to_node[coalesced_snode.get_name()] = coalesced_snode
+    scheduler.name_to_fused_node[coalesced_snode.get_name()] = coalesced_snode
+    for buf in coalesced_snode.get_outputs():
+        scheduler.name_to_buf[buf.get_name()] = buf
+    for member in members:
+        if member not in output_snodes_to_preserve:
+            for old_launch_buffer in member.get_outputs():
+                scheduler.name_to_buf.pop(old_launch_buffer.get_name(), None)
+
+    output_snodes: list[BaseSchedulerNode] = []
+    for preserved_output_snode, new_output_ir in zip(output_snodes_to_preserve, output_ir_nodes):
+        output_snode = scheduler.create_scheduler_node(new_output_ir)
+        output_snode.ancestors = OrderedSet(preserved_output_snode.ancestors) | OrderedSet([coalesced_snode.get_name()])
+        output_snode.min_order = preserved_output_snode.min_order
+        output_snode.max_order = preserved_output_snode.max_order
+        scheduler.name_to_node[output_snode.get_name()] = output_snode
+        scheduler.name_to_fused_node[output_snode.get_name()] = output_snode
+        for new_out, old_out in zip(output_snode.get_outputs(), preserved_output_snode.get_outputs()):
+            new_out.users = list(old_out.users)
+            scheduler.name_to_buf[old_out.get_name()] = new_out
+        output_snodes.append(output_snode)
+
+    coalesced_buf = coalesced_snode.get_outputs()[0]
+    coalesced_buf.users = [NodeUser(u, can_inplace=False) for u in output_snodes]
+
+    member_set = set(members)
+    for dep in coalesced_snode.unmet_dependencies:
+        buf = scheduler.name_to_buf.get(dep.name)
+        if buf is None:
+            continue
+        users = [u for u in buf.users if u.node not in member_set]
+        users.append(NodeUser(coalesced_snode, can_inplace=False))
+        buf.users = users
+
+    return coalesced_snode, output_snodes
+
+
 def coalesce_all_gathers(
     order: list[BaseSchedulerNode], members: list[BaseSchedulerNode]
 ) -> tuple[list[BaseSchedulerNode], BaseSchedulerNode, list[BaseSchedulerNode]]:
@@ -314,101 +426,25 @@ def coalesce_all_gathers(
             + _format_placement_constraints(graph, members)
         )
 
-    uses_copy_engine = gather_infos[0].transport == "ce"
-    scheduler = members[0].scheduler
-    launch_ir_nodes = [m.node for m in members]
-    world_size, group_name = launch_ir_nodes[0].constant_args
-    if uses_copy_engine:
-        # The names to keep are the unpacks': waits and readers hang off them.
-        output_snodes_to_preserve = []
-        for m in members:
-            unpacks = graph.unpacks_of(m)
-            if len(unpacks) != 1:
-                raise ValueError(f"copy-engine gather {m.get_name()} has {len(unpacks)} unpacks, expected one")
-            output_snodes_to_preserve.append(unpacks[0])
-        coalesced_op = ce_ag_ops()[1]
-    else:
-        output_snodes_to_preserve = list(members)
-        coalesced_op = COALESCED_ALL_GATHER_OP
-    old_output_ir_nodes = [s.node for s in output_snodes_to_preserve]
-
-    # ``process_kernel`` consults the FX node being lowered for unbacked-symbol
-    # bindings; lowering is long over, and a gather introduces no new symbols.
-    lowering_fx_node = torch.fx.Graph().call_function(coalesced_op, ())
-    buffer_count_before = len(V.graph.buffers)
-    inputs = [_as_kernel_input(launch.inputs[0]) for launch in launch_ir_nodes]
-    with V.set_current_node(lowering_fx_node):
-        if uses_copy_engine:
-            output_ir_nodes = list(ir.FallbackKernel.create(coalesced_op, inputs, world_size, group_name))
-        else:
-            output_ir_nodes = ir._CollectiveKernel.create_out_of_place(coalesced_op, inputs, world_size, group_name)
-    assert isinstance(output_ir_nodes, list) and len(output_ir_nodes) == len(old_output_ir_nodes)
-    coalesced_ir = output_ir_nodes[0].inputs[0]
-    if coalesced_ir.get_name() in scheduler.name_to_buf or coalesced_ir.get_operation_name() in scheduler.name_to_node:
-        raise ValueError(f"the coalesced gather was named {coalesced_ir.get_name()}, which is already in use")
-    # Anything beyond the coalesced launch and its unpacks is a buffer lowering
-    # made on the side (a copy of an input) that no scheduler node will run.
-    if len(V.graph.buffers) != buffer_count_before + 1 + len(old_output_ir_nodes):
-        raise ValueError("building the coalesced gather registered buffers it cannot schedule")
-    if [i.get_name() for i in coalesced_ir.inputs] != [launch.inputs[0].get_name() for launch in launch_ir_nodes]:
-        raise ValueError("the coalesced gather does not read the members' own inputs")
-    coalesced_ir.origins = OrderedSet(o for launch in launch_ir_nodes for o in launch.origins)
-
-    for old_output_ir, new_output_ir in zip(old_output_ir_nodes, output_ir_nodes):
-        same_shape = tuple(old_output_ir.get_size()) == tuple(new_output_ir.get_size())
-        if not same_shape or old_output_ir.get_dtype() != new_output_ir.get_dtype():
-            raise ValueError(
-                f"coalesced output {new_output_ir.get_size()} does not match "
-                f"{old_output_ir.get_name()} {old_output_ir.get_size()}"
-            )
-        new_output_ir.origins = OrderedSet(old_output_ir.origins)
-        _replace_ir_preserving_names(old_output_ir, new_output_ir)
-    # A copy-engine member's own launch stays in ``V.graph.buffers`` / ``operations``,
-    # unscheduled: Inductor names a new node after the lists' lengths, so shrinking
-    # them would hand a later merge a name already in use.
-
-    coalesced_snode = scheduler.create_scheduler_node(coalesced_ir)
-    _update_mutation_dependencies(scheduler, members, coalesced_snode)
-    coalesced_snode.ancestors = OrderedSet(a for m in members for a in m.ancestors)
-    coalesced_snode.min_order = min(m.min_order for m in members)
-    coalesced_snode.max_order = coalesced_snode.min_order
-    scheduler.name_to_node[coalesced_snode.get_name()] = coalesced_snode
-    scheduler.name_to_fused_node[coalesced_snode.get_name()] = coalesced_snode
-    for buf in coalesced_snode.get_outputs():
-        scheduler.name_to_buf[buf.get_name()] = buf
-    if uses_copy_engine:
-        for m in members:
-            for out in m.get_outputs():
-                scheduler.name_to_buf.pop(out.get_name(), None)
-
-    output_snodes: list[BaseSchedulerNode] = []
-    for preserved_output_snode, new_output_ir in zip(output_snodes_to_preserve, output_ir_nodes):
-        output_snode = scheduler.create_scheduler_node(new_output_ir)
-        output_snode.ancestors = OrderedSet(preserved_output_snode.ancestors) | OrderedSet([coalesced_snode.get_name()])
-        output_snode.min_order = preserved_output_snode.min_order
-        output_snode.max_order = preserved_output_snode.max_order
-        scheduler.name_to_node[output_snode.get_name()] = output_snode
-        scheduler.name_to_fused_node[output_snode.get_name()] = output_snode
-        for new_out, old_out in zip(output_snode.get_outputs(), preserved_output_snode.get_outputs()):
-            new_out.users = list(old_out.users)
-            scheduler.name_to_buf[old_out.get_name()] = new_out
-        output_snodes.append(output_snode)
-
-    coalesced_buf = coalesced_snode.get_outputs()[0]
-    coalesced_buf.users = [NodeUser(u, can_inplace=False) for u in output_snodes]
-
-    member_set = set(members)
-    for dep in coalesced_snode.unmet_dependencies:
-        buf = scheduler.name_to_buf.get(dep.name)
-        if buf is None:
-            continue
-        users = [u for u in buf.users if u.node not in member_set]
-        users.append(NodeUser(coalesced_snode, can_inplace=False))
-        buf.users = users
-
-    removed = [*members, *output_snodes_to_preserve] if uses_copy_engine else members
-    new_order = _insert_coalesced_block(order, removed, placement, [coalesced_snode, *output_snodes])
+    coalesced_ir, output_ir_nodes, output_snodes_to_preserve = _create_coalesced_gather_ir(
+        graph=graph, members=members, uses_copy_engine=gather_infos[0].transport == "ce"
+    )
+    old_output_ir_nodes = [snode.node for snode in output_snodes_to_preserve]
+    _replace_member_output_ir(old_output_ir_nodes=old_output_ir_nodes, output_ir_nodes=output_ir_nodes)
+    coalesced_snode, output_snodes = _register_coalesced_scheduler_nodes(
+        scheduler=members[0].scheduler,
+        members=members,
+        coalesced_ir=coalesced_ir,
+        output_ir_nodes=output_ir_nodes,
+        output_snodes_to_preserve=output_snodes_to_preserve,
+    )
+    new_order = _insert_coalesced_block(
+        order=order,
+        removed=[*members, *output_snodes_to_preserve],
+        placement=placement,
+        block=[coalesced_snode, *output_snodes],
+    )
     remaining_snodes = [s for s in new_order if s is not coalesced_snode and s not in output_snodes]
     for old_output_ir, new_output_ir in zip(old_output_ir_nodes, output_ir_nodes):
-        _replace_input_references(remaining_snodes, old_output_ir, new_output_ir)
+        _replace_input_references(snodes=remaining_snodes, old_ir=old_output_ir, replacement_ir=new_output_ir)
     return new_order, coalesced_snode, output_snodes
