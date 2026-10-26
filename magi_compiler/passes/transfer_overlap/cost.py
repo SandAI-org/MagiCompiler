@@ -1,0 +1,69 @@
+# Copyright (c) 2026 SandAI. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Read snode runtimes in nanoseconds and clamp negative estimates to zero.
+
+Measurement failures belong to the estimator or profiling table; unexpected
+cost-query errors propagate to the caller.
+"""
+
+from __future__ import annotations
+
+from torch._inductor.scheduler import BaseSchedulerNode
+from torch._inductor.utils import contains_wait
+
+from ..snode_utils import is_compute, is_multi_output
+
+
+def default_runtime_ns_fn():
+    from torch._inductor.comms import estimate_op_runtime
+
+    return estimate_op_runtime
+
+
+class CostView:
+    """Nonnegative nanoseconds per snode; cost-query errors propagate."""
+
+    def __init__(self, runtime_ns_fn) -> None:
+        self.runtime_ns_fn = runtime_ns_fn
+
+    @property
+    def is_profiling_valid(self) -> bool:
+        """False when the cost table says pricing failed on this rank."""
+        # Deferred: snode_cost imports this package.
+        from ..snode_cost import SnodeCostTable
+
+        return not isinstance(self.runtime_ns_fn, SnodeCostTable) or self.runtime_ns_fn.is_profiling_valid
+
+    def __call__(self, snode: BaseSchedulerNode) -> float:
+        return max(0.0, float(self.runtime_ns_fn(snode)))
+
+    def compute_prefix_ns(self, order: list[BaseSchedulerNode]) -> list[float]:
+        """Element ``i``: ns of compute that runs before the snode at index ``i``.
+
+        The time axis every transfer is placed on.  Only compute counts: a
+        transfer or a wait on it hides nothing.
+        """
+        compute_prefix_ns = [0.0] * (len(order) + 1)
+        for i, s in enumerate(order):
+            compute_ns = self(s) if is_compute(s) else 0.0
+            compute_prefix_ns[i + 1] = compute_prefix_ns[i] + compute_ns
+        return compute_prefix_ns
+
+    def is_transparent(self, snode: BaseSchedulerNode) -> bool:
+        """A forwarder that is not a real use of a transfer's result: waits,
+        MultiOutput unpacks, and ~zero-cost view/reshape/getitem kernels."""
+        if contains_wait(snode) or is_multi_output(snode):
+            return True
+        return self(snode) <= 1.0

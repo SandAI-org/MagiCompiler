@@ -36,8 +36,8 @@ import torch.fx as fx
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
-_AG = torch.ops._c10d_functional.all_gather_into_tensor.default
-_WAIT = torch.ops._c10d_functional.wait_tensor.default
+_ALL_GATHER_OP = torch.ops._c10d_functional.all_gather_into_tensor.default
+_WAIT_TENSOR_OP = torch.ops._c10d_functional.wait_tensor.default
 _TO_COPY = torch.ops.aten._to_copy.default
 
 
@@ -118,21 +118,40 @@ def _graph(params: list, *, derive: str | None = None, uneven: bool = False, ext
         if derive == "cast":
             cur = g.call_function(_TO_COPY, (cur,), {"dtype": torch.float32})
             cur.meta["example_value"] = local.to(torch.float32)
-        ag = g.call_function(_AG, (cur, 1, "dummy_group"))
+        ag = g.call_function(_ALL_GATHER_OP, (cur, 1, "dummy_group"))
         ag.meta["example_value"] = local.new_empty(local.shape)  # world size 1
         mark_weight_ag(ag, uneven=uneven)
-        outs.append(g.call_function(_WAIT, (ag,)))
+        outs.append(g.call_function(_WAIT_TENSOR_OP, (ag,)))
     g.output(tuple(outs))
     return fx.GraphModule(torch.nn.Module(), g), examples
 
 
-def _bind(gm, examples, **kw):
+def _bind(gm, examples, **kwargs):
     """Binding on its own, standing in for what the backend does around it."""
     from magi_compiler.passes.fsdp_overlap import copy_engine_weight_candidates
     from magi_compiler.symm_mem import bind_graph_weights
 
     names = (n.name for n in gm.graph.find_nodes(op="placeholder"))
-    return bind_graph_weights(gm, copy_engine_weight_candidates(gm), dict(zip(names, examples)), **kw)
+    return bind_graph_weights(gm, copy_engine_weight_candidates(gm), dict(zip(names, examples)), **kwargs)
+
+
+def _apply_weight_transfer_pipeline(gm, examples, *, transport="copy_engine") -> int:
+    """``WeightTransferPipeline.rewrite_graph_and_build_scheduler_passes`` with host offload off, inlined.
+
+    Lower, bind, retarget what bound -- one gather per weight; bucketing happens
+    later, during scheduling.  Returns how many gathers were retargeted.
+    """
+    from magi_compiler.passes.fsdp_overlap import (
+        bind_weights_for_copy_engine,
+        lower_prim_redistribute_to_collectives,
+        rewrite_weight_ag_to_copy_engine,
+    )
+
+    lower_prim_redistribute_to_collectives(gm)
+    if transport != "copy_engine":
+        return 0
+    bind_weights_for_copy_engine(gm, examples, 0)
+    return rewrite_weight_ag_to_copy_engine(gm)
 
 
 # ---------------------------------------------------------------------------
@@ -365,10 +384,8 @@ def test_shards_below_the_size_floor_are_not_bound(mesh_1rank):
 # ---------------------------------------------------------------------------
 @requires_cuda
 def test_many_shards_share_few_windows(mesh_1rank):
-    """Windows are a capped driver resource -- roughly 128 per process, however
-    small.  A window per shard looks fine at this scale and dies at shard 92 of
-    gaga4's 808, in ``rendezvous``, with tens of GiB of the card still free.  So
-    the invariant worth holding is a count that does not track the shard count."""
+    """Compatible shards must share symmetric-memory windows;
+    one window per shard can exhaust driver resources before device memory."""
     from magi_compiler.symm_mem import registered_buffers
 
     params = [_param(mesh_1rank) for _ in range(16)]
@@ -482,80 +499,37 @@ def test_bind_parameters_skips_what_it_cannot_gather(mesh_1rank):
 
 
 @requires_cuda
-def test_bound_weights_are_bucketed_and_retargeted(mesh_1rank):
-    """The pipeline end to end: bind, then bucket only what bound, then retarget.
-    Binding before bucketing is what keeps a bucket homogeneous."""
-    from magi_compiler.passes.fsdp_overlap import lower_and_bucket_full_graph
-    from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER_COALESCED
+def test_bound_weights_are_retargeted_one_gather_each(mesh_1rank):
+    """The pipeline end to end: bind, then retarget what bound."""
+    from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER
 
     gm, examples = _graph([_param(mesh_1rank) for _ in range(4)])
-    n = lower_and_bucket_full_graph(gm, "coalesced", bucket_size_bytes=0, transport="copy_engine", example_inputs=examples)
-
-    assert n == 1
-    coalesced = [x for x in gm.graph.nodes if x.target is CE_ALL_GATHER_COALESCED]
-    assert len(coalesced) == 1
-    assert len(coalesced[0].args[0]) == 4
+    assert _apply_weight_transfer_pipeline(gm, examples) == 4
+    assert len([x for x in gm.graph.nodes if x.target is CE_ALL_GATHER]) == 4
+    assert not [x for x in gm.graph.nodes if x.target is _ALL_GATHER_OP]
 
 
 @requires_cuda
-def test_an_unbound_weight_keeps_its_neighbours_on_the_copy_engine(mesh_1rank):
-    """Only the weight that could not be bound loses the copy engine. Excluding it
-    must not split the bucket around it, or one odd weight would cost throughput
-    across the whole model."""
-    from magi_compiler.passes.fsdp_overlap import lower_and_bucket_full_graph
+def test_an_unbound_weight_alone_stays_on_nccl(mesh_1rank):
+    """Only the weight that could not be bound loses the copy engine."""
     from magi_compiler.passes.fsdp_overlap.node_meta import UNEVEN_SHARD
-    from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER_COALESCED
+    from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER
 
     gm, examples = _graph([_param(mesh_1rank) for _ in range(4)])
-    gathers = [n for n in gm.graph.nodes if n.target is _AG]
+    gathers = [n for n in gm.graph.nodes if n.target is _ALL_GATHER_OP]
     gathers[1].meta[UNEVEN_SHARD] = True
 
-    lower_and_bucket_full_graph(gm, "coalesced", bucket_size_bytes=0, transport="copy_engine", example_inputs=examples)
-
-    coalesced = [n for n in gm.graph.nodes if n.target is CE_ALL_GATHER_COALESCED]
-    assert len(coalesced) == 1
-    assert len(coalesced[0].args[0]) == 3  # the three bound weights, in one bucket
-    assert len([n for n in gm.graph.nodes if n.target is _AG]) == 1  # the uneven one, on NCCL
-
-
-@requires_cuda
-def test_unbound_weights_are_still_bucketed_as_nccl(mesh_1rank):
-    """Losing the copy engine must not also lose bucketing.
-
-    Bucketing partitions by transport rather than filtering on it: if unbound
-    gathers were simply dropped out of the pass, a model that declines binding
-    wholesale would go from a handful of coalesced launches to one launch per
-    weight, which costs far more memory than the copy engine ever saved.
-    """
-    from magi_compiler.passes.fsdp_overlap import lower_and_bucket_full_graph
-    from magi_compiler.passes.fsdp_overlap.node_meta import UNEVEN_SHARD
-    from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER_COALESCED
-
-    _AG_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
-
-    gm, examples = _graph([_param(mesh_1rank) for _ in range(4)])
-    for node in [n for n in gm.graph.nodes if n.target is _AG][2:]:
-        node.meta[UNEVEN_SHARD] = True  # two weights the copy engine cannot serve
-
-    assert (
-        lower_and_bucket_full_graph(gm, "coalesced", bucket_size_bytes=0, transport="copy_engine", example_inputs=examples)
-        == 2
-    )
-
-    (ce,) = [n for n in gm.graph.nodes if n.target is CE_ALL_GATHER_COALESCED]
-    (nccl,) = [n for n in gm.graph.nodes if n.target is _AG_COALESCED]
-    assert len(ce.args[0]) == 2
-    assert len(nccl.args[0]) == 2
-    assert not [n for n in gm.graph.nodes if n.target is _AG]
+    assert _apply_weight_transfer_pipeline(gm, examples) == 3
+    assert len([n for n in gm.graph.nodes if n.target is CE_ALL_GATHER]) == 3
+    assert len([n for n in gm.graph.nodes if n.target is _ALL_GATHER_OP]) == 1  # the uneven one, on NCCL
 
 
 @requires_cuda
 def test_nccl_transport_binds_nothing(mesh_1rank):
     """Symmetric memory is a copy-engine cost; the default transport must not pay it."""
-    from magi_compiler.passes.fsdp_overlap import lower_and_bucket_full_graph
     from magi_compiler.symm_mem import registered_buffers
 
     gm, examples = _graph([_param(mesh_1rank) for _ in range(2)])
-    lower_and_bucket_full_graph(gm, "coalesced", transport="nccl", example_inputs=examples)
+    _apply_weight_transfer_pipeline(gm, examples, transport="nccl")
 
     assert registered_buffers() == []

@@ -211,37 +211,45 @@ def test_mark_unbacked_carrier_torch_compile():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.skipif(
-    IS_PT_212,
-    reason=(
-        "PT 2.12: accumulated CUDA state from CUTLASS EVT kernel compilation "
-        "causes illegal-memory-access when autotune_at_compile_time=True. "
-        "Resolved by 8-shard CI (pass/ and feature-runtime run in separate processes)."
-    ),
-)
-def test_mark_unbacked_carrier_autotune_compat():
-    """Verify carrier tensor + mark_unbacked works with autotune_at_compile_time
-    both enabled and disabled. standalone_compile hardcodes autotune=True, so
-    MagiCompiler needs to override it to False for unbacked SymInt compat."""
+def test_mark_unbacked_carrier_magi_compile_disables_compile_time_autotune(monkeypatch, tmp_path):
+    """magi_compile must compile carrier graphs with compile-time autotune off, even when it is on globally.
+
+    Compile-time autotune benchmarks unbacked dims at the fallback hint (8192) against
+    inputs at their real size and reads past them, so plain torch.compile with it on is
+    not exercised: the stray read can poison the CUDA context for every later test.
+    """
+    import torch._inductor as inductor
     from torch._inductor import config as inductor_config
 
+    torch._dynamo.reset()
+    patches_seen = []
+    standalone_compile = inductor.standalone_compile
+
+    def recording_standalone_compile(*args, options=None, **kwargs):
+        patches_seen.append(dict((options or {}).get("config_patches", {})))
+        return standalone_compile(*args, options=options, **kwargs)
+
+    monkeypatch.setattr(inductor, "standalone_compile", recording_standalone_compile)
+
+    def isolated_cache(cfg):
+        # A cache hit would skip standalone_compile and leave nothing to check.
+        cfg.cache_root_dir = str(tmp_path)
+        return cfg
+
+    @magi_compile(dynamic_arg_dims={"x": 0}, config_patch=isolated_cache)
+    class FixedModel(MultiModalSplitNormFixed):
+        pass
+
+    model = FixedModel(HIDDEN, NUM_MODALITIES).cuda().eval()
     scenarios = [[128, 0, 0], [60, 20, 20], [0, 100, 0], [50, 50, 50]]
 
-    for autotune_val in [False, True]:
-        torch._dynamo.reset()
-        model = MultiModalSplitNormFixed(HIDDEN, NUM_MODALITIES).cuda().eval()
+    with inductor_config.patch("triton.autotune_at_compile_time", True), torch.no_grad():
+        for sizes in scenarios:
+            out = model(_make_input(sizes), _make_carrier(sizes))
+            assert out.shape == (sum(sizes), HIDDEN), f"Failed for sizes={sizes}"
 
-        with inductor_config.patch("triton.autotune_at_compile_time", autotune_val):
-            compiled = torch.compile(
-                model, fullgraph=True, dynamic=True, backend="inductor", options={"guard_filter_fn": _bypass_all_guards}
-            )
-
-            with torch.no_grad():
-                for sizes in scenarios:
-                    x = _make_input(sizes)
-                    carrier = _make_carrier(sizes)
-                    out = compiled(x, carrier)
-                    assert out.shape == (sum(sizes), HIDDEN), f"Failed for sizes={sizes}, autotune={autotune_val}"
+    assert patches_seen, "the graph must have gone through standalone_compile"
+    assert all(p.get("triton.autotune_at_compile_time") is False for p in patches_seen), patches_seen
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

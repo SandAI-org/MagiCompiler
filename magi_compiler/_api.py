@@ -262,6 +262,34 @@ def _magi_compile_bound_method(
     if getattr(instance, installed_attr, False):
         return instance
 
+    if isinstance(instance, nn.Module) and conf.offload_config.graph_weight_offload:
+        if conf.compile_mode != CompileMode.MAGI_COMPILE:
+            raise ValueError(
+                "offload_config.graph_weight_offload requires compile_mode=MAGI_COMPILE: "
+                "host-first parks selected weights as empty CUDA stand-ins and only the Magi "
+                f"backend inserts magi::h2d_load. Got compile_mode={conf.compile_mode.value}. "
+                "TORCH_COMPILE and NONE skip that rewrite and would read the empty stand-in."
+            )
+        if conf.aot:
+            raise ValueError(
+                "offload_config.graph_weight_offload does not support aot=True: AOT artifacts keep "
+                "magi::h2d_load's process-local host slot integers but not the weight identity needed "
+                "to remap them, so a replay could load another weight."
+            )
+        if not conf.disable_graph_split:
+            raise ValueError(
+                "offload_config.graph_weight_offload requires disable_graph_split=True: the residency "
+                "budget (offload_max_device_weight_mib) is spent once per Inductor compile, so every "
+                "piecewise subgraph would spend it again, and no load can be hoisted across a split. "
+                f"Set disable_graph_split=True in {type(instance).__name__}'s config_patch, or disable "
+                "graph_weight_offload for this model."
+            )
+        from magi_compiler.passes.weight_offload import install_host_first_hooks
+
+        install_host_first_hooks(
+            instance=instance, min_weight_bytes=int(conf.offload_config.offload_min_shard_mib * 1024 * 1024)
+        )
+
     old_method = getattr(instance, method_name)
 
     @torch.compiler.disable()
@@ -281,6 +309,14 @@ def _magi_compile_bound_method(
 
         if torch.compiler.is_compiling():
             return old_method(*args, **kwargs)
+
+        # Before tracing and before every fast path, because all three read the
+        # weights: a shard still sitting in host memory would be lowered into CPU
+        # kernels, or replayed against an artifact that expects it on the device.
+        # A no-op after the first call, and when host-first is off.
+        from magi_compiler.passes.weight_offload import handoff_host_weights_if_pending
+
+        handoff_host_weights_if_pending(instance)
 
         return _run_orchestration(state, args, kwargs)
 

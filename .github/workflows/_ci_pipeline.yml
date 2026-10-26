@@ -179,8 +179,8 @@ jobs:
     # Shard split rationale (8 shards):
     #   perf           – GPU timing-sensitive, isolated for independent rerun
     #   api            – magi_compile API surface (compile / nested / custom-op / dynamic)
-    #   model          – model-level e2e: MLP train/infer, RMSNorm, Qwen inference
-    #   feature-fsdp   – FSDP overlap (torchrun subprocess tests)
+    #   model          - end-to-end training and inference
+    #   feature-fsdp   – FSDP overlap and H2D weight offload (torchrun subprocess tests)
     #   feature-cache  – cache invariant / topology / artifact management
     #   feature-pass   – inductor passes (CUTLASS EVT → separate ci:evt workflow)
     #   feature-runtime– CUDA graph, symbolic shapes, profiling, offload
@@ -202,13 +202,13 @@ jobs:
                 -   shard: model
                     paths: tests/model_tests/ tests/example_inference/
                 -   shard: feature-fsdp
-                    paths: tests/feature_tests/fsdp/
+                    paths: tests/feature_tests/fsdp/ tests/feature_tests/offload/
                 -   shard: feature-cache
                     paths: tests/feature_tests/cache/
                 -   shard: feature-pass
                     paths: tests/feature_tests/pass/ --ignore=tests/feature_tests/pass/test_matmul_epilogue_fusion.py
                 -   shard: feature-runtime
-                    paths: tests/feature_tests/ tests/torch_native_tests/ --ignore=tests/feature_tests/fsdp --ignore=tests/feature_tests/cache --ignore=tests/feature_tests/pass
+                    paths: tests/feature_tests/ tests/torch_native_tests/ --ignore=tests/feature_tests/fsdp --ignore=tests/feature_tests/offload --ignore=tests/feature_tests/cache --ignore=tests/feature_tests/pass
                 -   shard: depyf
                     paths: tests/magi_depyf/
         container:

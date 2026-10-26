@@ -17,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
-from triton.testing import do_bench
+from triton.testing import do_bench, do_bench_cudagraph
 
 
 @dataclass
@@ -62,6 +62,21 @@ def cuda_benchmark(
         torch.cuda.synchronize()
 
     times = do_bench(fn, warmup=warmup, rep=rep, grad_to_none=grad_to_none, return_mode="all")
+    return BenchmarkResult(times_ms=times)
+
+
+def cuda_graph_benchmark(fn: Callable[[], object], *, rep: int = 100, compilation_warmup: int = 0) -> BenchmarkResult:
+    """GPU time of ``fn`` replayed from a CUDA graph, so per-call host launch overhead is excluded.
+
+    For workloads whose GPU time is close to their host launch time, where ``cuda_benchmark``
+    measures whichever side is slower on the current machine. ``fn`` must be capturable.
+    """
+    if compilation_warmup > 0:
+        for _ in range(compilation_warmup):
+            fn()
+        torch.cuda.synchronize()
+
+    times = do_bench_cudagraph(fn, rep=rep, return_mode="all")
     return BenchmarkResult(times_ms=times)
 
 
