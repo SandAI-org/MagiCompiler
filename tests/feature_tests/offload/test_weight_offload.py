@@ -24,7 +24,7 @@ Three layers, tested separately because they fail in different ways:
   gather ends up reading the loaded copy rather than the freed shard.
 
 FSDP cases use a per-test 1-rank process group and device mesh. Plain-parameter
-cases also cover compilation by only one rank. Runtime and integration cases need CUDA.
+cases also cover ranks whose offload pass inserts no load. Runtime and integration cases need CUDA.
 """
 
 import os
@@ -140,7 +140,9 @@ class _RankLocalOffloadNet(torch.nn.Module):
         return self.linear(inputs)
 
 
-def _rank0_offload_worker(rank: int, world_size: int, port: str, cache_dir: str, cost_mode: str, compile_finished) -> None:
+def _offload_on_rank0_worker(
+    rank: int, world_size: int, port: str, cache_dir: str, cost_mode: str, compile_finished_by_rank
+) -> None:
     import faulthandler
     from datetime import timedelta
 
@@ -148,59 +150,68 @@ def _rank0_offload_worker(rank: int, world_size: int, port: str, cache_dir: str,
 
     from magi_compiler import magi_compile
     from magi_compiler.config import CudaGraphMode
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = port
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl", rank=rank, world_size=world_size, timeout=timedelta(seconds=60))
+    # Dump a stuck rank's stack before its peer's host-side wait expires.
+    faulthandler.dump_traceback_later(270)
     try:
-        if rank == 0:
-            # Dump the compiling rank's stack before the peer's host-side wait expires.
-            faulthandler.dump_traceback_later(270)
 
-            def configure_offload(config):
-                config.cache_root_dir = cache_dir
-                config.offload_config.graph_weight_offload = True
-                config.offload_config.offload_min_shard_mib = 0.0
-                config.offload_config.offload_h2d_bandwidth_gbps = 20.0
-                config.cudagraph_mode = CudaGraphMode.NONE
-                config.disable_graph_split = True
-                config.fsdp_config.cost_mode = cost_mode
-                return config
+        def configure_offload(config):
+            config.cache_root_dir = cache_dir
+            config.offload_config.graph_weight_offload = True
+            # The 128 KiB weight clears rank 0's floor only, so only rank 0's graph gets an H2D load.
+            config.offload_config.offload_min_shard_mib = 0.0 if rank == 0 else 1.0
+            config.offload_config.offload_h2d_bandwidth_gbps = 20.0
+            config.cudagraph_mode = CudaGraphMode.NONE
+            config.disable_graph_split = True
+            config.fsdp_config.cost_mode = cost_mode
+            return config
 
-            torch.manual_seed(2026)
-            model = _RankLocalOffloadNet()
-            reference_weight = model.linear.weight.detach().clone().cuda()
-            inputs = torch.randn(4, 256, device="cuda", dtype=torch.bfloat16)
-            model = magi_compile(model, dynamic_arg_dims={"inputs": 0}, config_patch=configure_offload)
-            model.cuda()
-            with torch.no_grad():
-                expected = torch.nn.functional.linear(inputs, reference_weight)
-                torch.testing.assert_close(model(inputs), expected)
-                torch.testing.assert_close(model(inputs), expected)
-            compile_finished.set()
-        # Compilation can exceed the process group's timeout; do not enqueue an NCCL barrier while it runs.
-        elif not compile_finished.wait(timeout=300):
-            raise TimeoutError(f"rank 0 offload compilation did not finish within 300 seconds ({cost_mode})")
+        torch.manual_seed(2026)
+        model = _RankLocalOffloadNet()
+        reference_weight = model.linear.weight.detach().clone().cuda()
+        inputs = torch.randn(4, 256, device="cuda", dtype=torch.bfloat16)
+        model = magi_compile(model, dynamic_arg_dims={"inputs": 0}, config_patch=configure_offload)
+        model.cuda()
+        assert get_global_host_weight_store().weight_count() == (1 if rank == 0 else 0)
+        with torch.no_grad():
+            expected = torch.nn.functional.linear(inputs, reference_weight)
+            torch.testing.assert_close(model(inputs), expected)
+            torch.testing.assert_close(model(inputs), expected)
+        compile_finished_by_rank[rank].set()
+        # Host-side wait: an NCCL barrier would pair with a stuck peer's pending WORLD collective.
+        for peer_rank, peer_compile_finished in enumerate(compile_finished_by_rank):
+            if not peer_compile_finished.wait(timeout=300):
+                raise TimeoutError(f"rank {peer_rank} offload compilation did not finish within 300 seconds ({cost_mode})")
     finally:
-        if rank == 0:
-            faulthandler.cancel_dump_traceback_later()
+        faulthandler.cancel_dump_traceback_later()
         dist.destroy_process_group()
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
 @pytest.mark.parametrize("cost_mode", ["profile_sync", "analytical"])
-def test_plain_param_offload_compiles_on_rank0_only(tmp_path, cost_mode):
-    """An initialized WORLD must not make local offload compilation wait for another rank to compile."""
+def test_plain_param_offload_on_some_ranks_compiles_on_every_rank(tmp_path, cost_mode):
+    """Every rank compiles, but only rank 0 offloads; its compile must not wait on a WORLD collective the rest skip."""
     import socket
 
     import torch.multiprocessing as mp
 
+    world_size = 2
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = str(listener.getsockname()[1])
-    compile_finished = mp.get_context("spawn").Event()
-    mp.spawn(_rank0_offload_worker, args=(2, port, str(tmp_path), cost_mode, compile_finished), nprocs=2, join=True)
+    spawn_context = mp.get_context("spawn")
+    compile_finished_by_rank = [spawn_context.Event() for _ in range(world_size)]
+    mp.spawn(
+        _offload_on_rank0_worker,
+        args=(world_size, port, str(tmp_path), cost_mode, compile_finished_by_rank),
+        nprocs=world_size,
+        join=True,
+    )
 
 
 @requires_cuda
