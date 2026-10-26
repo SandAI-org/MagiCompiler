@@ -140,7 +140,8 @@ class _RankLocalOffloadNet(torch.nn.Module):
         return self.linear(inputs)
 
 
-def _rank0_offload_worker(rank: int, world_size: int, port: str, cache_dir: str, cost_mode: str) -> None:
+def _rank0_offload_worker(rank: int, world_size: int, port: str, cache_dir: str, cost_mode: str, compile_finished) -> None:
+    import faulthandler
     from datetime import timedelta
 
     import torch.distributed as dist
@@ -154,6 +155,8 @@ def _rank0_offload_worker(rank: int, world_size: int, port: str, cache_dir: str,
     dist.init_process_group("nccl", rank=rank, world_size=world_size, timeout=timedelta(seconds=60))
     try:
         if rank == 0:
+            # Dump the compiling rank's stack before the peer's host-side wait expires.
+            faulthandler.dump_traceback_later(270)
 
             def configure_offload(config):
                 config.cache_root_dir = cache_dir
@@ -175,9 +178,13 @@ def _rank0_offload_worker(rank: int, world_size: int, port: str, cache_dir: str,
                 expected = torch.nn.functional.linear(inputs, reference_weight)
                 torch.testing.assert_close(model(inputs), expected)
                 torch.testing.assert_close(model(inputs), expected)
-        # Rank 1 never compiles: it waits here for rank 0's local work to finish.
-        dist.barrier()
+            compile_finished.set()
+        # Compilation can exceed the process group's timeout; do not enqueue an NCCL barrier while it runs.
+        elif not compile_finished.wait(timeout=300):
+            raise TimeoutError(f"rank 0 offload compilation did not finish within 300 seconds ({cost_mode})")
     finally:
+        if rank == 0:
+            faulthandler.cancel_dump_traceback_later()
         dist.destroy_process_group()
 
 
@@ -192,7 +199,8 @@ def test_plain_param_offload_compiles_on_rank0_only(tmp_path, cost_mode):
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = str(listener.getsockname()[1])
-    mp.spawn(_rank0_offload_worker, args=(2, port, str(tmp_path), cost_mode), nprocs=2, join=True)
+    compile_finished = mp.get_context("spawn").Event()
+    mp.spawn(_rank0_offload_worker, args=(2, port, str(tmp_path), cost_mode, compile_finished), nprocs=2, join=True)
 
 
 @requires_cuda
