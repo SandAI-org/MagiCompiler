@@ -113,8 +113,8 @@ def _scheduler_passes_worker(rank: int, world_size: int, port: str, out_dir: str
         dist.destroy_process_group()
 
 
-def test_plain_param_scheduler_only_profiles_ranks_with_loads(tmp_path):
-    """Plain-parameter profiling must not involve ranks without local loads."""
+def test_plain_param_scheduler_runs_on_every_rank_once_any_rank_loads(tmp_path):
+    """One rank's loads turn on the overlap reorder everywhere; only ranks with loads place them."""
     import json
     import socket
 
@@ -126,9 +126,8 @@ def test_plain_param_scheduler_only_profiles_ranks_with_loads(tmp_path):
     mp.spawn(_scheduler_passes_worker, args=(2, port, str(tmp_path)), nprocs=2, join=True)
 
     with_loads, without_loads = (json.loads((tmp_path / f"{rank}.json").read_text()) for rank in range(2))
-    assert with_loads[:1] == ["SnodeCostProfile"]
-    assert "H2dLoadReorder" in with_loads
-    assert without_loads == []
+    assert with_loads == ["SnodeCostProfile", "raise_comms", "sink_waits", "H2dLoadReorder"]
+    assert without_loads == ["SnodeCostProfile", "raise_comms", "sink_waits"]
 
 
 class _RankLocalOffloadNet(torch.nn.Module):
