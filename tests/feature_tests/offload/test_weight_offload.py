@@ -528,10 +528,8 @@ def test_bandwidth_probe_is_plausible_and_reset_clears_its_cache():
     assert get_global_host_weight_store()._bandwidth_bytes_per_ns is None
 
 
-@pytest.mark.parametrize(
-    "setup_fails", [pytest.param(False, marks=requires_cuda, id="probed"), pytest.param(True, id="setup-failed")]
-)
-def test_bandwidth_probe_issues_no_collective(monkeypatch, setup_fails):
+@pytest.mark.parametrize("probe_case", [pytest.param("probed", marks=requires_cuda), "setup-failed", "cuda-unavailable"])
+def test_bandwidth_probe_issues_no_collective(monkeypatch, probe_case):
     """Only ranks that compile a load probe, so a probe collective would hang the ranks that do not."""
     import torch.distributed as dist
 
@@ -541,16 +539,80 @@ def test_bandwidth_probe_issues_no_collective(monkeypatch, setup_fails):
     monkeypatch.setattr(dist, "is_initialized", lambda: True)
     for name in ("barrier", "all_reduce", "broadcast", "all_gather_object"):
         monkeypatch.setattr(dist, name, lambda *args, _name=name, **kwargs: collectives.append(_name))
-    if setup_fails:
+    if probe_case == "setup-failed":
         monkeypatch.setattr(bandwidth.torch.cuda, "is_available", lambda: True)
 
         def failing_empty(*args, **kwargs):
             raise RuntimeError("pinned allocation failed")
 
         monkeypatch.setattr(bandwidth.torch, "empty", failing_empty)
+        with pytest.raises(RuntimeError, match="pinned allocation failed"):
+            bandwidth.measure_h2d_bandwidth_bytes_per_ns()
+    elif probe_case == "cuda-unavailable":
+        monkeypatch.setattr(bandwidth.torch.cuda, "is_available", lambda: False)
 
-    assert bandwidth.measure_h2d_bandwidth_bytes_per_ns() > 0
+        def unexpected_allocation(*args, **kwargs):
+            pytest.fail("CUDA-unavailable fallback must not allocate probe buffers")
+
+        monkeypatch.setattr(bandwidth.torch, "empty", unexpected_allocation)
+        assert bandwidth.measure_h2d_bandwidth_bytes_per_ns() == bandwidth.FALLBACK_H2D_BYTES_PER_NS
+    else:
+        assert bandwidth.measure_h2d_bandwidth_bytes_per_ns() > 0
     assert collectives == []
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "operation,failing_call",
+    [
+        pytest.param("allocation", 2, id="device-allocation"),
+        pytest.param("copy", 1, id="warmup-copy"),
+        pytest.param("copy", 3, id="timed-copy"),
+        pytest.param("synchronize", 1, id="warmup-synchronize"),
+        pytest.param("synchronize", 2, id="timed-synchronize"),
+    ],
+)
+def test_bandwidth_probe_propagates_errors_without_caching(monkeypatch, operation, failing_call):
+    """Probe failures must reach the caller without caching a guessed bandwidth."""
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
+
+    owner, method_name = {
+        "allocation": (torch, "empty"),
+        "copy": (torch.Tensor, "copy_"),
+        "synchronize": (torch.cuda.Stream, "synchronize"),
+    }[operation]
+    original_method = getattr(owner, method_name)
+    probe_error = RuntimeError(f"injected {operation} failure")
+    call_count = 0
+
+    def fail_selected_call(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == failing_call:
+            raise probe_error
+        return original_method(*args, **kwargs)
+
+    store = get_global_host_weight_store()
+    with monkeypatch.context() as patch:
+        patch.setattr(owner, method_name, fail_selected_call)
+        with pytest.raises(RuntimeError) as caught:
+            store.h2d_bandwidth_bytes_per_ns()
+    assert caught.value is probe_error
+    assert store._bandwidth_bytes_per_ns is None
+    assert store.h2d_bandwidth_bytes_per_ns() > 0
+
+
+@requires_cuda
+@pytest.mark.parametrize("elapsed_ms", [0.0, -1.0])
+def test_bandwidth_probe_rejects_non_positive_duration(monkeypatch, elapsed_ms):
+    """Invalid CUDA timing must fail instead of supplying a fallback scheduling cost."""
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
+
+    monkeypatch.setattr(torch.cuda.Event, "elapsed_time", lambda *args: elapsed_ms)
+    store = get_global_host_weight_store()
+    with pytest.raises(RuntimeError, match="non-positive duration"):
+        store.h2d_bandwidth_bytes_per_ns()
+    assert store._bandwidth_bytes_per_ns is None
 
 
 # ------------------------------------------------------------------- the op
@@ -1071,6 +1133,41 @@ def test_host_first_uses_the_current_class_apply_after_installation():
 
     assert module.class_apply_calls == 1
     assert module.weight.dtype is torch.float64
+
+
+@requires_cuda
+@pytest.mark.parametrize("probe_stage", ["cpu_move", "cuda_move", "dtype"])
+@pytest.mark.parametrize("error_type", [RuntimeError, ValueError])
+def test_host_first_propagates_apply_probe_errors(probe_stage, error_type):
+    """A failing user conversion must not be treated as an unrelated _apply operation."""
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
+    from magi_compiler.passes.weight_offload.weight_lifecycle import get_offload_state
+
+    module = _install_host_first_hooks(torch.nn.Linear(4, 4, bias=False, dtype=torch.float64))
+    if probe_stage == "dtype":
+        module.cuda()
+    weight_before = module.weight
+    slot_before = get_global_host_weight_store().slot_for_tensor(weight_before)
+    parking_decided_before = get_offload_state(module).parking_decided
+    probe_error = error_type("user conversion failed")
+
+    def failing_conversion(tensor):
+        if tensor.numel() != 0:
+            return tensor
+        if probe_stage == "cpu_move" or (probe_stage == "cuda_move" and tensor.is_cuda):
+            raise probe_error
+        if probe_stage == "dtype":
+            if tensor.dtype == torch.float64:
+                raise probe_error
+            return tensor.double()
+        return tensor
+
+    with pytest.raises(error_type) as caught:
+        module._apply(failing_conversion)
+    assert caught.value is probe_error
+    assert module.weight is weight_before
+    assert get_global_host_weight_store().slot_for_tensor(module.weight) == slot_before
+    assert get_offload_state(module).parking_decided == parking_decided_before
 
 
 @requires_cuda

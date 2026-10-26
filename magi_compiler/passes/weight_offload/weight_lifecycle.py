@@ -219,16 +219,13 @@ def _probe_move_device(fn) -> torch.device | None:
 
     The probe has the default dtype, so ``.to(device, dtype)`` with that same dtype
     reads as a pure move and parked weights skip its cast; see the module's dtype contract."""
-    try:
-        probe = torch.empty(0)
-        moved = fn(probe)
-        if not isinstance(moved, torch.Tensor) or moved.dtype != probe.dtype:
-            return None
-        if moved.is_cuda:
-            return moved.device
-        moved_back = fn(torch.empty(0, device="cuda"))
-    except Exception:  # noqa: BLE001 - a function that cannot take a probe is not a device move
+    probe = torch.empty(0)
+    moved = fn(probe)
+    if not isinstance(moved, torch.Tensor) or moved.dtype != probe.dtype:
         return None
+    if moved.is_cuda:
+        return moved.device
+    moved_back = fn(torch.empty(0, device="cuda"))
     return moved_back.device if moved_back.dtype == probe.dtype and moved_back.device.type == "cpu" else None
 
 
@@ -245,10 +242,7 @@ def _reject_cast_after_handoff(module: nn.Module, fn) -> None:
         if dtype_device in probed_dtype_devices or get_global_host_weight_store().slot_for_tensor(local_weight) is None:
             continue
         probed_dtype_devices.add(dtype_device)
-        try:
-            converted_probe = fn(torch.empty(0, dtype=local_weight.dtype, device=local_weight.device))
-        except Exception:  # noqa: BLE001 - a function that cannot take a probe is not a cast
-            continue
+        converted_probe = fn(torch.empty(0, dtype=local_weight.dtype, device=local_weight.device))
         if isinstance(converted_probe, torch.Tensor) and converted_probe.dtype != local_weight.dtype:
             raise RuntimeError(
                 f"host offload: cannot cast {type(module).__name__}.{_normalize_parameter_name(name)} from {local_weight.dtype} to "
