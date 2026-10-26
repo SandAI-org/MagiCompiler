@@ -38,6 +38,7 @@ from magi_compiler.passes.fsdp_overlap import (
     rewrite_weight_ag_to_copy_engine,
 )
 from magi_compiler.passes.snode_cost import SnodeCostProfile, SnodeCostTable
+from magi_compiler.passes.transfer_overlap import rank_sync
 from magi_compiler.passes.weight_offload import (
     FsdpShardSource,
     H2dLoadReorder,
@@ -78,6 +79,13 @@ def _allow_reorder_without_process_group() -> None:
     comms.reorder_compute_and_comm_for_overlap = reorder_as_rank_0
 
 
+def _any_rank_inserted_loads(*, offload_config: OffloadConfig, loads_inserted: bool) -> bool:
+    if not offload_config.graph_weight_offload:
+        return False
+    # Overlap reorder must be on for every rank or none: PT 2.12 then gathers a graph hash over WORLD.
+    return rank_sync.any_rank_has_flag(loads_inserted)
+
+
 def build_transfer_overlap_passes(
     *, fsdp_config: FSDPConfig, offload_config: OffloadConfig, loads_inserted: bool, default_passes: list | None
 ) -> list | None:
@@ -86,7 +94,7 @@ def build_transfer_overlap_passes(
     ``SnodeCostProfile`` runs first and fills the cost table every later pass reads.
     FSDP replaces Inductor's default reorders; offload alone keeps them for CP/EP overlap.
     """
-    if not (fsdp_config.enable_fsdp or loads_inserted):
+    if not (fsdp_config.enable_fsdp or _any_rank_inserted_loads(offload_config=offload_config, loads_inserted=loads_inserted)):
         return None
 
     costs = SnodeCostTable()
