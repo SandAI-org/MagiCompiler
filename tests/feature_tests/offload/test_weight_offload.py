@@ -130,6 +130,27 @@ def test_plain_param_scheduler_runs_on_every_rank_once_any_rank_loads(tmp_path):
     assert without_loads == ["SnodeCostProfile"]
 
 
+def test_profile_sync_estimator_locks_ranks_for_offload_and_fsdp():
+    """Offload and FSDP both place against lockstep costs; analytical mode still skips the estimator."""
+    from magi_compiler.config import FSDPConfig, OffloadConfig
+    from magi_compiler.magi_backend.weight_transfer_pipeline import build_transfer_overlap_passes
+
+    def sync_across_ranks(*, enable_fsdp: bool, graph_weight_offload: bool, cost_mode: str = "profile_sync"):
+        passes = build_transfer_overlap_passes(
+            fsdp_config=FSDPConfig(enable_fsdp=enable_fsdp, cost_mode=cost_mode),
+            offload_config=OffloadConfig(graph_weight_offload=graph_weight_offload, offload_h2d_bandwidth_gbps=20.0),
+            loads_inserted=graph_weight_offload,
+            default_passes=None,
+        )
+        estimator = passes[0].estimator
+        return None if estimator is None else estimator.sync_across_ranks
+
+    assert sync_across_ranks(enable_fsdp=False, graph_weight_offload=True) is True
+    assert sync_across_ranks(enable_fsdp=True, graph_weight_offload=False) is True
+    assert sync_across_ranks(enable_fsdp=True, graph_weight_offload=True) is True
+    assert sync_across_ranks(enable_fsdp=False, graph_weight_offload=True, cost_mode="analytical") is None
+
+
 class _RankLocalOffloadNet(torch.nn.Module):
     def __init__(self):
         super().__init__()
