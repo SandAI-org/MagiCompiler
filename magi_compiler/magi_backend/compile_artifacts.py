@@ -61,13 +61,11 @@ class MagiSerializableFunction(SerializableCallable):
         graph_module,
         model_tag,
         optimized_call,
-        model_idx: int = 0,
         traced_files: list | None = None,
         compile_config: CompileConfig | None = None,
     ):
         assert isinstance(graph_module, torch.fx.GraphModule)
         self.graph_module = graph_module
-        self.model_idx = model_idx
         self.model_tag = model_tag
         self.traced_files = traced_files or []
         self.compile_config = compile_config
@@ -180,7 +178,6 @@ class MagiSerializableFunction(SerializableCallable):
         fake_mode = detect_fake_mode(compile_inputs)
         magi_backend = MagiBackend(
             self.compile_config,
-            model_idx=self.model_idx,
             model_tag=self.model_tag,
             traced_files=OrderedSet(self.traced_files),
             inductor_compile_config={},

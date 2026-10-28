@@ -20,6 +20,7 @@ import os
 import shutil
 import socket
 import time
+import weakref
 from collections.abc import Collection, Sequence
 from contextlib import contextmanager
 from typing import Callable
@@ -192,12 +193,27 @@ def _run_orchestration(state: MagiCompileState, args, kwargs):
         state.traced_files.clear()
 
 
+# The tag names the object's cache dir, so it may name only one live object per process.
+_TAG_OWNERS: weakref.WeakValueDictionary[str, object] = weakref.WeakValueDictionary()
+
+
+def _resolve_model_tag(model_tag: str | Callable[[object], str | None] | None, compile_obj: object) -> str:
+    """The given tag, else ``{call order}_{class/function name}``, unique by the call order."""
+    tag = model_tag(compile_obj) if callable(model_tag) else model_tag
+    if tag is None:
+        return f"{compilation_counter.num_models_seen}_{getattr(compile_obj, '__name__', type(compile_obj).__name__)}"
+    owner = _TAG_OWNERS.setdefault(tag, compile_obj)
+    if owner is not compile_obj:
+        raise ValueError(f"model_tag {tag!r} is already used by another live {type(owner).__name__} in this process")
+    return tag
+
+
 def _lazy_init_magi_state(
     state_holder: object,
     compile_obj: object,
     dynamic_arg_dims: dict[str, int | list[int]] | None,
     conf: CompileConfig,
-    model_tag: str,
+    model_tag: str | Callable[[object], str | None] | None,
     target_method_name: str | None,
     state_attr: str,
 ):
@@ -206,17 +222,13 @@ def _lazy_init_magi_state(
         return
 
     compilation_counter.num_models_seen += 1
+    model_tag = _resolve_model_tag(model_tag, compile_obj)
 
     setattr(
         state_holder,
         state_attr,
         MagiCompileState(
-            compile_obj,
-            conf,
-            model_idx=compilation_counter.num_models_seen,
-            model_tag=model_tag,
-            dynamic_arg_dims=dynamic_arg_dims,
-            target_method_name=target_method_name,
+            compile_obj, conf, model_tag=model_tag, dynamic_arg_dims=dynamic_arg_dims, target_method_name=target_method_name
         ),
     )
 
@@ -462,7 +474,7 @@ def _compilation_context(state: MagiCompileState):
     """
     from .magi_depyf.inspect import explain_compilation
 
-    _debug_dump_path = debug_dump_path(state.compile_config.cache_root_dir, state.model_idx, state.model_tag)
+    _debug_dump_path = debug_dump_path(state.compile_config.cache_root_dir, state.model_tag)
     _inductor_cache_dump_path = inductor_cache_dump_path(state.compile_config.cache_root_dir)
     _triton_cache_dump_path = triton_cache_dump_path(state.compile_config.cache_root_dir)
 
