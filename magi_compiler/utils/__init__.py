@@ -17,7 +17,13 @@ from ._utils import *
 from .compile_counter import compilation_counter
 from .device import device_capability, device_capability_major
 from .envs import set_env_var
-from .hash import compute_code_hash, compute_code_hash_with_content, compute_graph_hash, compute_hash
+from .hash import (
+    compute_code_hash,
+    compute_code_hash_with_content,
+    compute_graph_hash,
+    compute_hash,
+    compute_module_state_hash,
+)
 from .logger import logger, magi_logger
 from .nvtx import add_nvtx_event, instrument_nvtx
 from .ordered_set import OrderedSet
@@ -29,6 +35,7 @@ __all__ = [
     "compute_code_hash",
     "compute_code_hash_with_content",
     "compute_graph_hash",
+    "compute_module_state_hash",
     "compute_hash",
     "logger",
     "magi_logger",

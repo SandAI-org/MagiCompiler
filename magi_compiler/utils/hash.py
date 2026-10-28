@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import hashlib
+import itertools
 import os
 import re
 from collections.abc import Sequence
@@ -62,16 +63,19 @@ def compute_code_hash_with_content(file_contents: dict[str, str]) -> str:
 _MODULE_STATE = re.compile(r"_(parameters|buffers)_")
 
 
+def _state_layout(x: torch.Tensor) -> str:
+    layout = f"{x.dtype}{list(x.shape)}"
+    if isinstance(x, DTensor):
+        layout += f" {x.placements} {tuple(x.device_mesh.shape)}"
+    return layout
+
+
 def _input_signature(name: str, x: torch.Tensor) -> str | None:
     if _MODULE_STATE.search(name):
-        sig = f"{name}: {x.dtype}{list(x.shape)}"
-    elif isinstance(x, DTensor):
-        sig = f"{name}: {x.dtype}"
-    else:
-        return None
+        return f"{name}: {_state_layout(x)}"
     if isinstance(x, DTensor):
-        sig += f" {x.placements} {tuple(x.device_mesh.shape)}"
-    return sig
+        return f"{name}: {x.dtype} {x.placements} {tuple(x.device_mesh.shape)}"
+    return None
 
 
 def compute_graph_hash(graph: fx.GraphModule, example_inputs: Sequence[Any]) -> str:
@@ -85,6 +89,17 @@ def compute_graph_hash(graph: fx.GraphModule, example_inputs: Sequence[Any]) -> 
     names = [node.name for node in graph.graph.nodes if node.op == "placeholder"]
     sigs = [_input_signature(name, x) for name, x in zip(names, example_inputs) if isinstance(x, torch.Tensor)]
     return compute_hash([sig for sig in sigs if sig is not None])
+
+
+def compute_module_state_hash(obj: object) -> str:
+    """Every parameter and buffer of ``obj`` by name, dtype and shape, or nothing unless ``obj`` is a module.
+
+    The AOT key needs it: an AOT load skips Dynamo and drops every guard, so nothing else checks the weight layout.
+    """
+    if not isinstance(obj, torch.nn.Module):
+        return compute_hash([])
+    state = itertools.chain(obj.named_parameters(), obj.named_buffers())
+    return compute_hash([f"{name}: {_state_layout(x)}" for name, x in state])
 
 
 def compute_code_hash(files: set[str]) -> str:

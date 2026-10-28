@@ -30,7 +30,7 @@ from magi_compiler.config import CompileConfig, model_rank_dir_name
 from magi_compiler.magi_backend._aot_compat import extract_aot_artifacts_from_fn, load_aot_artifacts, save_aot_artifacts
 from magi_compiler.magi_backend.magi_backend import init_backend
 from magi_compiler.magi_depyf.timeline import emit_after_dynamo_bytecode_transform, observe_lifecycle
-from magi_compiler.utils import OrderedSet, compute_code_hash, compute_hash, magi_logger
+from magi_compiler.utils import OrderedSet, compute_code_hash, compute_hash, compute_module_state_hash, magi_logger
 
 
 def _source_meta_path(aot_path: str) -> str:
@@ -157,8 +157,18 @@ class MagiCompileState:
         The ``{hash}`` contains all factors *except* the source files being
         traced through (unknown before Dynamo runs).  On loading we verify
         traced-file checksums separately via ``_verify_source_unchanged``.
+        It covers the module's parameter layout, so another layer count or
+        quantization under the same tag gets its own artifact.
         """
-        hash_key = compute_hash([self.original_entry, self.model_tag, self.compile_config.hash, self.dynamic_arg_dims])
+        hash_key = compute_hash(
+            [
+                self.original_entry,
+                self.model_tag,
+                self.compile_config.hash,
+                self.dynamic_arg_dims,
+                compute_module_state_hash(self.obj),
+            ]
+        )
         cache_dir = os.path.join(
             self.compile_config.cache_root_dir, "torch_aot_compile", model_rank_dir_name(self.model_tag), hash_key
         )

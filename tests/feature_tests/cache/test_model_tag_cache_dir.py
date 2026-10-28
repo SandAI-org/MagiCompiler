@@ -34,13 +34,12 @@ import torch
 from magi_compiler import magi_compile
 from magi_compiler.utils import compilation_counter
 
-@magi_compile(model_tag=lambda block: getattr(block, "tag", None), dynamic_arg_dims={"x": 0})
+@magi_compile(model_tag=lambda block: block.tag, dynamic_arg_dims={"x": 0})
 class Block(torch.nn.Module):
     def __init__(self, scale, tag=None):
         super().__init__()
         self.register_buffer("scale", torch.tensor(scale, device="cuda"))
-        if tag is not None:
-            self.tag = tag
+        self.tag = tag
 
     def forward(self, x):
         return torch.relu(x * self.scale) + 1
