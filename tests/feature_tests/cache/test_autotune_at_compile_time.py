@@ -97,9 +97,7 @@ class TestTritonCacheAutotuningEnvVar:
         def _dummy_fn(x):
             return x
 
-        return MagiCompileState(
-            obj=_dummy_fn, compile_config=CompileConfig(), model_idx=0, model_tag="test", dynamic_arg_dims={}
-        )
+        return MagiCompileState(obj=_dummy_fn, compile_config=CompileConfig(), model_tag="test", dynamic_arg_dims={})
 
     def test_compile_context_enables_triton_cache_autotuning(self):
         from magi_compiler._api import _compilation_context

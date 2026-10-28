@@ -547,13 +547,11 @@ class MagiBackend:
     def __init__(
         self,
         compile_config: CompileConfig,
-        model_idx: int,
         model_tag: str,
         traced_files: "OrderedSet",
         inductor_compile_config: dict[str, Any],
     ):
         self.compile_config = compile_config
-        self.model_idx = model_idx
         self.model_tag = model_tag
         self.traced_files = traced_files
         self.inductor_compile_config = inductor_compile_config
@@ -599,10 +597,8 @@ class MagiBackend:
             ]
         )
 
-        # Path: .../model_{idx}_{model_tag}_rank_{rank}/{hash}/
-        self.local_magi_cache_path: Path = (
-            magi_cache_dump_path(self.compile_config.cache_root_dir, self.model_idx, self.model_tag) / hash_key
-        )
+        # Path: .../model_{model_tag}_rank_{rank}_{topology}/{hash}/
+        self.local_magi_cache_path: Path = magi_cache_dump_path(self.compile_config.cache_root_dir, self.model_tag) / hash_key
         self.local_magi_cache_path.mkdir(parents=True, exist_ok=True)
         self.compiler_manager.initialize_cache(self.local_magi_cache_path)
 
@@ -772,17 +768,12 @@ class MagiBackend:
             runnable_gm = gen_wrap_func_for_cudagraph(func=split_gm, mode_prefix=CudaGraphMode.FULL.name.lower())
 
         return MagiSerializableFunction(
-            graph,
-            self.model_tag,
-            runnable_gm,
-            model_idx=self.model_idx,
-            traced_files=list(self.traced_files),
-            compile_config=self.compile_config,
+            graph, self.model_tag, runnable_gm, traced_files=list(self.traced_files), compile_config=self.compile_config
         )
 
 
 def init_backend(
-    compile_config: CompileConfig, model_idx: int, model_tag: str, traced_files: "OrderedSet", inductor_config: dict[str, Any]
+    compile_config: CompileConfig, model_tag: str, traced_files: "OrderedSet", inductor_config: dict[str, Any]
 ) -> str | Callable:
     """
     Initialize the backend based on CompileConfig.
@@ -799,6 +790,6 @@ def init_backend(
         return compile_config.backend
     elif compile_config.compile_mode == CompileMode.MAGI_COMPILE:
         assert compile_config.backend in ["eager", "inductor"], f"Invalid backend for MagiCompiler: {compile_config.backend}"
-        return MagiBackend(compile_config, model_idx, model_tag, traced_files, inductor_config)
+        return MagiBackend(compile_config, model_tag, traced_files, inductor_config)
     else:
         raise ValueError(f"Invalid compile mode: {compile_config.compile_mode}")

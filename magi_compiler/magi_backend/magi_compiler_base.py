@@ -85,14 +85,12 @@ class MagiCompileState:
         self,
         obj: Callable | Class,
         compile_config: CompileConfig,
-        model_idx: int,
         model_tag: str,
         dynamic_arg_dims: dict[str, int | list[int]],
         target_method_name: str | None = None,
     ):
         self.obj = obj
         self.compile_config = compile_config
-        self.model_idx = model_idx
         self.model_tag = model_tag
         self.dynamic_arg_dims = dynamic_arg_dims
         self.traced_files: OrderedSet = OrderedSet()
@@ -123,9 +121,7 @@ class MagiCompileState:
         """
         if self.compiled_entry is not None:
             return
-        backend = init_backend(
-            self.compile_config, self.model_idx, self.model_tag, self.traced_files, self.inductor_compile_config
-        )
+        backend = init_backend(self.compile_config, self.model_tag, self.traced_files, self.inductor_compile_config)
         options = None
         if isinstance(backend, str) and backend == "inductor":
             options = self.inductor_compile_config
@@ -156,18 +152,15 @@ class MagiCompileState:
         AOT artifact path, following the same ``model_{idx}_{tag}_rank_{rank}``
         layout as the JIT cache (``cache_dump_path``):
 
-            cache_root_dir/torch_aot_compile/model_{idx}_{tag}_rank_{rank}/{hash}/model
+            cache_root_dir/torch_aot_compile/model_{tag}_rank_{rank}_{topology}/{hash}/model
 
         The ``{hash}`` contains all factors *except* the source files being
         traced through (unknown before Dynamo runs).  On loading we verify
         traced-file checksums separately via ``_verify_source_unchanged``.
         """
-        hash_key = compute_hash([self.original_entry, self.model_idx, self.compile_config.hash, self.dynamic_arg_dims])
+        hash_key = compute_hash([self.original_entry, self.model_tag, self.compile_config.hash, self.dynamic_arg_dims])
         cache_dir = os.path.join(
-            self.compile_config.cache_root_dir,
-            "torch_aot_compile",
-            model_rank_dir_name(self.model_idx, self.model_tag),
-            hash_key,
+            self.compile_config.cache_root_dir, "torch_aot_compile", model_rank_dir_name(self.model_tag), hash_key
         )
         os.makedirs(cache_dir, exist_ok=True)
         return os.path.join(cache_dir, "model")
