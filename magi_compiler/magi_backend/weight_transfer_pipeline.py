@@ -98,9 +98,12 @@ def build_transfer_overlap_passes(
         return None
 
     costs = SnodeCostTable()
-    # Plain-parameter models may compile on only one rank of an initialized WORLD.
+    # Custom ops count as internal collectives and stay at an analytical 0 until
+    # warm_and_sync remeasures them. H2D placement reads those costs, so offload
+    # needs the same lockstep estimator as FSDP.
+    sync_across_ranks = fsdp_config.enable_fsdp or offload_config.graph_weight_offload
     estimator = (
-        None if fsdp_config.cost_mode == "analytical" else ProfilingRuntimeEstimator(sync_across_ranks=fsdp_config.enable_fsdp)
+        None if fsdp_config.cost_mode == "analytical" else ProfilingRuntimeEstimator(sync_across_ranks=sync_across_ranks)
     )
     passes: list = [SnodeCostProfile(costs, estimator)]
 
