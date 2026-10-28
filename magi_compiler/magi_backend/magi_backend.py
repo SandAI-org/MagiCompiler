@@ -109,13 +109,13 @@ class CompilerManager:
         Initialize the cache directory for the compiler.
 
         The organization of the cache directory is as follows:
-        cache_dir=/path/to/magi_cache/model_{idx}[_{tag}]_rank_{rank}/hash_str/[prefix/]
+        cache_dir=/path/to/magi_cache/model_{tag}_rank_{rank}_{topology}/hash_str/[prefix/]
         inside cache_dir, there will be:
         - subgraph_indices.py
         - computation_graph.py
 
         for multiple prefixes, they can share the same base cache dir of
-        /path/to/magi_cache/model_{idx}[_{tag}]_rank_{rank}/hash_str/ to store some
+        /path/to/magi_cache/model_{tag}_rank_{rank}_{topology}/hash_str/ to store some
         common compilation artifacts.
         """
 
