@@ -458,8 +458,9 @@ def _get_parallel_topology() -> str:
     return f"ws{torch.distributed.get_world_size()}"
 
 
-def model_rank_dir_name(model_idx: int, model_tag: str | None) -> str:
-    """Directory name: ``model_{idx}[_{tag}]_rank_{rank}_{topology}``.
+def model_rank_dir_name(model_idx: int | None, model_tag: str | None) -> str:
+    """Directory name: ``model_{idx}[_{tag}]_rank_{rank}_{topology}``, or ``model_{tag}_rank_{rank}_{topology}``
+    when ``model_idx`` is None (an explicit tag, unique per process).
 
     Topology encodes all parallel dimension sizes via PSM.topology_key().
     Different topologies produce different tensor strides in custom-op meta
@@ -467,6 +468,8 @@ def model_rank_dir_name(model_idx: int, model_tag: str | None) -> str:
     """
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     topo = _get_parallel_topology()
+    if model_idx is None:
+        return f"model_{model_tag}_rank_{rank}_{topo}"
     if model_tag:
         return f"model_{model_idx}_{model_tag}_rank_{rank}_{topo}"
     return f"model_{model_idx}_rank_{rank}_{topo}"

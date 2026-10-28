@@ -18,6 +18,7 @@ import inspect
 from typing import Callable, TypeVar
 
 from ._api import (
+    DefaultTag,
     _check_dynamic_arg_dims,
     _infer_dynamic_arg_dims,
     _magi_compile_bound_method,
@@ -35,7 +36,7 @@ _O = TypeVar("_O", bound=object)
 def magi_compile(
     obj: _T | _O | _F | None = None,
     *,
-    model_tag: str | None = None,
+    model_tag: str | Callable[[object], str | None] | None = None,
     dynamic_arg_dims: dict[str, int | list[int]] | None = None,
     enable_if: Callable[[], bool] | None = None,
     config_patch: Callable[[CompileConfig], CompileConfig] | None = None,
@@ -105,7 +106,9 @@ def magi_compile(
     Arguments
     ---------
     - dynamic_arg_dims: Dictionary mapping argument names to dynamic dimensions (int or list[int]).
-    - model_tag: Optional tag for caching path (defaults to class/function name).
+    - model_tag: Name for the cache path, or a callable mapping the compiled object to one (or to None)
+      at its first call. An explicit tag replaces the call-order model index in the path, so a second
+      live object with the same tag raises ValueError. Defaults to the class/function name behind that index.
     - enable_if: Callable returning bool; compilation happens only if this returns True.
     - method_name: Optional explicit method for class/instance targets. If omitted,
       ``forward`` is used by default; for non-module targets without ``forward``,
@@ -177,7 +180,7 @@ def magi_compile(
     _check_dynamic_arg_dims(inferred_dims, target_func)
 
     if model_tag is None:
-        model_tag = getattr(obj, "__name__", obj.__class__.__name__)
+        model_tag = DefaultTag(getattr(obj, "__name__", obj.__class__.__name__))
 
     # 3. Dispatch by entry kind (class / instance / bound method / bare function)
 

@@ -20,6 +20,7 @@ import os
 import shutil
 import socket
 import time
+import weakref
 from collections.abc import Collection, Sequence
 from contextlib import contextmanager
 from typing import Callable
@@ -192,12 +193,31 @@ def _run_orchestration(state: MagiCompileState, args, kwargs):
         state.traced_files.clear()
 
 
+class DefaultTag(str):
+    """The class/function name magi_compile falls back to: not unique, so cache dirs keep model_idx."""
+
+
+# An explicit tag stands in for model_idx in cache dirs, so it may name only one live object per process.
+_TAG_OWNERS: weakref.WeakValueDictionary[str, object] = weakref.WeakValueDictionary()
+
+
+def _resolve_model_tag(model_tag: str | Callable[[object], str | None], compile_obj: object) -> str:
+    tag = model_tag(compile_obj) if callable(model_tag) else model_tag
+    if tag is None:
+        return DefaultTag(getattr(compile_obj, "__name__", type(compile_obj).__name__))
+    if not isinstance(tag, DefaultTag):
+        owner = _TAG_OWNERS.setdefault(tag, compile_obj)
+        if owner is not compile_obj:
+            raise ValueError(f"model_tag {tag!r} is already used by another live {type(owner).__name__} in this process")
+    return tag
+
+
 def _lazy_init_magi_state(
     state_holder: object,
     compile_obj: object,
     dynamic_arg_dims: dict[str, int | list[int]] | None,
     conf: CompileConfig,
-    model_tag: str,
+    model_tag: str | Callable[[object], str | None],
     target_method_name: str | None,
     state_attr: str,
 ):
@@ -206,6 +226,7 @@ def _lazy_init_magi_state(
         return
 
     compilation_counter.num_models_seen += 1
+    model_tag = _resolve_model_tag(model_tag, compile_obj)
 
     setattr(
         state_holder,
@@ -213,7 +234,7 @@ def _lazy_init_magi_state(
         MagiCompileState(
             compile_obj,
             conf,
-            model_idx=compilation_counter.num_models_seen,
+            model_idx=compilation_counter.num_models_seen if isinstance(model_tag, DefaultTag) else None,
             model_tag=model_tag,
             dynamic_arg_dims=dynamic_arg_dims,
             target_method_name=target_method_name,
