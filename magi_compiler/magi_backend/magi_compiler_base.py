@@ -149,7 +149,7 @@ class MagiCompileState:
     @property
     def aot_compilation_path(self) -> str:
         """
-        AOT artifact path, following the same ``model_{idx}_{tag}_rank_{rank}``
+        AOT artifact path, following the same ``model_{tag}_rank_{rank}_{topology}``
         layout as the JIT cache (``cache_dump_path``):
 
             cache_root_dir/torch_aot_compile/model_{tag}_rank_{rank}_{topology}/{hash}/model
