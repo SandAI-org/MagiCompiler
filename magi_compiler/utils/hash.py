@@ -13,11 +13,14 @@
 # limitations under the License.
 
 import hashlib
+import itertools
 import os
+import re
 from collections.abc import Sequence
 from functools import reduce
 from typing import Any, List, Union
 
+import torch
 import torch.fx as fx
 from torch.distributed.tensor import DTensor
 
@@ -56,12 +59,47 @@ def compute_code_hash_with_content(file_contents: dict[str, str]) -> str:
     return compute_hash("\n".join(hash_content))
 
 
+# Dynamo names a lifted module parameter or buffer placeholder ``..._parameters_<name>_`` / ``..._buffers_<name>_``.
+_MODULE_STATE = re.compile(r"_(parameters|buffers)_")
+
+
+def _state_layout(x: torch.Tensor) -> str:
+    layout = f"{x.dtype}{list(x.shape)}"
+    if isinstance(x, DTensor):
+        layout += f" {x.placements} {tuple(x.device_mesh.shape)}"
+    return layout
+
+
+def _input_signature(name: str, x: torch.Tensor) -> str | None:
+    if _MODULE_STATE.search(name):
+        return f"{name}: {_state_layout(x)}"
+    if isinstance(x, DTensor):
+        return f"{name}: {x.dtype} {x.placements} {tuple(x.device_mesh.shape)}"
+    return None
+
+
 def compute_graph_hash(graph: fx.GraphModule, example_inputs: Sequence[Any]) -> str:
-    # graph.code and Tensor/scalar types both change across TensorifyScalarRestartAnalysis.
-    # DTensor placements do not appear in traced source files.
-    return compute_hash(
-        [f"DTensor({x.dtype}, {x.placements}, {tuple(x.device_mesh.shape)})" for x in example_inputs if isinstance(x, DTensor)]
-    )
+    """Every parameter and buffer by name, dtype and shape, so another layer count or weight layout (PP stage,
+    quantization) gets its own key, plus DTensor placements, which do not appear in traced files.
+
+    Only these stay the same in the retrace after TensorifyScalarRestartAnalysis and between an AOT compile and load:
+    the retrace renames FX nodes and drops the 0-d tensors that carried Python floats, and the AOT compile sees
+    concrete sizes for the dims that are symbolic on load, so activations and graph.code stay out.
+    """
+    names = [node.name for node in graph.graph.nodes if node.op == "placeholder"]
+    sigs = [_input_signature(name, x) for name, x in zip(names, example_inputs) if isinstance(x, torch.Tensor)]
+    return compute_hash([sig for sig in sigs if sig is not None])
+
+
+def compute_module_state_hash(obj: object) -> str:
+    """Every parameter and buffer of ``obj`` by name, dtype and shape, or nothing unless ``obj`` is a module.
+
+    The AOT key needs it: an AOT load skips Dynamo and drops every guard, so nothing else checks the weight layout.
+    """
+    if not isinstance(obj, torch.nn.Module):
+        return compute_hash([])
+    state = itertools.chain(obj.named_parameters(), obj.named_buffers())
+    return compute_hash([f"{name}: {_state_layout(x)}" for name, x in state])
 
 
 def compute_code_hash(files: set[str]) -> str:

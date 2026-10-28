@@ -40,9 +40,9 @@ class TestTopologyCacheIsolation:
         p1, p2, p3 = _patch_dist(is_init=False)
         with p1, p2, p3:
             with patch("magi_compiler.config._get_parallel_topology", return_value="ep6_cp1"):
-                name_a = model_rank_dir_name(0, None)
+                name_a = model_rank_dir_name("m")
             with patch("magi_compiler.config._get_parallel_topology", return_value="ep8_cp1"):
-                name_b = model_rank_dir_name(0, None)
+                name_b = model_rank_dir_name("m")
         assert name_a != name_b
         assert "ep6_cp1" in name_a
         assert "ep8_cp1" in name_b
@@ -51,17 +51,17 @@ class TestTopologyCacheIsolation:
         p1, p2, p3 = _patch_dist(is_init=False)
         with p1, p2, p3:
             with patch("magi_compiler.config._get_parallel_topology", return_value="ws4"):
-                name = model_rank_dir_name(1, "sr")
-        assert "model_1_sr_rank_" in name
+                name = model_rank_dir_name("sr")
+        assert "model_sr_rank_" in name
         assert "ws4" in name
 
     def test_magi_cache_dump_path_varies_with_topology(self, tmp_path: Path):
         p1, p2, p3 = _patch_dist(is_init=False)
         with p1, p2, p3:
             with patch("magi_compiler.config._get_parallel_topology", return_value="ep6_cp1"):
-                path_a = magi_cache_dump_path(str(tmp_path), 0)
+                path_a = magi_cache_dump_path(str(tmp_path), "m")
             with patch("magi_compiler.config._get_parallel_topology", return_value="ep8_cp1"):
-                path_b = magi_cache_dump_path(str(tmp_path), 0)
+                path_b = magi_cache_dump_path(str(tmp_path), "m")
         assert path_a != path_b
         assert path_a.parent == path_b.parent
         assert "ep6_cp1" in str(path_a)
@@ -82,7 +82,7 @@ class TestTopologyCacheIsolation:
 
             os.environ.pop("MAGI_COMPILE_TOPOLOGY_KEY", None)
             topo = _get_parallel_topology()
-            name = model_rank_dir_name(0, None)
+            name = model_rank_dir_name("m")
         assert topo == "ws8"
         assert "ws8" in name
 
@@ -91,7 +91,7 @@ class TestTopologyCacheIsolation:
         p1, p2, p3 = _patch_dist(is_init=True, rank=0, world_size=8)
         with p1, p2, p3, patch.dict("os.environ", {"MAGI_COMPILE_TOPOLOGY_KEY": "ep6_cp2_dp1"}):
             topo = _get_parallel_topology()
-            name = model_rank_dir_name(0, None)
+            name = model_rank_dir_name("m")
         assert topo == "ep6_cp2_dp1"
         assert "ep6_cp2_dp1" in name
 
@@ -99,8 +99,8 @@ class TestTopologyCacheIsolation:
         p1, p2, p3 = _patch_dist(is_init=False)
         with p1, p2, p3:
             with patch("magi_compiler.config._get_parallel_topology", return_value="ep6_cp2"):
-                name1 = model_rank_dir_name(0, None)
-                name2 = model_rank_dir_name(0, None)
+                name1 = model_rank_dir_name("m")
+                name2 = model_rank_dir_name("m")
         assert name1 == name2
 
 

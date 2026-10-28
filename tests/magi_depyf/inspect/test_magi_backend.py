@@ -83,7 +83,7 @@ def _compile_simple_model(tmpdir: str, cudagraph_mode: str = "NONE"):
         return torch.nn.functional.linear(h, w2, b2)
 
     config = _make_config(tmpdir, cudagraph_mode=cudagraph_mode)
-    backend = MagiBackend(config, model_idx=1, model_tag="test", traced_files=OrderedSet(), inductor_compile_config={})
+    backend = MagiBackend(config, model_tag="test", traced_files=OrderedSet(), inductor_compile_config={})
     compiled = torch.compile(fn, backend=backend)
 
     ctx = patch.object(CudaGraphMgr, "run", _cudagraph_passthrough) if cudagraph_mode != "NONE" else _nullcontext()
@@ -268,7 +268,7 @@ class TestDumpSrcEndToEnd:
 
         cache = tempfile.mkdtemp(dir=self.cache_dir)
         config = _make_config(cache, cudagraph_mode=cudagraph_mode)
-        backend = MagiBackend(config, model_idx=1, model_tag="test", traced_files=OrderedSet(), inductor_compile_config={})
+        backend = MagiBackend(config, model_tag="test", traced_files=OrderedSet(), inductor_compile_config={})
         compiled = torch.compile(fn, backend=backend)
 
         output_dir = Path(self.tmpdir) / cudagraph_mode
