@@ -1377,6 +1377,31 @@ def test_a_host_built_module_parks_on_its_first_move_and_moves_the_rest_with_tor
 
 
 @requires_cuda
+def test_a_host_built_module_releases_each_original_before_copying_the_next(monkeypatch):
+    """Parking must not hold every pageable original alongside its pinned copy: an unsharded
+    400B Base has no room for the whole model twice in host memory."""
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
+
+    module = _install_host_first_hooks(torch.nn.Sequential(*(torch.nn.Linear(64, 64, bias=False) for _ in range(4))))
+    weights = [layer.weight for layer in module]
+    expected_weights = [weight.detach().clone() for weight in weights]
+    store = get_global_host_weight_store()
+    reserve_host_buffer = store.reserve_host_buffer
+    weights_on_host_at_each_reservation = []
+
+    def record_weights_on_host(*args, **kwargs):
+        weights_on_host_at_each_reservation.append(sum(weight.device.type == "cpu" for weight in weights))
+        return reserve_host_buffer(*args, **kwargs)
+
+    monkeypatch.setattr(store, "reserve_host_buffer", record_weights_on_host)
+    module.cuda()
+
+    assert weights_on_host_at_each_reservation == [4, 3, 2, 1]
+    for weight, expected in zip(weights, expected_weights):
+        torch.testing.assert_close(store.host_buffer(store.slot_for_tensor(weight)), expected)
+
+
+@requires_cuda
 @pytest.mark.parametrize("assign", [False, True], ids=["copy", "assign"])
 @pytest.mark.parametrize("load_target", ["parent", "compiled", "leaf"])
 @pytest.mark.parametrize("resident", [False, True], ids=["offloaded", "resident"])

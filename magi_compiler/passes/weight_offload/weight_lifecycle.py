@@ -276,29 +276,32 @@ def _skip_managed_weights(fn):
 
 # A move may arrive under inference mode, and placement later writes these stand-ins outside it.
 @torch.inference_mode(False)
-def _install_weight_standins(module: nn.Module, parked_parameters: list[tuple[list[str], nn.Parameter, torch.Tensor]]) -> int:
-    """Swap each weight for a storage-free CUDA stand-in and adopt its filled host buffer.
-    Returns the bytes handed over. Stand-in construction temporarily allocates one full shard."""
+def _install_weight_standin(names: list[str], param: nn.Parameter, host_buffer: torch.Tensor) -> int:
+    """Swap one weight for a storage-free CUDA stand-in and adopt its filled host buffer.
+    Returns its slot. Stand-in construction temporarily allocates one full shard."""
     device = torch.device("cuda", torch.cuda.current_device())
-    handed_off_bytes = 0
-    host_slots = []
-    for names, param, host_buffer in parked_parameters:
-        device_standin_buffer = torch.empty(host_buffer.shape, dtype=host_buffer.dtype, device=device)
-        device_standin_buffer.untyped_storage().resize_(0)
-        new_data = (
-            _rebuild_dtensor(param=param, local=device_standin_buffer) if isinstance(param, DTensor) else device_standin_buffer
-        )
-        _swap_parameter_payload(param=param, new_data=new_data)
-        # After, not before: the slot is keyed on the tensor the graph will be traced against.
-        device_standin = _local_weight_tensor(param)
-        host_slots.append(
-            get_global_host_weight_store().bind_host_buffer(
-                host_buffer=host_buffer, device_standin=device_standin, parameter_name=_normalize_parameter_name(names[0])
-            )
-        )
-        handed_off_bytes += host_buffer.numel() * host_buffer.element_size()
+    device_standin_buffer = torch.empty(host_buffer.shape, dtype=host_buffer.dtype, device=device)
+    device_standin_buffer.untyped_storage().resize_(0)
+    new_data = (
+        _rebuild_dtensor(param=param, local=device_standin_buffer) if isinstance(param, DTensor) else device_standin_buffer
+    )
+    _swap_parameter_payload(param=param, new_data=new_data)
+    # After, not before: the slot is keyed on the tensor the graph will be traced against.
+    device_standin = _local_weight_tensor(param)
+    return get_global_host_weight_store().bind_host_buffer(
+        host_buffer=host_buffer, device_standin=device_standin, parameter_name=_normalize_parameter_name(names[0])
+    )
+
+
+@torch.inference_mode(False)
+def _install_weight_standins(module: nn.Module, parked_parameters: list[tuple[list[str], nn.Parameter, torch.Tensor]]) -> int:
+    """Install a stand-in for each filled host buffer and record the slots. Returns the bytes handed over."""
+    host_slots = [
+        _install_weight_standin(names=names, param=param, host_buffer=host_buffer)
+        for names, param, host_buffer in parked_parameters
+    ]
     record_handoff_slots(module=module, slots=host_slots)
-    return handed_off_bytes
+    return sum(host_buffer.numel() * host_buffer.element_size() for _, _, host_buffer in parked_parameters)
 
 
 @torch.inference_mode(False)
@@ -311,23 +314,27 @@ def _park_cpu_parameters(module: nn.Module, min_weight_bytes: int) -> int:
             continue
         if param.is_contiguous():
             parameters_by_identity.setdefault(id(param), ([], param))[0].append(name)
-    parked_parameters = []
+    host_slots = []
+    handed_off_bytes = 0
     for names, param in parameters_by_identity.values():
         host_buffer = get_global_host_weight_store().reserve_host_buffer(
             shape=param.shape, dtype=param.dtype, parameter_name=_normalize_parameter_name(names[0])
         )
         host_buffer.copy_(param.detach())
-        parked_parameters.append((names, param, host_buffer))
-    if not parked_parameters:
+        # Swap before the next copy so the pageable original is freed now: copying every weight
+        # first holds the whole model twice in host memory, which a 400B unsharded Base cannot afford.
+        host_slots.append(_install_weight_standin(names=names, param=param, host_buffer=host_buffer))
+        handed_off_bytes += host_buffer.numel() * host_buffer.element_size()
+    if not host_slots:
         return 0
-    handed_off_bytes = _install_weight_standins(module=module, parked_parameters=parked_parameters)
+    record_handoff_slots(module=module, slots=host_slots)
     magi_logger.info(
         "host offload: %s parked %d CPU weight(s), %.1f MiB, on first CUDA move",
         type(module).__name__,
-        len(parked_parameters),
+        len(host_slots),
         handed_off_bytes / 2**20,
     )
-    return len(parked_parameters)
+    return len(host_slots)
 
 
 def _call_class_apply(module: nn.Module, fn, recurse: bool):
