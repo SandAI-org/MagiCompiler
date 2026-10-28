@@ -50,8 +50,6 @@ from magi_compiler.passes.weight_offload import (
 from magi_compiler.profiling import ProfilingRuntimeEstimator
 from magi_compiler.utils import magi_logger
 
-_INDUCTOR_DEFAULT_REORDERS = ["raise_comms", "sink_waits"]
-
 _MAX_LOGGED_WEIGHT_NAMES = 8
 """Arbitrary cap that keeps the restored-weights warning to one readable line."""
 
@@ -92,7 +90,9 @@ def build_transfer_overlap_passes(
     """Inductor's ``reorder_for_compute_comm_overlap_passes`` for this graph; None leaves Inductor's own.
 
     ``SnodeCostProfile`` runs first and fills the cost table every later pass reads.
-    FSDP replaces Inductor's default reorders; offload alone keeps them for CP/EP overlap.
+    FSDP replaces configured reorders; offload alone keeps only explicitly configured ones.
+    Inductor's ``raise_comms``/``sink_waits`` are never added: ``sink_waits`` treats H2D waits
+    as collective waits and hoists every dependency-free ``empty`` to the graph start.
     """
     if not (fsdp_config.enable_fsdp or _any_rank_inserted_loads(offload_config=offload_config, loads_inserted=loads_inserted)):
         return None
@@ -123,7 +123,7 @@ def build_transfer_overlap_passes(
             )
         )
     else:
-        passes.extend(default_passes or _INDUCTOR_DEFAULT_REORDERS)
+        passes.extend(default_passes or ())
 
     if loads_inserted:
         # Last: loads are hoisted around the gathers' final positions.
