@@ -126,8 +126,8 @@ def test_plain_param_scheduler_runs_on_every_rank_once_any_rank_loads(tmp_path):
     mp.spawn(_scheduler_passes_worker, args=(2, port, str(tmp_path)), nprocs=2, join=True)
 
     with_loads, without_loads = (json.loads((tmp_path / f"{rank}.json").read_text()) for rank in range(2))
-    assert with_loads == ["SnodeCostProfile", "raise_comms", "sink_waits", "H2dLoadReorder"]
-    assert without_loads == ["SnodeCostProfile", "raise_comms", "sink_waits"]
+    assert with_loads == ["SnodeCostProfile", "H2dLoadReorder"]
+    assert without_loads == ["SnodeCostProfile"]
 
 
 class _RankLocalOffloadNet(torch.nn.Module):
