@@ -57,14 +57,3 @@ def accelerator_type() -> str:
 
     acc = _torch.accelerator.current_accelerator()
     return acc.type if acc is not None else "cuda"
-
-
-def is_host_scalar(val) -> bool:
-    """0-dim CPU tensor, e.g. a Python float lifted by Dynamo.
-
-    Device kernels accept these as-is, and they must stay on the host: a fake one moved to the device loses
-    its constant value, so a later ``.item()`` becomes data-dependent.
-    """
-    import torch as _torch
-
-    return isinstance(val, _torch.Tensor) and val.dim() == 0 and val.device.type == "cpu"

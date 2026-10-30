@@ -32,10 +32,10 @@ from torch._guards import detect_fake_mode
 import magi_compiler.utils.envs as envs
 from magi_compiler.config import CompileConfig, CompileMode, CudaGraphMode, inductor_compile_config_hash, magi_cache_dump_path
 from magi_compiler.magi_depyf.timeline import observe_lifecycle, observe_lifecycle_context
-from magi_compiler.offload.offload_warpper import OffloadWrapper
+from magi_compiler.offload.offload_warpper import OffloadWrapper, is_python_scalar_input, mark_python_scalar_inputs
 from magi_compiler.passes import CustomJointGraphPartitionFn, FullGraphPassManager, PostGradPassManager, pass_context
 from magi_compiler.utils import compilation_counter, compute_code_hash, compute_graph_hash, compute_hash, magi_logger
-from magi_compiler.utils.device import accelerator_module, accelerator_type, is_host_scalar
+from magi_compiler.utils.device import accelerator_module, accelerator_type
 from magi_compiler.utils.visualize import save_fx_graph_visualization
 
 from ._cache_data_cls import CacheEntry, CacheHandle
@@ -110,13 +110,13 @@ class CompilerManager:
         Initialize the cache directory for the compiler.
 
         The organization of the cache directory is as follows:
-        cache_dir=/path/to/magi_cache/model_{idx}[_{tag}]_rank_{rank}/hash_str/[prefix/]
+        cache_dir=/path/to/magi_cache/model_{tag}_rank_{rank}_{topology}/hash_str/[prefix/]
         inside cache_dir, there will be:
         - subgraph_indices.py
         - computation_graph.py
 
         for multiple prefixes, they can share the same base cache dir of
-        /path/to/magi_cache/model_{idx}[_{tag}]_rank_{rank}/hash_str/ to store some
+        /path/to/magi_cache/model_{tag}_rank_{rank}_{topology}/hash_str/ to store some
         common compilation artifacts.
         """
 
@@ -277,7 +277,7 @@ def _recursive_to_device(val, target_device: torch.device):
     if isinstance(val, (list, tuple)):
         items = [_recursive_to_device(v, target_device) for v in val]
         return type(val)(items) if any(n is not o for n, o in zip(items, val)) else val
-    if hasattr(val, 'device') and str(val.device) == 'cpu' and not is_host_scalar(val):
+    if hasattr(val, 'device') and str(val.device) == 'cpu':
         new_val = val.to(target_device)
         if isinstance(val, torch.nn.Parameter):
             new_val = torch.nn.Parameter(new_val, requires_grad=val.requires_grad)
@@ -365,8 +365,9 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         fake_args = self._build_fake_args(args)
         if self.compile_config.offload_config.model_cpu_offload:
             fix_graph_device_placement(self.module)
-            for i, arg in enumerate(fake_args):
-                if isinstance(arg, torch.Tensor) and not is_host_scalar(arg):
+            placeholders = [node for node in self.module.graph.nodes if node.op == "placeholder"]
+            for i, (arg, node) in enumerate(zip(fake_args, placeholders, strict=True)):
+                if isinstance(arg, torch.Tensor) and not is_python_scalar_input(node):
                     fake_args[i] = arg.to(accelerator_type())
 
         with self.fake_mode, enable_python_dispatcher():
@@ -548,13 +549,11 @@ class MagiBackend:
     def __init__(
         self,
         compile_config: CompileConfig,
-        model_idx: int,
         model_tag: str,
         traced_files: "OrderedSet",
         inductor_compile_config: dict[str, Any],
     ):
         self.compile_config = compile_config
-        self.model_idx = model_idx
         self.model_tag = model_tag
         self.traced_files = traced_files
         self.inductor_compile_config = inductor_compile_config
@@ -600,10 +599,8 @@ class MagiBackend:
             ]
         )
 
-        # Path: .../model_{idx}_{model_tag}_rank_{rank}/{hash}/
-        self.local_magi_cache_path: Path = (
-            magi_cache_dump_path(self.compile_config.cache_root_dir, self.model_idx, self.model_tag) / hash_key
-        )
+        # Path: .../model_{model_tag}_rank_{rank}_{topology}/{hash}/
+        self.local_magi_cache_path: Path = magi_cache_dump_path(self.compile_config.cache_root_dir, self.model_tag) / hash_key
         self.local_magi_cache_path.mkdir(parents=True, exist_ok=True)
         self.compiler_manager.initialize_cache(self.local_magi_cache_path)
 
@@ -742,6 +739,7 @@ class MagiBackend:
 
         self._init_cache(graph=graph, example_inputs=example_inputs)
 
+        mark_python_scalar_inputs(graph)
         self.full_graph_pass_manager(graph)
 
         split_gm, piecewise_graphs = self._split_graph(graph, example_inputs)
@@ -772,17 +770,12 @@ class MagiBackend:
             runnable_gm = gen_wrap_func_for_cudagraph(func=split_gm, mode_prefix=CudaGraphMode.FULL.name.lower())
 
         return MagiSerializableFunction(
-            graph,
-            self.model_tag,
-            runnable_gm,
-            model_idx=self.model_idx,
-            traced_files=list(self.traced_files),
-            compile_config=self.compile_config,
+            graph, self.model_tag, runnable_gm, traced_files=list(self.traced_files), compile_config=self.compile_config
         )
 
 
 def init_backend(
-    compile_config: CompileConfig, model_idx: int, model_tag: str, traced_files: "OrderedSet", inductor_config: dict[str, Any]
+    compile_config: CompileConfig, model_tag: str, traced_files: "OrderedSet", inductor_config: dict[str, Any]
 ) -> str | Callable:
     """
     Initialize the backend based on CompileConfig.
@@ -799,6 +792,6 @@ def init_backend(
         return compile_config.backend
     elif compile_config.compile_mode == CompileMode.MAGI_COMPILE:
         assert compile_config.backend in ["eager", "inductor"], f"Invalid backend for MagiCompiler: {compile_config.backend}"
-        return MagiBackend(compile_config, model_idx, model_tag, traced_files, inductor_config)
+        return MagiBackend(compile_config, model_tag, traced_files, inductor_config)
     else:
         raise ValueError(f"Invalid compile mode: {compile_config.compile_mode}")

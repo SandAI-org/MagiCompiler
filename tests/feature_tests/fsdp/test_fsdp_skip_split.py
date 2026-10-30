@@ -33,7 +33,7 @@ def test_split_graph_skips_fsdp_overlap_when_graph_split_enabled(monkeypatch) ->
     called: list[bool] = []
     cfg = CompileConfig(fsdp_config=FSDPConfig(enable_fsdp=True))
     assert cfg.disable_graph_split is False
-    backend = MagiBackend(cfg, 0, "vae", OrderedSet(), {})
+    backend = MagiBackend(cfg, "vae", OrderedSet(), {})
     monkeypatch.setattr(backend, "_apply_fsdp_fullgraph_overlap", lambda *a, **k: called.append(True))
     graph = torch.fx.symbolic_trace(_Add())
     backend._split_graph(graph, (torch.zeros(2),))
@@ -43,7 +43,7 @@ def test_split_graph_skips_fsdp_overlap_when_graph_split_enabled(monkeypatch) ->
 def test_fullgraph_still_applies_fsdp_overlap(monkeypatch) -> None:
     called: list[bool] = []
     cfg = CompileConfig(disable_graph_split=True, fsdp_config=FSDPConfig(enable_fsdp=True))
-    backend = MagiBackend(cfg, 0, "base", OrderedSet(), {})
+    backend = MagiBackend(cfg, "base", OrderedSet(), {})
     monkeypatch.setattr(backend, "_apply_fsdp_fullgraph_overlap", lambda *a, **k: called.append(True))
     graph = torch.fx.symbolic_trace(_Add())
     backend._split_graph(graph, (torch.zeros(2),))

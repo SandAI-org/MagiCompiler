@@ -200,10 +200,13 @@ class OffloadConfig(BaseModel):
         None,
         description=(
             "Override for per-rank shared memory mode.  When None (default), "
-            "MagiCompiler auto-detects by comparing weight fingerprints across "
-            "ranks: if all ranks hold identical weights, a single shared mmap is "
-            "used; otherwise each rank writes its own file.  Set to True to force "
-            "per-rank mode (e.g. expert parallelism), or False to force sharing.  "
+            "MagiCompiler compares each weight's fingerprint across the ranks of "
+            "a host: weights identical on all of them (e.g. the dense weights "
+            "under expert parallelism) share one mmap per host if its shared "
+            "memory has room, the rest stay per rank.  Set to True to keep every "
+            "weight per rank, or False to skip the fingerprints and the room check "
+            "and share every weight.  Shared weights that differ from local rank "
+            "0's byte for byte always stay per rank.  "
             "Env var: MAGI_COMPILE_OFFLOAD_CONFIG__FORCE_PER_RANK_WEIGHTS (1/0/true/false)."
         ),
     )
@@ -455,8 +458,8 @@ def _get_parallel_topology() -> str:
     return f"ws{torch.distributed.get_world_size()}"
 
 
-def model_rank_dir_name(model_idx: int, model_tag: str | None) -> str:
-    """Directory name: ``model_{idx}[_{tag}]_rank_{rank}_{topology}``.
+def model_rank_dir_name(model_tag: str) -> str:
+    """Directory name: ``model_{tag}_rank_{rank}_{topology}``.
 
     Topology encodes all parallel dimension sizes via PSM.topology_key().
     Different topologies produce different tensor strides in custom-op meta
@@ -464,27 +467,25 @@ def model_rank_dir_name(model_idx: int, model_tag: str | None) -> str:
     """
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     topo = _get_parallel_topology()
-    if model_tag:
-        return f"model_{model_idx}_{model_tag}_rank_{rank}_{topo}"
-    return f"model_{model_idx}_rank_{rank}_{topo}"
+    return f"model_{model_tag}_rank_{rank}_{topo}"
 
 
-def debug_dump_path(cache_root_dir: str, model_idx: int, model_tag: str | None = None) -> Path:
+def debug_dump_path(cache_root_dir: str, model_tag: str) -> Path:
     from datetime import datetime
 
     run_id = datetime.now().strftime("run_%Y%m%d_%H%M%S")
-    return Path(cache_root_dir) / "magi_depyf" / run_id / model_rank_dir_name(model_idx, model_tag)
+    return Path(cache_root_dir) / "magi_depyf" / run_id / model_rank_dir_name(model_tag)
 
 
-def magi_cache_dump_path(cache_root_dir: str, model_idx: int, model_tag: str | None = None) -> Path:
-    return Path(cache_root_dir) / "magi_cache" / model_rank_dir_name(model_idx, model_tag)
+def magi_cache_dump_path(cache_root_dir: str, model_tag: str) -> Path:
+    return Path(cache_root_dir) / "magi_cache" / model_rank_dir_name(model_tag)
 
 
 def triton_cache_dump_path(cache_root_dir: str) -> Path:
     return Path(cache_root_dir) / "triton_cache"
 
 
-def inductor_cache_dump_path(cache_root_dir: str, model_idx: int | None = None, model_tag: str | None = None) -> Path:
+def inductor_cache_dump_path(cache_root_dir: str) -> Path:
     return Path(cache_root_dir) / "inductor_cache"
 
 
