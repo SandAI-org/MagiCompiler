@@ -24,12 +24,14 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 # global var for torch.autograd.profiler.emit_nvtx
 _EMIT_NVTX_CTX: None | torch.autograd.profiler.emit_nvtx = None
+_HAS_NVTX = hasattr(torch._C, "_nvtx")
 
 
 @torch.library.custom_op("magi_compile::nvtx_range_push", mutates_args=())
 def nvtx_range_push(event_name: str) -> None:
     """torch.ops.magi_compile.nvtx_range_push"""
-    torch.cuda.nvtx.range_push(event_name)
+    if _HAS_NVTX:
+        torch.cuda.nvtx.range_push(event_name)
 
 
 @nvtx_range_push.register_fake
@@ -40,7 +42,8 @@ def _(event_name: str) -> None:
 @torch.library.custom_op("magi_compile::nvtx_range_pop", mutates_args=())
 def nvtx_range_pop() -> None:
     """torch.ops.magi_compile.nvtx_range_pop"""
-    torch.cuda.nvtx.range_pop()
+    if _HAS_NVTX:
+        torch.cuda.nvtx.range_pop()
 
 
 @nvtx_range_pop.register_fake
@@ -67,14 +70,14 @@ class add_nvtx_event:
             # nor modifying a variable not in the current scope
             # so we have no choice but assign a constant event name when compiling
             nvtx_range_push("torch compile region")
-        else:
+        elif _HAS_NVTX:
             torch.cuda.nvtx.range_push(self.enter_name)
         return self
 
     def __exit__(self, *excinfo):
         if torch.compiler.is_compiling():
             nvtx_range_pop()
-        else:
+        elif _HAS_NVTX:
             torch.cuda.nvtx.range_pop()
 
 

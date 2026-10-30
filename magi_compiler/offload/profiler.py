@@ -16,26 +16,30 @@ from typing import Dict
 
 import torch
 
+from magi_compiler.utils.device import accelerator_module, accelerator_type
+
 
 class OffloadProfiler:
     def __init__(self):
+        self.device_module = accelerator_module()
         self.compute_events: Dict[str, Dict[str, torch.cuda.Event]] = {}
         self.timings: Dict[str, Dict[str, float]] = {}
 
     def start_compute_profile(self, name: str, stream: torch.cuda.Stream):
         if name not in self.compute_events:
             self.compute_events[name] = {}
-        start_event = torch.cuda.Event(enable_timing=True)
+        start_event = self.device_module.Event(enable_timing=True)
         start_event.record(stream)
         self.compute_events[name]["start"] = start_event
 
     def end_compute_profile(self, name: str, stream: torch.cuda.Stream):
-        end_event = torch.cuda.Event(enable_timing=True)
+        end_event = self.device_module.Event(enable_timing=True)
         end_event.record(stream)
         self.compute_events[name]["end"] = end_event
 
-    def get_h2d_bandwidth(self, size_mb=1024, iters=3, warmup=3, dtype=torch.float32, device=torch.device("cuda")):
-        torch.cuda.synchronize()
+    def get_h2d_bandwidth(self, size_mb=1024, iters=3, warmup=3, dtype=torch.float32, device=None):
+        device = device or accelerator_type()
+        self.device_module.synchronize()
 
         num_elements = size_mb * 1024 * 1024 // torch.tensor([], dtype=dtype).element_size()
 
@@ -45,10 +49,10 @@ class OffloadProfiler:
         # warmup
         for _ in range(warmup):
             gpu_tensor.copy_(cpu_tensor, non_blocking=True)
-        torch.cuda.synchronize()
+        self.device_module.synchronize()
 
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
+        start_event = self.device_module.Event(enable_timing=True)
+        end_event = self.device_module.Event(enable_timing=True)
 
         start_event.record()
 
@@ -56,7 +60,7 @@ class OffloadProfiler:
             gpu_tensor.copy_(cpu_tensor, non_blocking=True)
 
         end_event.record()
-        torch.cuda.synchronize()
+        self.device_module.synchronize()
 
         elapsed_ms = start_event.elapsed_time(end_event)
         elapsed_s = elapsed_ms / 1000.0
@@ -72,7 +76,7 @@ class OffloadProfiler:
         return obj_list[0]
 
     def summarize(self) -> Dict[str, Dict[str, float]]:
-        torch.cuda.synchronize()
+        self.device_module.synchronize()
         results = {}
         for name, evs in self.compute_events.items():
             if name not in results:
