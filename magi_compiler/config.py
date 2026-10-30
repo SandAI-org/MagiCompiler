@@ -226,8 +226,10 @@ class OffloadConfig(BaseModel):
             "for a meta-built model (e.g. model.half().cuda(), not model.cuda().half()); "
             "parked weights keep their dtype, and later dtype or combined device+dtype casts are unsupported. "
             "The graph loads separate device buffers with magi::h2d_load and schedules transfers to overlap compute. "
-            "Without FSDP, profiling and H2D placement are rank-local, so only participating ranks need to compile. "
-            "Collective ops use analytical costs in this mode rather than being replayed for profiling. "
+            "With an initialized multi-rank WORLD, every rank must compile the same graphs in the same order, "
+            "including ranks that offload no weight: overlap scheduling is agreed over WORLD, and "
+            "fsdp_config.cost_mode='profile_sync' profiles in rank lockstep, so a compile-cache miss on one rank "
+            "recompiles every rank. "
             "See offload_max_device_weight_mib for the residency and in-flight scheduling budget."
         ),
     )

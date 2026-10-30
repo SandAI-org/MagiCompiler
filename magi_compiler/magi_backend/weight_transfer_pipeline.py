@@ -84,6 +84,17 @@ def _any_rank_inserted_loads(*, offload_config: OffloadConfig, loads_inserted: b
     return rank_sync.any_rank_has_flag(loads_inserted)
 
 
+def _compiles_in_rank_lockstep(*, fsdp_config: FSDPConfig, offload_config: OffloadConfig) -> bool:
+    """Whether this graph's Inductor passes issue WORLD collectives.
+
+    Only ranks that miss the compile cache enter Inductor, so when this holds
+    every rank must hit or miss the cache together.
+    """
+    # FSDP placement negotiates over WORLD in every cost mode; offload alone only through the lockstep estimator.
+    profiles_offload_in_lockstep = offload_config.graph_weight_offload and fsdp_config.cost_mode == "profile_sync"
+    return fsdp_config.enable_fsdp or profiles_offload_in_lockstep
+
+
 def build_transfer_overlap_passes(
     *, fsdp_config: FSDPConfig, offload_config: OffloadConfig, loads_inserted: bool, default_passes: list | None
 ) -> list | None:
@@ -101,7 +112,7 @@ def build_transfer_overlap_passes(
     # Custom ops count as internal collectives and stay at an analytical 0 until
     # warm_and_sync remeasures them. H2D placement reads those costs, so offload
     # needs the same lockstep estimator as FSDP.
-    sync_across_ranks = fsdp_config.enable_fsdp or offload_config.graph_weight_offload
+    sync_across_ranks = _compiles_in_rank_lockstep(fsdp_config=fsdp_config, offload_config=offload_config)
     estimator = (
         None if fsdp_config.cost_mode == "analytical" else ProfilingRuntimeEstimator(sync_across_ranks=sync_across_ranks)
     )
@@ -210,6 +221,8 @@ class WeightTransferPipeline:
         _validate_weight_transfer_config(fsdp_config=fsdp_config, offload_config=offload_config, cudagraph_mode=cudagraph_mode)
         self._fsdp_config = fsdp_config
         self._offload_config = offload_config
+        # The compile-cache verdict must be OR-ed over WORLD exactly when this holds.
+        self.compiles_in_rank_lockstep = _compiles_in_rank_lockstep(fsdp_config=fsdp_config, offload_config=offload_config)
 
     def rewrite_graph_and_build_scheduler_passes(
         self, graph: fx.GraphModule, example_inputs, *, default_passes: list | None

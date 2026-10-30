@@ -151,6 +151,37 @@ def test_profile_sync_estimator_locks_ranks_for_offload_and_fsdp():
     assert sync_across_ranks(enable_fsdp=False, graph_weight_offload=True, cost_mode="analytical") is None
 
 
+@pytest.mark.parametrize(
+    "enable_fsdp, cost_mode, disable_graph_split, expected",
+    [
+        (False, "profile_sync", True, True),
+        (False, "analytical", True, False),
+        (True, "profile_sync", True, True),
+        (True, "analytical", True, True),
+        (True, "profile_sync", False, True),
+    ],
+)
+def test_offload_cache_syncs_whenever_inductor_issues_world_collectives(enable_fsdp, cost_mode, disable_graph_split, expected):
+    """A rank that replays its artifact skips Inductor, so the cache verdict must sync with every Inductor collective."""
+    from magi_compiler.config import CudaGraphMode, FSDPConfig, OffloadConfig
+    from magi_compiler.magi_backend.weight_transfer_pipeline import WeightTransferPipeline, build_transfer_overlap_passes
+
+    fsdp_config = FSDPConfig(enable_fsdp=enable_fsdp, cost_mode=cost_mode)
+    offload_config = OffloadConfig(graph_weight_offload=True, offload_h2d_bandwidth_gbps=20.0)
+    pipeline = WeightTransferPipeline(
+        fsdp_config=fsdp_config,
+        offload_config=offload_config,
+        cudagraph_mode=CudaGraphMode.NONE,
+        disable_graph_split=disable_graph_split,
+    )
+    assert pipeline.compiles_in_rank_lockstep is expected
+    [cost_profile, *_] = build_transfer_overlap_passes(
+        fsdp_config=pipeline._fsdp_config, offload_config=offload_config, loads_inserted=True, default_passes=None
+    )
+    if cost_profile.estimator is not None:
+        assert cost_profile.estimator.sync_across_ranks is pipeline.compiles_in_rank_lockstep
+
+
 class _RankLocalOffloadNet(torch.nn.Module):
     def __init__(self):
         super().__init__()

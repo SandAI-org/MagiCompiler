@@ -37,13 +37,13 @@ class TinyOffloadNet(nn.Module):
         return self.fc(x)
 
 
-def _patch_offload(cfg, *, fsdp: bool = False):
+def _patch_offload(cfg, *, fsdp: bool, cost_mode: str):
     cfg.offload_config.graph_weight_offload = True
     cfg.offload_config.offload_min_shard_mib = 0.0
     cfg.offload_config.offload_max_device_weight_mib = 4
     cfg.offload_config.offload_h2d_bandwidth_gbps = 20.0
     cfg.fsdp_config.enable_fsdp = fsdp
-    cfg.fsdp_config.cost_mode = "profile_sync" if fsdp else "analytical"
+    cfg.fsdp_config.cost_mode = cost_mode
     cfg.cudagraph_mode = CudaGraphMode.NONE
     cfg.disable_graph_split = True
     return cfg
@@ -53,9 +53,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True)
     parser.add_argument("--fsdp", action="store_true")
+    parser.add_argument("--distributed", action="store_true", help="join the torchrun WORLD with an unsharded model")
+    parser.add_argument("--cost-mode", choices=["profile_sync", "analytical"], default=None)
     args = parser.parse_args()
+    is_distributed = args.fsdp or args.distributed
+    cost_mode = args.cost_mode or ("profile_sync" if args.fsdp else "analytical")
 
-    if args.fsdp:
+    if is_distributed:
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
         dist.init_process_group("cpu:gloo,cuda:nccl", timeout=timedelta(seconds=60))
     else:
@@ -78,7 +82,10 @@ def main() -> None:
         mesh = init_device_mesh("cuda", (dist.get_world_size(),))
         model = data_parallel(model, mesh, mode="fully_shard", ac_mode="full")
     model = magi_compile(
-        model, dynamic_arg_dims={"x": 0}, config_patch=partial(_patch_offload, fsdp=args.fsdp), model_tag="offload_cache"
+        model,
+        dynamic_arg_dims={"x": 0},
+        config_patch=partial(_patch_offload, fsdp=args.fsdp, cost_mode=cost_mode),
+        model_tag="offload_cache",
     )
     model.to_empty(device=DEVICE)
     with torch.no_grad():
@@ -107,11 +114,11 @@ def main() -> None:
         "artifacts_saved": compilation_counter.num_compiled_artifacts_saved,
     }
     output_path = Path(args.output)
-    if args.fsdp:
+    if is_distributed:
         output_path = output_path.with_suffix(f".rank{dist.get_rank()}.json")
     with output_path.open("w") as f:
         json.dump(payload, f)
-    if args.fsdp:
+    if is_distributed:
         dist.destroy_process_group()
 
 

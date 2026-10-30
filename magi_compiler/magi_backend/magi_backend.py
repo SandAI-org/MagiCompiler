@@ -178,19 +178,19 @@ class CompilerManager:
             f.write(data)
         self.offload_cache.save_slot_sidecar()
 
-    def bind_offload_cache(self, graph: fx.GraphModule) -> None:
+    def bind_offload_cache(self, graph: fx.GraphModule, *, sync_across_ranks: bool) -> None:
         """Match the host_slots sidecar to this process's bound weights.
 
         On a match, install baked->current remap and replay the resident set
         the placement pass chose at bake time.  On a miss, drop the piecewise
         indices so ``load()`` cannot replay an artifact whose slot integers
-        belong to another pool.
+        belong to another pool.  ``sync_across_ranks`` turns one rank's miss
+        into a miss on every rank; it is required whenever Inductor issues
+        WORLD collectives, since only missing ranks enter Inductor.
         """
         if self.disable_cache:
             return
-        reason = self.offload_cache.prepare_graph_replay(
-            graph, sync_across_ranks=self.compile_config.fsdp_config.enable_fsdp and self.compile_config.disable_graph_split
-        )
+        reason = self.offload_cache.prepare_graph_replay(graph, sync_across_ranks=sync_across_ranks)
         if reason is not None:
             self.cache.clear()
             self._remaining_restart_skips = {}
@@ -666,7 +666,9 @@ class MagiBackend:
             self.inductor_compile_config["reorder_for_compute_comm_overlap"] = True
             self.inductor_compile_config[key] = passes
         if self.compile_config.offload_config.graph_weight_offload:
-            self.compiler_manager.bind_offload_cache(graph)
+            self.compiler_manager.bind_offload_cache(
+                graph, sync_across_ranks=weight_transfer_pipeline.compiles_in_rank_lockstep
+            )
 
     @observe_lifecycle("graph_split")
     def _split_graph(self, graph: fx.GraphModule, example_inputs) -> tuple[fx.GraphModule, list[SplitItem]]:

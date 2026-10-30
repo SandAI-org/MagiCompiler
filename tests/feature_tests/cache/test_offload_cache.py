@@ -303,7 +303,7 @@ def test_bind_miss_drops_compile_indices(tmp_path: Path):
     slot, _ = _park_test_weight()
     compiler_manager = _make_offload_manager(tmp_path)
     compiler_manager.cache[CacheEntry(None, 0, "inductor_standalone")] = CacheHandle("k", str(tmp_path), 0)
-    compiler_manager.bind_offload_cache(_make_slot_tagged_graph(slot))
+    compiler_manager.bind_offload_cache(_make_slot_tagged_graph(slot), sync_across_ranks=False)
 
     assert compiler_manager.cache == {}
     assert not compiler_manager.offload_cache.can_replay_artifact()
@@ -329,7 +329,7 @@ def test_bind_hit_keeps_compile_indices(tmp_path: Path):
     entry = CacheEntry(None, 0, "inductor_standalone")
     compiler_manager.cache[entry] = CacheHandle("k", str(tmp_path), 0)
     compiler_manager.offload_cache.host_slots_path.write_text(repr(sidecar))
-    compiler_manager.bind_offload_cache(_make_slot_tagged_graph(slot))
+    compiler_manager.bind_offload_cache(_make_slot_tagged_graph(slot), sync_across_ranks=False)
 
     assert entry in compiler_manager.cache
     assert compiler_manager.offload_cache.can_replay_artifact()
@@ -352,7 +352,7 @@ def test_replay_does_not_store_a_mixed_slot_artifact(tmp_path: Path):
     }
     compiler_manager = _make_offload_manager(tmp_path)
     compiler_manager.offload_cache.host_slots_path.write_text(repr(sidecar))
-    compiler_manager.bind_offload_cache(_make_slot_tagged_graph(slot))
+    compiler_manager.bind_offload_cache(_make_slot_tagged_graph(slot), sync_across_ranks=False)
     assert compiler_manager.offload_cache._cached_to_current_slots == {3: slot}
     assert not compiler_manager.offload_cache.can_store_artifact()
 
@@ -396,7 +396,7 @@ def test_wrap_loaded_applies_slot_remap(tmp_path: Path):
 def test_save_to_file_writes_host_slots_sidecar(tmp_path: Path):
     slot, _ = _park_test_weight()
     compiler_manager = _make_offload_manager(tmp_path)
-    compiler_manager.bind_offload_cache(_make_slot_tagged_graph(slot))
+    compiler_manager.bind_offload_cache(_make_slot_tagged_graph(slot), sync_across_ranks=False)
     compiler_manager.save_to_file()
 
     raw = ast.literal_eval(compiler_manager.offload_cache.host_slots_path.read_text())
@@ -414,7 +414,7 @@ def test_bind_miss_raises_when_assert_cache_hit(tmp_path: Path):
     compiler_manager = CompilerManager(conf)
     compiler_manager.initialize_cache(tmp_path)
     with pytest.raises(RuntimeError, match="host_slots sidecar"):
-        compiler_manager.bind_offload_cache(_make_slot_tagged_graph(slot))
+        compiler_manager.bind_offload_cache(_make_slot_tagged_graph(slot), sync_across_ranks=False)
 
 
 @requires_cuda
@@ -487,8 +487,14 @@ def test_offload_cache_reuse_across_processes(tmp_path: Path, sidecar_failure: s
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
 @pytest.mark.parametrize("sidecar_failure", ["missing", "corrupt"])
-def test_fsdp_sidecar_miss_recompiles_every_rank(tmp_path: Path, sidecar_failure: str):
-    """One rank's sidecar failure must recompile all FSDP ranks and produce reusable artifacts."""
+@pytest.mark.parametrize(
+    "model_args", [["--fsdp"], ["--distributed", "--cost-mode", "profile_sync"]], ids=["fsdp", "plain_param_profile_sync"]
+)
+def test_sidecar_miss_on_one_rank_recompiles_every_rank(tmp_path: Path, sidecar_failure: str, model_args: list[str]):
+    """One rank's sidecar failure must recompile every rank and produce reusable artifacts.
+
+    Inductor issues WORLD collectives in both modes, so a rank replaying its artifact alone would hang its peer.
+    """
     helper_path = Path(__file__).parent / "cache_reuse_helper" / "offload_cache_reuse_helper.py"
     cache_root = tmp_path / "cache"
     env = {**os.environ, "MAGI_LOGGING_LEVEL": "info", "MAGI_COMPILE_CACHE_ROOT_DIR": str(cache_root)}
@@ -503,7 +509,7 @@ def test_fsdp_sidecar_miss_recompiles_every_rank(tmp_path: Path, sidecar_failure
                 "--standalone",
                 "--nproc-per-node=2",
                 str(helper_path),
-                "--fsdp",
+                *model_args,
                 "--output",
                 str(tmp_path / f"{phase}.json"),
             ],
