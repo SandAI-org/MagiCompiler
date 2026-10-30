@@ -623,6 +623,9 @@ class MagiBackend:
         assert (
             self.compile_config.cudagraph_mode == CudaGraphMode.NONE
         ), "fsdp_config.enable_fullgraph_overlap requires cudagraph_mode=NONE"
+        assert (
+            fsdp_cfg.transport != "copy_engine" or accelerator_type() == "cuda"
+        ), "fsdp_config.transport='copy_engine' needs CUDA symmetric memory; use 'nccl'"
 
         from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder, lower_and_bucket_full_graph
         from magi_compiler.profiling import ProfilingRuntimeEstimator

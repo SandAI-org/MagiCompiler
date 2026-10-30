@@ -39,7 +39,7 @@ import torch
 import torch.fx as fx
 
 from magi_compiler.passes.pass_base import MagiInductorPass
-from magi_compiler.utils.device import device_capability_major
+from magi_compiler.utils.device import device_capability, device_capability_major
 
 from . import evt_runtime  # ensures torch.library op + fake impl are registered
 from .evt_ir import Accum, AuxLoad, ColBroadcast, Compute, RowBroadcast, Store, is_trivial, num_extras, to_canonical_json
@@ -450,7 +450,7 @@ def _validate_swiglu_weight(mm_node: fx.Node) -> Optional[Tuple[fx.Node, fx.Node
     if _val_dtype(mm_node.args[0]) != torch.bfloat16 or _val_dtype(weight_node) != torch.bfloat16:
         return None
     # SM90 TMA requires K * sizeof(elem) % 16 == 0.
-    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
+    if device_capability_major() == 9:
         elem_bytes = torch.bfloat16.itemsize
         if _is_static_int(K) and (int(K) * elem_bytes) % 16 != 0:
             return None
@@ -587,12 +587,7 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         # SM90 TMA requires globalStride to be 16-byte aligned.  A is
         # RowMajor (M, K) so stride_A[0] = K; need K * elem_bytes % 16 == 0.
         # (For bf16 this reduces to K % 8 == 0.)
-        if (
-            torch.cuda.is_available()
-            and torch.cuda.get_device_capability() == (9, 0)
-            and _is_static_int(K)
-            and (int(K) * a_dtype.itemsize) % 16 != 0
-        ):
+        if device_capability() == (9, 0) and _is_static_int(K) and (int(K) * a_dtype.itemsize) % 16 != 0:
             return False
         a_stride = _val_stride(A)
         if a_stride is None or a_stride != (a_shape[1], 1):
@@ -771,7 +766,7 @@ class MatmulEvtEpilogueFusionPass(MagiInductorPass):
         if out_dt not in _DTYPE_TO_STR:
             return None
 
-        if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0) and _is_static_int(n_dim):
+        if device_capability() == (9, 0) and _is_static_int(n_dim):
             n_int = int(n_dim)
             if (n_int * out_dt.itemsize) % 16 != 0:
                 return None
