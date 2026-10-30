@@ -215,7 +215,7 @@ jobs:
                     paths: tests/magi_depyf/
         container:
             # Any athena image that ships athena/disagg/cci/devtools/ci/cci_run.py; bump it to pick up cci_run fixes.
-            image: registry.cn-sh-01.sensecore.cn/sandai-ccr/athena:athena-1156-bcb433c
+            image: registry.cn-sh-01.sensecore.cn/sandai-ccr/athena:athena-1156-ee1de20
             credentials:
                 username: ${{ secrets.CCR_USERNAME }}
                 password: ${{ secrets.CCR_PASSWORD }}
