@@ -1459,14 +1459,14 @@ def test_a_host_built_module_releases_each_original_before_copying_the_next(monk
 @pytest.mark.parametrize("resident", [False, True], ids=["offloaded", "resident"])
 def test_checkpoint_load_after_handoff_is_rejected_before_any_write(assign, load_target, resident):
     """A reload must neither write empty stand-ins nor replace bindings or stale their host copies.
-    Parent loads must fail before touching earlier siblings or the parent's own buffers."""
+    Wherever the load enters, it must fail before touching any of the offloaded model's tensors."""
     from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
     torch.manual_seed(0)
     root = torch.nn.Module()
-    root.register_buffer("scale", torch.ones(1, device="cuda"))
     root.eager = torch.nn.Linear(4, 4, bias=False, device="cuda")
     root.compiled = _install_host_first_hooks(_CompiledWeightModule(rows=256, cols=64), min_shard_mib=0.01)
+    root.compiled.register_buffer("scale", torch.ones(1))
     root.compiled.cuda()
     store = get_global_host_weight_store()
     standin = root.compiled.big.weight
@@ -1474,28 +1474,33 @@ def test_checkpoint_load_after_handoff_is_rejected_before_any_write(assign, load
     expected_host_weight = store.host_buffer(slot).clone()
     if resident:
         store.make_weight_resident(slot)
-    parameters_before = dict(root.named_parameters())
-    expected_eager_weight = root.eager.weight.detach().clone()
+    parameters_before = dict(root.compiled.named_parameters())
     expected_small_weight = root.compiled.small.weight.detach().clone()
-    target = {"parent": root, "compiled": root.compiled, "leaf": root.compiled.big}[load_target]
+    target, rejected_key = {
+        "parent": (root, "compiled.big.weight"),
+        "compiled": (root.compiled, "big.weight"),
+        "leaf": (root.compiled.big, "weight"),
+    }[load_target]
     checkpoint = {name: torch.full(tensor.shape, 17.0, dtype=tensor.dtype) for name, tensor in target.state_dict().items()}
 
-    with pytest.raises(RuntimeError, match="cannot load a checkpoint.*after host handoff"):
+    with pytest.raises(RuntimeError, match=f"cannot load a checkpoint into {rejected_key} .*after host handoff"):
         target.load_state_dict(checkpoint, assign=assign)
 
-    assert all(parameter is parameters_before[name] for name, parameter in root.named_parameters())
+    assert all(parameter is parameters_before[name] for name, parameter in root.compiled.named_parameters())
     assert store.slot_for_tensor(root.compiled.big.weight) == slot
     assert store.is_resident(slot) == resident
     torch.testing.assert_close(store.host_buffer(slot), expected_host_weight)
-    torch.testing.assert_close(root.eager.weight, expected_eager_weight)
     torch.testing.assert_close(root.compiled.small.weight, expected_small_weight)
-    torch.testing.assert_close(root.scale, torch.ones_like(root.scale))
+    torch.testing.assert_close(root.compiled.scale, torch.ones_like(root.compiled.scale))
     if resident:
         torch.testing.assert_close(standin.cpu(), expected_host_weight)
     else:
         assert standin.untyped_storage().nbytes() == 0
 
-    # An unrelated module remains reloadable while the same process owns offloaded weights.
+    # The guard lives on the offloaded model's modules: torch's load_state_dict stays unpatched for everyone else.
+    assert torch.nn.Module.load_state_dict.__module__ == "torch.nn.modules.module"
+    assert not root._load_state_dict_pre_hooks and not root.eager._load_state_dict_pre_hooks
+    assert not root.compiled.small._load_state_dict_pre_hooks
     root.eager.load_state_dict({"weight": torch.full((4, 4), 23.0)}, assign=assign)
     torch.testing.assert_close(root.eager.weight, torch.full_like(root.eager.weight, 23.0))
 

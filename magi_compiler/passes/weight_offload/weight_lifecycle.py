@@ -35,14 +35,16 @@ else, e.g. ``.to(device, dtype)``, is unsupported and not reliably detected.
 
 Load checkpoints before the first CUDA move of a host-built model, or between
 to_empty and handoff for a meta-built model. After handoff, load_state_dict is
-refused before it writes any parameters or buffers, including through a parent.
+refused before it writes any of the model's parameters or buffers, whether it
+enters through the model, a submodule, or a parent; only the model's own modules
+are guarded, so a parent load may already have written modules it visited first.
 Custom loaders that write tensors directly must also finish before handoff.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache, partial, wraps
+from functools import partial
 from typing import Literal, Sequence
 
 import torch
@@ -301,6 +303,7 @@ def _install_weight_standins(module: nn.Module, parked_parameters: list[tuple[li
         for names, param, host_buffer in parked_parameters
     ]
     record_handoff_slots(module=module, slots=host_slots)
+    _guard_checkpoint_loads(module=module, host_slots=host_slots)
     return sum(host_buffer.numel() * host_buffer.element_size() for _, _, host_buffer in parked_parameters)
 
 
@@ -328,6 +331,7 @@ def _park_cpu_parameters(module: nn.Module, min_weight_bytes: int) -> int:
     if not host_slots:
         return 0
     record_handoff_slots(module=module, slots=host_slots)
+    _guard_checkpoint_loads(module=module, host_slots=host_slots)
     magi_logger.info(
         "host offload: %s parked %d CPU weight(s), %.1f MiB, on first CUDA move",
         type(module).__name__,
@@ -476,24 +480,47 @@ def _materialize_host_weights(module: nn.Module, fn, recurse: bool, *, min_weigh
     return result
 
 
-@lru_cache(maxsize=1)
-def _install_checkpoint_load_guard() -> None:
-    load_state_dict = nn.Module.load_state_dict
+def _reject_checkpoint_load_after_handoff(
+    module: nn.Module,
+    state_dict,
+    prefix: str,
+    local_metadata,
+    strict,
+    missing_keys,
+    unexpected_keys,
+    error_msgs,
+    *,
+    offloaded_weight_name: str,
+) -> None:
+    raise RuntimeError(
+        f"host offload: cannot load a checkpoint into {prefix}{offloaded_weight_name} ({type(module).__name__}) "
+        "after host handoff. Load checkpoints before the first CUDA move of a host-built model, or after to_empty "
+        "and before handoff for a meta-built model. Recreate the model to load different weights."
+    )
 
-    @wraps(load_state_dict)
-    def load_state_dict_before_handoff(self: nn.Module, state_dict, strict: bool = True, assign: bool = False):
-        store = get_global_host_weight_store()
-        for name, parameter in self.named_parameters():
-            if store.slot_for_tensor(_local_weight_tensor(parameter)) is not None:
-                raise RuntimeError(
-                    f"host offload: cannot load a checkpoint into {type(self).__name__}.{name} after host handoff. "
-                    "Load checkpoints before the first CUDA move of a host-built model, or after to_empty "
-                    "and before handoff for a meta-built model. Recreate the model to load different weights."
-                )
-        return load_state_dict(self, state_dict, strict=strict, assign=assign)
 
-    # Parent loads bypass child.load_state_dict; child pre-hooks run after earlier siblings were written.
-    nn.Module.load_state_dict = load_state_dict_before_handoff
+def _guard_checkpoint_loads(module: nn.Module, host_slots: Sequence[int]) -> None:
+    """Refuse ``load_state_dict`` into ``module``'s weights that ``host_slots`` handed off.
+
+    load_state_dict runs a module's pre-hooks before writing it or anything below it,
+    so guarding every ancestor of such a weight inside ``module`` refuses a load that
+    enters through ``module``, any submodule, or a parent before it writes ``module``.
+    """
+    store = get_global_host_weight_store()
+    handed_off_slots = set(host_slots)
+    modules_by_name = dict(module.named_modules(remove_duplicate=False))
+    offloaded_weight_name_by_guarded_module: dict[nn.Module, str] = {}
+    for name, param in module.named_parameters(remove_duplicate=False):
+        if store.slot_for_tensor(_local_weight_tensor(param)) not in handed_off_slots:
+            continue
+        name_parts = name.split(".")
+        for depth in range(len(name_parts)):
+            ancestor = modules_by_name[".".join(name_parts[:depth])]
+            offloaded_weight_name_by_guarded_module.setdefault(ancestor, ".".join(name_parts[depth:]))
+    for guarded_module, offloaded_weight_name in offloaded_weight_name_by_guarded_module.items():
+        guarded_module.register_load_state_dict_pre_hook(
+            partial(_reject_checkpoint_load_after_handoff, offloaded_weight_name=offloaded_weight_name)
+        )
 
 
 def install_host_first_hooks(instance: nn.Module, *, min_weight_bytes: int) -> None:
@@ -502,7 +529,6 @@ def install_host_first_hooks(instance: nn.Module, *, min_weight_bytes: int) -> N
     state = get_or_create_offload_state(instance)
     if state.hooks_installed:
         return
-    _install_checkpoint_load_guard()
     state.min_weight_bytes = min_weight_bytes
     instance._apply = _apply_with_host_offload.__get__(instance, type(instance))
     state.hooks_installed = True
