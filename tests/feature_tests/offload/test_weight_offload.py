@@ -215,7 +215,7 @@ def _offload_on_rank0_worker(
             config.cache_root_dir = cache_dir
             config.offload_config.graph_weight_offload = True
             # The 128 KiB weight clears rank 0's floor only, so only rank 0's graph gets an H2D load.
-            config.offload_config.offload_min_shard_mib = 0.0 if rank == 0 else 1.0
+            config.offload_config.offload_min_shard_mib = 0 if rank == 0 else 1
             config.offload_config.offload_h2d_bandwidth_gbps = 20.0
             config.cudagraph_mode = CudaGraphMode.NONE
             config.disable_graph_split = True
@@ -1527,7 +1527,7 @@ def test_checkpoint_load_before_handoff_reaches_compiled_execution(initial_devic
         cfg.disable_graph_split = True
         cfg.fsdp_config.cost_mode = "analytical"
         cfg.offload_config.graph_weight_offload = True
-        cfg.offload_config.offload_min_shard_mib = 0.01
+        cfg.offload_config.offload_min_shard_mib = 0
         cfg.offload_config.offload_h2d_bandwidth_gbps = 48.0
         return cfg
 

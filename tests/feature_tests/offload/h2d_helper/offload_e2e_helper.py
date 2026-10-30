@@ -116,7 +116,7 @@ def main() -> None:
     ap.add_argument("--cost-mode", default="analytical", choices=["analytical", "profile_sync"])
     ap.add_argument("--hidden", type=int, default=1024)
     ap.add_argument("--n-layers", type=int, default=4)
-    ap.add_argument("--min-shard-mib", type=float, default=0.0)
+    ap.add_argument("--min-shard-mib", type=int, default=0)
     # Counter-intuitive but load-bearing: SimpleFSDP reads ac_mode="none" as
     # "apply REGIONAL activation checkpointing", which wraps every weight access
     # in a checkpoint HOP and hides the redistribute inside a dynamo subgraph

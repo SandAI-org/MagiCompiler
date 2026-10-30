@@ -235,9 +235,9 @@ class OffloadConfig(BaseModel):
             "See offload_max_device_weight_mib for the residency and in-flight scheduling budget."
         ),
     )
-    offload_min_shard_mib: float = Field(
-        1.0,
-        ge=0.0,
+    offload_min_shard_mib: int = Field(
+        1,
+        ge=0,
         description=(
             "Minimum local-shard MiB to offload. Every offloaded weight is its own load, and below "
             "this its fixed submission cost (~40us of CPU; 1 MiB crosses PCIe in ~20us) rather than "

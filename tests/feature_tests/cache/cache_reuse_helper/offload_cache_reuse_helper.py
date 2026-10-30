@@ -39,7 +39,7 @@ class TinyOffloadNet(nn.Module):
 
 def _patch_offload(cfg, *, fsdp: bool, cost_mode: str):
     cfg.offload_config.graph_weight_offload = True
-    cfg.offload_config.offload_min_shard_mib = 0.0
+    cfg.offload_config.offload_min_shard_mib = 0
     cfg.offload_config.offload_max_device_weight_mib = 4
     cfg.offload_config.offload_h2d_bandwidth_gbps = 20.0
     cfg.fsdp_config.enable_fsdp = fsdp
