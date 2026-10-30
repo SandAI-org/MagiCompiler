@@ -54,11 +54,13 @@ on:
                 required: true
             CCR_PASSWORD:
                 required: true
+            CCI_AUTH_CONFIG:
+                required: true
 
 jobs:
     build:
         name: Build (${{ inputs.pytorch-label }})
-        runs-on: [self-hosted, magi-compiler]
+        runs-on: [self-hosted, magi-compiler-cci]
         timeout-minutes: 60
         outputs:
             image_tag: ${{ steps.docker.outputs.image_tag }}
@@ -167,9 +169,9 @@ jobs:
                 rm -rf "$PR_WORKSPACE"
 
     # ── Test shards ───────────────────────────────────────────────────
-    # 8 parallel shards after build.  Each shard picks the least-loaded
-    # GPU via nvidia-smi at startup to minimise contention when multiple
-    # shards land on the same physical runner.
+    # 8 parallel shards after build, each on 2 GPUs grabbed from CCI: the
+    # runner only orchestrates (athena's cci_run, from the athena image the
+    # job container runs) and the shard runs in the PR image on CCI.
     #
     # IMPORTANT: the union of all shard paths must cover tests/.
     # When adding a new test directory, assign it to a shard here.
@@ -189,8 +191,8 @@ jobs:
     test:
         name: ${{ matrix.shard }} (${{ inputs.pytorch-label }})
         needs: build
-        runs-on: [self-hosted, magi-compiler]
-        timeout-minutes: 60
+        runs-on: [self-hosted, magi-compiler-cci]
+        timeout-minutes: 120  # cci_run waits for idle GPUs and the image pull on top of the 60 min the shard gets
         strategy:
             fail-fast: false
             matrix:
@@ -212,45 +214,48 @@ jobs:
                 -   shard: depyf
                     paths: tests/magi_depyf/
         container:
-            image: ${{ needs.build.outputs.image_tag }}
+            # Any athena image that ships athena/disagg/cci/devtools/ci/cci_run.py; bump it to pick up cci_run fixes.
+            image: registry.cn-sh-01.sensecore.cn/sandai-ccr/athena:athena-1156-bcb433c
             credentials:
                 username: ${{ secrets.CCR_USERNAME }}
                 password: ${{ secrets.CCR_PASSWORD }}
-            options: --gpus all --ipc=host --shm-size=2g
+            # runc: the runner host's docker defaults to the nvidia runtime, which would hand its GPUs in.
+            options: --runtime runc --init
+            volumes:
+            -   /home/luyao/afs:/home/niubility2  # cci_run reads the shard's output and exit code from AFS
         env:
-            http_proxy: ${{ secrets.HTTP_PROXY }}
-            https_proxy: ${{ secrets.HTTPS_PROXY }}
-            no_proxy: localhost,127.0.0.1,::1
-            NCCL_NVLS_ENABLE: 0
-            PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
-            PIP_TRUSTED_HOST: pypi.tuna.tsinghua.edu.cn
+            PYTHONPATH: /app/athena
+            no_proxy: localhost,127.0.0.1,::1,.sensecoreapi.cn,.sensecore.cn
+            http_proxy: ''
+            https_proxy: ''
+            CCI_APP: ci-mc-${{ inputs.kind == 'main' && 'mg' || 'pr' }}${{ inputs.pr-number }}-${{ inputs.pytorch-label }}-${{ matrix.shard }}-${{ github.run_attempt }}
         defaults:
             run:
                 shell: bash
-                working-directory: /app
+                working-directory: /app/athena
         steps:
-        -   name: Pick 2 least-loaded GPUs
+        -   name: Write CCI auth
             run: |
-                GPUS=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits \
-                    | sort -t',' -k2 -n | head -2 | cut -d',' -f1 | tr -d ' ' | paste -sd, 2>/dev/null) || true
-                if [ -z "$GPUS" ]; then GPUS="0,1"; echo "nvidia-smi failed, falling back to GPUs 0,1"; fi
-                echo "CUDA_VISIBLE_DEVICES=${GPUS}" >> "$GITHUB_ENV"
-                echo "Selected GPUs: ${GPUS}"
-                nvidia-smi -i "${GPUS}" --query-gpu=index,name,memory.total,memory.used --format=csv,noheader || true
+                mkdir -p /tmp/cci_auth
+                echo "$CCI_AUTH_CONFIG" > /tmp/cci_auth/cci_config.yaml
+            env:
+                CCI_AUTH_CONFIG: ${{ secrets.CCI_AUTH_CONFIG }}
 
-        -   name: Check environment
+        -   name: Run ${{ matrix.shard }} tests on CCI
+            env:
+                TESTS: ${{ inputs.test-override || matrix.paths }}
             run: |
-                python3 -c "
-                import os, torch, magi_compiler
-                print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}')
-                print(f'GPU: {torch.cuda.get_device_name(0)} (CUDA_VISIBLE_DEVICES={os.environ.get(\"CUDA_VISIBLE_DEVICES\", \"all\")})')
-                assert torch.cuda.is_available()
-                "
+                CHECK="python3 -c \"import torch, magi_compiler; assert torch.cuda.is_available();"
+                CHECK+=" print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}, {torch.cuda.device_count()}x {torch.cuda.get_device_name(0)}')\""
+                python -m athena.disagg.cci.devtools.ci.cci_run --cci-auth /tmp/cci_auth/cci_config.yaml run \
+                    --name "$CCI_APP" --pool h200 --pool inference-h200 \
+                    --image "${{ needs.build.outputs.image_tag }}" --gpus 2 --timeout-min 60 --workdir /app \
+                    --env NCCL_NVLS_ENABLE=0 \
+                    --command "$CHECK && pytest -v $TESTS --tb=short"
 
-        -   name: Run ${{ matrix.shard }} tests
-            if: ${{ inputs.test-override == '' }}
-            run: pytest -v ${{ matrix.paths }} --tb=short
-
-        -   name: Run override tests
-            if: ${{ inputs.test-override != '' }}
-            run: pytest -v ${{ inputs.test-override }} --tb=short
+        -   name: Delete the CCI app
+            if: always()
+            run: |
+                python -m athena.disagg.cci.devtools.ci.cci_run --cci-auth /tmp/cci_auth/cci_config.yaml delete \
+                    --name "$CCI_APP" --pool h200 --pool inference-h200 \
+                || true

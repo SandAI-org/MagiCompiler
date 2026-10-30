@@ -1,0 +1,48 @@
+name: CCI trial (remove before merge)
+
+# integration_test.yml runs on pull_request_target, i.e. main's workflows: this runs the PR's _ci_pipeline.yml instead.
+on:
+    pull_request:
+        types: [labeled]
+        branches:
+        -   main
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+    cancel-in-progress: true
+
+jobs:
+    guard:
+        name: Check ci:cci-trial label
+        if: github.event.label.name == 'ci:cci-trial'
+        runs-on: ubuntu-latest
+        steps:
+        -   run: echo "trial of the PR's _ci_pipeline.yml"
+
+    pt29:
+        name: PyTorch 2.9
+        needs: guard
+        uses: ./.github/workflows/_ci_pipeline.yml
+        with:
+            kind: pr
+            workspace: /home/luyao/afs/luyao/disagg/ci/magi-compiler-workspaces/trial-${{ github.event.pull_request.number }}-pt29
+            head-sha: ${{ github.event.pull_request.head.sha }}
+            base-sha: ${{ github.event.pull_request.base.sha }}
+            pr-number: ${{ github.event.pull_request.number }}
+            base-image: nvcr.io/nvidia/pytorch:25.10-py3
+            pytorch-label: pt29
+        secrets: inherit
+
+    pt212:
+        name: PyTorch 2.12
+        needs: guard
+        uses: ./.github/workflows/_ci_pipeline.yml
+        with:
+            kind: pr
+            workspace: /home/luyao/afs/luyao/disagg/ci/magi-compiler-workspaces/trial-${{ github.event.pull_request.number }}-pt212
+            head-sha: ${{ github.event.pull_request.head.sha }}
+            base-sha: ${{ github.event.pull_request.base.sha }}
+            pr-number: ${{ github.event.pull_request.number }}
+            base-image: nvcr.io/nvidia/pytorch:26.05-py3
+            pytorch-label: pt212
+        secrets: inherit
