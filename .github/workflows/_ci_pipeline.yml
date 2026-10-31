@@ -172,8 +172,8 @@ jobs:
 
     # ── Test shards ───────────────────────────────────────────────────
     # 8 parallel shards after build, each on 2 GPUs grabbed from CCI: the
-    # runner only orchestrates (athena's cci_run, from the athena image the
-    # job container runs) and the shard runs in the PR image on CCI.
+    # runner only orchestrates (cci_run, from the launcher image the job
+    # container runs) and the shard runs in the PR image on CCI.
     #
     # IMPORTANT: the union of all shard paths must cover tests/.
     # When adding a new test directory, assign it to a shard here.
@@ -194,7 +194,7 @@ jobs:
         name: ${{ matrix.shard }} (${{ inputs.pytorch-label }})
         needs: build
         runs-on: [self-hosted, magi-compiler-cci]
-        timeout-minutes: 120  # cci_run waits for idle GPUs and the image pull on top of the 60 min the shard gets
+        timeout-minutes: 165  # above cci_run's budget: 60 min queue + 30 min start + 60 min shard, then cleanup
         strategy:
             fail-fast: false
             matrix:
@@ -216,8 +216,8 @@ jobs:
                 -   shard: depyf
                     paths: tests/magi_depyf/
         container:
-            # Any athena image that ships athena/disagg/cci/devtools/ci/cci_run.py; bump it to pick up cci_run fixes.
-            image: registry.cn-sh-01.sensecore.cn/sandai-ccr/athena:athena-1156-ee1de20
+            # The launcher image providing cci_run; bump the tag to pick up cci_run fixes.
+            image: registry.cn-sh-01.sensecore.cn/sandai-ccr/athena:athena-1156-a14cfe6
             credentials:
                 username: ${{ secrets.CCR_USERNAME }}
                 password: ${{ secrets.CCR_PASSWORD }}
