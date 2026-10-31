@@ -40,7 +40,7 @@ jobs:
         uses: ./.github/workflows/_ci_pipeline.yml
         with:
             kind: pr
-            workspace: /home/niubility2/cenzhiyao/ci/magi-compiler-workspaces/pr-${{ github.event.pull_request.number }}-pt29
+            workspace: /home/luyao/afs/luyao/disagg/ci/magi-compiler-workspaces/pr-${{ github.event.pull_request.number }}-pt29
             head-sha: ${{ github.event.pull_request.head.sha }}
             base-sha: ${{ github.event.pull_request.base.sha }}
             pr-number: ${{ github.event.pull_request.number }}
@@ -54,7 +54,7 @@ jobs:
         uses: ./.github/workflows/_ci_pipeline.yml
         with:
             kind: pr
-            workspace: /home/niubility2/cenzhiyao/ci/magi-compiler-workspaces/pr-${{ github.event.pull_request.number }}-pt212
+            workspace: /home/luyao/afs/luyao/disagg/ci/magi-compiler-workspaces/pr-${{ github.event.pull_request.number }}-pt212
             head-sha: ${{ github.event.pull_request.head.sha }}
             base-sha: ${{ github.event.pull_request.base.sha }}
             pr-number: ${{ github.event.pull_request.number }}
