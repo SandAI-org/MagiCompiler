@@ -56,12 +56,7 @@ def _candidate_key(candidate: OffloadCandidate) -> tuple:
 def _collect_candidate_sync_groups(
     candidates: list[OffloadCandidate], example_value_by_placeholder_name: Mapping[str, Any]
 ) -> dict[int, Any]:
-    """Process groups this rank must enter, even if collect found nothing there.
-
-    Scanning the graph inputs -- not just the plan -- is what keeps a rank
-    that skipped every weight on a mesh from walking past the collective its
-    peers are waiting on.
-    """
+    # Graph inputs identify mesh groups even when this rank has no candidates.
     process_groups_by_id: dict[int, Any] = {}
     for obj in example_value_by_placeholder_name.values():
         process_group = parameter_mesh_group(obj)

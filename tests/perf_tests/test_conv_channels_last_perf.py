@@ -90,9 +90,6 @@ def test_conv_channels_last_vs_torch_compile(device, decoder_input):
     magi_compiled = _compile_decoder(device)
     torch_compiled = _compile_torch(device)
 
-    # GPU time only: at this size magi's host launch time (~0.9ms, the channels-last
-    # copies are extra Triton launches) exceeds its GPU time (~0.6ms), so wall-clock
-    # timing measures the CPU and swings with machine load instead of the conv layout.
     with torch.no_grad():
         eager_result = cuda_graph_benchmark(lambda: eager_model(eager_input), compilation_warmup=3)
         torch_result = cuda_graph_benchmark(lambda: torch_compiled(torch_input), compilation_warmup=3)

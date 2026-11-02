@@ -212,12 +212,8 @@ def test_mark_unbacked_carrier_torch_compile():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_mark_unbacked_carrier_magi_compile_disables_compile_time_autotune(monkeypatch, tmp_path):
-    """magi_compile must compile carrier graphs with compile-time autotune off, even when it is on globally.
-
-    Compile-time autotune benchmarks unbacked dims at the fallback hint (8192) against
-    inputs at their real size and reads past them, so plain torch.compile with it on is
-    not exercised: the stray read can poison the CUDA context for every later test.
-    """
+    """Unbacked carrier graphs disable compile-time autotuning in magi_compile."""
+    # Compile-time autotuning with unbacked dimensions can read beyond input storage.
     import torch._inductor as inductor
     from torch._inductor import config as inductor_config
 

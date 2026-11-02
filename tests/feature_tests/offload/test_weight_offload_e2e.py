@@ -18,11 +18,8 @@ Driven through a ``torchrun`` subprocess (h2d_helper/offload_e2e_helper.py)
 because the chain needs a process group inside a real compile -- same pattern as
 test_fsdp_overlap_e2e.py.
 
-Offload tags whatever host-first parked and the redistribute lowering exposed,
-so if the installed SimpleFSDP emits a shape the lowering does not match, there
-is nothing to offload and the numeric check would pass on an ordinary graph.
-The helper prints ``OFFLOAD_SKIPPED`` in that case and these tests skip rather
-than report a green run for a chain that never executed.
+The helper reports ``OFFLOAD_SKIPPED`` when no host-weight slots are registered.
+These runs do not exercise offloaded-weight execution.
 """
 
 import os
@@ -37,11 +34,8 @@ import torch
 
 _OFFLOAD_HELPER_PATH = Path(__file__).parent / "h2d_helper" / "offload_e2e_helper.py"
 
-# Several 4 MiB buckets back to back, close enough together that the sweep
-# cannot hide them all: the shape where placement has to choose between
-# residency and exposure, and therefore the one the budget tests are worth
-# running on.  At one rank a gather moves no bytes, so the fitted per-byte cost
-# is zero and only the cap sizes the buckets.
+# Consecutive buckets create overlapping transfer demands for budget checks.
+# At one rank the fitted per-byte gather cost is zero, so the cap sizes the buckets.
 _MULTI_LOAD_ARGS = ("--bucket-mode", "auto", "--bucket-size-mib", "4", "--n-layers", "6")
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -49,11 +43,7 @@ requires_torchrun = pytest.mark.skipif(shutil.which("torchrun") is None, reason=
 
 
 def _free_port() -> str:
-    """A port the kernel just told us is free.
-
-    Hard-coded ports collide with whatever the previous test left in TIME_WAIT,
-    which fails as EADDRINUSE and reads exactly like a real regression.
-    """
+    # The selected port is released before torchrun binds it.
     with socket.socket() as s:
         s.bind(("localhost", 0))
         return str(s.getsockname()[1])
@@ -83,7 +73,7 @@ def _parse_marker_float(stdout: str, marker: str, field: str) -> float:
 def _require_success_or_skip(process_result: subprocess.CompletedProcess) -> str:
     combined_log = process_result.stdout + process_result.stderr
     if "OFFLOAD_SKIPPED" in process_result.stdout:
-        pytest.skip("the redistribute lowering matched no weight gather; nothing to offload")
+        pytest.skip("no host-weight slots were registered")
     assert process_result.returncode == 0, f"helper failed:\n{combined_log[-4000:]}"
     return combined_log
 

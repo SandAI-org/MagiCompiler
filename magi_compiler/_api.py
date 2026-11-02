@@ -320,10 +320,7 @@ def _magi_compile_bound_method(
         if torch.compiler.is_compiling():
             return old_method(*args, **kwargs)
 
-        # Before tracing and before every fast path, because all three read the
-        # weights: a shard still sitting in host memory would be lowered into CPU
-        # kernels, or replayed against an artifact that expects it on the device.
-        # A no-op after the first call, and when host-first is off.
+        # Pending host weights need CUDA stand-ins before tracing or compiled replay.
         from magi_compiler.passes.weight_offload import handoff_host_weights_if_pending
 
         handoff_host_weights_if_pending(instance)

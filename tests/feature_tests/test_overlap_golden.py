@@ -16,9 +16,8 @@
 
 The unit suites pin individual rules; this one pins the whole schedule, so a
 refactor of the shared scheduling core cannot shift a single snode unnoticed.
-Every node is built from the real Inductor IR classes (``object.__new__``, no
-constructor), so the passes classify waits, collectives and unpacks through
-Inductor's own predicates and nothing is stubbed.
+Synthetic scheduler nodes provide dependencies and runtimes. Wait, collective,
+unpack, and load classification uses real Inductor IR class identities.
 
 The frozen schedules live at the bottom of this file, one line per case, so an
 intended change shows up in review as exactly the cases it moved.  Regenerate
@@ -192,8 +191,6 @@ def _h2d_graph(seed, slots):
 
 # -- cases --------------------------------------------------------------------
 
-# One case per graph form and per knob setting.  Extra seeds only reshape the
-# random graph: they reach no branch the first seed misses.
 _FSDP_CASES = [
     (f"fsdp_{form}_s1_{scale}_{margin:.0f}", form, 1, scale, margin)
     for form in ("plain", "coalesced", "prep")

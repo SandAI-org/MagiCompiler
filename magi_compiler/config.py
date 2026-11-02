@@ -212,58 +212,37 @@ class OffloadConfig(BaseModel):
     graph_weight_offload: bool = Field(
         False,
         description=(
-            "Compile-time CPU weight offload for SimpleFSDP (transport='nccl') and unsharded nn.Parameter models. "
-            "Inference only: run under torch.no_grad() or torch.inference_mode(); a graph that needs the "
-            "offloaded weights' gradients fails to compile. "
-            "Requires compile_mode=MAGI_COMPILE, disable_graph_split=True and cudagraph_mode=NONE; "
-            "mutually exclusive with model_cpu_offload and aot. "
-            "Host-first materialization loads checkpoints into pinned memory; "
-            "handoff temporarily allocates one CUDA shard. "
-            "A host-built unsharded model parks eligible weights on its first CUDA move. "
-            "Load checkpoints before that move; meta-built models load after to_empty and before handoff. "
-            "load_state_dict after handoff is rejected before it writes this model, including through a parent "
-            "module; the guard is installed on this model's modules only, so other modules load as usual and "
-            "a parent load may already have written the modules it visits before this one. "
-            "Finish dtype conversion before parking -- before that first CUDA move, or before to_empty "
-            "for a meta-built model (e.g. model.half().cuda(), not model.cuda().half()); "
-            "parked weights keep their dtype, and later dtype or combined device+dtype casts are unsupported. "
-            "The graph loads separate device buffers with magi::h2d_load and schedules transfers to overlap compute. "
-            "With an initialized multi-rank WORLD, every rank must compile the same graphs in the same order, "
-            "including ranks that offload no weight: overlap scheduling is agreed over WORLD, and "
-            "fsdp_config.cost_mode='profile_sync' profiles in rank lockstep, so a compile-cache miss on one rank "
-            "recompiles every rank. "
-            "See offload_max_device_weight_mib for the residency and in-flight scheduling budget."
+            "Compile-time CPU weight offload for inference with SimpleFSDP (NCCL) or unsharded parameters. "
+            "Use no_grad or inference_mode; gradients for offloaded weights are unsupported. "
+            "Requires MAGI_COMPILE, disable_graph_split=True and cudagraph_mode=NONE; "
+            "incompatible with model_cpu_offload and aot. "
+            "For host-built models, load checkpoints and finish dtype conversion before the first CUDA move. "
+            "For meta-built models, finish dtype conversion before to_empty, then load checkpoints before handoff. "
+            "Once parked, dtype conversions are unsupported. Checkpoint reloads after handoff are rejected; "
+            "a parent load may modify earlier modules before reaching the guarded model. "
+            "Handoff temporarily allocates one CUDA shard. "
+            "In multi-rank WORLD, all ranks must compile the same graphs in the same order, including ranks "
+            "without offloaded weights. With profile_sync, cache misses are synchronized across ranks. "
+            "See offload_max_device_weight_mib for the device-weight scheduling budget."
         ),
     )
-    offload_min_shard_mib: int = Field(
-        1,
-        ge=0,
-        description=(
-            "Minimum local-shard MiB to offload. Every offloaded weight is its own load, and below "
-            "this its fixed submission cost (~40us of CPU; 1 MiB crosses PCIe in ~20us) rather than "
-            "bandwidth dominates the transfer, so it costs schedule slack and frees almost nothing."
-        ),
-    )
+    offload_min_shard_mib: int = Field(1, ge=0, description="Minimum local-shard size in MiB for weight offload.")
     offload_max_device_weight_mib: int = Field(
         0,
         ge=0,
         description=(
-            "Per-GPU scheduling budget in MiB, split between residency and in-flight H2D buffers. "
-            "The split aims to reduce exposed transfers. "
-            "The in-flight budget cannot fall below the unhoisted live-buffer peak, even if that exceeds this value. "
-            "Not a total device-memory cap: resident loads still allocate D2D outputs outside the in-flight budget, "
-            "and other graph buffers are not included. "
-            "0 = no residency, with in-flight room for the unhoisted peak plus one largest load."
+            "Per-GPU scheduling budget in MiB for resident weights and in-flight H2D buffers. "
+            "The unhoisted live-buffer peak is a minimum and may exceed the budget. "
+            "This is not a total GPU-memory cap; other graph buffers and resident-load D2D outputs are excluded. "
+            "0 disables residency and allows the unhoisted peak plus one largest load in flight."
         ),
     )
     offload_h2d_bandwidth_gbps: float = Field(
         0.0,
         ge=0.0,
         description=(
-            "Override the measured host-to-device bandwidth (GB/s) used to size each load's overlap "
-            "window. 0 = calibrate once per process with a rank-local pinned probe, which does not see "
-            "contention from ranks sharing a host link. Under-estimating is the safe direction: it "
-            "hoists loads further than needed."
+            "H2D bandwidth in GB/s for scheduling; 0 uses a process-cached rank-local pinned-memory probe. "
+            "The probe does not account for contention between ranks sharing a host link."
         ),
     )
 
@@ -286,11 +265,8 @@ class FSDPConfig(BaseModel):
     bucket_mode: Literal["none", "auto"] = Field(
         "auto",
         description=(
-            "'none' = one all-gather + wait per weight. 'auto' (default) = small weight gathers are merged "
-            "during Inductor scheduling, from the measured all-gather costs: a gather large enough that its "
-            "launch is at most auto_bucket_overhead_ratio of its time goes alone, and the smaller ones are "
-            "merged with their program-order neighbours until it is. Applies to NCCL and copy-engine "
-            "(transport='copy_engine') gathers alike."
+            "'none': one all-gather and wait per weight. 'auto': merge small weight gathers during Inductor "
+            "scheduling using the cost model and auto_bucket_overhead_ratio. Supports NCCL and copy-engine gathers."
         ),
     )
     bucket_size_mib: int = Field(
@@ -301,13 +277,9 @@ class FSDPConfig(BaseModel):
         gt=0.0,
         lt=1.0,
         description=(
-            "bucket_mode='auto': the share of a gather's time its fixed launch cost may take. With the "
-            "measured cost alpha + beta * bytes (fitted per transport and process group), a gather of "
-            "alpha * (1 - ratio) / (ratio * beta) gathered bytes or more goes alone; smaller ones are merged "
-            "with their program-order neighbours until a bucket reaches that size, never past twice it. "
-            "Smaller ratios merge more and allocate more gathered weight early. "
-            "None (default) picks per transport: 0.1 for NCCL gathers and 0.5 for copy-engine gathers. "
-            "A value set here applies to both transports."
+            "Maximum fixed-launch-cost share used to size auto buckets. Smaller values merge more gathers "
+            "and may allocate more weight memory early. None selects 0.1 for NCCL or 0.5 for copy-engine; "
+            "an explicit value applies to both."
         ),
     )
     cost_mode: Literal["profile_sync", "analytical"] = Field(

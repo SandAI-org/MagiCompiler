@@ -747,8 +747,7 @@ class MagiBackend:
         mark_python_scalar_inputs(graph)
         self.full_graph_pass_manager(graph)
 
-        # Still whole-graph, but it needs the example inputs and it configures
-        # Inductor's scheduling, neither of which a FullGraphPassManager pass does.
+        # Bind weights on the unsplit graph and install the corresponding scheduler passes.
         self._apply_weight_transfer_pipeline(graph, example_inputs)
 
         split_gm, piecewise_graphs = self._split_graph(graph, example_inputs)

@@ -42,11 +42,7 @@ def unhoisted_index(task: TransferTask) -> int:
 def latest_finish_times_ns(active_tasks: list[TransferTask], compute_prefix_ns: list[float]) -> dict:
     """Per task, the last instant its transfer may end and still keep order.
 
-    Walked back from the last deadline: a transfer may not finish later than
-    its own deadline, nor later than the start of the next one already pinned to
-    its deadline.  Without this a task with slack would be scheduled the moment
-    the resource is free, which is early, and then sit in memory until its
-    deadline -- the resource gains nothing and the in-flight budget pays for it.
+    Each transfer must finish by its deadline and the next transfer's latest start.
     """
     finish_limit_ns = float("inf")
     finish_ns_by_anchor: dict = {}

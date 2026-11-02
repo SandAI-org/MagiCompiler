@@ -127,8 +127,7 @@ class OffloadCache:
         if not self.enabled or self.host_slots_path is None:
             return
         if self._cached_to_current_slots is not None:
-            # Replay: artifacts on disk still use the baked slot space.  Rewriting
-            # the sidecar with this process's integers would desync the next load.
+            # Replay artifacts and their sidecar must share the baked slot IDs.
             return
         slot_table = refresh_resident_flags(self._graph_slot_table)
         printer = pprint.PrettyPrinter(indent=4)

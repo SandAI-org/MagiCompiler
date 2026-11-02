@@ -104,15 +104,8 @@ def test_nccl_transport_is_untouched():
 @requires_2gpu
 @requires_torchrun
 def test_copy_engine_many_scheduler_stage_buckets():
-    """Dozens of copy-engine merges in one graph.
-
-    Each merge leaves its members' launches unscheduled but in the graph's
-    lists; dropping them once made a later merge's new node reuse a live name
-    and attach another bucket's unpacks to the wrong launch.
-
-    The bucket target is fixed so the merge count does not depend on measured costs:
-    each layer gathers 0.5 MiB, so a 1 MiB target pairs the 48 gathers.
-    """
+    """Repeated CE bucket merges preserve launch-name uniqueness and correct output bindings."""
+    # A fixed target keeps the merge count independent of measured costs.
     shape = ("--hidden", "512", "--n-layers", "48", "--n-tokens", "256", "--bucket-target-mib", "1")
     p = _run("copy_engine", "29643", *shape)
     out = p.stdout + p.stderr

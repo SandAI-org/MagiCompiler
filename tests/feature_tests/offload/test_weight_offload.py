@@ -449,8 +449,7 @@ def test_pinned_reservation_failure_is_not_downgraded(monkeypatch):
 
 @requires_cuda
 def test_many_shards_share_one_pinned_slab():
-    """One slab per dtype, not one pinned allocation per weight: cudaHostAlloc is a
-    driver round trip that stalls every stream, and a model has thousands of these."""
+    """The sixteen small same-dtype shards share one backing pinned slab."""
     from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
     slots = [_park_weight_in_host_store(torch.randn(128, 32, device="cuda", dtype=torch.bfloat16)) for _ in range(16)]
@@ -478,11 +477,9 @@ def test_restore_all_puts_the_shards_back():
 
 @requires_cuda
 def test_reserve_and_adopt_park_a_shard_that_was_never_on_the_device():
-    """The only way into the pool, and the reason peak memory drops.
+    """bind_host_buffer associates a filled host buffer with an empty CUDA stand-in.
 
-    ``reserve`` hands out the host buffer up front, the loader fills it, and
-    ``adopt`` pairs it with a device tensor that carries nothing but shape --
-    so the shard is offloaded without ever having been resident.
+    Rebinding the same stand-in returns its existing slot.
     """
     from magi_compiler.passes.weight_offload import get_global_host_weight_store
 
@@ -994,14 +991,7 @@ def _mixed_weight_graph(mesh, rows=8, cols=64, odd_rows=9):
 
 @requires_cuda
 def test_a_replicated_weight_is_offloaded_even_though_nothing_gathers_it(dist_1rank):
-    """The weights that cost the most per GPU were the ones being skipped.
-
-    SimpleFSDP replicates a shard whose dim0 does not divide its mesh, so every
-    rank holds the whole tensor rather than 1/N -- world_size times the device
-    memory of the same weight sharded. Keying offload off all-gathers missed
-    exactly those, and the safety net then dutifully put back anything host-first
-    had parked for them.
-    """
+    """Replicated DTensor weights receive H2D loads without downstream all-gathers."""
     from magi_compiler.passes.weight_offload import (
         FsdpShardSource,
         bind_host_slots_to_graph,
@@ -1103,16 +1093,7 @@ def test_promotion_switches_the_source_and_updates_the_byte_accounting():
 
 @requires_cuda
 def test_a_promoted_load_still_returns_its_own_buffer():
-    """``h2d_load`` may never return a tensor that aliases its input.
-
-    For a promoted slot the bytes the op is asked for are already in the shard
-    it was handed, so handing that shard straight back looks free. It is not:
-    Inductor does not allocate a fallback kernel's output, but it does put it in
-    the reuse pool, so the next same-sized allocation takes the buffer over and
-    the kernel writing into it writes into the weight. That is silent numerical
-    corruption on the *second* call, with nothing pointing back here -- hence a
-    test on the op's contract rather than on any one graph that trips it.
-    """
+    """Writing resident load outputs leaves their source weights unchanged."""
     import torch._C._distributed_c10d as _c10d
 
     from magi_compiler.passes.weight_offload import get_global_host_weight_store
@@ -1995,11 +1976,7 @@ def test_unparked_plain_parameter_is_not_offloaded():
 @requires_cuda
 @pytest.mark.usefixtures("no_process_group")
 def test_offload_survives_a_real_inductor_compile_without_fsdp():
-    """The whole point of the decoupling, end to end in one process.
-
-    No process group is initialized here -- if anything in the offload path still
-    reached for a mesh, a rank or a collective, this would raise rather than run.
-    """
+    """Plain-parameter offload compiles and executes without an initialized process group."""
     from magi_compiler.passes.weight_offload.runtime.h2d_op import H2D_LOAD
 
     w = torch.nn.Parameter(torch.randn(512, 256, device="cuda", dtype=torch.bfloat16), requires_grad=False)
@@ -2079,12 +2056,7 @@ class _ConvWeightModule(torch.nn.Module):
 
 
 def _reference_materialized_layout(cls, memory_format=None) -> tuple[int, ...]:
-    """The stride an unpatched ``to_empty`` produces, which host-first must match.
-
-    ``to_empty`` is ``empty_like`` with ``preserve_format``, so a dense
-    non-contiguous weight keeps its stride.  Asserting against a measurement
-    rather than a literal is what makes these tests about the two paths agreeing.
-    """
+    """Return the stride produced by unpatched to_empty for the comparison model."""
     with torch.device("meta"):
         root = torch.nn.Module()
         root.inner = cls()

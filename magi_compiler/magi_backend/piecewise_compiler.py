@@ -333,15 +333,8 @@ class InductorStandaloneAdaptor(CompilerInterface):
         # Step1: Update compile settings
         compilation_counter.num_inductor_compiles += 1
 
-        # standalone_compile hardcodes autotune_at_compile_time=True, but
-        # unbacked SymInt dimensions cause CUDA illegal-memory-access when
-        # autotune benchmarks run at compile time (confirmed on PT 2.9 / B300).
-        # Override to False: autotuning defers to first forward pass instead.
-        #
-        # The runtime autotune results are persisted via TRITON_CACHE_AUTOTUNING=1
-        # (set in _api.py) — Triton writes .autotune.json to TRITON_CACHE_DIR
-        # (persistent AFS).  Subsequent cold starts read cached results and
-        # skip benchmarking, eliminating the ~3-5 min overhead.
+        # Runtime autotuning uses concrete input sizes;
+        # compile-time benchmarks of unbacked dimensions can exceed input storage.
         current_config: dict[str, Any] = {"triton.autotune_at_compile_time": False}
         if inductor_compile_config is not None:
             current_config.update(inductor_compile_config)

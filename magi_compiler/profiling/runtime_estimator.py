@@ -874,7 +874,7 @@ class ProfilingRuntimeEstimator:
             cnode = _leaf_collective(snode)
             spec = _collective_spec(cnode) if cnode is not None else None
             if spec is None:
-                return analytical_runtime_ns(snode)  # non-AG / unparseable -> old behaviour
+                return analytical_runtime_ns(snode)
             op, _group_name, group_size, specs = spec
             ckey = ("collective", str(op), group_size, tuple((tuple(shape), str(dt)) for shape, dt, _dev in specs))
             # NCCL stays analytical outside profile_sync; only CE supports local measurement here.

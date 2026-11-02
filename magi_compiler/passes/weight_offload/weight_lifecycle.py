@@ -310,7 +310,7 @@ def _install_weight_standin(names: list[str], param: nn.Parameter, host_buffer: 
         _rebuild_dtensor(param=param, local=device_standin_buffer) if isinstance(param, DTensor) else device_standin_buffer
     )
     _swap_parameter_payload(param=param, new_data=new_data)
-    # After, not before: the slot is keyed on the tensor the graph will be traced against.
+    # Host slots are keyed by the post-swap tensor identity used during tracing.
     device_standin = _local_weight_tensor(param)
     return get_global_host_weight_store().bind_host_buffer(
         host_buffer=host_buffer, device_standin=device_standin, parameter_name=_normalize_parameter_name(names[0])
@@ -346,8 +346,7 @@ def _park_cpu_parameters(module: nn.Module, min_weight_bytes: int) -> int:
             shape=param.shape, dtype=param.dtype, parameter_name=_normalize_parameter_name(names[0])
         )
         host_buffer.copy_(param.detach())
-        # Swap before the next copy so the pageable original is freed now: copying every weight
-        # first holds the whole model twice in host memory, which a 400B unsharded Base cannot afford.
+        # Hand off each parameter before copying the next pageable payload into pinned storage.
         host_slots.append(_install_weight_standin(names=names, param=param, host_buffer=host_buffer))
         handed_off_bytes += host_buffer.numel() * host_buffer.element_size()
     if not host_slots:
@@ -364,8 +363,7 @@ def _park_cpu_parameters(module: nn.Module, min_weight_bytes: int) -> int:
 
 
 def _call_class_apply(module: nn.Module, fn, recurse: bool):
-    # The class's, looked up per call: the instance's is this wrapper, and a
-    # sharding owner may swap the class after compile-time patching.
+    # A sharding owner may replace the module class after hooks are installed.
     return type(module)._apply(module, fn, recurse=recurse)
 
 
@@ -387,8 +385,6 @@ def _apply_with_host_offload(self: nn.Module, fn, recurse: bool = True):
             _park_cpu_parameters(module=self, min_weight_bytes=state.min_weight_bytes)
     if target is None:
         _reject_cast_after_handoff(module=self, fn=fn)
-    # Plain torch: not a device move, or no handoff is pending and none ever ran; e.g. a move to
-    # the host before the first CUDA move, or a module already on CUDA at that move.
     if target is None or state.handoff_status == "not_started":
         return _call_class_apply(module=self, fn=fn, recurse=recurse)
     # A device move of a module that owns host slots: hand off first if to_empty left it pending.
@@ -417,8 +413,7 @@ def _select_meta_weight_names(module: nn.Module, *, recurse: bool, min_weight_by
         if not _is_offloadable(param):
             continue
         local_weight = _local_weight_tensor(param)
-        # Before the two refusals below, so neither reports a weight that was
-        # never a candidate in the first place.
+        # Layout and materialization diagnostics include only size-eligible weights.
         if local_weight.numel() * local_weight.element_size() < min_weight_bytes:
             continue
         if not local_weight.is_contiguous():

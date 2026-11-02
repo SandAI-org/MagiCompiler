@@ -332,6 +332,7 @@ def _create_coalesced_gather_ir(
 
 def _replace_member_output_ir(*, old_output_ir_nodes: list[ir.Buffer], output_ir_nodes: list[ir.MultiOutput]) -> None:
     """Replace V.graph output registrations while keeping their names, list positions, and origins."""
+    # Unscheduled CE launches retain their graph-list slots to prevent name reuse.
     for old_output_ir, new_output_ir in zip(old_output_ir_nodes, output_ir_nodes):
         same_shape = tuple(old_output_ir.get_size()) == tuple(new_output_ir.get_size())
         if not same_shape or old_output_ir.get_dtype() != new_output_ir.get_dtype():
@@ -341,9 +342,6 @@ def _replace_member_output_ir(*, old_output_ir_nodes: list[ir.Buffer], output_ir
             )
         new_output_ir.origins = OrderedSet(old_output_ir.origins)
         _replace_ir_preserving_names(old_ir=old_output_ir, replacement_ir=new_output_ir)
-    # A copy-engine member's own launch stays in ``V.graph.buffers`` / ``operations``,
-    # unscheduled: Inductor names a new node after the lists' lengths, so shrinking
-    # them would hand a later merge a name already in use.
 
 
 def _register_coalesced_scheduler_nodes(

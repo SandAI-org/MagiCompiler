@@ -85,10 +85,11 @@ def _any_rank_inserted_loads(*, offload_config: OffloadConfig, loads_inserted: b
 
 
 def _compiles_in_rank_lockstep(*, fsdp_config: FSDPConfig, offload_config: OffloadConfig) -> bool:
-    """Whether this graph's Inductor passes issue WORLD collectives.
+    """Whether Inductor issues WORLD collectives for this graph (the Inductor rows of the
+    multi-rank contract table in ``transfer_overlap.rank_sync``).
 
-    Only ranks that miss the compile cache enter Inductor, so when this holds
-    every rank must hit or miss the cache together.
+    Only cache-miss ranks enter Inductor, so when this holds every rank must hit
+    or miss the compile cache together.
     """
     # FSDP placement negotiates over WORLD in every cost mode; offload alone only through the lockstep estimator.
     profiles_offload_in_lockstep = offload_config.graph_weight_offload and fsdp_config.cost_mode == "profile_sync"

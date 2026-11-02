@@ -12,16 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for autotune_at_compile_time override and TRITON_CACHE_AUTOTUNING.
-
-Bug: autotune_at_compile_time=False defers autotuning to first forward pass.
-Triton has a built-in disk cache (Autotuner.check_disk_cache → .autotune.json)
-but it's disabled by default (TRITON_CACHE_AUTOTUNING unset).  Each new pod
-re-benchmarks all kernel configs: ~3-5 min overhead on cold start.
-
-Fix: Set TRITON_CACHE_AUTOTUNING=1 in _compilation_context() so that
-bake warmup autotune results persist to AFS and verify pods skip benchmarking.
-"""
+"""Verify runtime-autotune configuration and cross-process persistence of autotune selections."""
 
 import glob
 import os
@@ -145,21 +136,9 @@ def _run_worker(cache_dir: str, enable_cache: bool) -> float:
 
 @pytest.mark.skipif(not os.path.exists("/dev/nvidia0"), reason="GPU required")
 class TestAutotuneCachePersistence:
-    """Reproduce the bug and verify the fix via 2-process simulation.
-
-    Bug: without TRITON_CACHE_AUTOTUNING=1, autotune results are NOT
-    persisted to disk → no .autotune.json → 2nd process re-benchmarks.
-
-    Fix: with TRITON_CACHE_AUTOTUNING=1, autotune results ARE persisted
-    → .autotune.json exists → 2nd process reads cache, skips benchmark.
-    """
+    """Autotune selections persist across worker processes when disk caching is enabled."""
 
     def test_bug_reproduced_no_cache_without_env(self):
-        """WITHOUT TRITON_CACHE_AUTOTUNING=1:
-        - Process 1 benchmarks and finishes
-        - No .autotune.json is written to disk
-        This proves the bug: autotune results are lost between processes.
-        """
         with tempfile.TemporaryDirectory() as cache_dir:
             _run_worker(cache_dir, enable_cache=False)
 
@@ -170,20 +149,7 @@ class TestAutotuneCachePersistence:
             )
 
     def test_bug_fixed_cache_persisted_with_env(self):
-        """WITH TRITON_CACHE_AUTOTUNING=1, .autotune.json is written to disk.
-
-        Primary evidence: .autotune.json file existence (deterministic).
-
-        Supplementary evidence (3-process controlled experiment):
-        - Process 1 warms both compilation cache AND autotune cache
-        - Process 2 (cache=True):  same compilation cache + autotune HIT
-        - Process 3 (cache=False): same compilation cache + autotune MISS
-
-        Comparing P2 vs P3 isolates the autotune cache variable: both share
-        the same Triton .cubin compilation cache and CUDA init overhead.
-        For a single kernel with 4 configs the gap is ~1.5-2x; real models
-        with hundreds of kernels see ~3-5 min cumulative savings.
-        """
+        """Compare autotune cache hits and misses using the same warmed compilation cache."""
         with tempfile.TemporaryDirectory() as cache_dir:
             # Process 1: warm both compilation and autotune caches
             _run_worker(cache_dir, enable_cache=True)
@@ -199,7 +165,6 @@ class TestAutotuneCachePersistence:
             t_cached = _run_worker(cache_dir, enable_cache=True)
 
             # Process 3: compilation cache warm + autotune cache MISS
-            # (must re-benchmark 4 configs × 3 runs = 12 kernel launches)
             t_uncached = _run_worker(cache_dir, enable_cache=False)
 
             assert t_uncached > t_cached, (

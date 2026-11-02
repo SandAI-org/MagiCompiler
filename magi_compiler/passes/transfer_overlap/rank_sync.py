@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Keeping a collective-moving placement identical on every rank.
+"""Keeping a collective-moving placement identical on every rank, and the multi-rank compile contract.
 
 A pass that moves NCCL-issuing snodes must emit the same collective sequence on
 every rank, or the ranks deadlock.  Costs are rank-local measurements and
@@ -27,8 +27,49 @@ per-rank graphs can differ in compute, so agreement is negotiated, not assumed:
 * ``all_ranks_agree`` ANDs a local commit verdict across ranks -- committing on
   some ranks and not on others is itself a divergent sequence.
 
-A pass that moves only rank-private work (a host-to-device load) needs none of
-this.
+Multi-rank contract
+-------------------
+Every rendezvous a weight-transfer compile (FSDP gathers, graph weight offload)
+can enter with an initialized multi-rank WORLD.  "Compiling ranks" are the ranks
+whose Dynamo backend sees the graph; Inductor runs only on the ones that miss
+the compile cache.  ``enable_fsdp`` is the graph's effective value: split-graph
+compiles turn it off.
+
++---------------+---------------------------------------+------------+--------------------------------+------------------+
+| Stage         | Rendezvous                            | Group      | Entered when                   | Who enters       |
++===============+=======================================+============+================================+==================+
+| backend (FX)  | ``_any_rank_inserted_loads``          | WORLD      | graph_weight_offload and not   | compiling ranks  |
+|               | (weight_transfer_pipeline)            |            | enable_fsdp, any cost_mode     |                  |
++---------------+---------------------------------------+------------+--------------------------------+------------------+
+| backend (FX)  | offload candidate intersection        | shard mesh | graph_weight_offload with      | compiling ranks  |
+|               | (weight_offload.graph.bind)           |            | DTensor weights                | of that mesh     |
++---------------+---------------------------------------+------------+--------------------------------+------------------+
+| cache verdict | ``OffloadCache.prepare_graph_replay`` | WORLD      | graph_weight_offload and       | compiling ranks  |
+|               | miss OR                               |            | ``_compiles_in_rank_lockstep`` |                  |
++---------------+---------------------------------------+------------+--------------------------------+------------------+
+| Inductor      | ``SnodeCostProfile`` and              | WORLD      | enable_fsdp or                 | cache-miss ranks |
+|               | ``ProfilingRuntimeEstimator.          |            | graph_weight_offload, with     |                  |
+|               | warm_and_sync``                       |            | cost_mode='profile_sync'       |                  |
++---------------+---------------------------------------+------------+--------------------------------+------------------+
+| Inductor      | FSDP reorder and auto-bucket          | WORLD      | enable_fsdp, any cost_mode     | cache-miss ranks |
+|               | (negotiate / align / agree)           |            |                                |                  |
++---------------+---------------------------------------+------------+--------------------------------+------------------+
+| Inductor      | H2D load placement                    | none       | --                             | rank-local       |
++---------------+---------------------------------------+------------+--------------------------------+------------------+
+
+What follows from it:
+
+* Once graph_weight_offload or enable_fsdp is on, every rank compiles the same
+  graphs in the same order, including ranks that offload or gather nothing.
+* Inductor rows reach only cache-miss ranks, so ranks must agree on the cache
+  verdict whenever one of them can fire.  ``_compiles_in_rank_lockstep`` in
+  weight_transfer_pipeline is the one predicate for that sync and for the
+  estimator's lockstep mode.
+* The verdict is OR-ed only for offload graphs, whose host-slot sidecar can miss
+  on one rank alone.  Nothing ORs it for an FSDP graph without offload: its
+  ranks must hit or miss the compile cache together on their own.
+* H2D placement stays rank-local: loads issue no collective, so the bandwidth
+  probe, residency choice and load positions may differ across ranks.
 """
 
 from __future__ import annotations

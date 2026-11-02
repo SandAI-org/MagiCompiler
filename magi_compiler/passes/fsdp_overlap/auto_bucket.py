@@ -163,7 +163,7 @@ def plan_bucket_segments(members: list[GatherMember], params: BucketPlanParams) 
 
 # -- the pass -----------------------------------------------------------------
 class FsdpAutoBucket:
-    """Reorder pass that merges small weight gathers until their launch is amortized, and never moves anything else."""
+    """Merge compatible weight gathers and hoist their required shard preparation."""
 
     log_prefix = "FSDP auto bucket"
 
@@ -180,9 +180,7 @@ class FsdpAutoBucket:
         cost = CostView(self._runtime_ns_fn)
         sync_group, skeleton_nodes = None, []
         if world_size > 1:
-            # Candidate count is rank-local. Every rank joins the exchange below,
-            # including one that found nothing to merge. Returning here skips the
-            # all_gather and blocks whichever ranks do enter it.
+            # Every rank joins negotiation, including ranks with no candidates.
             collective_indices, collective_signatures = rank_sync.collective_skeleton(order)
             consensus = rank_sync.negotiate_placement_mode(
                 candidate_count=len(candidates),
@@ -308,14 +306,7 @@ class FsdpAutoBucket:
     def _fit_bucket_params(
         self, candidates: list[GatherCandidate], cost: CostView
     ) -> dict[tuple[str, str, int], BucketPlanParams]:
-        """One fit per (transport, process group), and one ratio per transport.
-
-        Per transport because a copy-engine gather's fixed and per-byte costs are
-        nothing like an NCCL one's.  Per group because the per-byte cost depends on
-        who the bytes come from: a one-rank group's gather is a local copy at device
-        bandwidth, and fitted together with an eight-rank group's its gigabyte-sized
-        samples pull ``beta`` down by an order of magnitude for every other gather.
-        """
+        # Fit each transport and process group separately; their costs differ.
         samples_by_cost_model: dict[tuple[str, str, int], list[tuple[float, float]]] = {}
         for candidate in candidates:
             info = candidate.info

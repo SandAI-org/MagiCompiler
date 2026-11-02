@@ -168,9 +168,7 @@ def main() -> None:
         cfg.offload_config.offload_h2d_bandwidth_gbps = args.h2d_gbps
         return cfg
 
-    # The reference is what the checkpoint would be, so it has to be off the
-    # device before the peak is measured -- otherwise the thing under test is
-    # competing with a full copy of the model it is supposed to replace.
+    # Materialization memory accounting excludes the reference model weights.
     ref = ref.cpu()
     torch.cuda.empty_cache()
 
@@ -180,9 +178,7 @@ def main() -> None:
     compiled = magi_compile(model, config_patch=_patch, dynamic_arg_dims={"x": 0})
 
     torch.cuda.reset_peak_memory_stats()
-    # The delta, not the absolute peak: what is under test is what
-    # materializing and filling the model costs, and the process is holding
-    # unrelated tensors (the input, the eager reference output) either way.
+    # The baseline includes existing inputs and the eager reference output.
     allocation_baseline_bytes = torch.cuda.memory_allocated()
     model.to_empty(device=torch.device("cuda", dev))
     weights_mib = _fill_shards_from_reference(model, ref, rank, world_size)
@@ -205,11 +201,7 @@ def main() -> None:
             flush=True,
         )
         if get_global_host_weight_store().weight_count() == 0:
-            # Offload tags what the redistribute lowering exposed, so zero shards
-            # means the lowering found nothing -- which is a property of the
-            # installed SimpleFSDP, not of this run.  Say so explicitly: a numeric
-            # check on an un-offloaded graph passes for the wrong reason.
-            print("OFFLOAD_SKIPPED reason=no_weight_gather_lowered", flush=True)
+            print("OFFLOAD_SKIPPED reason=no_host_slots", flush=True)
         print("OFFLOAD_COMPILED", flush=True)
 
     output_fp32 = out.float()

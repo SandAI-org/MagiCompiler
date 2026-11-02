@@ -12,18 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``H2dLoadReorder`` placement, on synthetic snode lists.
+"""Verify H2D placement on synthetic schedules using bytes/ns transfer costs.
 
-Phase 1 leaves every ``h2d_load`` directly in front of the wait that guards it,
-which is correct and fully exposed; this pass is the one that opens a compute
-window in between.  What is worth testing here is the arithmetic of that window
-and the in-flight budget that bounds it -- both are pure functions of the snode
-list, so the list is synthetic and only the wait predicate is stubbed (Inductor
-decides it by ``isinstance``, which no synthetic node can satisfy).
-
-The cost model is deliberately NOT stubbed: a load's window comes from
-``bytes / bandwidth``, and getting that unit wrong by 1e9 is the failure mode
-this suite exists to catch.
+Dependency, serialized-transfer, and in-flight-memory constraints bound each placement.
 """
 
 import dataclasses

@@ -12,12 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Host memory, bump-allocated out of a few large slabs.
+"""Allocate host tensor views from dtype-specific slabs.
 
-One slab per dtype holds many tensors: a caller such as weight offload asks
-for thousands of small regions, and one allocation per region would pay the
-allocator -- for pinned memory, a ``cudaHostAlloc`` driver round trip that also
-pauses every other stream -- thousands of times.
+A dtype may occupy multiple slabs. Existing views retain their storage after pool reset.
 
 A pool is either pinned or paged.  Pinned is what makes a host-to-device copy
 asynchronous at all -- a pageable source forces ``cudaMemcpyAsync`` to stage
