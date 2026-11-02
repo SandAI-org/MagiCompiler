@@ -35,7 +35,7 @@ def ce_ag_ops() -> tuple:
         from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER, CE_ALL_GATHER_COALESCED
 
         return CE_ALL_GATHER, CE_ALL_GATHER_COALESCED
-    except Exception:  # noqa: BLE001
+    except ImportError:
         return None, None
 
 

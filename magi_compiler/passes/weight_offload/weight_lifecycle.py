@@ -255,6 +255,28 @@ def _reject_cast_after_handoff(module: nn.Module, fn) -> None:
             )
 
 
+def _is_enclosing_host_materialization(fn) -> bool:
+    """Whether ``fn`` is an enclosing compiled instance's ``to_empty`` reaching this one;
+    that instance already chose this module's meta weights for its own host buffers."""
+    return isinstance(fn, partial) and fn.func is _allocate_parameter_storage
+
+
+def _reject_unrecognized_meta_materialization(module: nn.Module) -> None:
+    """Raise before a CUDA ``_apply`` that is not ``to_empty`` reaches meta weights.
+
+    Without this, a torch change to ``to_empty``'s lambda would silently materialize
+    every weight on the device instead of parking it."""
+    for name, param in module.named_parameters():
+        if _local_weight_tensor(param).is_meta:
+            raise RuntimeError(
+                f"host offload: {type(module).__name__}.{_normalize_parameter_name(name)} is still on meta, and "
+                "a CUDA _apply that is not nn.Module.to_empty would materialize it on the device instead of "
+                "in host memory. Materialize meta-built models with module.to_empty(device=...); if this "
+                f"already is to_empty, torch changed its implementation and _TO_EMPTY_QUALNAME "
+                f"({_TO_EMPTY_QUALNAME!r}) must be updated."
+            )
+
+
 def _has_dtensor_parameters(module: nn.Module) -> bool:
     return any(isinstance(p, DTensor) for p in module.parameters())
 
@@ -355,6 +377,8 @@ def _apply_with_host_offload(self: nn.Module, fn, recurse: bool = True):
     # None unless fn is a pure host<->CUDA move: dtype casts and other conversions get None.
     # Combined device+dtype moves are unsupported once weights are parked (module docstring).
     target = _probe_move_device(fn)
+    if target is not None and target.type == "cuda" and not _is_enclosing_host_materialization(fn):
+        _reject_unrecognized_meta_materialization(module=self)
     # Decided once per instance. Weights on the host at the first CUDA move are parked: built on
     # the host, or built on CUDA and moved to the host first. Weights already on CUDA never are.
     if target is not None and target.type == "cuda" and not state.parking_decided:

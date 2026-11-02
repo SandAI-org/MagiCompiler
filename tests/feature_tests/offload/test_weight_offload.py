@@ -1280,6 +1280,33 @@ def test_empty_handoff_completes_after_all_parked_weights_are_reclaimed():
     assert module.weight.untyped_storage().nbytes() > 0
 
 
+@requires_cuda
+def test_a_cuda_materializer_that_is_not_to_empty_is_refused_on_meta_weights():
+    """to_empty is recognized by torch's lambda; any other CUDA _apply on meta weights,
+    e.g. to_empty after torch rewrites it, must fail instead of skipping the offload."""
+    module = _install_host_first_hooks(torch.nn.Linear(4, 4, bias=False, device="meta"))
+
+    with pytest.raises(RuntimeError, match="is still on meta"):
+        module._apply(lambda tensor: torch.empty_like(tensor, device="cuda"))
+    assert module.weight.is_meta, "the refused materializer must not have run"
+
+
+@requires_cuda
+def test_an_enclosing_to_empty_parks_a_nested_instance_without_refusal():
+    """The enclosing instance's to_empty reaches a nested one through its own materializer,
+    which must still count as to_empty there."""
+    with torch.device("meta"):
+        root = torch.nn.Module()
+        root.inner = _CompiledWeightModule(rows=256, cols=64)
+    _install_host_first_hooks(root)
+    _install_host_first_hooks(root.inner)
+
+    root.to_empty(device=torch.device("cuda"))
+
+    weight = root.inner.big.weight
+    assert weight.device.type == "cpu" and weight.is_pinned(), "the nested weight must be parked in host memory"
+
+
 class _TiedWeightModule(torch.nn.Module):
     """Two projections over one weight, the way a model ties its output head to an embedding."""
 

@@ -316,8 +316,13 @@ def _replay_key(snode: BaseSchedulerNode) -> tuple | None:
         with _shapeenv_sandbox(), _suppress_guards():
             target, args, kwargs = _extern_replay_inputs(snode)
             return ("replay", _op_name(target), _value_signature((args, sorted(kwargs.items()))))
-    except Exception as exc:  # noqa: BLE001
-        magi_logger.debug("replay key unavailable for %s: %s", snode.get_name(), exc)
+    # A failing hook is usually a hook bug, and its structural key may differ across ranks.
+    except Exception:  # noqa: BLE001
+        magi_logger.warning(
+            "replay key unavailable for %s; falling back to its structural key, which ranks may not share",
+            snode.get_name(),
+            exc_info=True,
+        )
         return None
 
 
