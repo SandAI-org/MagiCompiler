@@ -16,15 +16,14 @@
 SimpleFSDP-style model, and print machine-checkable markers to stdout for the pytest
 driver (tests/feature_tests/test_fsdp_overlap_e2e.py).
 
-Chain under test (magi_backend._apply_fsdp_fullgraph_overlap):
-  redistribute lowering  ->  whole-graph bucketing (coalesced)  ->  FsdpOverlapReorder
+Chain under test (magi_backend._apply_weight_transfer_pipeline):
+  redistribute lowering  ->  FsdpAutoBucket (scheduler stage)  ->  FsdpOverlapReorder
 
 Model: two Linear layers whose params are Shard(0) DTensors (via torchtitan
 ``data_parallel(mode="fully_shard")``), with an
 opaque ``@magi_register_custom_op(is_subgraph_boundary=True)`` op between them so the
 graph contains an opaque extern call alongside the
-weight ``prim_redistribute`` nodes the lowering pass rewrites.  Bucketing is
-whole-graph: the boundary op does NOT split buckets.
+weight ``prim_redistribute`` nodes the lowering pass rewrites.
 
 Run: torchrun --nproc_per_node=N tests/feature_tests/fsdp_overlap_helper/e2e_helper.py
      [--cost-mode analytical|profile_sync]
@@ -58,10 +57,8 @@ def boundary_gelu(x: torch.Tensor) -> torch.Tensor:
 
 
 class Block(nn.Module):
-    """One transformer-ish block: two Linears with an opaque extern op between them.
-    Multiple blocks give the graph many Shard(0) weight all-gathers interleaved with
-    compute -- so the bucketing pass coalesces them whole-graph and the reorder pass
-    has real compute to hide gathers behind."""
+    """Two linear layers separated by an opaque extern op.
+    Repeated blocks provide interleaved gathers and compute for bucketing and overlap."""
 
     def __init__(self, hidden: int):
         super().__init__()
@@ -98,7 +95,7 @@ def main() -> None:
 
     dist.init_process_group("cpu:gloo,cuda:nccl")
     rank = dist.get_rank()
-    world = dist.get_world_size()
+    world_size = dist.get_world_size()
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", rank)))
     dev = torch.cuda.current_device()
     torch.manual_seed(0)
@@ -109,11 +106,11 @@ def main() -> None:
     os.environ.setdefault("MAGI_LOGGING_LEVEL", "INFO")
 
     if rank == 0:
-        print(f"E2E_CONFIG world={world} cost_mode={args.cost_mode}", flush=True)
+        print(f"E2E_CONFIG world={world_size} cost_mode={args.cost_mode}", flush=True)
 
     from torchtitan.experiments.simple_fsdp.simple_fsdp import data_parallel
 
-    mesh = init_device_mesh("cuda", (world,))
+    mesh = init_device_mesh("cuda", (world_size,))
 
     # --- eager reference (plain replicated weights) ---
     hidden = args.hidden
@@ -135,7 +132,7 @@ def main() -> None:
         cfg.cudagraph_mode = CudaGraphMode.NONE
         cfg.disable_graph_split = True
         cfg.fsdp_config.enable_fsdp = True
-        cfg.fsdp_config.bucket_mode = "coalesced"
+        cfg.fsdp_config.bucket_mode = "auto"
         cfg.fsdp_config.cost_mode = args.cost_mode
         return cfg
 
@@ -158,7 +155,7 @@ def main() -> None:
     # confirm every rank agrees (no rank-divergent hang/output)
     ok_t = torch.tensor([1 if ok else 0], device=dev)
     dist.all_reduce(ok_t)
-    all_ok = int(ok_t.item()) == world
+    all_ok = int(ok_t.item()) == world_size
 
     if rank == 0:
         print(f"E2E_NUMERIC rel={rel:.5f} ok={ok}", flush=True)
