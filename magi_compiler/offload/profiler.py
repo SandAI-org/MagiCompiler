@@ -16,12 +16,12 @@ from typing import Dict
 
 import torch
 
-from magi_compiler.utils.device import accelerator_module, accelerator_type
+from magi_compiler.accelerator import PLATFORM
 
 
 class OffloadProfiler:
     def __init__(self):
-        self.device_module = accelerator_module()
+        self.device_module = PLATFORM
         self.compute_events: Dict[str, Dict[str, torch.cuda.Event]] = {}
         self.timings: Dict[str, Dict[str, float]] = {}
 
@@ -38,7 +38,7 @@ class OffloadProfiler:
         self.compute_events[name]["end"] = end_event
 
     def get_h2d_bandwidth(self, size_mb=1024, iters=3, warmup=3, dtype=torch.float32, device=None):
-        device = device or accelerator_type()
+        device = device or PLATFORM.device_type
         self.device_module.synchronize()
 
         num_elements = size_mb * 1024 * 1024 // torch.tensor([], dtype=dtype).element_size()

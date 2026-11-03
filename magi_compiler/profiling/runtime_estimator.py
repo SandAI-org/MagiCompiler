@@ -53,8 +53,8 @@ from torch._inductor.scheduler import BaseSchedulerNode, ExternKernelSchedulerNo
 from torch._inductor.utils import contains_collective, contains_wait
 from torch._inductor.virtualized import V
 
+from magi_compiler.accelerator import PLATFORM
 from magi_compiler.utils import magi_logger
-from magi_compiler.utils.device import accelerator_module
 
 from .materialize_inputs import apply_materialize_inputs, get_materialize_inputs_hook, op_has_internal_collective
 
@@ -331,17 +331,16 @@ def _time_fixed(fn, warmup: int = 3, iters: int = 10) -> float:
     number of them on every rank, or the NCCL counts diverge and the ranks
     deadlock inside what is supposed to be a measurement.
     """
-    accel = accelerator_module()
     for _ in range(warmup):
         fn()
-    accel.synchronize()
-    start = accel.Event(enable_timing=True)
-    end = accel.Event(enable_timing=True)
+    PLATFORM.synchronize()
+    start = PLATFORM.Event(enable_timing=True)
+    end = PLATFORM.Event(enable_timing=True)
     start.record()
     for _ in range(iters):
         fn()
     end.record()
-    accel.synchronize()
+    PLATFORM.synchronize()
     return (start.elapsed_time(end) / iters) * 1e6  # ms/iter -> ns
 
 

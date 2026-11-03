@@ -30,12 +30,12 @@ from torch._dispatch.python import enable_python_dispatcher
 from torch._guards import detect_fake_mode
 
 import magi_compiler.utils.envs as envs
+from magi_compiler.accelerator import PLATFORM
 from magi_compiler.config import CompileConfig, CompileMode, CudaGraphMode, inductor_compile_config_hash, magi_cache_dump_path
 from magi_compiler.magi_depyf.timeline import observe_lifecycle, observe_lifecycle_context
 from magi_compiler.offload.offload_warpper import OffloadWrapper, is_python_scalar_input, mark_python_scalar_inputs
 from magi_compiler.passes import CustomJointGraphPartitionFn, FullGraphPassManager, PostGradPassManager, pass_context
 from magi_compiler.utils import compilation_counter, compute_code_hash, compute_graph_hash, compute_hash, magi_logger
-from magi_compiler.utils.device import accelerator_module, accelerator_type
 from magi_compiler.utils.visualize import save_fx_graph_visualization
 
 from ._cache_data_cls import CacheEntry, CacheHandle
@@ -294,7 +294,7 @@ def fix_graph_device_placement(module: torch.nn.Module):
         return
 
     needs_recompile = False
-    target_device = torch.device(accelerator_type(), accelerator_module().current_device())
+    target_device = PLATFORM.device()
 
     for node in module.graph.nodes:
         if node.op == 'call_function' and 'device' in node.kwargs:
@@ -368,7 +368,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
             placeholders = [node for node in self.module.graph.nodes if node.op == "placeholder"]
             for i, (arg, node) in enumerate(zip(fake_args, placeholders, strict=True)):
                 if isinstance(arg, torch.Tensor) and not is_python_scalar_input(node):
-                    fake_args[i] = arg.to(accelerator_type())
+                    fake_args[i] = arg.to(PLATFORM.device_type)
 
         with self.fake_mode, enable_python_dispatcher():
             return super().run(*fake_args)
@@ -624,7 +624,7 @@ class MagiBackend:
             self.compile_config.cudagraph_mode == CudaGraphMode.NONE
         ), "fsdp_config.enable_fullgraph_overlap requires cudagraph_mode=NONE"
         assert (
-            fsdp_cfg.transport != "copy_engine" or accelerator_type() == "cuda"
+            fsdp_cfg.transport != "copy_engine" or PLATFORM.has_symm_mem
         ), "fsdp_config.transport='copy_engine' needs CUDA symmetric memory; use 'nccl'"
 
         from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder, lower_and_bucket_full_graph

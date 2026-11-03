@@ -20,9 +20,9 @@ from typing import Any, Dict, List, Set, Type
 import torch
 from torch.fx import Node
 
+from magi_compiler.accelerator import PLATFORM
 from magi_compiler.config import CompileConfig
 from magi_compiler.utils import magi_logger
-from magi_compiler.utils.device import accelerator_module, accelerator_type
 
 
 @dataclass
@@ -87,8 +87,8 @@ class OffloadScheduler(abc.ABC):
         self.weight_sizes = weight_sizes
 
         self.kept_weights: Set[str] = set()
-        self.device_module = accelerator_module()
-        self.device_type = accelerator_type()
+        self.device_module = PLATFORM
+        self.device_type = PLATFORM.device_type
 
     @abc.abstractmethod
     def schedule_kept_weights(self, profile_data: Dict[str, float]):

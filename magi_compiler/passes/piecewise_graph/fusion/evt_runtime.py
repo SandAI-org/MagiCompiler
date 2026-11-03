@@ -41,8 +41,8 @@ from typing import Optional
 
 import torch
 
+from magi_compiler.accelerator import PLATFORM
 from magi_compiler.config import get_compile_config
-from magi_compiler.utils.device import device_capability
 
 from .common.codegen_shared import max_tile_candidates
 from .evt_ir import Accum, AuxLoad, ColBroadcast, Compute, RowBroadcast, Store
@@ -127,7 +127,7 @@ def _device_gencode_flags() -> list[str]:
     override = os.environ.get("MAGI_EVT_GENCODE")
     if override:
         return [a for a in override.split(";") if a]
-    cap = device_capability()
+    cap = PLATFORM.sm
     arch = f"{cap[0]}{cap[1]}"  # "90" for H100, "120" for RTX 5090, "80" for A100
     # Use the wgmma-enabled "a" variant on Hopper; all other arches stay plain.
     arch_for_code = f"{arch}a" if arch == "90" else arch
@@ -141,7 +141,7 @@ def _device_gencode_flags() -> list[str]:
 
 def _device_arch_tag() -> str:
     """Short tag for the live device (e.g. ``sm90``), folded into build_dir."""
-    cap = device_capability()
+    cap = PLATFORM.sm
     return f"sm{cap[0]}{cap[1]}"
 
 

@@ -20,10 +20,10 @@ import torch
 from torch.fx import GraphModule, Node
 from torch.fx.node import map_arg
 
+from magi_compiler.accelerator import PLATFORM
 from magi_compiler.config import CompileConfig
 from magi_compiler.offload.profiler import OffloadProfiler
 from magi_compiler.offload.scheduler import OffloadRuntimeContext, SchedulerFactory
-from magi_compiler.utils.device import accelerator_module, accelerator_type
 from magi_compiler.utils.nvtx import add_nvtx_event
 
 from ..magi_depyf.timeline import observe_lifecycle
@@ -34,8 +34,8 @@ class OffloadExecutor:
         self.graph_module = graph_module
         self.compile_config = compile_config
 
-        self.device_module = accelerator_module()
-        self.device_type = accelerator_type()
+        self.device_module = PLATFORM
+        self.device_type = PLATFORM.device_type
         self.compute_stream = self.device_module.current_stream()
         self.h2d_stream = self.device_module.Stream()
 

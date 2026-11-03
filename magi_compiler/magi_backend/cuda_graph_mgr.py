@@ -18,9 +18,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from magi_compiler.accelerator import PLATFORM
 from magi_compiler.magi_depyf.timeline import observe_lifecycle
 from magi_compiler.utils import magi_logger, nvtx
-from magi_compiler.utils.device import accelerator_graph_cls, accelerator_module, accelerator_type
 
 
 class InplaceSubstituteFakeClass:
@@ -398,7 +398,7 @@ class CudaGraphMgr:
     def graph_mem_pool_size(self) -> float:
         if not hasattr(self, "graph_mem_pool") or self.graph_mem_pool is None:
             return 0.0
-        pool_stats = accelerator_module().memory.memory_stats(self.graph_mem_pool)
+        pool_stats = PLATFORM.memory.memory_stats(self.graph_mem_pool)
         used_mem = pool_stats.get("allocated_bytes.all.current", 0)
         return used_mem / (1024 * 1024)
 
@@ -465,13 +465,12 @@ class CudaGraphMgr:
     @nvtx.instrument_nvtx
     def warmup_run(self, func: Callable, *args, **kwargs) -> Union[torch.Tensor, List[torch.Tensor]]:
         warmup_outputs = None
-        accel = accelerator_module()
-        s = accel.Stream()
-        s.wait_stream(accel.current_stream())
-        with accel.stream(s), torch.no_grad():
+        s = PLATFORM.Stream()
+        s.wait_stream(PLATFORM.current_stream())
+        with PLATFORM.stream(s), torch.no_grad():
             for _ in range(1):
                 warmup_outputs = func(*args, **kwargs)
-        accel.current_stream().wait_stream(s)
+        PLATFORM.current_stream().wait_stream(s)
         return warmup_outputs
 
     @nvtx.instrument_nvtx
@@ -557,18 +556,16 @@ class CudaGraphMgr:
         init_cudagraph_global_pool()
         _set_capture_start()
         try:
-            graph = accelerator_graph_cls()()
+            graph = PLATFORM.graph_cls()
             _static_input_obj = ArgsUtils.replace_sliced_with_static(input_obj, static_input_tensors)
             s = None
-            # Under the default "global" mode torch_musa fails every capture, even a bare ``x * 2``.
-            mode = "global" if accelerator_type() == "cuda" else "relaxed"
-            with accelerator_module().graph(
-                graph, pool=self.graph_mem_pool, stream=s, capture_error_mode=mode
+            with PLATFORM.graph(
+                graph, pool=self.graph_mem_pool, stream=s, capture_error_mode=PLATFORM.graph_capture_error_mode
             ), torch.no_grad():
                 _sliced_output_obj = func(*_static_input_obj["args"], **_static_input_obj["kwargs"])
                 _static_output_obj = ArgsUtils.replace_sliced_with_static(_sliced_output_obj, static_output_tensors)
         except Exception as e:
-            accelerator_module().synchronize()
+            PLATFORM.synchronize()
             _set_capture_end()
             raise e
         _set_capture_end()
@@ -934,5 +931,5 @@ def init_cudagraph_global_pool():
     from magi_compiler.magi_backend.cuda_graph_mgr import cuda_graph_mgr
 
     if cuda_graph_mgr().graph_mem_pool is None:
-        cuda_graph_mgr().graph_mem_pool = accelerator_module().graph_pool_handle()
+        cuda_graph_mgr().graph_mem_pool = PLATFORM.graph_pool_handle()
         magi_logger.info("Initialized the global graph memory pool.")

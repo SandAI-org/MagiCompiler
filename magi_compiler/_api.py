@@ -31,12 +31,11 @@ from torch import distributed as dist
 from torch import nn
 from torch._dynamo.symbolic_convert import InliningInstructionTranslator
 
+from magi_compiler.accelerator import PLATFORM, pin_memory_in_place
 from magi_compiler.config import debug_dump_path, inductor_cache_dump_path, triton_cache_dump_path
-from magi_compiler.cuda.cudart import pin_memory_in_place
 from magi_compiler.magi_backend.magi_compiler_base import MagiCompileState
 from magi_compiler.utils import compilation_counter, envs, magi_logger
 from magi_compiler.utils.compile_time_monitor import CompileMonitor
-from magi_compiler.utils.device import accelerator_type
 from magi_compiler.utils.host_memory import fmt_host_mem
 
 from .config import CompileConfig, CompileMode
@@ -808,7 +807,7 @@ def _patch_cpu_offload_apply(cls: type[nn.Module], conf: CompileConfig):
         is_to_cuda = False
         if is_to_lambda and not getattr(self, "_magi_offloaded_once", False):
             try:
-                is_to_cuda = fn(torch.empty(0, device="cpu")).device.type == accelerator_type()
+                is_to_cuda = fn(torch.empty(0, device="cpu")).device.type == PLATFORM.device_type
             except Exception:
                 pass
 
