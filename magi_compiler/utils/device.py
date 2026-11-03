@@ -18,10 +18,10 @@ Centralised so that pass-manager / FX passes / runtime modules don't all
 re-implement the same try/except dance around ``torch.cuda``.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 
-def device_capability(device: int = 0) -> Tuple[int, int]:
+def device_capability(device: Optional[int] = None) -> Tuple[int, int]:
     """Return ``(major, minor)`` for the given CUDA device.
 
     Falls back to ``(0, 0)`` when CUDA is unavailable / not initialised /
@@ -39,7 +39,7 @@ def device_capability(device: int = 0) -> Tuple[int, int]:
     return (0, 0)
 
 
-def device_capability_major(device: int = 0) -> int:
+def device_capability_major(device: Optional[int] = None) -> int:
     """Convenience wrapper: just the major-capability int (0 if no CUDA)."""
     return device_capability(device)[0]
 
@@ -57,3 +57,16 @@ def accelerator_type() -> str:
 
     acc = _torch.accelerator.current_accelerator()
     return acc.type if acc is not None else "cuda"
+
+
+def accelerator_graph_cls():
+    """The backend's graph-capture class, ``CUDAGraph`` or ``MUSAGraph``.
+
+    Its name carries the device, which is the one thing ``get_device_module()`` does not normalise away.
+    """
+    device = accelerator_type()
+    module = accelerator_module()
+    cls = getattr(module, f"{device.upper()}Graph", None)
+    if cls is None:
+        raise RuntimeError(f"{module.__name__} exposes no graph capture class, so {device} cannot capture graphs")
+    return cls

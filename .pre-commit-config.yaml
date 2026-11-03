@@ -7,6 +7,13 @@ repos:
         entry: python3 ./.github/codestyle/copyright.hook
         language: system
         files: \.(c|cc|cxx|cpp|cu|cuh|h|hpp|hxx|proto|py|sh)$
+    -   id: device_agnostic
+        name: device_agnostic
+        description: Reach the accelerator through magi_compiler.utils.device; torch.cuda breaks MUSA and other backends.
+        entry: torch\.cuda\.[\w.]+\(
+        language: pygrep
+        files: ^magi_compiler/.*\.py$
+        exclude: ^magi_compiler/(utils/(device|nvtx)\.py|symm_mem/|cuda/|magi_depyf/example/)
 -   repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.4.0
     hooks:

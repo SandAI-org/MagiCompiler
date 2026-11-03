@@ -54,6 +54,7 @@ from torch._inductor.utils import contains_collective, contains_wait
 from torch._inductor.virtualized import V
 
 from magi_compiler.utils import magi_logger
+from magi_compiler.utils.device import accelerator_module
 
 from .materialize_inputs import apply_materialize_inputs, get_materialize_inputs_hook, op_has_internal_collective
 
@@ -324,22 +325,23 @@ def _measure_extern(snode: ExternKernelSchedulerNode, fixed_iters: bool = False)
 
 
 def _time_fixed(fn, warmup: int = 3, iters: int = 10) -> float:
-    """CUDA-event timing over a FIXED iteration count, in nanoseconds.
+    """Device-event timing over a FIXED iteration count, in nanoseconds.
 
     Fixed, not adaptive: anything that issues a collective must issue the same
     number of them on every rank, or the NCCL counts diverge and the ranks
     deadlock inside what is supposed to be a measurement.
     """
+    accel = accelerator_module()
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    accel.synchronize()
+    start = accel.Event(enable_timing=True)
+    end = accel.Event(enable_timing=True)
     start.record()
     for _ in range(iters):
         fn()
     end.record()
-    torch.cuda.synchronize()
+    accel.synchronize()
     return (start.elapsed_time(end) / iters) * 1e6  # ms/iter -> ns
 
 
