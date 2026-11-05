@@ -227,6 +227,22 @@ class OffloadConfig(BaseModel):
         ),
     )
     offload_min_shard_mib: int = Field(1, ge=0, description="Minimum local-shard size in MiB for weight offload.")
+    offload_host_weight_sharing: Literal["off", "per_numa_node", "per_host_interleaved"] = Field(
+        "off",
+        description=(
+            "Keep one pinned host copy, instead of one per rank, of the weights that a group of ranks parks "
+            "identically, in a file under envs.MAGI_SHARED_BIN_PATH (/dev/shm) that each rank of the group maps. "
+            "'per_numa_node': one copy per NUMA node, shared by the ranks whose GPUs attach to it and placed on it, "
+            "so loads read local memory. 'per_host_interleaved': one copy per machine with its pages interleaved "
+            "over the NUMA nodes; half the memory of 'per_numa_node' on a 2-socket machine, at about 4% less "
+            "concurrent H2D bandwidth (measured on 8x H200). 'off': every rank keeps its own copy. "
+            "Applies to unsharded weights parked on a host-built model's first CUDA move; FSDP shards and weights "
+            "materialized by to_empty keep a copy per rank. Weights are matched by name, shape, dtype and a sampled "
+            "fingerprint, then compared byte for byte; any that differ stay per rank, as does everything on a "
+            "machine whose shared memory lacks room. Unless 'off', parking is a collective over WORLD: every rank "
+            "must move the same compiled models to CUDA in the same order."
+        ),
+    )
     offload_max_device_weight_mib: int = Field(
         0,
         ge=0,

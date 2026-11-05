@@ -1,0 +1,336 @@
+# Copyright (c) 2026 SandAI. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Graph weight offload keeps one host copy per sharing group of the weights its ranks hold identically.
+
+Sharing is proven physically: after parking, rank 0 overwrites its host copies and
+the other ranks look for those writes in theirs. Page placement is read back from
+``/proc/self/numa_maps``.
+"""
+
+import json
+import os
+import re
+import socket
+import tempfile
+from datetime import timedelta
+
+import pytest
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch.nn as nn
+
+from magi_compiler.passes.weight_offload.runtime.rank_shared_host_region import (
+    SHARED_MEMORY_HEADROOM_BYTES,
+    _plan_group_layouts,
+    _RankOffer,
+    _WeightDescriptor,
+)
+from magi_compiler.utils.numa import online_numa_nodes
+
+requires_cuda_and_tmpfs = pytest.mark.skipif(
+    not torch.cuda.is_available() or not os.path.isdir("/dev/shm"), reason="requires CUDA and /dev/shm"
+)
+
+_OVERWRITE_VALUE = 7.0
+
+
+def _writer_failure_worker(rank: int, port: str, result_dir: str, failure_stage: str) -> None:
+    from unittest.mock import patch
+
+    from magi_compiler.passes.weight_offload.runtime import rank_shared_host_region as region_module
+    from magi_compiler.passes.weight_offload.weight_lifecycle import _park_with_shared_region
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = port
+    dist.init_process_group("gloo", rank=rank, world_size=2, timeout=timedelta(seconds=15))
+    layout = region_module._GroupLayout(
+        writer_rank=0,
+        hostname="host",
+        region_path=os.path.join(result_dir, "region"),
+        placement_by_weight_name={},
+        region_bytes=8,
+    )
+    try:
+
+        def create_region(**kwargs):
+            if failure_stage == "create":
+                raise OSError("injected create failure")
+
+        def park_weight(**kwargs):
+            raise RuntimeError("injected fill failure")
+
+        def map_region(**kwargs):
+            if failure_stage == "map" and rank == 0:
+                raise RuntimeError("injected map failure")
+            return torch.empty(8)
+
+        with (
+            patch.object(region_module, "_create_shared_memory_file", create_region),
+            patch.object(region_module, "_map_and_pin_shared_memory_file", map_region),
+            patch("magi_compiler.passes.weight_offload.weight_lifecycle._park_as_shared_region_writer", park_weight),
+        ):
+            region = region_module.RankSharedHostRegion(
+                layout=layout, is_writer=rank == 0, page_placement=None, gloo_group=dist.group.WORLD
+            )
+            try:
+                _park_with_shared_region(cpu_parameters=[(["weight"], None)], shared_region=region)
+            except RuntimeError as error:
+                with open(os.path.join(result_dir, f"{rank}.txt"), "w") as result_file:
+                    result_file.write(str(error))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("failure_stage", ["create", "map", "fill"])
+def test_writer_failure_reaches_every_rank(tmp_path, failure_stage):
+    """A writer failure must reach readers without leaving them waiting for publication."""
+    mp.spawn(_writer_failure_worker, args=(_free_port(), str(tmp_path), failure_stage), nprocs=2, join=True)
+    for rank in range(2):
+        assert f"rank 0: " in (tmp_path / f"{rank}.txt").read_text()
+        assert f"injected {failure_stage} failure" in (tmp_path / f"{rank}.txt").read_text()
+
+
+class _ReplicatedModelWithExpert(nn.Module):
+    """``dense`` is identical on every rank, ``expert`` differs per rank (like an EP shard)."""
+
+    def __init__(self, rank: int):
+        super().__init__()
+        torch.manual_seed(0)
+        self.dense = nn.Linear(256, 256, bias=False)
+        torch.manual_seed(1 + rank)
+        self.expert = nn.Linear(256, 256, bias=False)
+
+
+def _free_port() -> str:
+    with socket.socket() as probe_socket:
+        probe_socket.bind(("127.0.0.1", 0))
+        return str(probe_socket.getsockname()[1])
+
+
+def _scenario_patches(scenario: str, shared_dir: str) -> list:
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    region_module = "magi_compiler.passes.weight_offload.runtime.rank_shared_host_region"
+    scenario_patches = [patch("magi_compiler.utils.envs.MAGI_SHARED_BIN_PATH", shared_dir)]
+    if scenario == "fingerprint_collision":
+        scenario_patches.append(patch(f"{region_module}.compute_tensor_fingerprint", lambda tensor: b"collision"))
+    elif scenario == "no_room":
+        scenario_patches.append(patch(f"{region_module}.shutil.disk_usage", lambda path: SimpleNamespace(free=0)))
+    return scenario_patches
+
+
+def _numa_pages_of(tensor: torch.Tensor) -> dict[int, int]:
+    """Pages per NUMA node that this process has mapped of the mapping holding ``tensor``."""
+    address = tensor.data_ptr()
+    with open("/proc/self/maps") as maps_file:
+        mapping_starts = [int(line.split("-")[0], 16) for line in maps_file if _mapping_contains(line, address)]
+    with open("/proc/self/numa_maps") as numa_maps_file:
+        for line in numa_maps_file:
+            fields = line.split()
+            if int(fields[0], 16) in mapping_starts:
+                node_page_matches = (re.fullmatch(r"N(\d+)=(\d+)", field) for field in fields)
+                return {int(match[1]): int(match[2]) for match in node_page_matches if match}
+    return {}
+
+
+def _mapping_contains(maps_line: str, address: int) -> bool:
+    start, end = (int(bound, 16) for bound in maps_line.split()[0].split("-"))
+    return start <= address < end
+
+
+def _park_and_probe_sharing_worker(
+    rank: int, world_size: int, port: str, shared_dir: str, result_dir: str, scenario: str, sharing_scope: str
+) -> None:
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store, install_host_first_hooks
+    from magi_compiler.utils.numa import cuda_device_numa_node
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = port
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    # Spread the ranks over the GPUs, so on a multi-socket machine they span NUMA nodes.
+    device_index = rank * torch.cuda.device_count() // world_size
+    torch.cuda.set_device(device_index)
+    active_patches = _scenario_patches(scenario, shared_dir)
+    for active_patch in active_patches:
+        active_patch.start()
+    try:
+        model = _ReplicatedModelWithExpert(rank)
+        expected_weight_by_name = {name: param.detach().clone() for name, param in model.named_parameters()}
+        install_host_first_hooks(model, min_weight_bytes=0, host_weight_sharing=sharing_scope)
+        model.cuda()
+
+        store = get_global_host_weight_store()
+        host_buffer_by_name = {
+            name: store.host_buffer(store.slot_for_tensor(param)) for name, param in model.named_parameters()
+        }
+        result = {
+            "gpu_numa_node": cuda_device_numa_node(device_index),
+            "dense_page_numa_nodes": sorted(_numa_pages_of(host_buffer_by_name["dense.weight"])),
+            "matches_own_weights": {
+                name: torch.equal(host_buffer, expected_weight_by_name[name])
+                for name, host_buffer in host_buffer_by_name.items()
+            },
+            "is_pinned": {name: host_buffer.is_pinned() for name, host_buffer in host_buffer_by_name.items()},
+            "leftover_files": sorted(os.listdir(shared_dir)),
+        }
+
+        dist.barrier()
+        if rank == 0:
+            for host_buffer in host_buffer_by_name.values():
+                host_buffer.fill_(_OVERWRITE_VALUE)
+        dist.barrier()
+        result["sees_rank0_writes"] = {
+            name: bool((host_buffer == _OVERWRITE_VALUE).all()) for name, host_buffer in host_buffer_by_name.items()
+        }
+        with open(os.path.join(result_dir, f"{rank}.json"), "w") as result_file:
+            json.dump(result, result_file)
+    finally:
+        for active_patch in active_patches:
+            active_patch.stop()
+        dist.destroy_process_group()
+
+
+def _run_ranks(tmp_path, *, world_size: int, scenario: str, sharing_scope: str) -> list[dict]:
+    result_dir = tmp_path / "results"
+    result_dir.mkdir()
+    # cudaHostRegister refuses mappings of overlay-backed files, so the region must live on tmpfs.
+    with tempfile.TemporaryDirectory(dir="/dev/shm") as shared_dir:
+        mp.spawn(
+            _park_and_probe_sharing_worker,
+            args=(world_size, _free_port(), shared_dir, str(result_dir), scenario, sharing_scope),
+            nprocs=world_size,
+            join=True,
+        )
+    return [json.loads((result_dir / f"{rank}.json").read_text()) for rank in range(world_size)]
+
+
+def _assert_every_rank_keeps_its_own_pinned_weights(results: list[dict]) -> None:
+    for rank, result in enumerate(results):
+        assert all(result["matches_own_weights"].values()), f"rank {rank}: {result}"
+        assert all(result["is_pinned"].values()), f"rank {rank}: {result}"
+        assert result["leftover_files"] == [], f"rank {rank}: {result}"
+
+
+@requires_cuda_and_tmpfs
+def test_per_numa_node_shares_one_local_copy_per_node(tmp_path):
+    world_size = 4 if torch.cuda.device_count() >= 4 else 2
+    results = _run_ranks(tmp_path, world_size=world_size, scenario="default", sharing_scope="per_numa_node")
+
+    _assert_every_rank_keeps_its_own_pinned_weights(results)
+    rank0_numa_node = results[0]["gpu_numa_node"]
+    for rank, result in enumerate(results[1:], start=1):
+        shares_rank0_copy = result["gpu_numa_node"] == rank0_numa_node
+        assert result["sees_rank0_writes"] == {"dense.weight": shares_rank0_copy, "expert.weight": False}, f"rank {rank}"
+    for rank, result in enumerate(results):
+        if result["gpu_numa_node"] is not None:
+            assert result["dense_page_numa_nodes"] == [result["gpu_numa_node"]], f"rank {rank}: {result}"
+
+
+@requires_cuda_and_tmpfs
+def test_per_host_interleaved_shares_one_copy_spread_over_every_node(tmp_path):
+    world_size = 4 if torch.cuda.device_count() >= 4 else 2
+    results = _run_ranks(tmp_path, world_size=world_size, scenario="default", sharing_scope="per_host_interleaved")
+
+    _assert_every_rank_keeps_its_own_pinned_weights(results)
+    for rank, result in enumerate(results[1:], start=1):
+        assert result["sees_rank0_writes"] == {"dense.weight": True, "expert.weight": False}, f"rank {rank}"
+    if len(online_numa_nodes()) > 1:
+        for rank, result in enumerate(results):
+            assert result["dense_page_numa_nodes"] == online_numa_nodes(), f"rank {rank}: {result}"
+
+
+@requires_cuda_and_tmpfs
+def test_a_fingerprint_collision_never_hands_a_rank_another_ranks_weight(tmp_path):
+    """The reader compares bytes, so a weight whose sampled fingerprint matches but whose bytes differ stays private."""
+    results = _run_ranks(tmp_path, world_size=2, scenario="fingerprint_collision", sharing_scope="per_host_interleaved")
+
+    _assert_every_rank_keeps_its_own_pinned_weights(results)
+    assert results[1]["sees_rank0_writes"] == {"dense.weight": True, "expert.weight": False}
+
+
+@requires_cuda_and_tmpfs
+def test_a_host_without_shared_memory_room_keeps_every_weight_private(tmp_path):
+    """Writing past a full tmpfs is SIGBUS, so a host without room shares nothing."""
+    results = _run_ranks(tmp_path, world_size=2, scenario="no_room", sharing_scope="per_host_interleaved")
+
+    _assert_every_rank_keeps_its_own_pinned_weights(results)
+    assert results[1]["sees_rank0_writes"] == {"dense.weight": False, "expert.weight": False}
+
+
+def _offer(
+    sharing_group: str, fingerprint_by_weight_name: dict[str, bytes], free_bytes: int = 1 << 40, hostname: str | None = None
+) -> _RankOffer:
+    return _RankOffer(
+        hostname=hostname or sharing_group,
+        sharing_group=sharing_group,
+        region_path=f"/dev/shm/{sharing_group}_{len(fingerprint_by_weight_name)}",
+        free_shared_memory_bytes=free_bytes,
+        descriptor_by_weight_name={
+            name: _WeightDescriptor(shape=(10,), dtype=torch.float32, nbytes=40, fingerprint=fingerprint)
+            for name, fingerprint in fingerprint_by_weight_name.items()
+        },
+    )
+
+
+def test_each_host_plans_its_own_region_from_its_own_ranks():
+    """Hosts decide alone: one without room shares nothing while the other shares what its ranks agree on."""
+    offers_by_rank = [
+        _offer("host_a", {"dense": b"d", "norm": b"n", "expert": b"e0"}),
+        _offer("host_a", {"dense": b"d", "norm": b"n", "expert": b"e1"}),
+        _offer("host_b", {"dense": b"d"}, free_bytes=0),
+        _offer("host_b", {"dense": b"d"}),
+    ]
+
+    layout_by_sharing_group = _plan_group_layouts(offers_by_rank)
+
+    host_a_layout = layout_by_sharing_group["host_a"]
+    assert host_a_layout.writer_rank == 0
+    assert list(host_a_layout.placement_by_weight_name) == ["dense", "norm"]
+    # Every weight starts on the private pool's alignment.
+    assert [placement.byte_offset for placement in host_a_layout.placement_by_weight_name.values()] == [0, 512]
+    assert host_a_layout.region_bytes == 1024
+
+    host_b_layout = layout_by_sharing_group["host_b"]
+    assert host_b_layout.writer_rank == 2
+    assert host_b_layout.placement_by_weight_name == {} and host_b_layout.region_bytes == 0
+    assert host_b_layout.rejected_region_bytes == 512
+
+
+def test_numa_groups_of_one_host_must_fit_its_shared_memory_together():
+    """Each node's region fits the host's tmpfs alone, but both do not, so neither node shares."""
+    free_bytes = SHARED_MEMORY_HEADROOM_BYTES + 512 + 511
+    offers_by_rank = [
+        _offer("host/numa0", {"dense": b"d"}, free_bytes=free_bytes, hostname="host"),
+        _offer("host/numa0", {"dense": b"d"}, free_bytes=free_bytes, hostname="host"),
+        _offer("host/numa1", {"dense": b"d"}, free_bytes=free_bytes, hostname="host"),
+        _offer("host/numa1", {"dense": b"d"}, free_bytes=free_bytes, hostname="host"),
+    ]
+
+    layout_by_sharing_group = _plan_group_layouts(offers_by_rank)
+
+    assert {group: layout.writer_rank for group, layout in layout_by_sharing_group.items()} == {
+        "host/numa0": 0,
+        "host/numa1": 2,
+    }
+    assert all(layout.region_bytes == 0 for layout in layout_by_sharing_group.values())
+    assert all(layout.rejected_region_bytes == 512 for layout in layout_by_sharing_group.values())
+
+
+def test_a_rank_alone_in_its_group_shares_nothing():
+    layout_by_sharing_group = _plan_group_layouts([_offer("host_a", {"dense": b"d"}), _offer("host_b", {"dense": b"d"})])
+
+    assert all(layout.region_bytes == 0 for layout in layout_by_sharing_group.values())
