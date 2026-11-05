@@ -130,6 +130,8 @@ def _scenario_patches(scenario: str, shared_dir: str) -> list:
         scenario_patches.append(patch(f"{region_module}.compute_tensor_fingerprint", lambda tensor: b"collision"))
     elif scenario == "no_room":
         scenario_patches.append(patch(f"{region_module}.shutil.disk_usage", lambda path: SimpleNamespace(free=0)))
+    elif scenario == "numa_policy_denied":
+        scenario_patches.append(patch("magi_compiler.utils.numa._get_thread_memory_policy", return_value=None))
     return scenario_patches
 
 
@@ -155,8 +157,10 @@ def _mapping_contains(maps_line: str, address: int) -> bool:
 def _park_and_probe_sharing_worker(
     rank: int, world_size: int, port: str, shared_dir: str, result_dir: str, scenario: str, sharing_scope: str
 ) -> None:
+    from unittest.mock import patch
+
     from magi_compiler.passes.weight_offload import get_global_host_weight_store, install_host_first_hooks
-    from magi_compiler.utils.numa import cuda_device_numa_node
+    from magi_compiler.utils import numa
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = port
@@ -165,6 +169,15 @@ def _park_and_probe_sharing_worker(
     device_index = rank * torch.cuda.device_count() // world_size
     torch.cuda.set_device(device_index)
     active_patches = _scenario_patches(scenario, shared_dir)
+    policy_results = []
+    replace_policy = numa._replace_thread_memory_policy
+
+    def record_policy_result(*, policy, nodes):
+        saved_policy = replace_policy(policy=policy, nodes=nodes)
+        policy_results.append(saved_policy is not None)
+        return saved_policy
+
+    active_patches.append(patch.object(numa, "_replace_thread_memory_policy", side_effect=record_policy_result))
     for active_patch in active_patches:
         active_patch.start()
     try:
@@ -178,7 +191,7 @@ def _park_and_probe_sharing_worker(
             name: store.host_buffer(store.slot_for_tensor(param)) for name, param in model.named_parameters()
         }
         result = {
-            "gpu_numa_node": cuda_device_numa_node(device_index),
+            "gpu_numa_node": numa.cuda_device_numa_node(device_index),
             "dense_page_numa_nodes": sorted(_numa_pages_of(host_buffer_by_name["dense.weight"])),
             "matches_own_weights": {
                 name: torch.equal(host_buffer, expected_weight_by_name[name])
@@ -187,6 +200,10 @@ def _park_and_probe_sharing_worker(
             "is_pinned": {name: host_buffer.is_pinned() for name, host_buffer in host_buffer_by_name.items()},
             "leftover_files": sorted(os.listdir(shared_dir)),
         }
+
+        policies_by_rank = [None] * world_size
+        dist.all_gather_object(policies_by_rank, policy_results)
+        result["policy_results_by_rank"] = policies_by_rank
 
         dist.barrier()
         if rank == 0:
@@ -226,9 +243,10 @@ def _assert_every_rank_keeps_its_own_pinned_weights(results: list[dict]) -> None
 
 
 @requires_cuda_and_tmpfs
-def test_per_numa_node_shares_one_local_copy_per_node(tmp_path):
+@pytest.mark.parametrize("scenario", ["default", "numa_policy_denied"])
+def test_per_numa_node_shares_one_local_copy_per_node(tmp_path, scenario):
     world_size = 4 if torch.cuda.device_count() >= 4 else 2
-    results = _run_ranks(tmp_path, world_size=world_size, scenario="default", sharing_scope="per_numa_node")
+    results = _run_ranks(tmp_path, world_size=world_size, scenario=scenario, sharing_scope="per_numa_node")
 
     _assert_every_rank_keeps_its_own_pinned_weights(results)
     rank0_numa_node = results[0]["gpu_numa_node"]
@@ -236,19 +254,27 @@ def test_per_numa_node_shares_one_local_copy_per_node(tmp_path):
         shares_rank0_copy = result["gpu_numa_node"] == rank0_numa_node
         assert result["sees_rank0_writes"] == {"dense.weight": shares_rank0_copy, "expert.weight": False}, f"rank {rank}"
     for rank, result in enumerate(results):
-        if result["gpu_numa_node"] is not None:
+        writer_rank = next(i for i, peer in enumerate(results) if peer["gpu_numa_node"] == result["gpu_numa_node"])
+        writer_policies = result["policy_results_by_rank"][writer_rank]
+        group_size = sum(peer["gpu_numa_node"] == result["gpu_numa_node"] for peer in results)
+        if scenario == "numa_policy_denied" and result["gpu_numa_node"] is not None and group_size > 1:
+            assert writer_policies == [False]
+        if writer_policies == [True]:
             assert result["dense_page_numa_nodes"] == [result["gpu_numa_node"]], f"rank {rank}: {result}"
 
 
 @requires_cuda_and_tmpfs
-def test_per_host_interleaved_shares_one_copy_spread_over_every_node(tmp_path):
+@pytest.mark.parametrize("scenario", ["default", "numa_policy_denied"])
+def test_per_host_interleaved_shares_one_copy_spread_over_every_node(tmp_path, scenario):
     world_size = 4 if torch.cuda.device_count() >= 4 else 2
-    results = _run_ranks(tmp_path, world_size=world_size, scenario="default", sharing_scope="per_host_interleaved")
+    results = _run_ranks(tmp_path, world_size=world_size, scenario=scenario, sharing_scope="per_host_interleaved")
 
     _assert_every_rank_keeps_its_own_pinned_weights(results)
     for rank, result in enumerate(results[1:], start=1):
         assert result["sees_rank0_writes"] == {"dense.weight": True, "expert.weight": False}, f"rank {rank}"
-    if len(online_numa_nodes()) > 1:
+    if scenario == "numa_policy_denied" and len(online_numa_nodes()) > 1:
+        assert results[0]["policy_results_by_rank"][0] == [False]
+    if len(online_numa_nodes()) > 1 and results[0]["policy_results_by_rank"][0] == [True]:
         for rank, result in enumerate(results):
             assert result["dense_page_numa_nodes"] == online_numa_nodes(), f"rank {rank}: {result}"
 
