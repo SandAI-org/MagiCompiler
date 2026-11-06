@@ -106,12 +106,8 @@ TENSOR_FINGERPRINT_SAMPLE_BYTES = 4096
 
 
 def compute_tensor_fingerprint(tensor: torch.Tensor) -> bytes:
-    """Shape, dtype and up to 4 KiB of a CPU tensor's bytes, spread evenly over it (both ends included).
-
-    Small tensors are hashed whole. Large ones are told apart when they differ throughout (e.g. two EP ranks'
-    experts), not when they differ only in bytes between the samples, so callers that act on a match must
-    still compare the tensors byte for byte.
-    """
+    """Hash shape, dtype and up to 4 KiB of evenly sampled CPU tensor bytes.
+    A match requires byte-for-byte verification before sharing storage."""
     sha256_hash = hashlib.sha256(f"{tuple(tensor.shape)},{tensor.dtype}".encode())
     tensor_bytes = tensor.reshape(-1).view(torch.uint8)
     if tensor_bytes.numel() > TENSOR_FINGERPRINT_SAMPLE_BYTES:

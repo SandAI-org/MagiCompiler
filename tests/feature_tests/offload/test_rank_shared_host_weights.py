@@ -12,13 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Graph weight offload keeps one host copy per sharing group of the weights its ranks hold identically.
+"""Shared-weight tests check cross-rank writes and NUMA placement via /proc/self/numa_maps."""
 
-Sharing is proven physically: after parking, rank 0 overwrites its host copies and
-the other ranks look for those writes in theirs. Page placement is read back from
-``/proc/self/numa_maps``.
-"""
-
+import errno
 import json
 import os
 import re
@@ -70,11 +66,13 @@ def _writer_failure_worker(rank: int, port: str, result_dir: str, failure_stage:
                 raise OSError("injected create failure")
 
         def park_weight(**kwargs):
-            raise RuntimeError("injected fill failure")
+            if failure_stage == "fill":
+                raise RuntimeError("injected fill failure")
+            return 0
 
         def map_region(**kwargs):
-            if failure_stage == "map" and rank == 0:
-                raise RuntimeError("injected map failure")
+            if (failure_stage == "map" and rank == 0) or (failure_stage == "reader_map" and rank == 1):
+                raise RuntimeError(f"injected {failure_stage} failure")
             return torch.empty(8)
 
         with (
@@ -94,13 +92,56 @@ def _writer_failure_worker(rank: int, port: str, result_dir: str, failure_stage:
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("failure_stage", ["create", "map", "fill"])
-def test_writer_failure_reaches_every_rank(tmp_path, failure_stage):
-    """A writer failure must reach readers without leaving them waiting for publication."""
+@pytest.mark.parametrize("failure_stage", ["create", "map", "fill", "reader_map"])
+def test_publication_failure_reaches_every_rank(tmp_path, failure_stage):
+    """A writer or reader mapping failure must reach every rank without a barrier timeout."""
     mp.spawn(_writer_failure_worker, args=(_free_port(), str(tmp_path), failure_stage), nprocs=2, join=True)
     for rank in range(2):
-        assert f"rank 0: " in (tmp_path / f"{rank}.txt").read_text()
+        failed_rank = 1 if failure_stage == "reader_map" else 0
+        assert f"rank {failed_rank}: " in (tmp_path / f"{rank}.txt").read_text()
         assert f"injected {failure_stage} failure" in (tmp_path / f"{rank}.txt").read_text()
+
+
+def _preparation_failure_worker(rank: int, port: str, result_dir: str, failure_stage: str) -> None:
+    from unittest.mock import patch
+
+    from magi_compiler.passes.weight_offload.runtime import rank_shared_host_region as region_module
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = port
+    dist.init_process_group("gloo", rank=rank, world_size=2, timeout=timedelta(seconds=15))
+    target = "shutil.disk_usage" if failure_stage == "disk_usage" else "compute_tensor_fingerprint"
+    original = region_module.shutil.disk_usage if failure_stage == "disk_usage" else region_module.compute_tensor_fingerprint
+
+    def prepare_value(*args):
+        if rank == 1:
+            raise OSError(f"injected {failure_stage} failure")
+        return original(*args)
+
+    try:
+        with (
+            patch.object(region_module, "get_cpu_gloo_group", return_value=dist.group.WORLD),
+            patch("magi_compiler.utils.envs.MAGI_SHARED_BIN_PATH", result_dir),
+            patch(f"{region_module.__name__}.{target}", side_effect=prepare_value),
+        ):
+            try:
+                region_module.open_rank_shared_host_region(
+                    tensor_by_weight_name={"weight": torch.ones(8)}, region_label="test", sharing_scope="per_host_interleaved"
+                )
+            except RuntimeError as error:
+                with open(os.path.join(result_dir, f"{rank}.txt"), "w") as result_file:
+                    result_file.write(str(error))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("failure_stage", ["disk_usage", "fingerprint"])
+def test_offer_preparation_failure_reaches_every_rank(tmp_path, failure_stage: str) -> None:
+    """A single rank's local preparation failure must not strand peers in the offer gather."""
+    mp.spawn(_preparation_failure_worker, args=(_free_port(), str(tmp_path), failure_stage), nprocs=2, join=True)
+    for rank in range(2):
+        error_message = (tmp_path / f"{rank}.txt").read_text()
+        assert f"rank 1: OSError: injected {failure_stage} failure" in error_message
 
 
 class _ReplicatedModelWithExpert(nn.Module):
@@ -130,6 +171,10 @@ def _scenario_patches(scenario: str, shared_dir: str) -> list:
         scenario_patches.append(patch(f"{region_module}.compute_tensor_fingerprint", lambda tensor: b"collision"))
     elif scenario == "no_room":
         scenario_patches.append(patch(f"{region_module}.shutil.disk_usage", lambda path: SimpleNamespace(free=0)))
+    elif scenario == "allocation_no_room":
+        scenario_patches.append(
+            patch(f"{region_module}.os.posix_fallocate", side_effect=OSError(errno.ENOSPC, "injected allocation failure"))
+        )
     elif scenario == "numa_policy_denied":
         scenario_patches.append(patch("magi_compiler.utils.numa._get_thread_memory_policy", return_value=None))
     return scenario_patches
@@ -164,7 +209,7 @@ def _park_and_probe_sharing_worker(
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = port
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    dist.init_process_group("gloo", rank=rank, world_size=world_size, timeout=timedelta(seconds=60))
     # Spread the ranks over the GPUs, so on a multi-socket machine they span NUMA nodes.
     device_index = rank * torch.cuda.device_count() // world_size
     torch.cuda.set_device(device_index)
@@ -289,9 +334,10 @@ def test_a_fingerprint_collision_never_hands_a_rank_another_ranks_weight(tmp_pat
 
 
 @requires_cuda_and_tmpfs
-def test_a_host_without_shared_memory_room_keeps_every_weight_private(tmp_path):
+@pytest.mark.parametrize("scenario", ["no_room", "allocation_no_room"])
+def test_a_host_without_shared_memory_room_keeps_every_weight_private(tmp_path, scenario):
     """Writing past a full tmpfs is SIGBUS, so a host without room shares nothing."""
-    results = _run_ranks(tmp_path, world_size=2, scenario="no_room", sharing_scope="per_host_interleaved")
+    results = _run_ranks(tmp_path, world_size=2, scenario=scenario, sharing_scope="per_host_interleaved")
 
     _assert_every_rank_keeps_its_own_pinned_weights(results)
     assert results[1]["sees_rank0_writes"] == {"dense.weight": False, "expert.weight": False}
@@ -360,3 +406,109 @@ def test_a_rank_alone_in_its_group_shares_nothing():
     layout_by_sharing_group = _plan_group_layouts([_offer("host_a", {"dense": b"d"}), _offer("host_b", {"dense": b"d"})])
 
     assert all(layout.region_bytes == 0 for layout in layout_by_sharing_group.values())
+
+
+def _asymmetric_parking_worker(rank: int, port: str, result_dir: str, scenario: str) -> None:
+    from unittest.mock import patch
+
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Replicate
+
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store, install_host_first_hooks
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = port
+    dist.init_process_group("gloo", rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    torch.cuda.set_device(rank % torch.cuda.device_count())
+    torch.manual_seed(0)
+    model = nn.Linear(8, 8, bias=False)
+    try:
+        if scenario == "dtensor":
+            mesh = init_device_mesh("cuda", (2,))
+            if rank == 1:
+                model.weight = nn.Parameter(DTensor.from_local(model.weight.cuda(), mesh, [Replicate()], run_check=False))
+        elif rank == 1:
+            if scenario == "already_cuda":
+                model.cuda()
+            else:
+                model = nn.Identity()
+        with patch("magi_compiler.utils.envs.MAGI_SHARED_BIN_PATH", result_dir):
+            install_host_first_hooks(model, min_weight_bytes=0, host_weight_sharing="per_host_interleaved")
+            model.cuda()
+        store = get_global_host_weight_store()
+        parked_weights = [store.slot_for_tensor(param) is not None for param in model.parameters()]
+        with open(os.path.join(result_dir, f"{rank}.json"), "w") as result_file:
+            json.dump(parked_weights, result_file)
+    finally:
+        get_global_host_weight_store().reset()
+        dist.destroy_process_group()
+
+
+@requires_cuda_and_tmpfs
+@pytest.mark.parametrize("scenario", ["empty", "already_cuda", "dtensor"])
+def test_ineligible_rank_still_joins_parking(tmp_path, scenario: str) -> None:
+    """Ranks without eligible CPU parameters must join negotiation without parking DTensors or CUDA weights."""
+    mp.spawn(_asymmetric_parking_worker, args=(_free_port(), str(tmp_path), scenario), nprocs=2, join=True)
+    assert json.loads((tmp_path / "0.json").read_text()) == [True]
+    assert not any(json.loads((tmp_path / "1.json").read_text()))
+
+
+def _compiled_inference_worker(rank: int, port: str, shared_dir: str, result_dir: str) -> None:
+    from unittest.mock import patch
+
+    from magi_compiler import magi_compile
+    from magi_compiler.config import CompileConfig, CompileMode, CudaGraphMode
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = port
+    dist.init_process_group("cpu:gloo,cuda:nccl", rank=rank, world_size=2, timeout=timedelta(seconds=180))
+    torch.cuda.set_device(rank % torch.cuda.device_count())
+    store = get_global_host_weight_store()
+    outputs = []
+    try:
+        with patch("magi_compiler.utils.envs.MAGI_SHARED_BIN_PATH", shared_dir), torch.no_grad():
+            for sharing_scope in ("off", "per_numa_node", "per_host_interleaved"):
+                torch.manual_seed(0)
+                model = nn.Sequential(nn.Linear(64, 64, bias=False), nn.GELU(), nn.Linear(64, 64, bias=False))
+                inputs = torch.randn(8, 64)
+                expected_output = model(inputs).cuda()
+
+                def configure(config: CompileConfig) -> CompileConfig:
+                    config.compile_mode = CompileMode.MAGI_COMPILE
+                    config.cudagraph_mode = CudaGraphMode.NONE
+                    config.disable_graph_split = True
+                    config.fsdp_config.cost_mode = "analytical"
+                    config.offload_config.graph_weight_offload = True
+                    config.offload_config.offload_min_shard_mib = 0
+                    config.offload_config.offload_h2d_bandwidth_gbps = 20.0
+                    config.offload_config.offload_host_weight_sharing = sharing_scope
+                    return config
+
+                compiled = magi_compile(model, config_patch=configure, dynamic_arg_dims={"input": 0})
+                model.cuda()
+                device_inputs = inputs.cuda()
+                for _ in range(2):
+                    actual_output = compiled(device_inputs)
+                    torch.testing.assert_close(actual_output, expected_output, rtol=1e-4, atol=1e-5)
+                assert store.offloaded_bytes() > 0
+                outputs.append(actual_output.cpu())
+                del actual_output, compiled, model
+                torch._dynamo.reset()
+                store.reset()
+        for output in outputs[1:]:
+            torch.testing.assert_close(output, outputs[0], rtol=0, atol=0)
+        with open(os.path.join(result_dir, f"{rank}.txt"), "w") as result_file:
+            result_file.write("shared and private inference match")
+    finally:
+        store.reset()
+        dist.destroy_process_group()
+
+
+@requires_cuda_and_tmpfs
+def test_public_compile_config_shared_inference_matches_private(tmp_path) -> None:
+    """Both sharing modes must preserve compiled H2D execution and match the private-copy output on every rank."""
+    with tempfile.TemporaryDirectory(dir="/dev/shm") as shared_dir:
+        mp.spawn(_compiled_inference_worker, args=(_free_port(), shared_dir, str(tmp_path)), nprocs=2, join=True)
+    for rank in range(2):
+        assert (tmp_path / f"{rank}.txt").read_text() == "shared and private inference match"

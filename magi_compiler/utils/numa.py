@@ -82,12 +82,8 @@ def cuda_device_numa_node(device_index: int) -> int | None:
 
 @contextmanager
 def numa_page_policy(*, policy: NumaPagePolicy, nodes: Sequence[int]) -> Iterator[None]:
-    """Place pages this thread allocates inside the block per ``policy`` over ``nodes``,
-    then restore the thread's previous policy (e.g. one set by ``numactl``).
-
-    Placement only affects performance, so when the policy cannot be set the block
-    still runs with the current policy, after a warning.
-    """
+    """Apply the calling thread's allocation policy within the block, then restore it.
+    If unavailable or denied, warn and continue with the current policy."""
     saved_policy = _replace_thread_memory_policy(policy=policy, nodes=nodes)
     try:
         yield

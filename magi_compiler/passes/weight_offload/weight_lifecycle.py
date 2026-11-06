@@ -376,8 +376,7 @@ def _park_as_shared_region_reader(names: list[str], param: nn.Parameter, shared_
 def _park_with_shared_region(
     cpu_parameters: list[tuple[list[str], nn.Parameter]], shared_region: RankSharedHostRegion
 ) -> list[int]:
-    """Park in the same order as without sharing: the writer fills the region before publishing it,
-    readers adopt the writer's copies after it is published."""
+    """Preserve parameter order; readers adopt shared buffers only after publication."""
     try:
         if shared_region.is_writer:
             host_slots = []
@@ -403,10 +402,12 @@ def _park_with_shared_region(
 
 @torch.inference_mode(False)
 def _park_cpu_parameters(module: nn.Module, *, min_weight_bytes: int, host_weight_sharing: HostWeightSharing) -> int:
-    """Copy a host-built module's offloadable weights into host memory and hand them over.
-    Each weight is handed off before the next is copied, so its pageable original is freed first.
-    Returns the number parked; the rest keep their normal placement."""
-    cpu_parameters = _collect_cpu_parameters_to_park(module=module, min_weight_bytes=min_weight_bytes)
+    """Hand off each weight before copying the next to avoid retaining all pageable originals."""
+    cpu_parameters = (
+        _collect_cpu_parameters_to_park(module=module, min_weight_bytes=min_weight_bytes)
+        if _can_park_on_first_cuda_move(module)
+        else []
+    )
     # Collective: every rank opens it, even one without CPU weights to park.
     shared_region = (
         None
@@ -455,7 +456,7 @@ def _apply_with_host_offload(self: nn.Module, fn, recurse: bool = True):
     # the host, or built on CUDA and moved to the host first. Weights already on CUDA never are.
     if target is not None and target.type == "cuda" and not state.parking_decided:
         state.parking_decided = True
-        if _can_park_on_first_cuda_move(self):
+        if state.host_weight_sharing != "off" or _can_park_on_first_cuda_move(self):
             _park_cpu_parameters(
                 module=self, min_weight_bytes=state.min_weight_bytes, host_weight_sharing=state.host_weight_sharing
             )
@@ -622,8 +623,7 @@ def install_host_first_hooks(
     instance: nn.Module, *, min_weight_bytes: int, host_weight_sharing: HostWeightSharing = "off"
 ) -> None:
     """Install host-first allocation and residency-aware moves once per module.
-    Finish dtype conversion before parking; see the module's dtype contract.
-    Unless ``host_weight_sharing`` is "off", parking on the first CUDA move is a WORLD collective."""
+    Finish dtype conversion before parking. Sharing makes the first CUDA move a WORLD collective."""
     state = get_or_create_offload_state(instance)
     if state.hooks_installed:
         return
