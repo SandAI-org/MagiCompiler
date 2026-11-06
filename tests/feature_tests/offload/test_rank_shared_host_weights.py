@@ -30,8 +30,8 @@ import torch.nn as nn
 
 from magi_compiler.passes.weight_offload.runtime.rank_shared_host_region import (
     SHARED_MEMORY_HEADROOM_BYTES,
-    _plan_group_layouts,
-    _RankOffer,
+    _plan_sharing_group_regions,
+    _RankSharingPlanInput,
     _WeightDescriptor,
 )
 from magi_compiler.utils.numa import online_numa_nodes
@@ -52,12 +52,8 @@ def _writer_failure_worker(rank: int, port: str, result_dir: str, failure_stage:
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = port
     dist.init_process_group("gloo", rank=rank, world_size=2, timeout=timedelta(seconds=15))
-    layout = region_module._GroupLayout(
-        writer_rank=0,
-        hostname="host",
-        region_path=os.path.join(result_dir, "region"),
-        placement_by_weight_name={},
-        region_bytes=8,
+    region_plan = region_module._SharingGroupRegionPlan(
+        writer_rank=0, hostname="host", region_path=os.path.join(result_dir, "region"), slice_by_weight_name={}, region_bytes=8
     )
     try:
 
@@ -81,7 +77,7 @@ def _writer_failure_worker(rank: int, port: str, result_dir: str, failure_stage:
             patch("magi_compiler.passes.weight_offload.weight_lifecycle._park_as_shared_region_writer", park_weight),
         ):
             region = region_module.RankSharedHostRegion(
-                layout=layout, is_writer=rank == 0, page_placement=None, gloo_group=dist.group.WORLD
+                region_plan=region_plan, is_writer=rank == 0, region_numa_policy=None, gloo_group=dist.group.WORLD
             )
             try:
                 _park_with_shared_region(cpu_parameters=[(["weight"], None)], shared_region=region)
@@ -136,8 +132,8 @@ def _preparation_failure_worker(rank: int, port: str, result_dir: str, failure_s
 
 
 @pytest.mark.parametrize("failure_stage", ["disk_usage", "fingerprint"])
-def test_offer_preparation_failure_reaches_every_rank(tmp_path, failure_stage: str) -> None:
-    """A single rank's local preparation failure must not strand peers in the offer gather."""
+def test_plan_input_collection_failure_reaches_every_rank(tmp_path, failure_stage: str) -> None:
+    """A single rank's local collection failure must not strand peers in the plan input gather."""
     mp.spawn(_preparation_failure_worker, args=(_free_port(), str(tmp_path), failure_stage), nprocs=2, join=True)
     for rank in range(2):
         error_message = (tmp_path / f"{rank}.txt").read_text()
@@ -343,10 +339,10 @@ def test_a_host_without_shared_memory_room_keeps_every_weight_private(tmp_path, 
     assert results[1]["sees_rank0_writes"] == {"dense.weight": False, "expert.weight": False}
 
 
-def _offer(
+def _plan_input(
     sharing_group: str, fingerprint_by_weight_name: dict[str, bytes], free_bytes: int = 1 << 40, hostname: str | None = None
-) -> _RankOffer:
-    return _RankOffer(
+) -> _RankSharingPlanInput:
+    return _RankSharingPlanInput(
         hostname=hostname or sharing_group,
         sharing_group=sharing_group,
         region_path=f"/dev/shm/{sharing_group}_{len(fingerprint_by_weight_name)}",
@@ -360,52 +356,54 @@ def _offer(
 
 def test_each_host_plans_its_own_region_from_its_own_ranks():
     """Hosts decide alone: one without room shares nothing while the other shares what its ranks agree on."""
-    offers_by_rank = [
-        _offer("host_a", {"dense": b"d", "norm": b"n", "expert": b"e0"}),
-        _offer("host_a", {"dense": b"d", "norm": b"n", "expert": b"e1"}),
-        _offer("host_b", {"dense": b"d"}, free_bytes=0),
-        _offer("host_b", {"dense": b"d"}),
+    plan_input_by_rank = [
+        _plan_input("host_a", {"dense": b"d", "norm": b"n", "expert": b"e0"}),
+        _plan_input("host_a", {"dense": b"d", "norm": b"n", "expert": b"e1"}),
+        _plan_input("host_b", {"dense": b"d"}, free_bytes=0),
+        _plan_input("host_b", {"dense": b"d"}),
     ]
 
-    layout_by_sharing_group = _plan_group_layouts(offers_by_rank)
+    region_plan_by_sharing_group = _plan_sharing_group_regions(plan_input_by_rank)
 
-    host_a_layout = layout_by_sharing_group["host_a"]
-    assert host_a_layout.writer_rank == 0
-    assert list(host_a_layout.placement_by_weight_name) == ["dense", "norm"]
+    host_a_plan = region_plan_by_sharing_group["host_a"]
+    assert host_a_plan.writer_rank == 0
+    assert list(host_a_plan.slice_by_weight_name) == ["dense", "norm"]
     # Every weight starts on the private pool's alignment.
-    assert [placement.byte_offset for placement in host_a_layout.placement_by_weight_name.values()] == [0, 512]
-    assert host_a_layout.region_bytes == 1024
+    assert [weight_slice.byte_offset for weight_slice in host_a_plan.slice_by_weight_name.values()] == [0, 512]
+    assert host_a_plan.region_bytes == 1024
 
-    host_b_layout = layout_by_sharing_group["host_b"]
-    assert host_b_layout.writer_rank == 2
-    assert host_b_layout.placement_by_weight_name == {} and host_b_layout.region_bytes == 0
-    assert host_b_layout.rejected_region_bytes == 512
+    host_b_plan = region_plan_by_sharing_group["host_b"]
+    assert host_b_plan.writer_rank == 2
+    assert host_b_plan.slice_by_weight_name == {} and host_b_plan.region_bytes == 0
+    assert host_b_plan.rejected_region_bytes == 512
 
 
 def test_numa_groups_of_one_host_must_fit_its_shared_memory_together():
     """Each node's region fits the host's tmpfs alone, but both do not, so neither node shares."""
     free_bytes = SHARED_MEMORY_HEADROOM_BYTES + 512 + 511
-    offers_by_rank = [
-        _offer("host/numa0", {"dense": b"d"}, free_bytes=free_bytes, hostname="host"),
-        _offer("host/numa0", {"dense": b"d"}, free_bytes=free_bytes, hostname="host"),
-        _offer("host/numa1", {"dense": b"d"}, free_bytes=free_bytes, hostname="host"),
-        _offer("host/numa1", {"dense": b"d"}, free_bytes=free_bytes, hostname="host"),
+    plan_input_by_rank = [
+        _plan_input("host/numa0", {"dense": b"d"}, free_bytes=free_bytes, hostname="host"),
+        _plan_input("host/numa0", {"dense": b"d"}, free_bytes=free_bytes, hostname="host"),
+        _plan_input("host/numa1", {"dense": b"d"}, free_bytes=free_bytes, hostname="host"),
+        _plan_input("host/numa1", {"dense": b"d"}, free_bytes=free_bytes, hostname="host"),
     ]
 
-    layout_by_sharing_group = _plan_group_layouts(offers_by_rank)
+    region_plan_by_sharing_group = _plan_sharing_group_regions(plan_input_by_rank)
 
-    assert {group: layout.writer_rank for group, layout in layout_by_sharing_group.items()} == {
+    assert {group: region_plan.writer_rank for group, region_plan in region_plan_by_sharing_group.items()} == {
         "host/numa0": 0,
         "host/numa1": 2,
     }
-    assert all(layout.region_bytes == 0 for layout in layout_by_sharing_group.values())
-    assert all(layout.rejected_region_bytes == 512 for layout in layout_by_sharing_group.values())
+    assert all(region_plan.region_bytes == 0 for region_plan in region_plan_by_sharing_group.values())
+    assert all(region_plan.rejected_region_bytes == 512 for region_plan in region_plan_by_sharing_group.values())
 
 
 def test_a_rank_alone_in_its_group_shares_nothing():
-    layout_by_sharing_group = _plan_group_layouts([_offer("host_a", {"dense": b"d"}), _offer("host_b", {"dense": b"d"})])
+    region_plan_by_sharing_group = _plan_sharing_group_regions(
+        [_plan_input("host_a", {"dense": b"d"}), _plan_input("host_b", {"dense": b"d"})]
+    )
 
-    assert all(layout.region_bytes == 0 for layout in layout_by_sharing_group.values())
+    assert all(region_plan.region_bytes == 0 for region_plan in region_plan_by_sharing_group.values())
 
 
 def _asymmetric_parking_worker(rank: int, port: str, result_dir: str, scenario: str) -> None:
