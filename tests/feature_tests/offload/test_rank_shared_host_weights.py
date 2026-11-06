@@ -453,7 +453,7 @@ def test_ineligible_rank_still_joins_parking(tmp_path, scenario: str) -> None:
     assert not any(json.loads((tmp_path / "1.json").read_text()))
 
 
-def _compiled_inference_worker(rank: int, port: str, shared_dir: str, result_dir: str) -> None:
+def _compiled_inference_worker(rank: int, port: str, shared_dir: str, result_dir: str, sharing_scope: str) -> None:
     from unittest.mock import patch
 
     from magi_compiler import magi_compile
@@ -464,11 +464,13 @@ def _compiled_inference_worker(rank: int, port: str, shared_dir: str, result_dir
     os.environ["MASTER_PORT"] = port
     dist.init_process_group("cpu:gloo,cuda:nccl", rank=rank, world_size=2, timeout=timedelta(seconds=180))
     torch.cuda.set_device(rank % torch.cuda.device_count())
+    # Compare CPU reference and CUDA compilation without TF32 rounding differences.
+    torch.set_float32_matmul_precision("highest")
     store = get_global_host_weight_store()
     outputs = []
     try:
         with patch("magi_compiler.utils.envs.MAGI_SHARED_BIN_PATH", shared_dir), torch.no_grad():
-            for sharing_scope in ("off", "per_numa_node", "per_host_interleaved"):
+            for mode in ("off", sharing_scope):
                 torch.manual_seed(0)
                 model = nn.Sequential(nn.Linear(64, 64, bias=False), nn.GELU(), nn.Linear(64, 64, bias=False))
                 inputs = torch.randn(8, 64)
@@ -482,7 +484,7 @@ def _compiled_inference_worker(rank: int, port: str, shared_dir: str, result_dir
                     config.offload_config.graph_weight_offload = True
                     config.offload_config.offload_min_shard_mib = 0
                     config.offload_config.offload_h2d_bandwidth_gbps = 20.0
-                    config.offload_config.offload_host_weight_sharing = sharing_scope
+                    config.offload_config.offload_host_weight_sharing = mode
                     return config
 
                 compiled = magi_compile(model, config_patch=configure, dynamic_arg_dims={"input": 0})
@@ -506,9 +508,12 @@ def _compiled_inference_worker(rank: int, port: str, shared_dir: str, result_dir
 
 
 @requires_cuda_and_tmpfs
-def test_public_compile_config_shared_inference_matches_private(tmp_path) -> None:
+@pytest.mark.parametrize("sharing_scope", ["per_numa_node", "per_host_interleaved"])
+def test_public_compile_config_shared_inference_matches_private(tmp_path, sharing_scope: str) -> None:
     """Both sharing modes must preserve compiled H2D execution and match the private-copy output on every rank."""
     with tempfile.TemporaryDirectory(dir="/dev/shm") as shared_dir:
-        mp.spawn(_compiled_inference_worker, args=(_free_port(), shared_dir, str(tmp_path)), nprocs=2, join=True)
+        mp.spawn(
+            _compiled_inference_worker, args=(_free_port(), shared_dir, str(tmp_path), sharing_scope), nprocs=2, join=True
+        )
     for rank in range(2):
         assert (tmp_path / f"{rank}.txt").read_text() == "shared and private inference match"
