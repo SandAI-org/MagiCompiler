@@ -56,7 +56,12 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 from magi_compiler.utils import magi_logger
 
 from .runtime.host_weights import get_global_host_weight_store
-from .runtime.rank_shared_host_region import HostWeightSharing, RankSharedHostRegion, open_rank_shared_host_region
+from .runtime.rank_shared_host_region import (
+    HostWeightSharing,
+    RankSharedHostParkingPlan,
+    RankSharedHostRegion,
+    open_rank_shared_host_region,
+)
 
 _TO_EMPTY_QUALNAME = "Module.to_empty.<locals>.<lambda>"
 """Only ``to_empty`` materializes; dtype casts and other ``_apply`` uses keep torch behavior."""
@@ -376,28 +381,52 @@ def _park_as_shared_region_reader(names: list[str], param: nn.Parameter, shared_
 def _park_with_shared_region(
     cpu_parameters: list[tuple[list[str], nn.Parameter]], shared_region: RankSharedHostRegion
 ) -> list[int]:
-    """Preserve parameter order; readers adopt shared buffers only after publication."""
+    """Publish one chunk and complete all reader handoffs before another chunk can allocate."""
     try:
-        if shared_region.is_writer:
-            host_slots = []
-            writer_error = None
-            if shared_region.writer_ready:
-                try:
-                    host_slots = [
-                        _park_as_shared_region_writer(names=names, param=param, shared_region=shared_region)
-                        for names, param in cpu_parameters
-                    ]
-                except Exception as error:
-                    writer_error = error
-            shared_region.publish(writer_error=writer_error)
-            return host_slots
-        shared_region.publish()
-        return [
-            _park_as_shared_region_reader(names=names, param=param, shared_region=shared_region)
-            for names, param in cpu_parameters
-        ]
+        host_slots = []
+        writer_error = None
+        if shared_region.is_writer and shared_region.writer_ready:
+            try:
+                host_slots = [
+                    _park_as_shared_region_writer(names=names, param=param, shared_region=shared_region)
+                    for names, param in cpu_parameters
+                ]
+            except Exception as error:
+                writer_error = error
+        shared_region.publish(writer_error=writer_error)
+        reader_error = None
+        if not shared_region.is_writer:
+            try:
+                host_slots = [
+                    _park_as_shared_region_reader(names=names, param=param, shared_region=shared_region)
+                    for names, param in cpu_parameters
+                ]
+            except Exception as error:
+                reader_error = error
+        shared_region.finish_parking(local_error=reader_error)
+        return host_slots
     finally:
         shared_region.close_writer_fd()
+
+
+def _park_with_shared_plan(
+    cpu_parameters: list[tuple[list[str], nn.Parameter]], parking_plan: RankSharedHostParkingPlan
+) -> list[int]:
+    slots_by_name = {}
+    private_error = None
+    try:
+        for names, param in cpu_parameters:
+            if not parking_plan.holds(names[0]):
+                slots_by_name[names[0]] = _park_in_private_host_buffer(names=names, param=param)
+    except Exception as error:
+        private_error = error
+    parking_plan.finish_private_parking(local_error=private_error)
+    parameters_by_name = {names[0]: (names, param) for names, param in cpu_parameters}
+    for region, weight_names in parking_plan.chunks():
+        chunk_parameters = [parameters_by_name[name] for name in weight_names]
+        host_slots = _park_with_shared_region(cpu_parameters=chunk_parameters, shared_region=region)
+        slots_by_name.update(zip(weight_names, host_slots))
+    return [slots_by_name[names[0]] for names, _ in cpu_parameters]
 
 
 @torch.inference_mode(False)
@@ -421,7 +450,7 @@ def _park_cpu_parameters(module: nn.Module, *, min_weight_bytes: int, host_weigh
     if shared_region is None:
         host_slots = [_park_in_private_host_buffer(names=names, param=param) for names, param in cpu_parameters]
     else:
-        host_slots = _park_with_shared_region(cpu_parameters=cpu_parameters, shared_region=shared_region)
+        host_slots = _park_with_shared_plan(cpu_parameters=cpu_parameters, parking_plan=shared_region)
     if not host_slots:
         return 0
     record_handoff_slots(module=module, slots=host_slots)

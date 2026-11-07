@@ -238,7 +238,9 @@ class OffloadConfig(BaseModel):
             "ENOSPC), FSDP shards and to_empty weights stay private. When enabled, every WORLD rank must move the same "
             "compiled models to CUDA in the same order, including ranks without eligible weights. Sharing ranks must "
             "access the writer through /proc/<pid>/fd/<fd> (same PID namespace and proc permissions). "
-            "MAGI_SHARED_BIN_PATH free space remains a conservative capacity budget; no weight files are created there."
+            "MAGI_SHARED_BIN_PATH free space remains a total capacity budget; no weight files are created there. "
+            "Sharing groups advance one at a time in batches targeting 256 MiB (larger weights stand alone), "
+            "with reader handoff before the next allocation. MemAvailable and visible cgroup limits cap chunk headroom."
         ),
     )
     offload_max_device_weight_mib: int = Field(

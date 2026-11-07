@@ -73,6 +73,11 @@ def _writer_failure_worker(rank: int, port: str, result_dir: str, failure_stage:
                 raise RuntimeError("injected fill failure")
             return 0
 
+        def park_reader(**kwargs):
+            if failure_stage == "reader_handoff":
+                raise RuntimeError("injected reader_handoff failure")
+            return 0
+
         def map_region(**kwargs):
             if (failure_stage == "map" and rank == 0) or (failure_stage == "reader_map" and rank == 1):
                 raise RuntimeError(f"injected {failure_stage} failure")
@@ -82,6 +87,7 @@ def _writer_failure_worker(rank: int, port: str, result_dir: str, failure_stage:
             patch.object(region_module, "_create_shared_memory_file", create_region),
             patch.object(region_module, "_map_and_pin_shared_memory_file", map_region),
             patch("magi_compiler.passes.weight_offload.weight_lifecycle._park_as_shared_region_writer", park_weight),
+            patch("magi_compiler.passes.weight_offload.weight_lifecycle._park_as_shared_region_reader", park_reader),
         ):
             region = region_module.RankSharedHostRegion(
                 region_plan=region_plan,
@@ -102,12 +108,12 @@ def _writer_failure_worker(rank: int, port: str, result_dir: str, failure_stage:
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("failure_stage", ["create", "map", "fill", "reader_map"])
+@pytest.mark.parametrize("failure_stage", ["create", "map", "fill", "reader_map", "reader_handoff"])
 def test_publication_failure_reaches_every_rank(tmp_path, failure_stage):
     """A writer or reader mapping failure must reach every rank without a barrier timeout."""
     mp.spawn(_writer_failure_worker, args=(_free_port(), str(tmp_path), failure_stage), nprocs=2, join=True)
     for rank in range(2):
-        failed_rank = 1 if failure_stage == "reader_map" else 0
+        failed_rank = 1 if failure_stage in ("reader_map", "reader_handoff") else 0
         assert f"rank {failed_rank}: " in (tmp_path / f"{rank}.txt").read_text()
         assert f"injected {failure_stage} failure" in (tmp_path / f"{rank}.txt").read_text()
 
@@ -354,12 +360,17 @@ def test_a_host_without_shared_memory_room_keeps_every_weight_private(tmp_path, 
 
 
 def _plan_input(
-    sharing_group: str, fingerprint_by_weight_name: dict[str, bytes], free_bytes: int = 1 << 40, hostname: str | None = None
+    sharing_group: str,
+    fingerprint_by_weight_name: dict[str, bytes],
+    free_bytes: int = 1 << 40,
+    hostname: str | None = None,
+    available_bytes: int = 1 << 40,
 ) -> _RankSharingPlanInput:
     return _RankSharingPlanInput(
         hostname=hostname or sharing_group,
         sharing_group=sharing_group,
         free_shared_memory_bytes=free_bytes,
+        available_host_memory_bytes=available_bytes,
         descriptor_by_weight_name={
             name: _WeightDescriptor(shape=(10,), dtype=torch.float32, nbytes=40, fingerprint=fingerprint)
             for name, fingerprint in fingerprint_by_weight_name.items()
@@ -630,3 +641,20 @@ def test_failed_memfd_allocation_closes_descriptor(monkeypatch) -> None:
     with pytest.raises(OSError) as error:
         os.fstat(allocated_descriptors[0])
     assert error.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize("available_chunk_bytes, should_share", [(512, True), (511, False)])
+def test_host_headroom_checks_one_chunk_not_the_full_region(
+    monkeypatch, available_chunk_bytes: int, should_share: bool
+) -> None:
+    from magi_compiler.passes.weight_offload.runtime import rank_shared_host_region as region_module
+
+    monkeypatch.setattr(region_module, "SHARED_MEMORY_CHUNK_BYTES", 512)
+    plan_inputs = [
+        _plan_input(
+            "host", {"a": b"a", "b": b"b", "c": b"c"}, available_bytes=SHARED_MEMORY_HEADROOM_BYTES + available_chunk_bytes
+        )
+        for _ in range(2)
+    ]
+    plans = _plan_sharing_group_regions(plan_inputs)
+    assert bool(plans["host"].slice_by_weight_name) == should_share

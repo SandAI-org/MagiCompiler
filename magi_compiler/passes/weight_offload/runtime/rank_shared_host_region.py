@@ -15,6 +15,7 @@
 """Shared pinned CPU weights backed by anonymous memfd files.
 
 WORLD ranks enter in the same model order, including ranks without eligible weights.
+Groups advance serially in weight batches; readers release originals before the next allocation.
 Writers retain their fd until all readers map it through /proc/<pid>/fd/<fd>.
 No directory entry is created; existing reader mappings survive writer exit.
 Allocation-time ENOSPC falls back per host. Fingerprint matches require byte comparison.
@@ -38,6 +39,7 @@ from magi_compiler.cuda.cudart import pin_memory_in_place
 from magi_compiler.utils import envs, magi_logger
 from magi_compiler.utils.dist_utils import get_cpu_gloo_group
 from magi_compiler.utils.hash import compute_tensor_fingerprint
+from magi_compiler.utils.host_memory import get_available_host_memory_bytes
 from magi_compiler.utils.numa import NumaPagePolicy, cuda_device_numa_node, numa_page_policy, online_numa_nodes
 
 from .host_memory_pool import ALIGN_BYTES
@@ -46,8 +48,9 @@ SharingScope = Literal["per_numa_node", "per_host_interleaved"]
 HostWeightSharing = Literal["off", "per_numa_node", "per_host_interleaved"]
 """Mirrors ``OffloadConfig.offload_host_weight_sharing``."""
 
+SHARED_MEMORY_CHUNK_BYTES = 256 << 20
 SHARED_MEMORY_HEADROOM_BYTES = 256 << 20
-"""Arbitrary margin for unrelated tmpfs users; concurrent allocations can still exhaust it."""
+"""Arbitrary reserve for concurrent host-memory and shared-capacity consumers."""
 
 
 @dataclass(frozen=True)
@@ -73,6 +76,7 @@ class _RankSharingPlanInput:
     hostname: str
     sharing_group: str
     free_shared_memory_bytes: int
+    available_host_memory_bytes: int
     descriptor_by_weight_name: dict[str, _WeightDescriptor]
 
 
@@ -134,7 +138,7 @@ class RankSharedHostRegion:
                 except Exception as error:
                     self._writer_error = error
 
-    def prepare(self) -> None:
+    def prepare(self) -> set[str]:
         """Every rank: agree on allocation errors before any weight changes ownership."""
         local_error = None if self._allocation_out_of_space else self._writer_error
         status = (self._region_plan.hostname, self._allocation_out_of_space, _error_message(local_error), self._region_path)
@@ -149,6 +153,7 @@ class RankSharedHostRegion:
             self._writer_error = None
             self._region_plan = dataclasses.replace(self._region_plan, slice_by_weight_name={}, region_bytes=0)
             magi_logger.warning("host offload: shared allocation exhausted tmpfs; this host keeps private copies")
+        return full_hosts
 
     @property
     def writer_ready(self) -> bool:
@@ -189,14 +194,86 @@ class RankSharedHostRegion:
         _exchange_errors(local_error=mapping_error, phase="reader mapping", gloo_group=self._gloo_group)
         self.close_writer_fd()
 
+    def finish_parking(self, *, local_error: Exception | None) -> None:
+        _exchange_errors(local_error=local_error, phase="reader handoff", gloo_group=self._gloo_group)
+
     def close_writer_fd(self) -> None:
         """Release the writer fd after publication or failure; existing mappings remain valid."""
         self._writer_file.close()
 
 
+class RankSharedHostParkingPlan:
+    def __init__(
+        self,
+        *,
+        local_plan: _SharingGroupRegionPlan,
+        chunk_plans: tuple[_SharingGroupRegionPlan, ...],
+        region_label: str,
+        region_numa_policy: _RegionNumaPolicy | None,
+        gloo_group: dist.ProcessGroup,
+    ) -> None:
+        self._local_plan = local_plan
+        self._chunk_plans = chunk_plans
+        self._region_label = region_label
+        self._region_numa_policy = region_numa_policy
+        self._gloo_group = gloo_group
+        self.shared_bytes = 0
+
+    def holds(self, weight_name: str) -> bool:
+        return weight_name in self._local_plan.slice_by_weight_name
+
+    def finish_private_parking(self, *, local_error: Exception | None) -> None:
+        _exchange_errors(local_error=local_error, phase="private handoff", gloo_group=self._gloo_group)
+
+    def chunks(self) -> Iterator[tuple[RankSharedHostRegion, tuple[str, ...]]]:
+        """WORLD advances one sharing group at a time, after every reader releases the preceding originals."""
+        disabled_hosts: set[str] = set()
+        for chunk_plan in self._chunk_plans:
+            if chunk_plan.hostname not in disabled_hosts and not self._has_chunk_capacity(chunk_plan):
+                disabled_hosts.add(chunk_plan.hostname)
+            is_local_group = chunk_plan.writer_rank == self._local_plan.writer_rank
+            weight_names = tuple(chunk_plan.slice_by_weight_name) if is_local_group else ()
+            local_chunk = chunk_plan
+            if not is_local_group or chunk_plan.hostname in disabled_hosts:
+                local_chunk = dataclasses.replace(chunk_plan, slice_by_weight_name={}, region_bytes=0)
+            region = RankSharedHostRegion(
+                region_plan=local_chunk,
+                region_label=self._region_label,
+                is_writer=dist.get_rank() == chunk_plan.writer_rank,
+                region_numa_policy=self._region_numa_policy,
+                gloo_group=self._gloo_group,
+            )
+            try:
+                disabled_hosts.update(region.prepare())
+                yield region, weight_names
+                self.shared_bytes += region.shared_bytes
+            finally:
+                region.close_writer_fd()
+
+    def _has_chunk_capacity(self, chunk_plan: _SharingGroupRegionPlan) -> bool:
+        local_error = None
+        available_bytes = 0
+        try:
+            available_bytes = get_available_host_memory_bytes()
+        except Exception as error:
+            local_error = error
+        status = (self._local_plan.hostname, available_bytes, _error_message(local_error))
+        statuses = [None] * dist.get_world_size(group=self._gloo_group)
+        dist.all_gather_object(statuses, status, group=self._gloo_group)
+        _raise_for_errors(errors=[status[2] for status in statuses], phase="chunk capacity", local_error=local_error)
+        fits = all(
+            available >= chunk_plan.region_bytes + SHARED_MEMORY_HEADROOM_BYTES
+            for hostname, available, _ in statuses
+            if hostname == chunk_plan.hostname
+        )
+        if not fits and self._local_plan.hostname == chunk_plan.hostname:
+            magi_logger.warning("host offload: insufficient host/cgroup headroom for the next chunk; keeping private copies")
+        return fits
+
+
 def open_rank_shared_host_region(
     *, tensor_by_weight_name: Mapping[str, torch.Tensor], region_label: str, sharing_scope: SharingScope
-) -> RankSharedHostRegion | None:
+) -> RankSharedHostParkingPlan | None:
     """Collective over WORLD: call for the same models in the same order and with the same sharing_scope.
 
     Ranks without eligible CPU weights pass an empty mapping. Returns None everywhere
@@ -227,8 +304,8 @@ def open_rank_shared_host_region(
     local_region_plan = region_plan_by_sharing_group[sharing_group]
     if local_region_plan.rejected_region_bytes > 0:
         magi_logger.warning(
-            "host offload: %s has %.1f GiB free, too little for this host's shared %s regions (%.1f GiB for this "
-            "rank's group); every rank keeps a private copy",
+            "host offload: %s has %.1f GiB free; sharing budget or host/cgroup chunk headroom is insufficient "
+            "for %s (%.1f GiB for this rank's group); keeping private copies",
             envs.MAGI_SHARED_BIN_PATH,
             local_plan_input.free_shared_memory_bytes / 2**30,
             region_label,
@@ -236,19 +313,15 @@ def open_rank_shared_host_region(
         )
     if all(region_plan.region_bytes == 0 for region_plan in region_plan_by_sharing_group.values()):
         return None
-    shared_region = RankSharedHostRegion(
-        region_plan=local_region_plan,
+    return RankSharedHostParkingPlan(
+        local_plan=local_region_plan,
+        chunk_plans=tuple(
+            chunk for group_plan in region_plan_by_sharing_group.values() for chunk in _split_region_plan(group_plan)
+        ),
         region_label=region_label,
-        is_writer=dist.get_rank() == local_region_plan.writer_rank,
         region_numa_policy=region_numa_policy,
         gloo_group=gloo_group,
     )
-    try:
-        shared_region.prepare()
-    except Exception:
-        shared_region.close_writer_fd()
-        raise
-    return shared_region
 
 
 def _error_message(error: Exception | None) -> str | None:
@@ -279,6 +352,7 @@ def _collect_local_plan_input(
             hostname=hostname,
             sharing_group=sharing_group,
             free_shared_memory_bytes=shutil.disk_usage(envs.MAGI_SHARED_BIN_PATH).free,
+            available_host_memory_bytes=get_available_host_memory_bytes(),
             descriptor_by_weight_name={name: _describe_weight(tensor) for name, tensor in tensor_by_weight_name.items()},
         ),
         region_numa_policy,
@@ -355,24 +429,52 @@ def _plan_sharing_group_region(group_plan_input_by_rank: dict[int, _RankSharingP
     )
 
 
+def _split_region_plan(region_plan: _SharingGroupRegionPlan) -> Iterator[_SharingGroupRegionPlan]:
+    slices = {}
+    chunk_bytes = 0
+    for name, weight_slice in region_plan.slice_by_weight_name.items():
+        aligned_bytes = (weight_slice.nbytes + ALIGN_BYTES - 1) // ALIGN_BYTES * ALIGN_BYTES
+        if slices and chunk_bytes + aligned_bytes > SHARED_MEMORY_CHUNK_BYTES:
+            yield dataclasses.replace(region_plan, slice_by_weight_name=slices, region_bytes=chunk_bytes)
+            slices = {}
+            chunk_bytes = 0
+        slices[name] = dataclasses.replace(weight_slice, byte_offset=chunk_bytes)
+        chunk_bytes += aligned_bytes
+    if slices:
+        yield dataclasses.replace(region_plan, slice_by_weight_name=slices, region_bytes=chunk_bytes)
+
+
 def _drop_region_plans_on_hosts_without_room(
     *, region_plan_by_sharing_group: dict[str, _SharingGroupRegionPlan], plan_input_by_rank: list[_RankSharingPlanInput]
 ) -> dict[str, _SharingGroupRegionPlan]:
-    """Groups on one host compete for the same tmpfs; writing beyond capacity causes SIGBUS."""
+    """Check total sharing budget and the transient chunk against host/cgroup headroom."""
     free_bytes_by_hostname: dict[str, int] = {}
+    available_bytes_by_hostname: dict[str, int] = {}
     for plan_input in plan_input_by_rank:
         free_bytes_by_hostname[plan_input.hostname] = min(
             plan_input.free_shared_memory_bytes,
             free_bytes_by_hostname.get(plan_input.hostname, plan_input.free_shared_memory_bytes),
         )
+        available_bytes_by_hostname[plan_input.hostname] = min(
+            plan_input.available_host_memory_bytes,
+            available_bytes_by_hostname.get(plan_input.hostname, plan_input.available_host_memory_bytes),
+        )
+    peak_chunk_by_hostname: dict[str, int] = {}
     needed_bytes_by_hostname: dict[str, int] = {}
     for region_plan in region_plan_by_sharing_group.values():
+        for chunk in _split_region_plan(region_plan):
+            peak_chunk_by_hostname[region_plan.hostname] = max(
+                peak_chunk_by_hostname.get(region_plan.hostname, 0), chunk.region_bytes
+            )
         needed_bytes_by_hostname[region_plan.hostname] = (
             needed_bytes_by_hostname.get(region_plan.hostname, 0) + region_plan.region_bytes
         )
 
     def fits(hostname: str) -> bool:
-        return needed_bytes_by_hostname[hostname] + SHARED_MEMORY_HEADROOM_BYTES <= free_bytes_by_hostname[hostname]
+        return (
+            needed_bytes_by_hostname[hostname] + SHARED_MEMORY_HEADROOM_BYTES <= free_bytes_by_hostname[hostname]
+            and peak_chunk_by_hostname.get(hostname, 0) + SHARED_MEMORY_HEADROOM_BYTES <= available_bytes_by_hostname[hostname]
+        )
 
     return {
         sharing_group: (
