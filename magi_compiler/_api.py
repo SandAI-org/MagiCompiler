@@ -37,6 +37,7 @@ from magi_compiler.utils import compilation_counter, envs, magi_logger
 from magi_compiler.utils.compile_time_monitor import CompileMonitor
 from magi_compiler.utils.hash import compute_tensor_fingerprint
 from magi_compiler.utils.host_memory import fmt_host_mem
+from magi_compiler.utils.torch_threads import intra_op_threads
 
 from .config import CompileConfig, CompileMode
 
@@ -714,16 +715,6 @@ def _pin_per_rank(
         buffers.append(giant)
 
 
-@contextmanager
-def _intra_op_threads(num_threads: int):
-    previous = torch.get_num_threads()
-    torch.set_num_threads(num_threads)
-    try:
-        yield
-    finally:
-        torch.set_num_threads(previous)
-
-
 def _split_shared(
     grouped_params: dict[torch.dtype, list[tuple[str, torch.Tensor]]], shared: Collection[str]
 ) -> tuple[dict[torch.dtype, list[tuple[str, torch.Tensor]]], dict[torch.dtype, list[tuple[str, torch.Tensor]]]]:
@@ -780,7 +771,7 @@ def _materialize_shm_weights(
         if local_rank != 0 and param_list:
             giant = torch.from_file(path, shared=True, size=total_numel, dtype=dtype, device="cpu")
             start = time.perf_counter()
-            with _intra_op_threads(compare_threads):
+            with intra_op_threads(compare_threads):
                 for (name, tensor), view in zip(param_list, _split_flat_to_params(giant, param_list).values()):
                     if torch.equal(_as_bytes(view), _as_bytes(tensor)):
                         _assign_param(module, name, view)
@@ -801,6 +792,7 @@ def _materialize_shm_weights(
             '[offload] compared %.1f GiB of shared weights with local rank 0 in %.1f s',
             compared_bytes / 2**30,
             compare_seconds,
+            rank="all",
         )
     if differing:
         names = [name for params in differing.values() for name, _ in params]

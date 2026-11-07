@@ -10,7 +10,7 @@ from datetime import timedelta
 from multiprocessing.synchronize import Lock
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -32,6 +32,7 @@ def _chunk_peak_worker(
     lock: Lock,
     failure_mode: str | None = None,
 ) -> None:
+    from magi_compiler.passes.weight_offload import weight_lifecycle
     from magi_compiler.passes.weight_offload.runtime import rank_shared_host_region as region_module
     from magi_compiler.passes.weight_offload.weight_lifecycle import _park_with_shared_plan
 
@@ -45,6 +46,13 @@ def _chunk_peak_worker(
     allocation_sizes = []
     allocate_region = region_module._create_shared_memory_file
     initial_bytes = sum(weight_counts) * _WEIGHT_BYTES
+    previous_threads = torch.get_num_threads()
+    compare_thread_counts = []
+    compare_weights = region_module.RankSharedHostRegion.holds_identical_copy
+
+    def compare_region(region, weight_name: str, tensor: torch.Tensor) -> bool:
+        compare_thread_counts.append(torch.get_num_threads())
+        return compare_weights(region, weight_name, tensor)
 
     @contextmanager
     def allocate_chunk(**kwargs):
@@ -83,6 +91,8 @@ def _chunk_peak_worker(
     try:
         with (
             patch.object(region_module, 'SHARED_MEMORY_CHUNK_BYTES', _WEIGHT_BYTES),
+            patch.object(region_module.RankSharedHostRegion, 'holds_identical_copy', compare_region),
+            patch.object(weight_lifecycle.magi_logger, 'info') as comparison_log,
             patch.object(region_module, 'get_available_host_memory_bytes', side_effect=available_memory),
             patch.object(region_module.shutil, 'disk_usage', return_value=SimpleNamespace(free=1 << 40)),
             patch.object(
@@ -108,9 +118,32 @@ def _chunk_peak_worker(
             if failure_mode is not None:
                 expected_shared_bytes = _WEIGHT_BYTES if rank < 2 else 0
             assert parking_plan.shared_bytes == expected_shared_bytes
+            _assert_reader_comparison_metrics(
+                thread_counts=compare_thread_counts,
+                previous_threads=previous_threads,
+                expected_shared_bytes=expected_shared_bytes,
+                comparison_log=comparison_log,
+            )
             Path(result_dir, f'{rank}.json').write_text(json.dumps(allocation_sizes))
     finally:
         dist.destroy_process_group()
+
+
+def _assert_reader_comparison_metrics(
+    *, thread_counts: list[int], previous_threads: int, expected_shared_bytes: int, comparison_log: Mock
+) -> None:
+    assert torch.get_num_threads() == previous_threads
+    if not thread_counts:
+        assert comparison_log.call_count == 0
+        return
+    expected_threads = min(previous_threads, max(1, len(os.sched_getaffinity(0)) // 4))
+    assert set(thread_counts) == {expected_threads}
+    assert comparison_log.call_count == 1
+    metrics = comparison_log.call_args.kwargs
+    assert metrics['rank'] == 'all'
+    assert metrics['extra']['compared_bytes'] == expected_shared_bytes
+    assert metrics['extra']['compare_seconds'] >= 0
+    assert metrics['extra']['compare_threads'] == expected_threads
 
 
 @pytest.mark.parametrize(

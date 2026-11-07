@@ -54,6 +54,7 @@ import torch.nn as nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from magi_compiler.utils import magi_logger
+from magi_compiler.utils.torch_threads import intra_op_threads
 
 from .runtime.host_weights import get_global_host_weight_store
 from .runtime.rank_shared_host_region import (
@@ -422,10 +423,28 @@ def _park_with_shared_plan(
         private_error = error
     parking_plan.finish_private_parking(local_error=private_error)
     parameters_by_name = {names[0]: (names, param) for names, param in cpu_parameters}
-    for region, weight_names in parking_plan.chunks():
-        chunk_parameters = [parameters_by_name[name] for name in weight_names]
-        host_slots = _park_with_shared_region(cpu_parameters=chunk_parameters, shared_region=region)
-        slots_by_name.update(zip(weight_names, host_slots))
+    compared_bytes = 0
+    compare_seconds = 0.0
+    with intra_op_threads(parking_plan.compare_threads):
+        for region, weight_names in parking_plan.chunks():
+            chunk_parameters = [parameters_by_name[name] for name in weight_names]
+            host_slots = _park_with_shared_region(cpu_parameters=chunk_parameters, shared_region=region)
+            slots_by_name.update(zip(weight_names, host_slots))
+            compared_bytes += region.compared_bytes
+            compare_seconds += region.compare_seconds
+    if compared_bytes:
+        magi_logger.info(
+            "host offload: compared %.3f GiB of shared weights in %.3f s with %d intra-op threads",
+            compared_bytes / 2**30,
+            compare_seconds,
+            parking_plan.compare_threads,
+            rank="all",
+            extra={
+                "compared_bytes": compared_bytes,
+                "compare_seconds": compare_seconds,
+                "compare_threads": parking_plan.compare_threads,
+            },
+        )
     return [slots_by_name[names[0]] for names, _ in cpu_parameters]
 
 

@@ -28,6 +28,7 @@ import errno
 import os
 import shutil
 import socket
+import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Iterator, Literal, Mapping
@@ -116,6 +117,8 @@ class RankSharedHostRegion:
         self._gloo_group = gloo_group
         self._mapped_region: torch.Tensor | None = None
         self._writer_error: Exception | None = None
+        self.compared_bytes = 0
+        self.compare_seconds = 0.0
         self._allocation_out_of_space = False
         self._writer_file = ExitStack()
         self._region_path: str | None = None
@@ -175,7 +178,11 @@ class RankSharedHostRegion:
         return weight_bytes.view(weight_slice.dtype).view(weight_slice.shape)
 
     def holds_identical_copy(self, weight_name: str, tensor: torch.Tensor) -> bool:
-        return torch.equal(_as_flat_bytes(self.host_buffer(weight_name)), _as_flat_bytes(tensor))
+        start = time.perf_counter()
+        is_identical = torch.equal(_as_flat_bytes(self.host_buffer(weight_name)), _as_flat_bytes(tensor))
+        self.compare_seconds += time.perf_counter() - start
+        self.compared_bytes += tensor.numel() * tensor.element_size()
+        return is_identical
 
     def publish(self, *, writer_error: Exception | None = None) -> None:
         """Every rank: publish filled weights, map readers, then close the writer fd."""
@@ -207,6 +214,7 @@ class RankSharedHostParkingPlan:
         self,
         *,
         local_plan: _SharingGroupRegionPlan,
+        local_rank_count: int,
         chunk_plans: tuple[_SharingGroupRegionPlan, ...],
         region_label: str,
         region_numa_policy: _RegionNumaPolicy | None,
@@ -218,6 +226,10 @@ class RankSharedHostParkingPlan:
         self._region_numa_policy = region_numa_policy
         self._gloo_group = gloo_group
         self.shared_bytes = 0
+        self.compare_threads = torch.get_num_threads()
+        if dist.get_rank() != local_plan.writer_rank and local_plan.slice_by_weight_name:
+            rank_thread_budget = max(1, len(os.sched_getaffinity(0)) // local_rank_count)
+            self.compare_threads = min(self.compare_threads, rank_thread_budget)
 
     def holds(self, weight_name: str) -> bool:
         return weight_name in self._local_plan.slice_by_weight_name
@@ -315,6 +327,7 @@ def open_rank_shared_host_region(
         return None
     return RankSharedHostParkingPlan(
         local_plan=local_region_plan,
+        local_rank_count=sum(plan_input.hostname == local_region_plan.hostname for plan_input in plan_input_by_rank),
         chunk_plans=tuple(
             chunk for group_plan in region_plan_by_sharing_group.values() for chunk in _split_region_plan(group_plan)
         ),
