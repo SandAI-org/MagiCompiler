@@ -17,9 +17,9 @@
 from __future__ import annotations
 
 import ctypes
+import functools
 import platform
 from contextlib import contextmanager
-from dataclasses import dataclass
 from typing import Iterator, Literal, Sequence
 
 import torch
@@ -32,25 +32,11 @@ NumaPagePolicy = Literal["preferred", "interleave"]
 _MPOL_MODE_BY_POLICY = {"preferred": 1, "interleave": 3}
 _NODE_MASK_BITS = 1024
 _NodeMask = ctypes.c_ulong * (_NODE_MASK_BITS // 64)
-
-
-@dataclass(frozen=True)
-class _MempolicySyscallNumbers:
-    get_mempolicy: int
-    set_mempolicy: int
-
-
-# glibc wraps neither call, so they go through syscall(2); numbers from asm/unistd_64.h and asm-generic/unistd.h.
-_MEMPOLICY_SYSCALL_NUMBERS_BY_MACHINE = {
-    "x86_64": _MempolicySyscallNumbers(get_mempolicy=239, set_mempolicy=238),
-    "aarch64": _MempolicySyscallNumbers(get_mempolicy=236, set_mempolicy=237),
-}
-
-
-@dataclass(frozen=True)
-class _SavedMemoryPolicy:
-    mode: int
-    node_mask: ctypes.Array
+# One past the last mask bit, as libnuma passes it.
+_MAX_NODE = ctypes.c_ulong(_NODE_MASK_BITS + 1)
+# glibc wraps neither call, so they go through syscall(2); (get_mempolicy, set_mempolicy) numbers
+# from asm/unistd_64.h and asm-generic/unistd.h.
+_MEMPOLICY_SYSCALL_NUMBERS_BY_MACHINE = {"x86_64": (239, 238), "aarch64": (236, 237)}
 
 
 def online_numa_nodes() -> list[int]:
@@ -89,20 +75,25 @@ def numa_page_policy(*, policy: NumaPagePolicy, nodes: Sequence[int]) -> Iterato
         yield
     finally:
         if saved_policy is not None:
-            _set_thread_memory_policy(mode=saved_policy.mode, node_mask=saved_policy.node_mask)
+            _set_thread_memory_policy(*saved_policy)
 
 
-def _replace_thread_memory_policy(*, policy: NumaPagePolicy, nodes: Sequence[int]) -> _SavedMemoryPolicy | None:
-    """Install ``policy``; return the policy it replaced, or None if nothing was installed."""
-    syscall_numbers = _MEMPOLICY_SYSCALL_NUMBERS_BY_MACHINE.get(platform.machine())
-    if syscall_numbers is None:
+def _replace_thread_memory_policy(*, policy: NumaPagePolicy, nodes: Sequence[int]) -> tuple[int, ctypes.Array] | None:
+    """Install ``policy``; return the (mode, node mask) it replaced, or None if nothing was installed."""
+    if platform.machine() not in _MEMPOLICY_SYSCALL_NUMBERS_BY_MACHINE:
         magi_logger.warning("numa: no mempolicy syscalls known for %s; pages keep their placement", platform.machine())
         return None
-    saved_policy = _get_thread_memory_policy()
+    get_mempolicy, _ = _MEMPOLICY_SYSCALL_NUMBERS_BY_MACHINE[platform.machine()]
+    saved_mode = ctypes.c_int()
+    saved_node_mask = _NodeMask()
     requested_node_mask = _NodeMask()
     for node in nodes:
         requested_node_mask[node // 64] |= 1 << (node % 64)
-    if saved_policy is None or not _set_thread_memory_policy(mode=_MPOL_MODE_BY_POLICY[policy], node_mask=requested_node_mask):
+    # get_mempolicy(mode, nodemask, maxnode, addr=NULL, flags=0): the calling thread's policy.
+    saved = _libc().syscall(
+        ctypes.c_long(get_mempolicy), ctypes.byref(saved_mode), saved_node_mask, _MAX_NODE, None, ctypes.c_ulong(0)
+    )
+    if saved != 0 or not _set_thread_memory_policy(_MPOL_MODE_BY_POLICY[policy], requested_node_mask):
         magi_logger.warning(
             "numa: could not set the %s policy over nodes %s (errno %d); pages keep their placement",
             policy,
@@ -110,28 +101,14 @@ def _replace_thread_memory_policy(*, policy: NumaPagePolicy, nodes: Sequence[int
             ctypes.get_errno(),
         )
         return None
-    return saved_policy
+    return saved_mode.value, saved_node_mask
 
 
-def _get_thread_memory_policy() -> _SavedMemoryPolicy | None:
-    mode = ctypes.c_int()
-    node_mask = _NodeMask()
-    syscall_number = _MEMPOLICY_SYSCALL_NUMBERS_BY_MACHINE[platform.machine()].get_mempolicy
-    # get_mempolicy(mode, nodemask, maxnode, addr=NULL, flags=0): the calling thread's policy.
-    if _libc().syscall(ctypes.c_long(syscall_number), ctypes.byref(mode), node_mask, _max_node(), None, ctypes.c_ulong(0)):
-        return None
-    return _SavedMemoryPolicy(mode=mode.value, node_mask=node_mask)
+def _set_thread_memory_policy(mode: int, node_mask: ctypes.Array) -> bool:
+    _, set_mempolicy = _MEMPOLICY_SYSCALL_NUMBERS_BY_MACHINE[platform.machine()]
+    return _libc().syscall(ctypes.c_long(set_mempolicy), ctypes.c_int(mode), node_mask, _MAX_NODE) == 0
 
 
-def _set_thread_memory_policy(*, mode: int, node_mask: ctypes.Array) -> bool:
-    syscall_number = _MEMPOLICY_SYSCALL_NUMBERS_BY_MACHINE[platform.machine()].set_mempolicy
-    return _libc().syscall(ctypes.c_long(syscall_number), ctypes.c_int(mode), node_mask, _max_node()) == 0
-
-
-def _max_node() -> ctypes.c_ulong:
-    # One past the last mask bit, as libnuma passes it.
-    return ctypes.c_ulong(_NODE_MASK_BITS + 1)
-
-
+@functools.cache
 def _libc() -> ctypes.CDLL:
     return ctypes.CDLL(None, use_errno=True)

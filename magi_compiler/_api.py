@@ -35,7 +35,7 @@ from magi_compiler.cuda.cudart import pin_memory_in_place
 from magi_compiler.magi_backend.magi_compiler_base import MagiCompileState
 from magi_compiler.utils import compilation_counter, envs, magi_logger
 from magi_compiler.utils.compile_time_monitor import CompileMonitor
-from magi_compiler.utils.hash import compute_tensor_fingerprint
+from magi_compiler.utils.hash import as_flat_bytes, compute_tensor_fingerprint
 from magi_compiler.utils.host_memory import fmt_host_mem
 from magi_compiler.utils.torch_threads import intra_op_threads
 
@@ -651,10 +651,6 @@ def _create_empty_shm(shm_path: str, total_numel: int, dtype: torch.dtype) -> to
 _SHM_HEADROOM_BYTES = 256 << 20
 
 
-def _as_bytes(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor.reshape(-1).view(torch.uint8)
-
-
 def _rank_identical_params(
     grouped_params: dict[torch.dtype, list[tuple[str, torch.Tensor]]]
 ) -> tuple[set[str], list[torch.dtype]]:
@@ -773,7 +769,7 @@ def _materialize_shm_weights(
             start = time.perf_counter()
             with intra_op_threads(compare_threads):
                 for (name, tensor), view in zip(param_list, _split_flat_to_params(giant, param_list).values()):
-                    if torch.equal(_as_bytes(view), _as_bytes(tensor)):
+                    if torch.equal(as_flat_bytes(view), as_flat_bytes(tensor)):
                         _assign_param(module, name, view)
                     else:
                         differing.setdefault(dtype, []).append((name, tensor))

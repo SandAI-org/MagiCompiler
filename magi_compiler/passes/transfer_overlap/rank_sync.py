@@ -38,9 +38,9 @@ compiles turn it off.
 +---------------+---------------------------------------+------------+--------------------------------+------------------+
 | Stage         | Rendezvous                            | Group      | Entered when                   | Who enters       |
 +===============+=======================================+============+================================+==================+
-| first CUDA    | host sharing offers, allocation,      | WORLD      | host_weight_sharing != 'off',   | all moving ranks |
-| move          | writer fill and reader mapping       | (Gloo)     | before graph compilation       | including empty  |
-|               | (rank_shared_host_region)            |            |                                | offers           |
+| first CUDA    | host sharing plan, then per chunk     | WORLD      | host_weight_sharing != 'off',  | all moving ranks |
+| move          | writer publish and reader handoff     | (Gloo)     | before graph compilation       | including empty  |
+|               | (rank_shared_host_region)             |            |                                | offers           |
 +---------------+---------------------------------------+------------+--------------------------------+------------------+
 | backend (FX)  | ``_any_rank_inserted_loads``          | WORLD      | graph_weight_offload and not   | compiling ranks  |
 |               | (weight_transfer_pipeline)            |            | enable_fsdp, any cost_mode     |                  |
@@ -64,10 +64,8 @@ compiles turn it off.
 What follows from it:
 
 * Host sharing requires the same first-CUDA-move order on every rank, including
-  empty offers. Exchanges cover preparation, allocation, writer fill and reader
-  mapping and handoff errors per chunk. Groups advance serially; the next chunk
-  allocates only after all readers release the preceding originals. ENOSPC hosts
-  fall back but keep participating. ``to_empty`` is local.
+  empty offers. Every group's chunk k parks in round k; ranks without one join
+  with an empty chunk. ``to_empty`` is local.
 * Once graph_weight_offload or enable_fsdp is on, every rank compiles the same
   graphs in the same order, including ranks that offload or gather nothing.
 * Inductor rows reach only cache-miss ranks, so ranks must agree on the cache

@@ -230,17 +230,11 @@ class OffloadConfig(BaseModel):
     offload_host_weight_sharing: Literal["off", "per_numa_node", "per_host_interleaved"] = Field(
         "off",
         description=(
-            "Share identical unsharded CPU weights on the first CUDA move via anonymous memfd mappings. "
-            "'off': private copies; 'per_numa_node': one copy per GPU NUMA group with preferred local placement; "
-            "'per_host_interleaved': one copy per host with interleaved placement. NUMA placement is best effort: "
-            "unavailable or denied policies warn and retain the current policy; unknown GPU affinity uses host "
-            "grouping and default placement. Different weights, insufficient shared capacity (including allocation-time "
-            "ENOSPC), FSDP shards and to_empty weights stay private. When enabled, every WORLD rank must move the same "
-            "compiled models to CUDA in the same order, including ranks without eligible weights. Sharing ranks must "
-            "access the writer through /proc/<pid>/fd/<fd> (same PID namespace and proc permissions). "
-            "MAGI_SHARED_BIN_PATH free space remains a total capacity budget; no weight files are created there. "
-            "Sharing groups advance one at a time in batches targeting 256 MiB (larger weights stand alone), "
-            "with reader handoff before the next allocation. MemAvailable and visible cgroup limits cap chunk headroom."
+            "Share identical unsharded CPU weights across ranks on their first CUDA move. 'off': a private copy per "
+            "rank; 'per_numa_node': one copy per GPU NUMA node, placed on that node; 'per_host_interleaved': one copy "
+            "per host, interleaved over its NUMA nodes. NUMA placement is best effort. FSDP shards and to_empty weights "
+            "stay private. When enabled, every WORLD rank must move the same compiled models to CUDA in the same order, "
+            "and the ranks of a host must share a PID namespace."
         ),
     )
     offload_max_device_weight_mib: int = Field(

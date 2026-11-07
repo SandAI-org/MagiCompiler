@@ -45,6 +45,7 @@ Custom loaders that write tensors directly must also finish before handoff.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import Literal, Sequence
@@ -59,9 +60,9 @@ from magi_compiler.utils.torch_threads import intra_op_threads
 from .runtime.host_weights import get_global_host_weight_store
 from .runtime.rank_shared_host_region import (
     HostWeightSharing,
-    RankSharedHostParkingPlan,
-    RankSharedHostRegion,
-    open_rank_shared_host_region,
+    SharedHostChunk,
+    SharedHostParkingPlan,
+    plan_shared_host_parking,
 )
 
 _TO_EMPTY_QUALNAME = "Module.to_empty.<locals>.<lambda>"
@@ -359,93 +360,62 @@ def _park_in_private_host_buffer(names: list[str], param: nn.Parameter) -> int:
     return _install_weight_standin(names=names, param=param, host_buffer=host_buffer)
 
 
-def _park_as_shared_region_writer(names: list[str], param: nn.Parameter, shared_region: RankSharedHostRegion) -> int:
-    if not shared_region.holds(names[0]):
+def _park_in_shared_chunk(names: list[str], param: nn.Parameter, chunk: SharedHostChunk) -> int:
+    if not chunk.is_shared:
         return _park_in_private_host_buffer(names=names, param=param)
-    host_buffer = shared_region.host_buffer(names[0])
-    host_buffer.copy_(param.detach())
+    host_buffer = chunk.host_buffer(names[0])
+    if chunk.is_writer:
+        host_buffer.copy_(param.detach())
+    elif not chunk.holds_identical_copy(names[0], param.detach()):
+        magi_logger.warning(
+            "host offload: %s matched the shared copy's fingerprint but not its bytes; this rank keeps a private copy",
+            _normalize_parameter_name(names[0]),
+        )
+        return _park_in_private_host_buffer(names=names, param=param)
     return _install_weight_standin(names=names, param=param, host_buffer=host_buffer)
 
 
-def _park_as_shared_region_reader(names: list[str], param: nn.Parameter, shared_region: RankSharedHostRegion) -> int:
-    if not shared_region.holds(names[0]):
-        return _park_in_private_host_buffer(names=names, param=param)
-    if shared_region.holds_identical_copy(names[0], param.detach()):
-        return _install_weight_standin(names=names, param=param, host_buffer=shared_region.host_buffer(names[0]))
-    magi_logger.warning(
-        "host offload: %s matched the shared copy's fingerprint but not its bytes; this rank keeps a private copy",
-        _normalize_parameter_name(names[0]),
-    )
-    return _park_in_private_host_buffer(names=names, param=param)
+def _park_shared_chunk(chunk: SharedHostChunk, chunk_parameters: list[tuple[list[str], nn.Parameter]]) -> list[int]:
+    """Writers fill before ``publish``; readers adopt the writer's pages before ``finish``."""
+    host_slots = []
+    writer_error = None
+    if chunk.is_writer:
+        try:
+            host_slots = [_park_in_shared_chunk(names=names, param=param, chunk=chunk) for names, param in chunk_parameters]
+        except Exception as error:
+            writer_error = error
+    chunk.publish(writer_error=writer_error)
+    reader_error = None
+    if not chunk.is_writer:
+        try:
+            chunk.map_writer_region()
+            host_slots = [_park_in_shared_chunk(names=names, param=param, chunk=chunk) for names, param in chunk_parameters]
+        except Exception as error:
+            reader_error = error
+    chunk.finish(reader_error=reader_error)
+    return host_slots
 
 
-def _park_with_shared_region(
-    cpu_parameters: list[tuple[list[str], nn.Parameter]], shared_region: RankSharedHostRegion
-) -> list[int]:
-    """Publish one chunk and complete all reader handoffs before another chunk can allocate."""
-    try:
-        host_slots = []
-        writer_error = None
-        if shared_region.is_writer and shared_region.writer_ready:
-            try:
-                host_slots = [
-                    _park_as_shared_region_writer(names=names, param=param, shared_region=shared_region)
-                    for names, param in cpu_parameters
-                ]
-            except Exception as error:
-                writer_error = error
-        shared_region.publish(writer_error=writer_error)
-        reader_error = None
-        if not shared_region.is_writer:
-            try:
-                host_slots = [
-                    _park_as_shared_region_reader(names=names, param=param, shared_region=shared_region)
-                    for names, param in cpu_parameters
-                ]
-            except Exception as error:
-                reader_error = error
-        shared_region.finish_parking(local_error=reader_error)
-        return host_slots
-    finally:
-        shared_region.close_writer_fd()
-
-
-def _park_with_shared_plan(
-    cpu_parameters: list[tuple[list[str], nn.Parameter]], parking_plan: RankSharedHostParkingPlan
-) -> list[int]:
-    slots_by_name = {}
-    private_error = None
-    try:
-        for names, param in cpu_parameters:
-            if not parking_plan.holds(names[0]):
-                slots_by_name[names[0]] = _park_in_private_host_buffer(names=names, param=param)
-    except Exception as error:
-        private_error = error
-    parking_plan.finish_private_parking(local_error=private_error)
+def _park_parameters(
+    cpu_parameters: list[tuple[list[str], nn.Parameter]], parking_plan: SharedHostParkingPlan | None
+) -> tuple[list[int], int]:
+    """Returns the slots and the bytes parked in rank-shared regions.
+    Private weights park after the last round: no collective follows, so a local failure cannot strand peers."""
     parameters_by_name = {names[0]: (names, param) for names, param in cpu_parameters}
-    compared_bytes = 0
-    compare_seconds = 0.0
-    with intra_op_threads(parking_plan.compare_threads):
-        for region, weight_names in parking_plan.chunks():
-            chunk_parameters = [parameters_by_name[name] for name in weight_names]
-            host_slots = _park_with_shared_region(cpu_parameters=chunk_parameters, shared_region=region)
-            slots_by_name.update(zip(weight_names, host_slots))
-            compared_bytes += region.compared_bytes
-            compare_seconds += region.compare_seconds
-    if compared_bytes:
-        magi_logger.info(
-            "host offload: compared %.3f GiB of shared weights in %.3f s with %d intra-op threads",
-            compared_bytes / 2**30,
-            compare_seconds,
-            parking_plan.compare_threads,
-            rank="all",
-            extra={
-                "compared_bytes": compared_bytes,
-                "compare_seconds": compare_seconds,
-                "compare_threads": parking_plan.compare_threads,
-            },
-        )
-    return [slots_by_name[names[0]] for names, _ in cpu_parameters]
+    slots_by_name = {}
+    shared_bytes = 0
+    with nullcontext() if parking_plan is None else intra_op_threads(parking_plan.parking_threads):
+        for round_index in range(0 if parking_plan is None else parking_plan.round_count):
+            with parking_plan.open_chunk(round_index) as chunk:
+                chunk_parameters = [parameters_by_name[name] for name in chunk.weight_names]
+                slots_by_name.update(
+                    zip(chunk.weight_names, _park_shared_chunk(chunk=chunk, chunk_parameters=chunk_parameters))
+                )
+                shared_bytes += chunk.shared_bytes
+    for names, param in cpu_parameters:
+        if names[0] not in slots_by_name:
+            slots_by_name[names[0]] = _park_in_private_host_buffer(names=names, param=param)
+    return [slots_by_name[names[0]] for names, _ in cpu_parameters], shared_bytes
 
 
 @torch.inference_mode(False)
@@ -456,20 +426,17 @@ def _park_cpu_parameters(module: nn.Module, *, min_weight_bytes: int, host_weigh
         if _can_park_on_first_cuda_move(module)
         else []
     )
-    # Collective: every rank opens it, even one without CPU weights to park.
-    shared_region = (
+    # Collective: every rank plans, even one without CPU weights to park.
+    parking_plan = (
         None
         if host_weight_sharing == "off"
-        else open_rank_shared_host_region(
+        else plan_shared_host_parking(
             tensor_by_weight_name={names[0]: param.detach() for names, param in cpu_parameters},
             region_label=type(module).__name__,
             sharing_scope=host_weight_sharing,
         )
     )
-    if shared_region is None:
-        host_slots = [_park_in_private_host_buffer(names=names, param=param) for names, param in cpu_parameters]
-    else:
-        host_slots = _park_with_shared_plan(cpu_parameters=cpu_parameters, parking_plan=shared_region)
+    host_slots, shared_bytes = _park_parameters(cpu_parameters=cpu_parameters, parking_plan=parking_plan)
     if not host_slots:
         return 0
     record_handoff_slots(module=module, slots=host_slots)
@@ -480,7 +447,7 @@ def _park_cpu_parameters(module: nn.Module, *, min_weight_bytes: int, host_weigh
         type(module).__name__,
         len(host_slots),
         sum(store.slot_bytes(slot) for slot in host_slots) / 2**20,
-        0.0 if shared_region is None else shared_region.shared_bytes / 2**20,
+        shared_bytes / 2**20,
     )
     return len(host_slots)
 
@@ -504,10 +471,9 @@ def _apply_with_host_offload(self: nn.Module, fn, recurse: bool = True):
     # the host, or built on CUDA and moved to the host first. Weights already on CUDA never are.
     if target is not None and target.type == "cuda" and not state.parking_decided:
         state.parking_decided = True
-        if state.host_weight_sharing != "off" or _can_park_on_first_cuda_move(self):
-            _park_cpu_parameters(
-                module=self, min_weight_bytes=state.min_weight_bytes, host_weight_sharing=state.host_weight_sharing
-            )
+        _park_cpu_parameters(
+            module=self, min_weight_bytes=state.min_weight_bytes, host_weight_sharing=state.host_weight_sharing
+        )
     if target is None:
         _reject_cast_after_handoff(module=self, fn=fn)
     if target is None or state.handoff_status == "not_started":

@@ -105,11 +105,15 @@ def compute_module_state_hash(obj: object) -> str:
 TENSOR_FINGERPRINT_SAMPLE_BYTES = 4096
 
 
+def as_flat_bytes(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.reshape(-1).view(torch.uint8)
+
+
 def compute_tensor_fingerprint(tensor: torch.Tensor) -> bytes:
     """Hash shape, dtype and up to 4 KiB of evenly sampled CPU tensor bytes.
     A match requires byte-for-byte verification before sharing storage."""
     sha256_hash = hashlib.sha256(f"{tuple(tensor.shape)},{tensor.dtype}".encode())
-    tensor_bytes = tensor.reshape(-1).view(torch.uint8)
+    tensor_bytes = as_flat_bytes(tensor)
     if tensor_bytes.numel() > TENSOR_FINGERPRINT_SAMPLE_BYTES:
         sample_indices = torch.linspace(0, tensor_bytes.numel() - 1, TENSOR_FINGERPRINT_SAMPLE_BYTES, dtype=torch.float64)
         tensor_bytes = tensor_bytes[sample_indices.long()]
