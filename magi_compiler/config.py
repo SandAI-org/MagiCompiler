@@ -237,6 +237,20 @@ class OffloadConfig(BaseModel):
             "and the ranks of a host must share a PID namespace."
         ),
     )
+    defer_host_materialization: bool = Field(
+        False,
+        description=(
+            "With graph_weight_offload on a host-built model: the first CUDA move only records each offloadable "
+            "weight's CPU original (e.g. a checkpoint mmap) and binds its slot to a shared zero placeholder, so "
+            "nothing is read or pinned yet. When the first compile of the model has chosen the resident weights, "
+            "and before the compiled graph runs, every weight is copied once: resident ones into device memory "
+            "with no host copy, the rest into pinned host memory (shared per offload_host_weight_sharing). Later "
+            "compiles keep that resident set. Weights without a host copy cannot move back to the host, so the "
+            "model must stay on CUDA. Meta-built (to_empty) models are refused. Unless offload_host_weight_sharing "
+            "is 'off', every compile of the model is a collective over WORLD. "
+            "Env var: MAGI_COMPILE_OFFLOAD_CONFIG__DEFER_HOST_MATERIALIZATION."
+        ),
+    )
     offload_max_device_weight_mib: int = Field(
         0,
         ge=0,

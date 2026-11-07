@@ -767,7 +767,10 @@ class ProfilingRuntimeEstimator:
                 return ns, True
             return self._measure(snode), True
         except BaseException as exc:  # noqa: BLE001
-            magi_logger.warning("warm/sync measure fell back to analytical for %s: %s", snode.get_name(), exc)
+            # Every rank: a fallback on some ranks only skips collectives the others still issue.
+            magi_logger.warning(
+                "warm/sync measure fell back to analytical for %s: %r", snode.get_name(), exc, rank="all", exc_info=True
+            )
             return analytical_runtime_ns(snode), False
 
     def summary(self) -> str:

@@ -22,6 +22,7 @@ splice, the placement pass -- is written once against that.
 Layout, in the order a compile meets it:
 
 * ``weight_lifecycle`` -- model materialization, host handoff, and device residency.
+* ``deferred_materialization`` -- copy deferred weights once compilation has picked the residents.
 * ``graph/``      -- FX weight pipeline: bind parked weights, splice loads in.
 * ``schedule/``   -- Inductor scheduler pass: place each load, buy residency.
 * ``cache/``      -- host-slot sidecar next to the piecewise compile cache.
@@ -29,6 +30,7 @@ Layout, in the order a compile meets it:
 """
 
 from .cache.offload_cache import OffloadCache
+from .deferred_materialization import materialize_deferred_host_weights
 from .graph.bind import bind_host_slots_to_graph, insert_h2d_loads
 from .graph.weight_source import FsdpShardSource, PlainParamSource
 from .node_meta import is_host_offloaded
@@ -47,4 +49,5 @@ __all__ = [
     "handoff_host_weights_if_pending",
     "install_host_first_hooks",
     "is_host_offloaded",
+    "materialize_deferred_host_weights",
 ]

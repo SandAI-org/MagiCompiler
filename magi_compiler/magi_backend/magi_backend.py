@@ -35,7 +35,7 @@ from magi_compiler.config import CompileConfig, CompileMode, CudaGraphMode, indu
 from magi_compiler.magi_depyf.timeline import observe_lifecycle, observe_lifecycle_context
 from magi_compiler.offload.offload_warpper import OffloadWrapper, is_python_scalar_input, mark_python_scalar_inputs
 from magi_compiler.passes import CustomJointGraphPartitionFn, FullGraphPassManager, PostGradPassManager, pass_context
-from magi_compiler.passes.weight_offload import OffloadCache
+from magi_compiler.passes.weight_offload import OffloadCache, materialize_deferred_host_weights
 from magi_compiler.utils import compilation_counter, compute_code_hash, compute_graph_hash, compute_hash, magi_logger
 from magi_compiler.utils.visualize import save_fx_graph_visualization
 
@@ -768,6 +768,15 @@ class MagiBackend:
         PiecewiseCompileInterpreter(
             split_gm, self.compiler_manager, submod_names_to_compile, self.compile_config, self.inductor_compile_config
         ).run(*example_inputs)
+
+        offload_config = self.compile_config.offload_config
+        if offload_config.graph_weight_offload and offload_config.defer_host_materialization:
+            # Placement has fixed the resident weights, and Dynamo runs the graph on real inputs right after.
+            materialize_deferred_host_weights(
+                example_inputs=example_inputs,
+                host_weight_sharing=offload_config.offload_host_weight_sharing,
+                region_label=self.model_tag,
+            )
 
         self._called_once = True
 

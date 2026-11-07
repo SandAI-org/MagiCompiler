@@ -17,6 +17,8 @@
 Park eligible weights in pinned memory on meta to_empty or the first CPU-to-CUDA move.
 On that first move, weights a group of ranks holds identically can be parked once per
 NUMA node or per host in a rank-shared region (``runtime/rank_shared_host_region.py``).
+With ``defer_host_materialization`` that move only defers the weights; ``deferred_materialization.py``
+copies them once the first compile has chosen which stay resident.
 
 After initialization, handoff installs storage-free CUDA stand-ins before tracing;
 it temporarily allocates one local shard. Tied registrations share a reservation
@@ -57,7 +59,7 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 from magi_compiler.utils import magi_logger
 from magi_compiler.utils.torch_threads import intra_op_threads
 
-from .runtime.host_weights import get_global_host_weight_store
+from .runtime.host_weights import get_global_host_weight_store, zero_placeholder_host_buffers
 from .runtime.rank_shared_host_region import (
     HostWeightSharing,
     SharedHostChunk,
@@ -74,6 +76,7 @@ class OffloadState:
     hooks_installed: bool = False
     min_weight_bytes: int = 0
     host_weight_sharing: HostWeightSharing = "off"
+    defer_host_materialization: bool = False
     parking_decided: bool = False
     handoff_status: Literal["not_started", "pending", "complete"] = "not_started"
     parked_parameter_names: tuple[str, ...] = ()
@@ -311,18 +314,23 @@ def _skip_managed_weights(fn):
 
 # A move may arrive under inference mode, and placement later writes these stand-ins outside it.
 @torch.inference_mode(False)
-def _install_weight_standin(names: list[str], param: nn.Parameter, host_buffer: torch.Tensor) -> int:
-    """Swap one weight for a storage-free CUDA stand-in and adopt its filled host buffer.
-    Returns its slot. Stand-in construction temporarily allocates one full shard."""
+def _swap_in_storage_free_standin(param: nn.Parameter, like: torch.Tensor) -> torch.Tensor:
+    """Give ``param`` a storage-free CUDA payload shaped like ``like``; return the tensor slots key on.
+    Stand-in construction temporarily allocates one full shard."""
     device = torch.device("cuda", torch.cuda.current_device())
-    device_standin_buffer = torch.empty(host_buffer.shape, dtype=host_buffer.dtype, device=device)
+    device_standin_buffer = torch.empty(like.shape, dtype=like.dtype, device=device)
     device_standin_buffer.untyped_storage().resize_(0)
     new_data = (
         _rebuild_dtensor(param=param, local=device_standin_buffer) if isinstance(param, DTensor) else device_standin_buffer
     )
     _swap_parameter_payload(param=param, new_data=new_data)
     # Host slots are keyed by the post-swap tensor identity used during tracing.
-    device_standin = _local_weight_tensor(param)
+    return _local_weight_tensor(param)
+
+
+def _install_weight_standin(names: list[str], param: nn.Parameter, host_buffer: torch.Tensor) -> int:
+    """Swap one weight for a storage-free CUDA stand-in and adopt its filled host buffer. Returns its slot."""
+    device_standin = _swap_in_storage_free_standin(param=param, like=host_buffer)
     return get_global_host_weight_store().bind_host_buffer(
         host_buffer=host_buffer, device_standin=device_standin, parameter_name=_normalize_parameter_name(names[0])
     )
@@ -452,6 +460,44 @@ def _park_cpu_parameters(module: nn.Module, *, min_weight_bytes: int, host_weigh
     return len(host_slots)
 
 
+@torch.inference_mode(False)
+def _defer_cpu_parameters(module: nn.Module, *, min_weight_bytes: int) -> int:
+    """Hand a host-built module's offloadable weights over without reading or pinning their bytes.
+    Returns the number deferred; ``materialize_deferred_host_weights`` copies them after compilation."""
+    if not _can_park_on_first_cuda_move(module):
+        return 0
+    cpu_parameters = _collect_cpu_parameters_to_park(module=module, min_weight_bytes=min_weight_bytes)
+    if not cpu_parameters:
+        return 0
+    store = get_global_host_weight_store()
+    deferred_group_id = store.new_deferred_group_id()
+    placeholders = zero_placeholder_host_buffers([(param.shape, param.dtype) for _, param in cpu_parameters])
+    host_slots = []
+    for (names, param), placeholder in zip(cpu_parameters, placeholders):
+        # Taken before the swap, so it keeps the CPU original's storage.
+        cpu_original = param.detach()
+        device_standin = _swap_in_storage_free_standin(param=param, like=cpu_original)
+        host_slots.append(
+            store.bind_deferred_weight(
+                placeholder=placeholder,
+                device_standin=device_standin,
+                parameter_name=_normalize_parameter_name(names[0]),
+                pending_source=cpu_original,
+                deferred_group_id=deferred_group_id,
+            )
+        )
+    record_handoff_slots(module=module, slots=host_slots)
+    _guard_checkpoint_loads(module=module, host_slots=host_slots)
+    magi_logger.info(
+        "host offload: %s deferred %d CPU weight(s), %.1f MiB, on first CUDA move; "
+        "they are copied once its first compile has chosen the resident ones",
+        type(module).__name__,
+        len(host_slots),
+        sum(store.slot_bytes(slot) for slot in host_slots) / 2**20,
+    )
+    return len(host_slots)
+
+
 def _call_class_apply(module: nn.Module, fn, recurse: bool):
     # A sharding owner may replace the module class after hooks are installed.
     return type(module)._apply(module, fn, recurse=recurse)
@@ -461,6 +507,11 @@ def _apply_with_host_offload(self: nn.Module, fn, recurse: bool = True):
     state: OffloadState = self._magi_offload_state
     # Meta-built (e.g. SimpleFSDP): to_empty(cuda) puts eligible weights in the pool, handoff pending.
     if getattr(fn, "__qualname__", "") == _TO_EMPTY_QUALNAME:
+        if state.defer_host_materialization:
+            raise RuntimeError(
+                f"host offload: {type(self).__name__} is built on meta, but defer_host_materialization supports "
+                "host-built models only: to_empty would allocate host buffers before compilation picks residents"
+            )
         return _materialize_host_weights(module=self, fn=fn, recurse=recurse, min_weight_bytes=state.min_weight_bytes)
     # None unless fn is a pure host<->CUDA move: dtype casts and other conversions get None.
     # Combined device+dtype moves are unsupported once weights are parked (module docstring).
@@ -471,9 +522,12 @@ def _apply_with_host_offload(self: nn.Module, fn, recurse: bool = True):
     # the host, or built on CUDA and moved to the host first. Weights already on CUDA never are.
     if target is not None and target.type == "cuda" and not state.parking_decided:
         state.parking_decided = True
-        _park_cpu_parameters(
-            module=self, min_weight_bytes=state.min_weight_bytes, host_weight_sharing=state.host_weight_sharing
-        )
+        if state.defer_host_materialization:
+            _defer_cpu_parameters(module=self, min_weight_bytes=state.min_weight_bytes)
+        else:
+            _park_cpu_parameters(
+                module=self, min_weight_bytes=state.min_weight_bytes, host_weight_sharing=state.host_weight_sharing
+            )
     if target is None:
         _reject_cast_after_handoff(module=self, fn=fn)
     if target is None or state.handoff_status == "not_started":
@@ -634,15 +688,21 @@ def _guard_checkpoint_loads(module: nn.Module, host_slots: Sequence[int]) -> Non
 
 
 def install_host_first_hooks(
-    instance: nn.Module, *, min_weight_bytes: int, host_weight_sharing: HostWeightSharing = "off"
+    instance: nn.Module,
+    *,
+    min_weight_bytes: int,
+    host_weight_sharing: HostWeightSharing = "off",
+    defer_host_materialization: bool = False,
 ) -> None:
     """Install host-first allocation and residency-aware moves once per module.
-    Finish dtype conversion before parking. Sharing makes the first CUDA move a WORLD collective."""
+    Finish dtype conversion before parking. Sharing makes the first CUDA move a WORLD collective;
+    with ``defer_host_materialization`` that collective moves to the end of the module's compiles."""
     state = get_or_create_offload_state(instance)
     if state.hooks_installed:
         return
     state.min_weight_bytes = min_weight_bytes
     state.host_weight_sharing = host_weight_sharing
+    state.defer_host_materialization = defer_host_materialization
     instance._apply = _apply_with_host_offload.__get__(instance, type(instance))
     state.hooks_installed = True
     magi_logger.info("host offload: %s will materialize its offloadable weights in host memory", type(instance).__name__)
