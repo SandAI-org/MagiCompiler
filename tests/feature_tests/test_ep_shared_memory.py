@@ -40,7 +40,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 
-from magi_compiler._api import _materialize_shm_weights, _param_fingerprint, _rank_identical_params
+from magi_compiler._api import _materialize_shm_weights, _rank_identical_params
+from magi_compiler.utils.hash import compute_tensor_fingerprint
 
 
 class FakeExpertBlock(nn.Module):
@@ -337,7 +338,7 @@ def test_fingerprint_identical_models():
     torch.manual_seed(42)
     m2 = FakeExpertBlock(num_experts=4, dim=8)
 
-    assert _param_fingerprint(m1.expert_weight.data) == _param_fingerprint(m2.expert_weight.data)
+    assert compute_tensor_fingerprint(m1.expert_weight.data) == compute_tensor_fingerprint(m2.expert_weight.data)
 
 
 def test_fingerprint_different_models():
@@ -347,7 +348,7 @@ def test_fingerprint_different_models():
     torch.manual_seed(123)
     m2 = FakeExpertBlock(num_experts=4, dim=8)
 
-    assert _param_fingerprint(m1.expert_weight.data) != _param_fingerprint(m2.expert_weight.data)
+    assert compute_tensor_fingerprint(m1.expert_weight.data) != compute_tensor_fingerprint(m2.expert_weight.data)
 
 
 def test_fingerprint_detects_single_element_change():
@@ -357,7 +358,7 @@ def test_fingerprint_detects_single_element_change():
     changed = w.clone()
     changed[2, 3] += 1.0
 
-    assert _param_fingerprint(w) != _param_fingerprint(changed)
+    assert compute_tensor_fingerprint(w) != compute_tensor_fingerprint(changed)
 
 
 def test_fingerprint_samples_the_middle_of_large_tensors():
@@ -366,6 +367,6 @@ def test_fingerprint_samples_the_middle_of_large_tensors():
     b = a.clone()
     b[1000:-1000] = 1.0
 
-    assert _param_fingerprint(a) != _param_fingerprint(b)
-    assert _param_fingerprint(a) == _param_fingerprint(a.clone())
-    assert _param_fingerprint(a) != _param_fingerprint(a.view(1024, 1024))
+    assert compute_tensor_fingerprint(a) != compute_tensor_fingerprint(b)
+    assert compute_tensor_fingerprint(a) == compute_tensor_fingerprint(a.clone())
+    assert compute_tensor_fingerprint(a) != compute_tensor_fingerprint(a.view(1024, 1024))

@@ -14,7 +14,6 @@
 
 import functools
 import gc
-import hashlib
 import inspect
 import os
 import shutil
@@ -36,7 +35,9 @@ from magi_compiler.cuda.cudart import pin_memory_in_place
 from magi_compiler.magi_backend.magi_compiler_base import MagiCompileState
 from magi_compiler.utils import compilation_counter, envs, magi_logger
 from magi_compiler.utils.compile_time_monitor import CompileMonitor
+from magi_compiler.utils.hash import as_flat_bytes, compute_tensor_fingerprint
 from magi_compiler.utils.host_memory import fmt_host_mem
+from magi_compiler.utils.torch_threads import intra_op_threads
 
 from .config import CompileConfig, CompileMode
 
@@ -298,7 +299,11 @@ def _magi_compile_bound_method(
             )
         from magi_compiler.passes.weight_offload import install_host_first_hooks
 
-        install_host_first_hooks(instance=instance, min_weight_bytes=conf.offload_config.offload_min_shard_mib * 1024 * 1024)
+        install_host_first_hooks(
+            instance=instance,
+            min_weight_bytes=conf.offload_config.offload_min_shard_mib * 1024 * 1024,
+            host_weight_sharing=conf.offload_config.offload_host_weight_sharing,
+        )
 
     old_method = getattr(instance, method_name)
 
@@ -646,25 +651,6 @@ def _create_empty_shm(shm_path: str, total_numel: int, dtype: torch.dtype) -> to
 _SHM_HEADROOM_BYTES = 256 << 20
 
 
-def _as_bytes(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor.reshape(-1).view(torch.uint8)
-
-
-def _param_fingerprint(tensor: torch.Tensor) -> bytes:
-    """Shape, dtype and up to 4 KiB of *tensor*'s bytes, spread evenly over it (both ends included).
-
-    Small tensors are hashed whole. Large ones are told apart when they differ throughout (e.g. two EP ranks'
-    experts), not when they differ only in bytes between the samples: :func:`_materialize_shm_weights` compares
-    the shared weights byte for byte, so a collision only costs a per-rank copy.
-    """
-    h = hashlib.sha256(f"{tuple(tensor.shape)},{tensor.dtype}".encode())
-    data = _as_bytes(tensor)
-    if data.numel() > 4096:
-        data = data[torch.linspace(0, data.numel() - 1, 4096, dtype=torch.float64).long()]
-    h.update(data.numpy().tobytes())
-    return h.digest()
-
-
 def _rank_identical_params(
     grouped_params: dict[torch.dtype, list[tuple[str, torch.Tensor]]]
 ) -> tuple[set[str], list[torch.dtype]]:
@@ -682,7 +668,7 @@ def _rank_identical_params(
         return set(), []
 
     local = {
-        name: (t.dtype, _param_fingerprint(t), t.numel() * t.element_size())
+        name: (t.dtype, compute_tensor_fingerprint(t), t.numel() * t.element_size())
         for params in grouped_params.values()
         for name, t in params
     }
@@ -723,16 +709,6 @@ def _pin_per_rank(
         _stream_copy_and_replace(module, giant, param_list)
         pin_memory_in_place(giant)
         buffers.append(giant)
-
-
-@contextmanager
-def _intra_op_threads(num_threads: int):
-    previous = torch.get_num_threads()
-    torch.set_num_threads(num_threads)
-    try:
-        yield
-    finally:
-        torch.set_num_threads(previous)
 
 
 def _split_shared(
@@ -791,9 +767,9 @@ def _materialize_shm_weights(
         if local_rank != 0 and param_list:
             giant = torch.from_file(path, shared=True, size=total_numel, dtype=dtype, device="cpu")
             start = time.perf_counter()
-            with _intra_op_threads(compare_threads):
+            with intra_op_threads(compare_threads):
                 for (name, tensor), view in zip(param_list, _split_flat_to_params(giant, param_list).values()):
-                    if torch.equal(_as_bytes(view), _as_bytes(tensor)):
+                    if torch.equal(as_flat_bytes(view), as_flat_bytes(tensor)):
                         _assign_param(module, name, view)
                     else:
                         differing.setdefault(dtype, []).append((name, tensor))
@@ -812,6 +788,7 @@ def _materialize_shm_weights(
             '[offload] compared %.1f GiB of shared weights with local rank 0 in %.1f s',
             compared_bytes / 2**30,
             compare_seconds,
+            rank="all",
         )
     if differing:
         names = [name for params in differing.values() for name, _ in params]

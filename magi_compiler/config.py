@@ -227,6 +227,16 @@ class OffloadConfig(BaseModel):
         ),
     )
     offload_min_shard_mib: int = Field(1, ge=0, description="Minimum local-shard size in MiB for weight offload.")
+    offload_host_weight_sharing: Literal["off", "per_numa_node", "per_host_interleaved"] = Field(
+        "off",
+        description=(
+            "Share identical unsharded CPU weights across ranks on their first CUDA move. 'off': a private copy per "
+            "rank; 'per_numa_node': one copy per GPU NUMA node, placed on that node; 'per_host_interleaved': one copy "
+            "per host, interleaved over its NUMA nodes. NUMA placement is best effort. FSDP shards and to_empty weights "
+            "stay private. When enabled, every WORLD rank must move the same compiled models to CUDA in the same order, "
+            "and the ranks of a host must share a PID namespace."
+        ),
+    )
     offload_max_device_weight_mib: int = Field(
         0,
         ge=0,

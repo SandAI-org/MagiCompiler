@@ -15,6 +15,8 @@
 """Manage weight materialization, host handoff, and device residency.
 
 Park eligible weights in pinned memory on meta to_empty or the first CPU-to-CUDA move.
+On that first move, weights a group of ranks holds identically can be parked once per
+NUMA node or per host in a rank-shared region (``runtime/rank_shared_host_region.py``).
 
 After initialization, handoff installs storage-free CUDA stand-ins before tracing;
 it temporarily allocates one local shard. Tied registrations share a reservation
@@ -43,6 +45,7 @@ Custom loaders that write tensors directly must also finish before handoff.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import Literal, Sequence
@@ -52,8 +55,15 @@ import torch.nn as nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from magi_compiler.utils import magi_logger
+from magi_compiler.utils.torch_threads import intra_op_threads
 
 from .runtime.host_weights import get_global_host_weight_store
+from .runtime.rank_shared_host_region import (
+    HostWeightSharing,
+    SharedHostChunk,
+    SharedHostParkingPlan,
+    plan_shared_host_parking,
+)
 
 _TO_EMPTY_QUALNAME = "Module.to_empty.<locals>.<lambda>"
 """Only ``to_empty`` materializes; dtype casts and other ``_apply`` uses keep torch behavior."""
@@ -63,6 +73,7 @@ _TO_EMPTY_QUALNAME = "Module.to_empty.<locals>.<lambda>"
 class OffloadState:
     hooks_installed: bool = False
     min_weight_bytes: int = 0
+    host_weight_sharing: HostWeightSharing = "off"
     parking_decided: bool = False
     handoff_status: Literal["not_started", "pending", "complete"] = "not_started"
     parked_parameter_names: tuple[str, ...] = ()
@@ -329,35 +340,114 @@ def _install_weight_standins(module: nn.Module, parked_parameters: list[tuple[li
     return sum(host_buffer.numel() * host_buffer.element_size() for _, _, host_buffer in parked_parameters)
 
 
-@torch.inference_mode(False)
-def _park_cpu_parameters(module: nn.Module, min_weight_bytes: int) -> int:
-    """Copy a host-built module's offloadable weights into the pool and hand them over.
-    Returns the number parked; the rest keep their normal placement."""
+def _collect_cpu_parameters_to_park(module: nn.Module, min_weight_bytes: int) -> list[tuple[list[str], nn.Parameter]]:
+    """Contiguous CPU weights of at least ``min_weight_bytes``, grouped by identity with every tied registration."""
     parameters_by_identity: dict[int, tuple[list[str], nn.Parameter]] = {}
     for name, param in module.named_parameters(remove_duplicate=False):
         if param.device.type != "cpu" or param.numel() * param.element_size() < min_weight_bytes:
             continue
         if param.is_contiguous():
             parameters_by_identity.setdefault(id(param), ([], param))[0].append(name)
-    host_slots = []
-    handed_off_bytes = 0
-    for names, param in parameters_by_identity.values():
-        host_buffer = get_global_host_weight_store().reserve_host_buffer(
-            shape=param.shape, dtype=param.dtype, parameter_name=_normalize_parameter_name(names[0])
-        )
+    return list(parameters_by_identity.values())
+
+
+def _park_in_private_host_buffer(names: list[str], param: nn.Parameter) -> int:
+    """Copy one weight into this rank's own pinned pool and hand it over; returns its slot."""
+    host_buffer = get_global_host_weight_store().reserve_host_buffer(
+        shape=param.shape, dtype=param.dtype, parameter_name=_normalize_parameter_name(names[0])
+    )
+    host_buffer.copy_(param.detach())
+    return _install_weight_standin(names=names, param=param, host_buffer=host_buffer)
+
+
+def _park_in_shared_chunk(names: list[str], param: nn.Parameter, chunk: SharedHostChunk) -> int:
+    if not chunk.is_shared:
+        return _park_in_private_host_buffer(names=names, param=param)
+    host_buffer = chunk.host_buffer(names[0])
+    if chunk.is_writer:
         host_buffer.copy_(param.detach())
-        # Hand off each parameter before copying the next pageable payload into pinned storage.
-        host_slots.append(_install_weight_standin(names=names, param=param, host_buffer=host_buffer))
-        handed_off_bytes += host_buffer.numel() * host_buffer.element_size()
+    elif not chunk.holds_identical_copy(names[0], param.detach()):
+        magi_logger.warning(
+            "host offload: %s matched the shared copy's fingerprint but not its bytes; this rank keeps a private copy",
+            _normalize_parameter_name(names[0]),
+        )
+        return _park_in_private_host_buffer(names=names, param=param)
+    return _install_weight_standin(names=names, param=param, host_buffer=host_buffer)
+
+
+def _park_shared_chunk(chunk: SharedHostChunk, chunk_parameters: list[tuple[list[str], nn.Parameter]]) -> list[int]:
+    """Writers fill before ``publish``; readers adopt the writer's pages before ``finish``."""
+    host_slots = []
+    writer_error = None
+    if chunk.is_writer:
+        try:
+            host_slots = [_park_in_shared_chunk(names=names, param=param, chunk=chunk) for names, param in chunk_parameters]
+        except Exception as error:
+            writer_error = error
+    chunk.publish(writer_error=writer_error)
+    reader_error = None
+    if not chunk.is_writer:
+        try:
+            chunk.map_writer_region()
+            host_slots = [_park_in_shared_chunk(names=names, param=param, chunk=chunk) for names, param in chunk_parameters]
+        except Exception as error:
+            reader_error = error
+    chunk.finish(reader_error=reader_error)
+    return host_slots
+
+
+def _park_parameters(
+    cpu_parameters: list[tuple[list[str], nn.Parameter]], parking_plan: SharedHostParkingPlan | None
+) -> tuple[list[int], int]:
+    """Returns the slots and the bytes parked in rank-shared regions.
+    Private weights park after the last round: no collective follows, so a local failure cannot strand peers."""
+    parameters_by_name = {names[0]: (names, param) for names, param in cpu_parameters}
+    slots_by_name = {}
+    shared_bytes = 0
+    with nullcontext() if parking_plan is None else intra_op_threads(parking_plan.parking_threads):
+        for round_index in range(0 if parking_plan is None else parking_plan.round_count):
+            with parking_plan.open_chunk(round_index) as chunk:
+                chunk_parameters = [parameters_by_name[name] for name in chunk.weight_names]
+                slots_by_name.update(
+                    zip(chunk.weight_names, _park_shared_chunk(chunk=chunk, chunk_parameters=chunk_parameters))
+                )
+                shared_bytes += chunk.shared_bytes
+    for names, param in cpu_parameters:
+        if names[0] not in slots_by_name:
+            slots_by_name[names[0]] = _park_in_private_host_buffer(names=names, param=param)
+    return [slots_by_name[names[0]] for names, _ in cpu_parameters], shared_bytes
+
+
+@torch.inference_mode(False)
+def _park_cpu_parameters(module: nn.Module, *, min_weight_bytes: int, host_weight_sharing: HostWeightSharing) -> int:
+    """Hand off each weight before copying the next to avoid retaining all pageable originals."""
+    cpu_parameters = (
+        _collect_cpu_parameters_to_park(module=module, min_weight_bytes=min_weight_bytes)
+        if _can_park_on_first_cuda_move(module)
+        else []
+    )
+    # Collective: every rank plans, even one without CPU weights to park.
+    parking_plan = (
+        None
+        if host_weight_sharing == "off"
+        else plan_shared_host_parking(
+            tensor_by_weight_name={names[0]: param.detach() for names, param in cpu_parameters},
+            region_label=type(module).__name__,
+            sharing_scope=host_weight_sharing,
+        )
+    )
+    host_slots, shared_bytes = _park_parameters(cpu_parameters=cpu_parameters, parking_plan=parking_plan)
     if not host_slots:
         return 0
     record_handoff_slots(module=module, slots=host_slots)
     _guard_checkpoint_loads(module=module, host_slots=host_slots)
+    store = get_global_host_weight_store()
     magi_logger.info(
-        "host offload: %s parked %d CPU weight(s), %.1f MiB, on first CUDA move",
+        "host offload: %s parked %d CPU weight(s), %.1f MiB, on first CUDA move; %.1f MiB in a rank-shared region",
         type(module).__name__,
         len(host_slots),
-        handed_off_bytes / 2**20,
+        sum(store.slot_bytes(slot) for slot in host_slots) / 2**20,
+        shared_bytes / 2**20,
     )
     return len(host_slots)
 
@@ -381,8 +471,9 @@ def _apply_with_host_offload(self: nn.Module, fn, recurse: bool = True):
     # the host, or built on CUDA and moved to the host first. Weights already on CUDA never are.
     if target is not None and target.type == "cuda" and not state.parking_decided:
         state.parking_decided = True
-        if _can_park_on_first_cuda_move(self):
-            _park_cpu_parameters(module=self, min_weight_bytes=state.min_weight_bytes)
+        _park_cpu_parameters(
+            module=self, min_weight_bytes=state.min_weight_bytes, host_weight_sharing=state.host_weight_sharing
+        )
     if target is None:
         _reject_cast_after_handoff(module=self, fn=fn)
     if target is None or state.handoff_status == "not_started":
@@ -542,13 +633,16 @@ def _guard_checkpoint_loads(module: nn.Module, host_slots: Sequence[int]) -> Non
         )
 
 
-def install_host_first_hooks(instance: nn.Module, *, min_weight_bytes: int) -> None:
+def install_host_first_hooks(
+    instance: nn.Module, *, min_weight_bytes: int, host_weight_sharing: HostWeightSharing = "off"
+) -> None:
     """Install host-first allocation and residency-aware moves once per module.
-    Finish dtype conversion before parking; see the module's dtype contract."""
+    Finish dtype conversion before parking. Sharing makes the first CUDA move a WORLD collective."""
     state = get_or_create_offload_state(instance)
     if state.hooks_installed:
         return
     state.min_weight_bytes = min_weight_bytes
+    state.host_weight_sharing = host_weight_sharing
     instance._apply = _apply_with_host_offload.__get__(instance, type(instance))
     state.hooks_installed = True
     magi_logger.info("host offload: %s will materialize its offloadable weights in host memory", type(instance).__name__)
