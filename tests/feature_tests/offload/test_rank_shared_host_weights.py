@@ -16,10 +16,13 @@
 
 import errno
 import json
+import mmap
 import os
 import re
+import signal
 import socket
 import tempfile
+from contextlib import contextmanager
 from datetime import timedelta
 
 import pytest
@@ -53,13 +56,17 @@ def _writer_failure_worker(rank: int, port: str, result_dir: str, failure_stage:
     os.environ["MASTER_PORT"] = port
     dist.init_process_group("gloo", rank=rank, world_size=2, timeout=timedelta(seconds=15))
     region_plan = region_module._SharingGroupRegionPlan(
-        writer_rank=0, hostname="host", region_path=os.path.join(result_dir, "region"), slice_by_weight_name={}, region_bytes=8
+        writer_rank=0, hostname="host", slice_by_weight_name={}, region_bytes=8
     )
+    create_shared_memory_file = region_module._create_shared_memory_file
     try:
 
+        @contextmanager
         def create_region(**kwargs):
             if failure_stage == "create":
                 raise OSError("injected create failure")
+            with create_shared_memory_file(**kwargs) as file_descriptor:
+                yield file_descriptor
 
         def park_weight(**kwargs):
             if failure_stage == "fill":
@@ -77,13 +84,20 @@ def _writer_failure_worker(rank: int, port: str, result_dir: str, failure_stage:
             patch("magi_compiler.passes.weight_offload.weight_lifecycle._park_as_shared_region_writer", park_weight),
         ):
             region = region_module.RankSharedHostRegion(
-                region_plan=region_plan, is_writer=rank == 0, region_numa_policy=None, gloo_group=dist.group.WORLD
+                region_plan=region_plan,
+                region_label="test",
+                is_writer=rank == 0,
+                region_numa_policy=None,
+                gloo_group=dist.group.WORLD,
             )
             try:
+                region.prepare()
                 _park_with_shared_region(cpu_parameters=[(["weight"], None)], shared_region=region)
             except RuntimeError as error:
                 with open(os.path.join(result_dir, f"{rank}.txt"), "w") as result_file:
                     result_file.write(str(error))
+            finally:
+                region.close_writer_fd()
     finally:
         dist.destroy_process_group()
 
@@ -345,7 +359,6 @@ def _plan_input(
     return _RankSharingPlanInput(
         hostname=hostname or sharing_group,
         sharing_group=sharing_group,
-        region_path=f"/dev/shm/{sharing_group}_{len(fingerprint_by_weight_name)}",
         free_shared_memory_bytes=free_bytes,
         descriptor_by_weight_name={
             name: _WeightDescriptor(shape=(10,), dtype=torch.float32, nbytes=40, fingerprint=fingerprint)
@@ -515,3 +528,105 @@ def test_public_compile_config_shared_inference_matches_private(tmp_path, sharin
         )
     for rank in range(2):
         assert (tmp_path / f"{rank}.txt").read_text() == "shared and private inference match"
+
+
+def _unpublished_region_worker(connection, stage: str) -> None:
+    from unittest.mock import patch
+
+    from magi_compiler.passes.weight_offload.runtime import rank_shared_host_region as region_module
+
+    region_path = None
+
+    def map_region(*, path: str, nbytes: int) -> torch.Tensor:
+        nonlocal region_path
+        region_path = path
+        return torch.from_file(path, shared=True, size=nbytes, dtype=torch.uint8)
+
+    def wait_for_kill() -> None:
+        connection.send(region_path)
+        connection.recv()
+
+    def exchange_errors(**kwargs) -> None:
+        if kwargs["phase"] == "reader mapping":
+            wait_for_kill()
+
+    region_plan = region_module._SharingGroupRegionPlan(
+        writer_rank=0,
+        hostname="host",
+        slice_by_weight_name={
+            "weight": region_module._RegionWeightSlice(byte_offset=0, shape=(1024,), dtype=torch.uint8, nbytes=1024)
+        },
+        region_bytes=4 << 20,
+    )
+    with patch.object(region_module, "_map_and_pin_shared_memory_file", side_effect=map_region):
+        region = region_module.RankSharedHostRegion(
+            region_plan=region_plan, region_label="crash_test", is_writer=True, region_numa_policy=None, gloo_group=None
+        )
+    try:
+        region.host_buffer("weight").fill_(7)
+        if stage == "fill":
+            wait_for_kill()
+        else:
+            with patch.object(region_module, "_exchange_errors", side_effect=exchange_errors):
+                region.publish()
+    finally:
+        region.close_writer_fd()
+        connection.close()
+
+
+@pytest.mark.parametrize("stage", ["fill", "reader_mapping"])
+@pytest.mark.parametrize("keep_reader_mapping", [False, True])
+def test_sigkill_leaves_no_named_region(stage: str, keep_reader_mapping: bool) -> None:
+    """Killing an unpublished writer must leave no file; a reader's existing mapping must survive it."""
+    context = mp.get_context("spawn")
+    parent_connection, child_connection = context.Pipe()
+    writer = context.Process(target=_unpublished_region_worker, args=(child_connection, stage))
+    reader_mapping = None
+    writer.start()
+    child_connection.close()
+    try:
+        assert parent_connection.poll(60), "writer did not allocate its region"
+        region_path = parent_connection.recv()
+        assert os.stat(region_path).st_nlink == 0
+        if keep_reader_mapping:
+            with open(region_path, "r+b") as region_file:
+                reader_mapping = mmap.mmap(region_file.fileno(), 0)
+        writer.kill()
+        writer.join(timeout=10)
+        assert writer.exitcode == -signal.SIGKILL
+        assert not os.path.exists(region_path)
+        if reader_mapping is not None:
+            assert reader_mapping[:1024] == bytes([7]) * 1024
+    finally:
+        if writer.is_alive():
+            writer.kill()
+        writer.join(timeout=10)
+        parent_connection.close()
+        if reader_mapping is not None:
+            reader_mapping.close()
+
+
+def test_failed_memfd_allocation_closes_descriptor(monkeypatch) -> None:
+    """Allocation errors must close the anonymous fd even before it is returned to the writer."""
+    from magi_compiler.passes.weight_offload.runtime import rank_shared_host_region as region_module
+
+    allocated_descriptors = []
+    memfd_create = os.memfd_create
+
+    def record_descriptor(*args, **kwargs) -> int:
+        file_descriptor = memfd_create(*args, **kwargs)
+        allocated_descriptors.append(file_descriptor)
+        return file_descriptor
+
+    def fail_allocation(*args) -> None:
+        raise OSError(errno.ENOSPC, "injected capacity failure")
+
+    monkeypatch.setattr(region_module.os, "memfd_create", record_descriptor)
+    monkeypatch.setattr(region_module.os, "posix_fallocate", fail_allocation)
+    with pytest.raises(OSError, match="injected capacity failure"):
+        with region_module._create_shared_memory_file(region_label="failure_test", nbytes=4096, region_numa_policy=None):
+            pytest.fail("allocation unexpectedly succeeded")
+    assert len(allocated_descriptors) == 1
+    with pytest.raises(OSError) as error:
+        os.fstat(allocated_descriptors[0])
+    assert error.value.errno == errno.EBADF

@@ -65,7 +65,8 @@ What follows from it:
 
 * Host sharing requires the same first-CUDA-move order on every rank, including
   empty offers. Exchanges cover preparation, allocation, writer fill and reader
-  mapping errors; ENOSPC hosts fall back but keep participating. ``to_empty`` is local.
+  mapping errors; writer memfds close after all readers map. ENOSPC hosts fall back
+  but keep participating. ``to_empty`` is local.
 * Once graph_weight_offload or enable_fsdp is on, every rank compiles the same
   graphs in the same order, including ranks that offload or gather nothing.
 * Inductor rows reach only cache-miss ranks, so ranks must agree on the cache

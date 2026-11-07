@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared pinned copies of identical CPU weights, backed by MAGI_SHARED_BIN_PATH files.
+"""Shared pinned CPU weights backed by anonymous memfd files.
 
 WORLD ranks enter in the same model order, including ranks without eligible weights.
-Writers allocate before handoff and fill before readers map; files outlive all
-reader mappings. Allocation-time ENOSPC falls back per host. Sampled fingerprints
-only select candidates: readers must compare bytes before adopting shared weights.
+Writers retain their fd until all readers map it through /proc/<pid>/fd/<fd>.
+No directory entry is created; existing reader mappings survive writer exit.
+Allocation-time ENOSPC falls back per host. Fingerprint matches require byte comparison.
 NUMA grouping and best-effort placement follow OffloadConfig."""
 
 from __future__ import annotations
@@ -27,9 +27,9 @@ import errno
 import os
 import shutil
 import socket
-import uuid
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from typing import Literal, Mapping
+from typing import Iterator, Literal, Mapping
 
 import torch
 import torch.distributed as dist
@@ -68,11 +68,10 @@ class _RegionNumaPolicy:
 
 @dataclass(frozen=True)
 class _RankSharingPlanInput:
-    """One rank's contribution to the gather; ``region_path`` is used if it becomes its group's writer."""
+    """One rank's weights and capacity budget for sharing-group planning."""
 
     hostname: str
     sharing_group: str
-    region_path: str
     free_shared_memory_bytes: int
     descriptor_by_weight_name: dict[str, _WeightDescriptor]
 
@@ -91,7 +90,6 @@ class _SharingGroupRegionPlan:
 
     writer_rank: int
     hostname: str
-    region_path: str
     slice_by_weight_name: Mapping[str, _RegionWeightSlice]
     region_bytes: int
     rejected_region_bytes: int = 0
@@ -104,6 +102,7 @@ class RankSharedHostRegion:
         self,
         *,
         region_plan: _SharingGroupRegionPlan,
+        region_label: str,
         is_writer: bool,
         region_numa_policy: _RegionNumaPolicy | None,
         gloo_group: dist.ProcessGroup,
@@ -114,18 +113,23 @@ class RankSharedHostRegion:
         self._mapped_region: torch.Tensor | None = None
         self._writer_error: Exception | None = None
         self._allocation_out_of_space = False
+        self._writer_file = ExitStack()
+        self._region_path: str | None = None
         if is_writer and region_plan.region_bytes > 0:
             try:
-                _create_shared_memory_file(
-                    path=region_plan.region_path, nbytes=region_plan.region_bytes, region_numa_policy=region_numa_policy
+                file_descriptor = self._writer_file.enter_context(
+                    _create_shared_memory_file(
+                        region_label=region_label, nbytes=region_plan.region_bytes, region_numa_policy=region_numa_policy
+                    )
                 )
+                self._region_path = f"/proc/{os.getpid()}/fd/{file_descriptor}"
             except Exception as error:
                 self._writer_error = error
                 self._allocation_out_of_space = isinstance(error, OSError) and error.errno == errno.ENOSPC
             if self._writer_error is None:
                 try:
                     self._mapped_region = _map_and_pin_shared_memory_file(
-                        path=region_plan.region_path, nbytes=region_plan.region_bytes
+                        path=self._region_path, nbytes=region_plan.region_bytes
                     )
                 except Exception as error:
                     self._writer_error = error
@@ -133,13 +137,14 @@ class RankSharedHostRegion:
     def prepare(self) -> None:
         """Every rank: agree on allocation errors before any weight changes ownership."""
         local_error = None if self._allocation_out_of_space else self._writer_error
-        status = (self._region_plan.hostname, self._allocation_out_of_space, _error_message(local_error))
+        status = (self._region_plan.hostname, self._allocation_out_of_space, _error_message(local_error), self._region_path)
         statuses = [None] * dist.get_world_size(group=self._gloo_group)
         dist.all_gather_object(statuses, status, group=self._gloo_group)
         _raise_for_errors(errors=[status[2] for status in statuses], phase="writer preparation", local_error=local_error)
-        full_hosts = {hostname for hostname, out_of_space, _ in statuses if out_of_space}
+        self._region_path = statuses[self._region_plan.writer_rank][3]
+        full_hosts = {hostname for hostname, out_of_space, _, _ in statuses if out_of_space}
         if self._region_plan.hostname in full_hosts:
-            self.remove_file()
+            self.close_writer_fd()
             self._mapped_region = None
             self._writer_error = None
             self._region_plan = dataclasses.replace(self._region_plan, slice_by_weight_name={}, region_bytes=0)
@@ -168,25 +173,25 @@ class RankSharedHostRegion:
         return torch.equal(_as_flat_bytes(self.host_buffer(weight_name)), _as_flat_bytes(tensor))
 
     def publish(self, *, writer_error: Exception | None = None) -> None:
-        """Every rank: wait until the writers have filled their regions, map this group's, then drop its file."""
+        """Every rank: publish filled weights, map readers, then close the writer fd."""
         local_error = self._writer_error if self._writer_error is not None else writer_error
         _exchange_errors(local_error=local_error, phase="writer", gloo_group=self._gloo_group)
         mapping_error = None
         if not self.is_writer and self._region_plan.region_bytes > 0:
             try:
+                assert self._region_path is not None
                 self._mapped_region = _map_and_pin_shared_memory_file(
-                    path=self._region_plan.region_path, nbytes=self._region_plan.region_bytes
+                    path=self._region_path, nbytes=self._region_plan.region_bytes
                 )
             except Exception as error:
                 mapping_error = error
-        # The file must outlive every reader's mapping call; the exchange also synchronizes successful mappings.
+        # Keep the writer fd open until every reader has mapped it; mappings then own the memory.
         _exchange_errors(local_error=mapping_error, phase="reader mapping", gloo_group=self._gloo_group)
-        self.remove_file()
+        self.close_writer_fd()
 
-    def remove_file(self) -> None:
-        """Delete the writer's file; idempotent, so a failed park can call it too."""
-        if self.is_writer and os.path.exists(self._region_plan.region_path):
-            os.remove(self._region_plan.region_path)
+    def close_writer_fd(self) -> None:
+        """Release the writer fd after publication or failure; existing mappings remain valid."""
+        self._writer_file.close()
 
 
 def open_rank_shared_host_region(
@@ -208,7 +213,7 @@ def open_rank_shared_host_region(
     region_numa_policy = None
     try:
         local_plan_input, region_numa_policy = _collect_local_plan_input(
-            tensor_by_weight_name=tensor_by_weight_name, region_label=region_label, sharing_scope=sharing_scope
+            tensor_by_weight_name=tensor_by_weight_name, sharing_scope=sharing_scope
         )
     except Exception as error:
         collection_error = error
@@ -233,6 +238,7 @@ def open_rank_shared_host_region(
         return None
     shared_region = RankSharedHostRegion(
         region_plan=local_region_plan,
+        region_label=region_label,
         is_writer=dist.get_rank() == local_region_plan.writer_rank,
         region_numa_policy=region_numa_policy,
         gloo_group=gloo_group,
@@ -240,7 +246,7 @@ def open_rank_shared_host_region(
     try:
         shared_region.prepare()
     except Exception:
-        shared_region.remove_file()
+        shared_region.close_writer_fd()
         raise
     return shared_region
 
@@ -262,7 +268,7 @@ def _exchange_errors(*, local_error: Exception | None, phase: str, gloo_group: d
 
 
 def _collect_local_plan_input(
-    *, tensor_by_weight_name: Mapping[str, torch.Tensor], region_label: str, sharing_scope: SharingScope
+    *, tensor_by_weight_name: Mapping[str, torch.Tensor], sharing_scope: SharingScope
 ) -> tuple[_RankSharingPlanInput, _RegionNumaPolicy | None]:
     hostname = socket.gethostname()
     sharing_group, region_numa_policy = _local_sharing_group_and_region_numa_policy(
@@ -272,7 +278,6 @@ def _collect_local_plan_input(
         _RankSharingPlanInput(
             hostname=hostname,
             sharing_group=sharing_group,
-            region_path=os.path.join(envs.MAGI_SHARED_BIN_PATH, f"magi_offload_{region_label}_{uuid.uuid4().hex}.bin"),
             free_shared_memory_bytes=shutil.disk_usage(envs.MAGI_SHARED_BIN_PATH).free,
             descriptor_by_weight_name={name: _describe_weight(tensor) for name, tensor in tensor_by_weight_name.items()},
         ),
@@ -345,7 +350,6 @@ def _plan_sharing_group_region(group_plan_input_by_rank: dict[int, _RankSharingP
     return _SharingGroupRegionPlan(
         writer_rank=writer_rank,
         hostname=writer_plan_input.hostname,
-        region_path=writer_plan_input.region_path,
         slice_by_weight_name=slice_by_weight_name,
         region_bytes=region_bytes,
     )
@@ -382,29 +386,26 @@ def _drop_region_plans_on_hosts_without_room(
     }
 
 
-def _create_shared_memory_file(*, path: str, nbytes: int, region_numa_policy: _RegionNumaPolicy | None) -> None:
-    file_descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
-    try:
-        # tmpfs allocates the pages here, under this thread's NUMA policy. Reserving them now also
-        # turns running out of tmpfs into an error instead of a SIGBUS while writing the mapping.
+@contextmanager
+def _create_shared_memory_file(
+    *, region_label: str, nbytes: int, region_numa_policy: _RegionNumaPolicy | None
+) -> Iterator[int]:
+    with os.fdopen(os.memfd_create(f"magi_offload_{region_label}", flags=os.MFD_CLOEXEC), "w+b") as region_file:
+        file_descriptor = region_file.fileno()
+        # Allocate before mapping to report capacity failure instead of SIGBUS during weight copies.
         if region_numa_policy is None:
             os.posix_fallocate(file_descriptor, 0, nbytes)
         else:
             with numa_page_policy(policy=region_numa_policy.page_policy, nodes=region_numa_policy.numa_nodes):
                 os.posix_fallocate(file_descriptor, 0, nbytes)
-    except OSError:
-        os.remove(path)
-        raise
-    finally:
-        os.close(file_descriptor)
+        yield file_descriptor
 
 
 def _map_and_pin_shared_memory_file(*, path: str, nbytes: int) -> torch.Tensor:
     mapped_region = torch.from_file(path, shared=True, size=nbytes, dtype=torch.uint8)
     pin_error_message = (
         f"host offload: could not pin the shared host region {path}; magi::h2d_load needs pinned memory to copy "
-        "asynchronously. cudaHostRegister refuses mappings of files outside tmpfs, so MAGI_SHARED_BIN_PATH must "
-        "be a tmpfs such as /dev/shm, and libcudart must be loadable; or set "
+        "asynchronously. Anonymous memfd mappings require CUDA host registration support and loadable libcudart; set "
         "offload_config.offload_host_weight_sharing='off'."
     )
     try:

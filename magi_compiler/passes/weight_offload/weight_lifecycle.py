@@ -397,7 +397,7 @@ def _park_with_shared_region(
             for names, param in cpu_parameters
         ]
     finally:
-        shared_region.remove_file()
+        shared_region.close_writer_fd()
 
 
 @torch.inference_mode(False)
