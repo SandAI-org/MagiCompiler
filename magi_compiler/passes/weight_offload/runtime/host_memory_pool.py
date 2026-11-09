@@ -53,9 +53,8 @@ EXACT_PINNED_MIN_BYTES = 64 << 20
 """Pinned requests from this size get their own exact-size region registered in place.
 
 torch's pinned allocator rounds every block up to a power of two, so a 960 MiB weight
-reserves 1 GiB and a pinned slab packs 480 MiB weights with 6% left over; measured
-4 GiB per rank on the 400B W8A8 Gaga4 Base. Below this size slabs keep the count of
-cudaHostRegister calls low.
+reserves 1 GiB and a pinned slab packs 480 MiB weights with 6% left over. Below this
+size, slabs keep the count of cudaHostRegister calls low.
 """
 
 
