@@ -17,6 +17,7 @@ import torch.nn as nn
 
 from magi_compiler import magi_compile
 from magi_compiler.config import CudaGraphMode
+from magi_compiler.magi_backend.weight_transfer_pipeline import WeightTransferPipeline
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
@@ -49,6 +50,15 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
+    traced_passes = []
+    build_passes = WeightTransferPipeline.rewrite_graph_and_build_scheduler_passes
+
+    def record_passes(self, **kwargs):
+        passes = build_passes(self, **kwargs)
+        traced_passes.append([type(p).__name__ for p in passes or ()])
+        return passes
+
+    WeightTransferPipeline.rewrite_graph_and_build_scheduler_passes = record_passes
     torch._dynamo.reset()
     torch.manual_seed(2026)
     model = OffloadBlock().eval()
@@ -60,7 +70,8 @@ def main() -> None:
         expected = x + nn.functional.linear(nn.functional.layer_norm(x, (HIDDEN,), norm_weight, norm_bias), fc_weight)
         out = model(x)
     torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
-    args.output.write_text(json.dumps({"shape": list(out.shape), "sum": float(out.float().sum().item())}))
+    report = {"shape": list(out.shape), "sum": float(out.float().sum().item()), "traced_passes": traced_passes}
+    args.output.write_text(json.dumps(report))
 
 
 if __name__ == "__main__":

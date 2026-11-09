@@ -516,6 +516,9 @@ def test_offload_cache_hits_after_bake_restart_analysis(tmp_path: Path):
     bake_report = json.loads((tmp_path / "bake.json").read_text())
     verify_report = json.loads((tmp_path / "verify.json").read_text())
     assert abs(bake_report["sum"] - verify_report["sum"]) < 1e-2
+    first_trace, retrace = bake_report["traced_passes"]
+    assert first_trace == ["SnodeCostProfile", "H2dLoadReorder"]
+    assert retrace == first_trace, "the retrace must not stack the first trace's passes"
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")

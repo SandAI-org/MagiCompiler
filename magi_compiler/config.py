@@ -544,19 +544,26 @@ def inductor_compile_config_hash(inductor_compile_config: dict[str, Any]) -> str
     """Hash covering an Inductor compile config dict (pass managers, etc.)."""
     if not inductor_compile_config:
         return ""
+
+    def stable_str(key: str, value: Any) -> str:
+        text = str(value)
+        if " at 0x" in text:
+            raise TypeError(f"Inductor config {key!r} has no uuid() and its str() is per-process: {text}")
+        return text
+
     serialized: dict[str, Any] = {}
     for key, value in inductor_compile_config.items():
         if hasattr(value, "uuid") and callable(getattr(value, "uuid", None)):
             try:
                 serialized[key] = value.uuid()
             except (AttributeError, RuntimeError):
-                serialized[key] = str(value)
+                serialized[key] = stable_str(key, value)
         else:
             try:
                 json.dumps(value)
                 serialized[key] = value
             except (TypeError, ValueError):
-                serialized[key] = str(value)
+                serialized[key] = stable_str(key, value)
     return compute_hash(serialized)
 
 

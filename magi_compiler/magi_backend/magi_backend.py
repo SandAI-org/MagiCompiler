@@ -47,6 +47,8 @@ from .piecewise_backend import PiecewiseBackend
 from .piecewise_compiler import CompilerInterface, EagerAdaptor, InductorStandaloneAdaptor
 from .weight_transfer_pipeline import WeightTransferPipeline
 
+_OVERLAP_PASSES_KEY = "reorder_for_compute_comm_overlap_passes"
+
 compilation_start_time: float = 0.0
 
 
@@ -604,6 +606,8 @@ class MagiBackend:
         self.inductor_compile_config = inductor_compile_config
         self._configure_custom_passes()
         self._inductor_compile_config_hash = inductor_compile_config_hash(self.inductor_compile_config)
+        # A RestartAnalysis retrace rebuilds the overlap passes from these, not from the first trace's.
+        self._default_overlap_passes = self.inductor_compile_config.get(_OVERLAP_PASSES_KEY)
         self.compiler_manager: CompilerManager = CompilerManager(self.compile_config)
         self._called_once = False
 
@@ -658,14 +662,13 @@ class MagiBackend:
             cudagraph_mode=self.compile_config.cudagraph_mode,
             disable_graph_split=self.compile_config.disable_graph_split,
         )
-        key = "reorder_for_compute_comm_overlap_passes"
         # Out of the cache key (see __init__): CompileConfig.hash already covers the fsdp/offload configs they come from.
         passes = weight_transfer_pipeline.rewrite_graph_and_build_scheduler_passes(
-            graph=graph, example_inputs=example_inputs, default_passes=self.inductor_compile_config.get(key)
+            graph=graph, example_inputs=example_inputs, default_passes=self._default_overlap_passes
         )
         if passes is not None:
             self.inductor_compile_config["reorder_for_compute_comm_overlap"] = True
-            self.inductor_compile_config[key] = passes
+            self.inductor_compile_config[_OVERLAP_PASSES_KEY] = passes
         if self.compile_config.offload_config.graph_weight_offload:
             self.compiler_manager.bind_offload_cache(
                 graph, sync_across_ranks=weight_transfer_pipeline.compiles_in_rank_lockstep
