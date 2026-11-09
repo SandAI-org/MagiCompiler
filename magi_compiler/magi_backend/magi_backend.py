@@ -603,6 +603,7 @@ class MagiBackend:
         self.traced_files = traced_files
         self.inductor_compile_config = inductor_compile_config
         self._configure_custom_passes()
+        self._inductor_compile_config_hash = inductor_compile_config_hash(self.inductor_compile_config)
         self.compiler_manager: CompilerManager = CompilerManager(self.compile_config)
         self._called_once = False
 
@@ -637,7 +638,7 @@ class MagiBackend:
         hash_key = compute_hash(
             [
                 self.compile_config.hash,
-                inductor_compile_config_hash(self.inductor_compile_config),
+                self._inductor_compile_config_hash,
                 self.compiler_manager.hash,
                 compute_code_hash(self.traced_files),
                 compute_graph_hash(graph, example_inputs),
@@ -658,7 +659,7 @@ class MagiBackend:
             disable_graph_split=self.compile_config.disable_graph_split,
         )
         key = "reorder_for_compute_comm_overlap_passes"
-        # Written after _init_cache: the cache hash takes str() of pass objects, which embeds their addresses.
+        # Out of the cache key (see __init__): CompileConfig.hash already covers the fsdp/offload configs they come from.
         passes = weight_transfer_pipeline.rewrite_graph_and_build_scheduler_passes(
             graph=graph, example_inputs=example_inputs, default_passes=self.inductor_compile_config.get(key)
         )
