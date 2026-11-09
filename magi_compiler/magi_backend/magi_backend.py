@@ -603,8 +603,6 @@ class MagiBackend:
         self.traced_files = traced_files
         self.inductor_compile_config = inductor_compile_config
         self._configure_custom_passes()
-        # A RestartAnalysis retrace calls this backend again with the transfer passes of the first trace in the
-        # config: keying on the config as built here keeps both traces, and the bake and the verify, on one cache dir.
         self._inductor_compile_config_hash = inductor_compile_config_hash(self.inductor_compile_config)
         self.compiler_manager: CompilerManager = CompilerManager(self.compile_config)
         self._called_once = False
