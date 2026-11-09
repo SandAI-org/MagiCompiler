@@ -485,6 +485,39 @@ def test_offload_cache_reuse_across_processes(tmp_path: Path, sidecar_failure: s
     assert abs(cold_run_report["sum"] - replay_report["sum"]) < 1e-2
 
 
+@requires_cuda
+def test_offload_cache_hits_after_bake_restart_analysis(tmp_path: Path):
+    """A bake whose first trace restarts must save under the cache dir the first trace of a verify opens.
+
+    The retrace re-entered ``_init_cache`` with the overlap passes of the first trace in the Inductor config, whose
+    ``str()`` holds object addresses: the bake saved under a per-process hash, and the verify missed its sidecar.
+    """
+    helper_path = Path(__file__).parent / "cache_reuse_helper" / "offload_restart_analysis_helper.py"
+    cache_root = tmp_path / "cache"
+    env = {**os.environ, "MAGI_LOGGING_LEVEL": "info", "MAGI_COMPILE_CACHE_ROOT_DIR": str(cache_root)}
+
+    bake_result = subprocess.run(
+        [sys.executable, str(helper_path), "--output", str(tmp_path / "bake.json")], env=env, capture_output=True, text=True
+    )
+    assert bake_result.returncode == 0, f"bake failed\nstderr:\n{bake_result.stderr}"
+    assert "standalone_compile raised RestartAnalysis" in bake_result.stderr, "precondition: the bake must restart"
+    cache_dirs = [path for path in cache_root.glob("magi_cache/*/*") if path.is_dir()]
+    assert len(cache_dirs) == 1, f"the restarted trace must reuse the first trace's cache dir, got {cache_dirs}"
+    assert (cache_dirs[0] / "host_slots.py").exists()
+
+    verify_result = subprocess.run(
+        [sys.executable, str(helper_path), "--output", str(tmp_path / "verify.json")],
+        env={**env, "MAGI_COMPILE_ASSERT_CACHE_HIT": "1"},
+        capture_output=True,
+        text=True,
+    )
+    assert verify_result.returncode == 0, f"verify (assert_cache_hit) failed\nstderr:\n{verify_result.stderr}"
+    assert "Directly load" in verify_result.stderr
+    bake_report = json.loads((tmp_path / "bake.json").read_text())
+    verify_report = json.loads((tmp_path / "verify.json").read_text())
+    assert abs(bake_report["sum"] - verify_report["sum"]) < 1e-2
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
 @pytest.mark.parametrize("sidecar_failure", ["missing", "corrupt"])
 @pytest.mark.parametrize(
