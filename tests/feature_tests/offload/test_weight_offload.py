@@ -103,6 +103,7 @@ def _scheduler_passes_worker(rank: int, world_size: int, port: str, out_dir: str
         passes = build_transfer_overlap_passes(
             fsdp_config=FSDPConfig(),
             offload_config=OffloadConfig(graph_weight_offload=True, offload_h2d_bandwidth_gbps=20.0),
+            transfer_link_sharing="off",
             loads_inserted=rank == 0,
             default_passes=None,
         )
@@ -139,6 +140,7 @@ def test_profile_sync_estimator_locks_ranks_for_offload_and_fsdp():
         passes = build_transfer_overlap_passes(
             fsdp_config=FSDPConfig(enable_fsdp=enable_fsdp, cost_mode=cost_mode),
             offload_config=OffloadConfig(graph_weight_offload=graph_weight_offload, offload_h2d_bandwidth_gbps=20.0),
+            transfer_link_sharing="off",
             loads_inserted=graph_weight_offload,
             default_passes=None,
         )
@@ -171,12 +173,17 @@ def test_offload_cache_syncs_whenever_inductor_issues_world_collectives(enable_f
     pipeline = WeightTransferPipeline(
         fsdp_config=fsdp_config,
         offload_config=offload_config,
+        transfer_link_sharing="off",
         cudagraph_mode=CudaGraphMode.NONE,
         disable_graph_split=disable_graph_split,
     )
     assert pipeline.compiles_in_rank_lockstep is expected
     [cost_profile, *_] = build_transfer_overlap_passes(
-        fsdp_config=pipeline._fsdp_config, offload_config=offload_config, loads_inserted=True, default_passes=None
+        fsdp_config=pipeline._fsdp_config,
+        offload_config=offload_config,
+        transfer_link_sharing="off",
+        loads_inserted=True,
+        default_passes=None,
     )
     if cost_profile.estimator is not None:
         assert cost_profile.estimator.sync_across_ranks is pipeline.compiles_in_rank_lockstep

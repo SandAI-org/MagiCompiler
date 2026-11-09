@@ -23,12 +23,16 @@ a long kernel's leftover time is simply there for the next task.
 A task's ``deadline_index`` is the first index its transfer has to be done by,
 so ``deadline_index - 1`` is where it sits unhoisted: a load in front of its
 wait, a gather at its own position.
+
+``blocked_windows_ns`` are sorted, disjoint spans of that axis no transfer may
+overlap, not even partly: a copy cannot pause, so one that straddles a window
+runs through it.
 """
 
 from __future__ import annotations
 
 from bisect import bisect_right
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from .memory import InflightMemoryBudget
 from .task import ScheduleResult, TransferTask
@@ -39,7 +43,25 @@ def unhoisted_index(task: TransferTask) -> int:
     return max(task.earliest_launch_index, task.deadline_index - 1)
 
 
-def latest_finish_times_ns(active_tasks: list[TransferTask], compute_prefix_ns: list[float]) -> dict:
+def _latest_finish_clear_of_windows(finish_ns: float, duration_ns: float, blocked_windows_ns: Sequence) -> float:
+    """Latest finish at or before ``finish_ns`` whose transfer overlaps no blocked window."""
+    for window_start_ns, window_end_ns in reversed(blocked_windows_ns):
+        if window_start_ns < finish_ns and finish_ns - duration_ns < window_end_ns:
+            finish_ns = window_start_ns
+    return finish_ns
+
+
+def _earliest_start_clear_of_windows(start_ns: float, duration_ns: float, blocked_windows_ns: Sequence) -> float:
+    """Earliest start at or after ``start_ns`` whose transfer overlaps no blocked window."""
+    for window_start_ns, window_end_ns in blocked_windows_ns:
+        if window_start_ns < start_ns + duration_ns and start_ns < window_end_ns:
+            start_ns = window_end_ns
+    return start_ns
+
+
+def latest_finish_times_ns(
+    active_tasks: list[TransferTask], compute_prefix_ns: list[float], blocked_windows_ns: Sequence = ()
+) -> dict:
     """Per task, the last instant its transfer may end and still keep order.
 
     Each transfer must finish by its deadline and the next transfer's latest start.
@@ -48,6 +70,7 @@ def latest_finish_times_ns(active_tasks: list[TransferTask], compute_prefix_ns: 
     finish_ns_by_anchor: dict = {}
     for task in reversed(active_tasks):
         finish_limit_ns = min(compute_prefix_ns[task.deadline_index], finish_limit_ns)
+        finish_limit_ns = _latest_finish_clear_of_windows(finish_limit_ns, task.required_overlap_ns, blocked_windows_ns)
         finish_ns_by_anchor[task.anchor] = finish_limit_ns
         finish_limit_ns -= task.required_overlap_ns
     return finish_ns_by_anchor
@@ -80,6 +103,7 @@ def schedule_transfers_alap(
     inflight_budget_bytes: float,
     *,
     off_bus_anchors: frozenset = frozenset(),
+    blocked_windows_ns: Sequence = (),
 ) -> ScheduleResult:
     """Place transfers in deadline order on one serial resource, each as late as possible.
 
@@ -93,7 +117,7 @@ def schedule_transfers_alap(
         inflight_memory.reserve_live_range(unhoisted_index(task), task.last_user_index, task.transfer_bytes)
 
     tasks_by_deadline = sorted(tasks_on_bus, key=lambda t: (t.deadline_index, original_index_by_node[t.anchor]))
-    finish_ns_by_anchor = latest_finish_times_ns(tasks_by_deadline, compute_prefix_ns)
+    finish_ns_by_anchor = latest_finish_times_ns(tasks_by_deadline, compute_prefix_ns, blocked_windows_ns)
 
     launch_index_by_anchor: dict = {}
     unhidden_ns_by_anchor: dict = {}
@@ -109,7 +133,9 @@ def schedule_transfers_alap(
         # issue; it starts once the resource is free as well.
         release_ns = compute_prefix_ns[earliest_launch_index]
         requested_start_ns = max(release_ns, finish_ns_by_anchor[task.anchor] - task.required_overlap_ns)
-        transfer_start_ns = max(requested_start_ns, bus_available_ns)
+        transfer_start_ns = _earliest_start_clear_of_windows(
+            max(requested_start_ns, bus_available_ns), task.required_overlap_ns, blocked_windows_ns
+        )
         bus_available_ns = transfer_start_ns + task.required_overlap_ns
         unhidden_ns = max(0.0, bus_available_ns - compute_prefix_ns[task.deadline_index])
         unhidden_ns_by_anchor[task.anchor] = unhidden_ns

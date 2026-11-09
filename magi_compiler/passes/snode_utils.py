@@ -74,6 +74,9 @@ def issues_comm(snode: BaseSchedulerNode) -> bool:
 
 ALL_GATHER_OP = torch.ops._c10d_functional.all_gather_into_tensor.default
 COALESCED_ALL_GATHER_OP = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
+ALL_TO_ALL_OP = torch.ops._c10d_functional.all_to_all_single.default
+LINK_COLLECTIVE_OPS = (ALL_GATHER_OP, COALESCED_ALL_GATHER_OP, ALL_TO_ALL_OP)
+"""The NCCL collectives that can queue on a shared link stream (``RouteCollectivesToLinkStream``)."""
 
 
 def is_all_gather_launch(snode: BaseSchedulerNode) -> bool:
@@ -82,6 +85,14 @@ def is_all_gather_launch(snode: BaseSchedulerNode) -> bool:
     node = leaf_comm_node(snode)
     op = node.op_overload if node is not None else None
     return op is not None and (op in (ALL_GATHER_OP, COALESCED_ALL_GATHER_OP) or op in ce_ag_ops())
+
+
+def link_collective_node(snode: BaseSchedulerNode) -> ir.ExternKernel | None:
+    """The functional NCCL collective in ``LINK_COLLECTIVE_OPS`` this snode launches; None otherwise (copy engine included)."""
+    node = leaf_comm_node(snode)
+    if node is None or node.op_overload not in LINK_COLLECTIVE_OPS:
+        return None
+    return node
 
 
 def _tagged_as_weight(snode: BaseSchedulerNode) -> bool:

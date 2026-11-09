@@ -50,6 +50,7 @@ def get_h2d_stream() -> torch.cuda.Stream:
     A single stream serializes the loads, which is what the reorder pass assumes
     when it hands each load a disjoint run of compute to hide behind: the DMA
     engines would not go faster for being asked twice at once anyway.
+    Without NVLink, NCCL collectives that share the PCIe link queue here too (``link_collective_op``).
     """
     return torch.cuda.Stream()
 
