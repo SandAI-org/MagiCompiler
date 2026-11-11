@@ -913,7 +913,7 @@ def test_collective_requery_preserves_measurement_policy_and_reuse_counts(monkey
     monkeypatch.setattr(re_mod, "_leaf_collective", lambda node: launch)
     monkeypatch.setattr(re_mod, "_ce_ag_spec", lambda node: (((8, 4),), torch.bfloat16, 2, "group"))
     monkeypatch.setattr(
-        re_mod, "_collective_spec", lambda node: ("all_gather", "group", 2, [((8, 4), torch.bfloat16, "cuda")])
+        re_mod, "_collective_spec", lambda node: ("all_gather", "group", 2, [((8, 4), torch.bfloat16, "cuda")], ())
     )
     monkeypatch.setattr(re_mod, "analytical_runtime_ns", lambda node: 111.0)
 

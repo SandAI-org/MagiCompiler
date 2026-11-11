@@ -25,6 +25,11 @@ limits overlap. Separate resident/in-flight budgets remain supported.
 ``schedule_transfers_alap`` places transfers by deadline. Serialized bus time and buffer
 lifetime through the last consumer are separate constraints. Resident loads keep
 their existing position and are charged to residency, not in-flight storage.
+
+With ``share_link_with_collectives`` (no NVLink) the NCCL gathers and all-to-alls run
+on the load stream, so loads are placed on the compute time those collectives leave
+free (``free_time_axis``).  A load longer than every gap within reach runs into the
+next collective; that overrun is its exposure (see ``scheduler``).
 """
 
 from __future__ import annotations
@@ -44,7 +49,9 @@ from ...transfer_overlap import (
     ScheduleResult,
     SnodeGraph,
     TransferTask,
+    free_time_axis,
     inflight_peak_bytes,
+    link_busy_spans_ns,
     schedule_transfers_alap,
     unhoisted_index,
     weight_storage_peak_bytes,
@@ -83,6 +90,10 @@ class H2dLoadCallState(OverlapCallState):
     """The chosen schedule and what committing it cost, for the later hooks."""
 
     load_schedule: LoadSchedule | None = None  # set by assign_launch_indices
+    # Set by assign_launch_indices: the time axis loads were placed on, over the order the pass received.
+    placement_prefix_ns: list[float] = field(default_factory=list)
+    link_collective_count: int = 0  # set by assign_launch_indices when loads share the link with collectives
+    link_collective_busy_ns: float = 0.0
     promoted_bytes: int = 0  # set by on_commit: device bytes the resident weights took back
 
 
@@ -102,6 +113,7 @@ class H2dLoadReorder(OverlapPass):
         weight_budget_bytes: int = 0,
         bus_utilization: float = 1.0,
         runtime_ns_fn=None,
+        share_link_with_collectives: bool = False,
     ) -> None:
         super().__init__(runtime_ns_fn)
         self.bandwidth_bytes_per_ns = max(1e-6, bandwidth_bytes_per_ns)
@@ -111,6 +123,7 @@ class H2dLoadReorder(OverlapPass):
         self.max_inflight_bytes = max_inflight_bytes
         self.weight_budget_bytes = weight_budget_bytes
         self.bus_utilization = min(1.0, max(1e-3, bus_utilization))
+        self.share_link_with_collectives = share_link_with_collectives
 
     # -- OverlapPass hooks ------------------------------------------------
     def has_transfer_candidates(self, order: list[BaseSchedulerNode]) -> bool:
@@ -149,14 +162,26 @@ class H2dLoadReorder(OverlapPass):
         self, graph: SnodeGraph, cost: CostView, tasks: list[H2dLoadTask], call_state: H2dLoadCallState
     ) -> dict:
         original_index_by_node = graph.original_index_by_node
-        compute_prefix_ns = cost.compute_prefix_ns(graph.order)
+        placement_prefix_ns = cost.compute_prefix_ns(graph.order)
+        blocked_windows_ns: list[tuple[float, float]] = []
+        if self.share_link_with_collectives:
+            busy_spans = link_busy_spans_ns(graph, cost, placement_prefix_ns)
+            placement_prefix_ns, blocked_windows_ns = free_time_axis(placement_prefix_ns, busy_spans)
+            call_state.link_collective_count = len(busy_spans)
+            call_state.link_collective_busy_ns = sum(end_ns - start_ns for start_ns, end_ns in busy_spans)
+        call_state.placement_prefix_ns = placement_prefix_ns
         best_schedule: LoadSchedule | None = None
         for resident_budget_bytes, inflight_budget_bytes in self._iter_budget_splits(tasks):
             resident_anchors = self._search_resident_weights(
-                tasks=tasks, compute_prefix_ns=compute_prefix_ns, resident_budget_bytes=resident_budget_bytes
+                tasks=tasks, compute_prefix_ns=placement_prefix_ns, resident_budget_bytes=resident_budget_bytes
             )
             schedule_result = schedule_transfers_alap(
-                tasks, compute_prefix_ns, original_index_by_node, inflight_budget_bytes, off_bus_anchors=resident_anchors
+                tasks,
+                placement_prefix_ns,
+                original_index_by_node,
+                inflight_budget_bytes,
+                off_bus_anchors=resident_anchors,
+                blocked_windows_ns=blocked_windows_ns,
             )
             total_unhidden_ns = schedule_result.total_unhidden_ns
             if best_schedule is None or total_unhidden_ns < best_schedule.schedule_result.total_unhidden_ns - 1e-9:
@@ -200,11 +225,8 @@ class H2dLoadReorder(OverlapPass):
             1 for load, launch_index in launch_index_by_anchor.items() if launch_index != original_index_by_node[load]
         )
         bus_transfer_bytes = sum(p.transfer_bytes for p in tasks if p.anchor not in resident_anchors)
-        # graph.order is already reordered; deadlines still index the original order.
-        original_order = list(original_index_by_node)
-        overlap_capacity_bytes = self._overlap_capacity_bytes(
-            tasks=tasks, compute_prefix_ns=cost.compute_prefix_ns(original_order)
-        )
+        # graph.order is already reordered; deadlines index the order the axis was built on.
+        overlap_capacity_bytes = self._overlap_capacity_bytes(tasks=tasks, compute_prefix_ns=call_state.placement_prefix_ns)
         uncovered_bytes = bus_transfer_bytes - overlap_capacity_bytes
         if uncovered_bytes > 0 and schedule_result.total_unhidden_ns > 0:
             magi_logger.warning(
@@ -231,6 +253,18 @@ class H2dLoadReorder(OverlapPass):
             schedule_result.total_unhidden_ns / 1e6,
             schedule_result.inflight_budget_limited_unhidden_ns / 1e6,
         )
+        if self.share_link_with_collectives:
+            straddling_anchors = schedule_result.window_straddling_anchors
+            magi_logger.info(
+                "h2d load reorder: loads placed around %d collective(s) on the load stream; "
+                "collectives occupy %.1fms of compute, %.1fms left free for loads; "
+                "%d load(s) run into a collective, exposing %.1fms",
+                call_state.link_collective_count,
+                call_state.link_collective_busy_ns / 1e6,
+                call_state.placement_prefix_ns[-1] / 1e6,
+                len(straddling_anchors),
+                sum(schedule_result.unhidden_ns_by_anchor[anchor] for anchor in straddling_anchors) / 1e6,
+            )
         assert peak_inflight_bytes <= inflight_budget_bytes, (
             f"h2d load reorder: in-flight peak {peak_inflight_bytes} B exceeds "
             f"the {inflight_budget_bytes} B budget it was placed under"

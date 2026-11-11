@@ -659,8 +659,10 @@ class MagiBackend:
         weight_transfer_pipeline = WeightTransferPipeline(
             fsdp_config=self.compile_config.fsdp_config,
             offload_config=self.compile_config.offload_config,
+            transfer_link_sharing=self.compile_config.transfer_link_sharing,
             cudagraph_mode=self.compile_config.cudagraph_mode,
             disable_graph_split=self.compile_config.disable_graph_split,
+            pairwise_all_to_all=self.compile_config.pairwise_all_to_all,
         )
         # Out of the cache key (see __init__): CompileConfig.hash already covers the fsdp/offload configs they come from.
         passes = weight_transfer_pipeline.rewrite_graph_and_build_scheduler_passes(

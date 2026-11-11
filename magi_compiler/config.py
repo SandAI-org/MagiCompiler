@@ -439,6 +439,30 @@ class CompileConfig(BaseSettings):
             "model). Fields reachable via MAGI_COMPILE_FSDP_CONFIG__<FIELD> env vars."
         ),
     )
+    transfer_link_sharing: Literal["auto", "pcie", "nvlink", "off"] = Field(
+        "auto",
+        description=(
+            "Which graph transfers take turns on a shared physical link, so none slows another down: FSDP weight "
+            "all-gathers, all-to-alls issued in the graph (e.g. Ulysses attention) and graph weight loads. "
+            "'pcie': without NVLink all three cross the GPU's PCIe link, so they queue on the H2D load stream "
+            "one at a time. 'nvlink': all-gathers and all-to-alls share NVLink and queue on one stream of their own; "
+            "loads overlap them freely. In both, a gather or load is placed only in the compute time the transfers "
+            "it takes turns with leave free, never straddling one. 'off': every transfer keeps its own stream "
+            "and is placed as if alone. 'auto' (default): 'nvlink' when NVML reports an active NVLink on this GPU, "
+            "'pcie' when it reports none, 'off' when it cannot tell. Applies to graphs with FSDP gathers or "
+            "graph weight loads."
+        ),
+    )
+    pairwise_all_to_all: bool = Field(
+        False,
+        description=(
+            "Run every graph all-to-all (``_c10d_functional.all_to_all_single``) as world_size - 1 pairwise "
+            "send/recv steps, one peer in flight per rank: at step k rank r sends to r + k and receives from r - k. "
+            "On PCIe without NVLink, NCCL's all-to-all runs every peer at once and the transfers contend for the "
+            "same links. The exchange queues on the stream ``transfer_link_sharing`` picks for collectives, or "
+            "on a stream of its own when that is 'off'; profiled costs replay the same exchange."
+        ),
+    )
 
     # ---- torch.compile options keys ----
     post_grad_pass: str = Field(
