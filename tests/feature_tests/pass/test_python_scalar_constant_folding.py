@@ -50,6 +50,23 @@ def test_folds_constant_scalar_expression_chain_to_literals():
     assert not any(node.op == "call_function" and node.target in {operator.neg, operator.sub} for node in graph.nodes)
 
 
+def test_folding_keeps_in_place_copies_that_have_no_users():
+    """``packed[:, :k].copy_(src)`` fills a buffer read later through ``packed``; the copy itself has no users."""
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    packed = graph.call_method("new_empty", (x, (4, 8)))
+    head_slice = graph.call_function(operator.getitem, (packed, (slice(None), slice(0, 4))))
+    copy = graph.call_method("copy_", (head_slice, x))
+    neg = graph.call_function(operator.neg, (448.0,))
+    graph.output((packed, neg))
+
+    FoldPythonScalarConstantsPass()(graph)
+
+    assert copy in graph.nodes
+    assert _output_values(graph) == (packed, -448.0)
+    assert neg not in graph.nodes
+
+
 def test_does_not_fold_tensor_or_symbolic_dependent_expression():
     graph = torch.fx.Graph()
     x = graph.placeholder("x")
