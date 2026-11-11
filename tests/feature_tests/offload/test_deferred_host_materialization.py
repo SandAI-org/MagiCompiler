@@ -18,6 +18,8 @@ Single-process cases; a weight resident on some ranks of a sharing group is cove
 ``test_rank_shared_host_weights.py``.
 """
 
+import weakref
+
 import pytest
 import torch
 
@@ -140,3 +142,30 @@ def test_first_compile_places_each_deferred_weight_once(max_device_weight_mib, i
     else:
         assert module.big.weight.untyped_storage().nbytes() == 0
         torch.testing.assert_close(store.host_buffer(big_slot), reference.big.weight.detach().cpu())
+
+
+@requires_cuda
+@pytest.mark.usefixtures("no_process_group")
+@pytest.mark.parametrize("host_weight_sharing", ["off", "per_host_interleaved"])
+def test_each_cpu_original_is_freed_before_the_next_host_copy(monkeypatch, host_weight_sharing):
+    """Sharing that ends up sharing nothing must still free each CPU original right after its copy,
+    or the host holds every original and every copy at once."""
+    from magi_compiler.passes.weight_offload import materialize_deferred_host_weights
+
+    module = _install_deferring_hooks(torch.nn.Sequential(*(torch.nn.Linear(_COLS, _ROWS, bias=False) for _ in range(3))))
+    module.cuda()
+    store = get_global_host_weight_store()
+    original_refs = [weakref.ref(store.pending_source(store.slot_for_tensor(layer.weight))) for layer in module]
+    alive_originals_at_each_allocation = []
+    reserve_host_buffer = store.reserve_host_buffer
+
+    def record_alive_originals(**kwargs):
+        alive_originals_at_each_allocation.append([index for index, ref in enumerate(original_refs) if ref() is not None])
+        return reserve_host_buffer(**kwargs)
+
+    monkeypatch.setattr(store, "reserve_host_buffer", record_alive_originals)
+    materialize_deferred_host_weights(
+        example_inputs=list(module.parameters()), host_weight_sharing=host_weight_sharing, region_label="release_order"
+    )
+
+    assert alive_originals_at_each_allocation == [[0, 1, 2], [1, 2], [2]]
