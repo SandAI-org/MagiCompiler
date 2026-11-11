@@ -375,6 +375,62 @@ def test_a_reader_dropping_chunks_it_keeps_on_the_device_can_still_pin_later_chu
         assert all(result["matches_own_weights"]), f"rank {rank}: {result}"
 
 
+def _same_named_weights_worker(rank: int, port: str, result_dir: str) -> None:
+    from magi_compiler.passes.weight_offload import (
+        get_global_host_weight_store,
+        install_host_first_hooks,
+        materialize_deferred_host_weights,
+    )
+
+    _init_process_group(rank=rank, world_size=2, port=port)
+    torch.cuda.set_device(rank % torch.cuda.device_count())
+    torch.manual_seed(0)
+    # Moved to CUDA one at a time, so they are two deferred groups that both name their weight "weight".
+    modules = [nn.Linear(256, 256, bias=False), nn.Linear(256, 256, bias=False)]
+    expected_weights = [module.weight.detach().clone() for module in modules]
+    try:
+        for module in modules:
+            install_host_first_hooks(
+                module, min_weight_bytes=0, host_weight_sharing="per_host_interleaved", defer_host_materialization=True
+            )
+            module.cuda()
+        store = get_global_host_weight_store()
+        slots = [store.slot_for_tensor(module.weight) for module in modules]
+        if rank == 0:
+            # The writer keeps the second weight on the device; the reader offloads both.
+            store.make_weight_resident(slots[1])
+        materialize_deferred_host_weights(
+            example_inputs=[module.weight for module in modules],
+            host_weight_sharing="per_host_interleaved",
+            region_label="same_names",
+        )
+        result = {"device_only": [], "matches_own_weights": [], "in_shared_region": []}
+        for module, slot, expected_weight in zip(modules, slots, expected_weights):
+            is_device_only = store.is_device_only(slot)
+            copy = module.weight.detach().cpu() if is_device_only else store.host_buffer(slot)
+            result["device_only"].append(is_device_only)
+            result["matches_own_weights"].append(torch.equal(copy, expected_weight))
+            result["in_shared_region"].append((not is_device_only) and "magi_offload_" in _mapping_pathname_of(copy))
+        with open(os.path.join(result_dir, f"{rank}.json"), "w") as result_file:
+            json.dump(result, result_file)
+    finally:
+        dist.destroy_process_group()
+
+
+@requires_cuda
+def test_same_named_weights_of_two_deferred_groups_keep_their_own_bytes(tmp_path):
+    """A parameter name is unique only within the module it was deferred with. One graph reading two
+    such modules must not hand the writer's offloaded weight the bytes of its same-named resident one."""
+    mp.spawn(_same_named_weights_worker, args=(_free_port(), str(tmp_path)), nprocs=2, join=True)
+    results = [json.loads((tmp_path / f"{rank}.json").read_text()) for rank in range(2)]
+
+    for rank, result in enumerate(results):
+        assert result["matches_own_weights"] == [True, True], f"rank {rank}: {result}"
+    assert results[0]["device_only"] == [False, True]
+    assert results[0]["in_shared_region"] == [True, False]
+    assert results[1]["in_shared_region"] == [True, True]
+
+
 def _plan_input(sharing_group: str, nbytes_by_weight_name: dict[str, int], expert_fingerprint: bytes = b"") -> _RankPlanInput:
     return _RankPlanInput(
         hostname=sharing_group,
