@@ -21,6 +21,8 @@ compute prefixes ending at load deadlines, within the residency budget.
 A unified device-weight budget starts with minimal pipelining room and assigns
 the remainder to residency. More in-flight room is tried only when that budget
 limits overlap. Separate resident/in-flight budgets remain supported.
+Weights without a host copy (deferred and settled on the device) are always
+resident and are charged to residency first.
 
 ``schedule_transfers_alap`` places transfers by deadline. Serialized bus time and buffer
 lifetime through the last consumer are separate constraints. Resident loads keep
@@ -150,10 +152,16 @@ class H2dLoadReorder(OverlapPass):
     ) -> dict:
         original_index_by_node = graph.original_index_by_node
         compute_prefix_ns = cost.compute_prefix_ns(graph.order)
+        device_only_tasks = self._tasks_without_host_copy(tasks)
+        device_only_anchors = frozenset(task.anchor for task in device_only_tasks)
+        device_only_bytes = sum(task.transfer_bytes for task in device_only_tasks)
+        promotable_tasks = [task for task in tasks if task.anchor not in device_only_anchors]
         best_schedule: LoadSchedule | None = None
         for resident_budget_bytes, inflight_budget_bytes in self._iter_budget_splits(tasks):
-            resident_anchors = self._search_resident_weights(
-                tasks=tasks, compute_prefix_ns=compute_prefix_ns, resident_budget_bytes=resident_budget_bytes
+            resident_anchors = device_only_anchors | self._search_resident_weights(
+                tasks=promotable_tasks,
+                compute_prefix_ns=compute_prefix_ns,
+                resident_budget_bytes=max(0, resident_budget_bytes - device_only_bytes),
             )
             schedule_result = schedule_transfers_alap(
                 tasks, compute_prefix_ns, original_index_by_node, inflight_budget_bytes, off_bus_anchors=resident_anchors
@@ -241,6 +249,14 @@ class H2dLoadReorder(OverlapPass):
     def _load_nodes_and_waits(load, graph: SnodeGraph) -> tuple[list, list]:
         """The load plus the ``MultiOutput`` unpack its result reaches readers through, and the waits guarding it."""
         return [load, *graph.unpacks_of(load)], graph.waits_of(load)
+
+    @staticmethod
+    def _tasks_without_host_copy(tasks) -> list[H2dLoadTask]:
+        """Loads of deferred weights that settled on the device: resident whatever this graph's budget."""
+        from ..runtime.host_weights import get_global_host_weight_store
+
+        store = get_global_host_weight_store()
+        return [task for task in tasks if store.is_device_only(task.host_slot)]
 
     # -- scheduling --------------------------------------------------------
     def _effective_inflight_budget_bytes(self, tasks) -> int:

@@ -24,8 +24,10 @@ An allocation-time ENOSPC keeps that chunk's weights private."""
 from __future__ import annotations
 
 import errno
+import mmap
 import os
 import socket
+import weakref
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Literal, Mapping
@@ -39,7 +41,7 @@ from magi_compiler.utils.dist_utils import get_cpu_gloo_group
 from magi_compiler.utils.hash import as_flat_bytes, compute_tensor_fingerprint
 from magi_compiler.utils.numa import NumaPagePolicy, cuda_device_numa_node, numa_page_policy, online_numa_nodes
 
-from .host_memory_pool import ALIGN_BYTES
+from .host_memory_pool import ALIGN_BYTES, _unregister_host_memory
 
 SharingScope = Literal["per_numa_node", "per_host_interleaved"]
 HostWeightSharing = Literal["off", SharingScope]
@@ -332,7 +334,13 @@ def _create_shared_memory_file(*, region_label: str, nbytes: int, numa_policy: _
 
 
 def _map_and_pin_shared_memory_file(*, path: str, nbytes: int) -> torch.Tensor:
-    mapped_region = torch.from_file(path, shared=True, size=nbytes, dtype=torch.uint8)
+    """The mapping stays registered while any view of it lives and is unregistered before it is unmapped.
+
+    A rank that adopts no weight of a chunk drops its mapping right away; a registration left behind
+    would make a later mapping that reuses those addresses fail to register."""
+    with open(path, "r+b") as region_file:
+        mapping = mmap.mmap(region_file.fileno(), nbytes, flags=mmap.MAP_SHARED)
+    mapped_region = torch.frombuffer(mapping, dtype=torch.uint8)
     pin_error_message = (
         f"host offload: could not pin the shared host region {path}, which magi::h2d_load needs; this requires CUDA "
         "host registration of memfd mappings, else set offload_config.offload_host_weight_sharing='off'."
@@ -343,4 +351,5 @@ def _map_and_pin_shared_memory_file(*, path: str, nbytes: int) -> torch.Tensor:
         raise RuntimeError(pin_error_message) from error
     if not mapped_region.is_pinned():
         raise RuntimeError(pin_error_message)
+    weakref.finalize(mapping, _unregister_host_memory, mapped_region.data_ptr())
     return mapped_region
