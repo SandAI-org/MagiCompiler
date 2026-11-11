@@ -159,15 +159,12 @@ def _scope_deferred_runtime_asserts(example_inputs: list[Any]):
 
 def _read_generated_code_expected_arity(path: str) -> int | None:
     try:
-        py_files = list(Path(path).rglob("*.py"))
-        if not py_files:
-            return None
-        text = py_files[0].read_text()
-        m = re.search(r"def call\(self, args\):\n\s+([^\n]+)= args", text)
-        if m is None:
-            return None
-        lhs = m.group(1)
-        return len([x for x in lhs.split(",") if x.strip()])
+        for py_file in sorted(Path(path).rglob("*.py")):
+            # Graph partition emits ``Runner.call(self, args)``; without it the wrapper is a module-level ``call(args)``.
+            m = re.search(r"def call\((?:self, )?args\):\n\s+([^\n]+)= args", py_file.read_text())
+            if m is not None:
+                return len([x for x in m.group(1).split(",") if x.strip()])
+        return None
     except Exception:
         return None
 
