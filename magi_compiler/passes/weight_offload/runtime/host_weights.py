@@ -178,6 +178,10 @@ class HostWeightStore:
     def is_pending(self, slot: int) -> bool:
         return self._weight_for_slot(slot).pending_source is not None
 
+    def deferred_group_id(self, slot: int) -> int | None:
+        """The process-local id of the first CUDA move that deferred ``slot``, or None if it was not deferred."""
+        return self._weight_for_slot(slot).deferred_group_id
+
     def pending_slots_in_groups_of(self, slots: Sequence[int]) -> list[int]:
         """Every pending slot deferred together with any pending slot in ``slots``."""
         group_ids = {self._weights_by_slot[slot].deferred_group_id for slot in slots if self.is_pending(slot)}

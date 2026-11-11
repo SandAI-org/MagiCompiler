@@ -54,7 +54,8 @@ def materialize_deferred_host_weights(
     Unless ``host_weight_sharing`` is "off", this is a collective over WORLD on every compile.
     """
     store = get_global_host_weight_store()
-    pending_slots = store.pending_slots_in_groups_of(_host_slots_of_graph_inputs(example_inputs=example_inputs, store=store))
+    graph_input_slots = _host_slots_of_graph_inputs(example_inputs=example_inputs, store=store)
+    pending_slots = store.pending_slots_in_groups_of(graph_input_slots)
     if not _any_rank_has_pending_slots(has_pending_slots=bool(pending_slots), host_weight_sharing=host_weight_sharing):
         return
     resident_slots = [slot for slot in pending_slots if store.is_resident(slot)]
@@ -64,7 +65,9 @@ def materialize_deferred_host_weights(
     else:
         host_copy_bytes = _complete_with_shared_host_copies(
             store=store,
-            pending_slots=pending_slots,
+            weight_key_by_slot=_shared_weight_key_by_slot(
+                store=store, graph_input_slots=graph_input_slots, pending_slots=pending_slots
+            ),
             offloaded_slots=offloaded_slots,
             host_weight_sharing=host_weight_sharing,
             region_label=region_label,
@@ -118,37 +121,56 @@ def _complete_with_private_host_copies(*, store: HostWeightStore, offloaded_slot
     return _HostCopyBytes(private_bytes=sum(store.slot_bytes(slot) for slot in offloaded_slots), shared_bytes=0)
 
 
-def _names_resident_on_every_rank(local_resident_names: set[str]) -> set[str]:
+def _shared_weight_key_by_slot(
+    *, store: HostWeightStore, graph_input_slots: Sequence[int], pending_slots: Sequence[int]
+) -> dict[int, str]:
+    """Name each pending slot the same way on every rank, so ranks match their copies of one weight by it.
+
+    A parameter name is unique only within its deferred group, the module whose first CUDA move deferred
+    it, and the group id is process-local; so the name is prefixed with the order in which this graph's
+    inputs first read the group. A slot whose key is still not unique is left out and keeps a private copy:
+    sharing it could complete it with the bytes of the other slot under that key.
+    """
+    group_order_by_group_id: dict[int | None, int] = {}
+    for slot in graph_input_slots:
+        if store.is_pending(slot):
+            group_order_by_group_id.setdefault(store.deferred_group_id(slot), len(group_order_by_group_id))
+    slots_by_key: dict[str, list[int]] = {}
+    for slot in pending_slots:
+        group_order = group_order_by_group_id[store.deferred_group_id(slot)]
+        slots_by_key.setdefault(f"{group_order}/{store.parameter_name(slot)}", []).append(slot)
+    return {slots[0]: key for key, slots in slots_by_key.items() if len(slots) == 1}
+
+
+def _keys_resident_on_every_rank(local_resident_keys: set[str]) -> set[str]:
     if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
-        return local_resident_names
-    resident_names_by_rank: list[set[str] | None] = [None] * dist.get_world_size()
-    dist.all_gather_object(resident_names_by_rank, local_resident_names, group=get_cpu_gloo_group())
-    return set.intersection(*resident_names_by_rank)
+        return local_resident_keys
+    resident_keys_by_rank: list[set[str] | None] = [None] * dist.get_world_size()
+    dist.all_gather_object(resident_keys_by_rank, local_resident_keys, group=get_cpu_gloo_group())
+    return set.intersection(*resident_keys_by_rank)
 
 
 def _complete_with_shared_host_copies(
     *,
     store: HostWeightStore,
-    pending_slots: Sequence[int],
+    weight_key_by_slot: dict[int, str],
     offloaded_slots: Sequence[int],
     host_weight_sharing: HostWeightSharing,
     region_label: str,
 ) -> _HostCopyBytes:
     """Offer every weight some rank keeps on the host, so a group shares it even where it is resident on a few ranks.
     Private copies follow the last round: no collective comes after them, so a local failure cannot strand peers."""
-    local_resident_names = {store.parameter_name(slot) for slot in pending_slots if store.is_resident(slot)}
-    resident_everywhere_names = _names_resident_on_every_rank(local_resident_names)
-    cpu_original_by_name = {
-        store.parameter_name(slot): store.pending_source(slot)
-        for slot in pending_slots
-        if store.parameter_name(slot) not in resident_everywhere_names
+    local_resident_keys = {key for slot, key in weight_key_by_slot.items() if store.is_resident(slot)}
+    resident_everywhere_keys = _keys_resident_on_every_rank(local_resident_keys)
+    cpu_original_by_key = {
+        key: store.pending_source(slot) for slot, key in weight_key_by_slot.items() if key not in resident_everywhere_keys
     }
     parking_plan = plan_shared_host_parking(
-        tensor_by_weight_name=cpu_original_by_name, region_label=region_label, sharing_scope=host_weight_sharing
+        tensor_by_weight_name=cpu_original_by_key, region_label=region_label, sharing_scope=host_weight_sharing
     )
     if parking_plan is None:
         return _complete_with_private_host_copies(store=store, offloaded_slots=offloaded_slots)
-    offloaded_slot_by_name = {store.parameter_name(slot): slot for slot in offloaded_slots}
+    offloaded_slot_by_key = {weight_key_by_slot[slot]: slot for slot in offloaded_slots if slot in weight_key_by_slot}
     shared_bytes = 0
     with intra_op_threads(parking_plan.parking_threads):
         for round_index in range(parking_plan.round_count):
@@ -156,8 +178,8 @@ def _complete_with_shared_host_copies(
                 shared_bytes += _complete_shared_chunk(
                     store=store,
                     chunk=chunk,
-                    cpu_original_by_name=cpu_original_by_name,
-                    offloaded_slot_by_name=offloaded_slot_by_name,
+                    cpu_original_by_key=cpu_original_by_key,
+                    offloaded_slot_by_key=offloaded_slot_by_key,
                 )
     still_pending_slots = [slot for slot in offloaded_slots if store.is_pending(slot)]
     private_bytes = _complete_with_private_host_copies(store=store, offloaded_slots=still_pending_slots).private_bytes
@@ -168,8 +190,8 @@ def _complete_shared_chunk(
     *,
     store: HostWeightStore,
     chunk: SharedHostChunk,
-    cpu_original_by_name: dict[str, torch.Tensor],
-    offloaded_slot_by_name: dict[str, int],
+    cpu_original_by_key: dict[str, torch.Tensor],
+    offloaded_slot_by_key: dict[str, int],
 ) -> int:
     """Writers fill the whole chunk, their own resident weights included, before ``publish``;
     readers adopt the writer's pages before ``finish``. Returns the bytes this rank now reads from the chunk."""
@@ -177,9 +199,9 @@ def _complete_shared_chunk(
     writer_error = None
     if chunk.is_writer and chunk.is_shared:
         try:
-            for name in chunk.weight_names:
-                chunk.host_buffer(name).copy_(cpu_original_by_name[name])
-            adopted_bytes = _adopt_shared_copies(store=store, chunk=chunk, offloaded_slot_by_name=offloaded_slot_by_name)
+            for key in chunk.weight_names:
+                chunk.host_buffer(key).copy_(cpu_original_by_key[key])
+            adopted_bytes = _adopt_shared_copies(store=store, chunk=chunk, offloaded_slot_by_key=offloaded_slot_by_key)
         except Exception as error:
             writer_error = error
     chunk.publish(writer_error=writer_error)
@@ -187,27 +209,26 @@ def _complete_shared_chunk(
     if not chunk.is_writer and chunk.is_shared:
         try:
             chunk.map_writer_region()
-            adopted_bytes = _adopt_shared_copies(store=store, chunk=chunk, offloaded_slot_by_name=offloaded_slot_by_name)
+            adopted_bytes = _adopt_shared_copies(store=store, chunk=chunk, offloaded_slot_by_key=offloaded_slot_by_key)
         except Exception as error:
             reader_error = error
     chunk.finish(reader_error=reader_error)
     return adopted_bytes
 
 
-def _adopt_shared_copies(*, store: HostWeightStore, chunk: SharedHostChunk, offloaded_slot_by_name: dict[str, int]) -> int:
+def _adopt_shared_copies(*, store: HostWeightStore, chunk: SharedHostChunk, offloaded_slot_by_key: dict[str, int]) -> int:
     """Complete this rank's offloaded slots in the chunk; one whose bytes differ stays pending for a private copy."""
     adopted_bytes = 0
-    for name in chunk.weight_names:
-        slot = offloaded_slot_by_name.get(name)
+    for key in chunk.weight_names:
+        slot = offloaded_slot_by_key.get(key)
         # None: resident here, though another rank of the group keeps it on the host.
         if slot is None:
             continue
-        if not chunk.is_writer and not chunk.holds_identical_copy(name, store.pending_source(slot)):
+        if not chunk.is_writer and not chunk.holds_identical_copy(key, store.pending_source(slot)):
             magi_logger.warning(
-                "host offload: %s matched the shared copy's fingerprint but not its bytes; this rank keeps a private copy",
-                name,
+                "host offload: %s matched the shared copy's fingerprint but not its bytes; this rank keeps a private copy", key
             )
             continue
-        store.complete_pending_slot_in_host_buffer(slot, chunk.host_buffer(name))
+        store.complete_pending_slot_in_host_buffer(slot, chunk.host_buffer(key))
         adopted_bytes += store.slot_bytes(slot)
     return adopted_bytes
