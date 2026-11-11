@@ -28,7 +28,8 @@ their existing position and are charged to residency, not in-flight storage.
 
 With ``share_link_with_collectives`` (no NVLink) the NCCL gathers and all-to-alls run
 on the load stream, so loads are placed on the compute time those collectives leave
-free (``free_time_axis``), and none may straddle one it would otherwise push back.
+free (``free_time_axis``).  A load longer than every gap within reach runs into the
+next collective; that overrun is its exposure (see ``scheduler``).
 """
 
 from __future__ import annotations
@@ -253,12 +254,16 @@ class H2dLoadReorder(OverlapPass):
             schedule_result.inflight_budget_limited_unhidden_ns / 1e6,
         )
         if self.share_link_with_collectives:
+            straddling_anchors = schedule_result.window_straddling_anchors
             magi_logger.info(
                 "h2d load reorder: loads placed around %d collective(s) on the load stream; "
-                "collectives occupy %.1fms of compute, %.1fms left free for loads",
+                "collectives occupy %.1fms of compute, %.1fms left free for loads; "
+                "%d load(s) run into a collective, exposing %.1fms",
                 call_state.link_collective_count,
                 call_state.link_collective_busy_ns / 1e6,
                 call_state.placement_prefix_ns[-1] / 1e6,
+                len(straddling_anchors),
+                sum(schedule_result.unhidden_ns_by_anchor[anchor] for anchor in straddling_anchors) / 1e6,
             )
         assert peak_inflight_bytes <= inflight_budget_bytes, (
             f"h2d load reorder: in-flight peak {peak_inflight_bytes} B exceeds "

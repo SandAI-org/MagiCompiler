@@ -263,6 +263,73 @@ def test_a_load_finishes_before_the_all_to_all_it_shares_the_link_with():
     assert names.index("ld") < names.index("c1"), "ends by 6 ms, so it starts by 4.95 ms"
 
 
+def test_a_load_longer_than_every_gap_starts_in_the_attention_gap_and_runs_into_one_all_to_all():
+    """The load (~1.05 ms) fits no gap: 0.5 ms before a2a1, 0.8 ms of attention, 0.3 ms of mlp.
+    It starts after a2a1 and runs 0.25 ms into a2a2, rather than waiting until just before its own wait."""
+    order = [
+        _compute("c0", 0.5e6),
+        _all_to_all("a2a1", 0.1e6, deps=["c0"]),
+        _wait("w1", "a2a1"),
+        _compute("attn", 0.8e6, deps=["w1"]),
+        _all_to_all("a2a2", 0.1e6, deps=["attn"]),
+        _wait("w2", "a2a2"),
+        _compute("mlp", 0.3e6, deps=["w2"]),
+        _load("ld", 10),
+        _wait("w", "ld"),
+        _compute("user", 1e6, deps=["w"]),
+    ]
+
+    names = _place_loads(order, share_link_with_collectives=True)
+
+    assert names.index("w1") < names.index("ld") < names.index("attn")
+
+
+def test_loads_longer_than_every_gap_each_run_into_one_window_without_pushing_the_rest_back():
+    """Windows every 18 ns leave 18 ns gaps; each 30 ns load hides 18 ns and exposes 12 ns.
+    The overrun holds back one collective and does not cascade into the next load."""
+    early = _task("early", deadline_index=10, required_overlap_ns=30.0)
+    late = _task("late", deadline_index=20, required_overlap_ns=30.0)
+    prefix_ns = [10.0 * index for index in range(21)]
+    windows_ns = [(18.0 * index, 18.0 * index) for index in range(1, 12)]
+
+    result = schedule_transfers_alap(
+        [early, late], prefix_ns, {early.anchor: 9, late.anchor: 19}, float("inf"), blocked_windows_ns=windows_ns
+    )
+
+    assert result.unhidden_ns_by_anchor[early.anchor] == pytest.approx(12.0)
+    assert result.unhidden_ns_by_anchor[late.anchor] == pytest.approx(12.0)
+    assert result.launch_index_by_anchor[early.anchor] == 7, "starts at 72, in the gap before the window at 90"
+    assert result.launch_index_by_anchor[late.anchor] == 18, "starts at 180, in the gap before the window at 198"
+    assert result.window_straddling_anchors == {early.anchor, late.anchor}
+
+
+def _hoist_bound_result(axis_end_ns):
+    """A 40 ns load due at 200: gaps of 120, 30, 30 and 10 ns lie before it, split by windows at 120, 150, 180, 190.
+    Only the first gap hides it whole, 80 ns of compute before the next-best one."""
+    task = _task("ld", deadline_index=20, required_overlap_ns=40.0)
+    prefix_ns = [10.0 * index for index in range(int(axis_end_ns // 10) + 1)]
+    windows_ns = [(120.0, 120.0), (150.0, 150.0), (180.0, 180.0), (190.0, 190.0)]
+    result = schedule_transfers_alap([task], prefix_ns, {task.anchor: 19}, float("inf"), blocked_windows_ns=windows_ns)
+    return task, result
+
+
+def test_a_busy_link_keeps_the_load_in_the_gap_that_barely_hides_it():
+    """At load factor 0.2 the 80 ns of idle link the first gap leaves cost 16 ns; the 30 ns gap at 150 scores
+    14 ns (10 ns exposed, 20 ns of idle link at 0.2)."""
+    task, result = _hoist_bound_result(axis_end_ns=200.0)
+
+    assert result.launch_index_by_anchor[task.anchor] == 15
+    assert result.unhidden_ns_by_anchor[task.anchor] == pytest.approx(10.0)
+
+
+def test_an_idle_link_hoists_the_load_back_to_a_gap_that_hides_it_whole():
+    """At load factor 0.1 the same 80 ns of idle link cost 8 ns; the gap at 150 now scores 12 ns."""
+    task, result = _hoist_bound_result(axis_end_ns=400.0)
+
+    assert result.launch_index_by_anchor[task.anchor] == 8, "ends at 120, before the first window"
+    assert result.unhidden_ns_by_anchor[task.anchor] == 0
+
+
 # ------------------------------------------------ FSDP gathers around all-to-alls
 
 

@@ -19,8 +19,9 @@ them take turns: every collective in ``LINK_COLLECTIVE_OPS`` (weight all-gathers
 graph all-to-alls) queues on one link stream (``RouteCollectivesToLinkStream``),
 and without NVLink H2D loads queue there too.  A pass placing transfers on such a
 link then sees the collectives already there as busy spans of the compute time
-axis: it places its transfers on the time they leave free, and none may straddle
-one, since on one stream that would hold the collective back.
+axis: it places its transfers on the time they leave free.  A transfer longer than
+the gap between two of them may run into the next one, which on one stream holds
+that collective back; the scheduler charges the overrun as exposure.
 """
 
 from __future__ import annotations
@@ -86,8 +87,8 @@ def free_time_axis(
 ) -> tuple[list[float], list[tuple[float, float]]]:
     """The compute axis with every busy span cut out, and each span's position on it.
 
-    A span collapses to a point on the free axis; as a blocked window it keeps a
-    transfer from straddling it, which on one stream would push it back.
+    A span collapses to a point on the free axis; as a blocked window it ends the
+    gap a transfer hides in, since on one stream the collective waits for it.
     ``busy_spans`` must be sorted and disjoint, as ``link_busy_spans_ns`` returns them.
     """
     span_starts = [start_ns for start_ns, _ in busy_spans]
