@@ -431,6 +431,57 @@ def test_same_named_weights_of_two_deferred_groups_keep_their_own_bytes(tmp_path
     assert results[1]["in_shared_region"] == [True, True]
 
 
+def _release_after_sharing_worker(rank: int, port: str, result_dir: str) -> None:
+    import weakref
+    from unittest.mock import patch
+
+    from magi_compiler.passes.weight_offload import (
+        get_global_host_weight_store,
+        install_host_first_hooks,
+        materialize_deferred_host_weights,
+    )
+
+    _init_process_group(rank=rank, world_size=2, port=port)
+    torch.cuda.set_device(rank % torch.cuda.device_count())
+    try:
+        model = _ReplicatedModelWithExpert(rank)
+        install_host_first_hooks(
+            model, min_weight_bytes=0, host_weight_sharing="per_host_interleaved", defer_host_materialization=True
+        )
+        model.cuda()
+        store = get_global_host_weight_store()
+        original_ref_by_name = {
+            name: weakref.ref(store.pending_source(store.slot_for_tensor(param))) for name, param in model.named_parameters()
+        }
+        alive_originals_at_each_allocation = []
+        reserve_host_buffer = store.reserve_host_buffer
+
+        def record_alive_originals(**kwargs):
+            alive_originals_at_each_allocation.append(
+                sorted(name for name, ref in original_ref_by_name.items() if ref() is not None)
+            )
+            return reserve_host_buffer(**kwargs)
+
+        with patch.object(store, "reserve_host_buffer", side_effect=record_alive_originals):
+            materialize_deferred_host_weights(
+                example_inputs=list(model.parameters()), host_weight_sharing="per_host_interleaved", region_label="release"
+            )
+        with open(os.path.join(result_dir, f"{rank}.json"), "w") as result_file:
+            json.dump(alive_originals_at_each_allocation, result_file)
+    finally:
+        dist.destroy_process_group()
+
+
+@requires_cuda
+def test_a_shared_weights_cpu_original_is_freed_before_the_private_copies(tmp_path):
+    """``dense`` is shared and ``expert`` differs per rank, so ``expert`` gets a private copy after the
+    shared rounds; by then ``dense``'s CPU original must already be gone on every rank."""
+    mp.spawn(_release_after_sharing_worker, args=(_free_port(), str(tmp_path)), nprocs=2, join=True)
+
+    for rank in range(2):
+        assert json.loads((tmp_path / f"{rank}.json").read_text()) == [["expert.weight"]], f"rank {rank}"
+
+
 def _plan_input(sharing_group: str, nbytes_by_weight_name: dict[str, int], expert_fingerprint: bytes = b"") -> _RankPlanInput:
     return _RankPlanInput(
         hostname=sharing_group,

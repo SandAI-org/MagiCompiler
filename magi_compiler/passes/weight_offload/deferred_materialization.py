@@ -162,15 +162,17 @@ def _complete_with_shared_host_copies(
     Private copies follow the last round: no collective comes after them, so a local failure cannot strand peers."""
     local_resident_keys = {key for slot, key in weight_key_by_slot.items() if store.is_resident(slot)}
     resident_everywhere_keys = _keys_resident_on_every_rank(local_resident_keys)
-    cpu_original_by_key = {
-        key: store.pending_source(slot) for slot, key in weight_key_by_slot.items() if key not in resident_everywhere_keys
-    }
+    offered_slot_by_key = {key: slot for slot, key in weight_key_by_slot.items() if key not in resident_everywhere_keys}
+    # The CPU originals are passed only for the plan's fingerprints and read again from the store when a
+    # chunk is filled: any reference held here would keep each original alive after its slot is completed.
     parking_plan = plan_shared_host_parking(
-        tensor_by_weight_name=cpu_original_by_key, region_label=region_label, sharing_scope=host_weight_sharing
+        tensor_by_weight_name={key: store.pending_source(slot) for key, slot in offered_slot_by_key.items()},
+        region_label=region_label,
+        sharing_scope=host_weight_sharing,
     )
     if parking_plan is None:
         return _complete_with_private_host_copies(store=store, offloaded_slots=offloaded_slots)
-    offloaded_slot_by_key = {weight_key_by_slot[slot]: slot for slot in offloaded_slots if slot in weight_key_by_slot}
+    offloaded_slot_by_key = {key: slot for key, slot in offered_slot_by_key.items() if not store.is_resident(slot)}
     shared_bytes = 0
     with intra_op_threads(parking_plan.parking_threads):
         for round_index in range(parking_plan.round_count):
@@ -178,7 +180,7 @@ def _complete_with_shared_host_copies(
                 shared_bytes += _complete_shared_chunk(
                     store=store,
                     chunk=chunk,
-                    cpu_original_by_key=cpu_original_by_key,
+                    offered_slot_by_key=offered_slot_by_key,
                     offloaded_slot_by_key=offloaded_slot_by_key,
                 )
     still_pending_slots = [slot for slot in offloaded_slots if store.is_pending(slot)]
@@ -190,7 +192,7 @@ def _complete_shared_chunk(
     *,
     store: HostWeightStore,
     chunk: SharedHostChunk,
-    cpu_original_by_key: dict[str, torch.Tensor],
+    offered_slot_by_key: dict[str, int],
     offloaded_slot_by_key: dict[str, int],
 ) -> int:
     """Writers fill the whole chunk, their own resident weights included, before ``publish``;
@@ -200,7 +202,7 @@ def _complete_shared_chunk(
     if chunk.is_writer and chunk.is_shared:
         try:
             for key in chunk.weight_names:
-                chunk.host_buffer(key).copy_(cpu_original_by_key[key])
+                chunk.host_buffer(key).copy_(store.pending_source(offered_slot_by_key[key]))
             adopted_bytes = _adopt_shared_copies(store=store, chunk=chunk, offloaded_slot_by_key=offloaded_slot_by_key)
         except Exception as error:
             writer_error = error
