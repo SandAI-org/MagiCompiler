@@ -105,6 +105,7 @@ def build_transfer_overlap_passes(
     transfer_link_sharing: str,
     loads_inserted: bool,
     default_passes: list | None,
+    pairwise_all_to_all: bool = False,
 ) -> list | None:
     """Inductor's ``reorder_for_compute_comm_overlap_passes`` for this graph; None leaves Inductor's own.
 
@@ -112,9 +113,12 @@ def build_transfer_overlap_passes(
     FSDP replaces configured reorders; offload alone keeps only explicitly configured ones.
     Inductor's ``raise_comms``/``sink_waits`` are never added: ``sink_waits`` treats H2D waits
     as collective waits and hoists every dependency-free ``empty`` to the graph start.
+    Without FSDP or loads, ``pairwise_all_to_all`` still routes the graph's all-to-alls.
     """
     if not (fsdp_config.enable_fsdp or _any_rank_inserted_loads(offload_config=offload_config, loads_inserted=loads_inserted)):
-        return None
+        if not pairwise_all_to_all:
+            return None
+        return [*(default_passes or ()), RouteCollectivesToLinkStream(LinkSharing.OFF, pairwise_all_to_all=True)]
 
     link_sharing = _resolve_link_sharing(transfer_link_sharing)
     costs = SnodeCostTable()
@@ -123,7 +127,9 @@ def build_transfer_overlap_passes(
     # needs the same lockstep estimator as FSDP.
     sync_across_ranks = _compiles_in_rank_lockstep(fsdp_config=fsdp_config, offload_config=offload_config)
     estimator = (
-        None if fsdp_config.cost_mode == "analytical" else ProfilingRuntimeEstimator(sync_across_ranks=sync_across_ranks)
+        None
+        if fsdp_config.cost_mode == "analytical"
+        else ProfilingRuntimeEstimator(sync_across_ranks=sync_across_ranks, pairwise_all_to_all=pairwise_all_to_all)
     )
     passes: list = [SnodeCostProfile(costs, estimator)]
 
@@ -162,9 +168,9 @@ def build_transfer_overlap_passes(
                 share_link_with_collectives=link_sharing.loads_take_turns_with_collectives,
             )
         )
-    if link_sharing.collectives_take_turns:
+    if link_sharing.collectives_take_turns or pairwise_all_to_all:
         # After every placement: it rewrites only the kernel name the wrapper emits.
-        passes.append(RouteCollectivesToLinkStream(link_sharing))
+        passes.append(RouteCollectivesToLinkStream(link_sharing, pairwise_all_to_all=pairwise_all_to_all))
     return passes
 
 
@@ -240,6 +246,7 @@ class WeightTransferPipeline:
         transfer_link_sharing: str,
         cudagraph_mode: CudaGraphMode,
         disable_graph_split: bool,
+        pairwise_all_to_all: bool = False,
     ) -> None:
         if fsdp_config.enable_fsdp and not disable_graph_split:
             # enable_fsdp is process-wide: split-graph models (e.g. a VAE beside an FSDP DiT)
@@ -249,6 +256,7 @@ class WeightTransferPipeline:
         self._fsdp_config = fsdp_config
         self._offload_config = offload_config
         self._transfer_link_sharing = transfer_link_sharing
+        self._pairwise_all_to_all = pairwise_all_to_all
         # The compile-cache verdict must be OR-ed over WORLD exactly when this holds.
         self.compiles_in_rank_lockstep = _compiles_in_rank_lockstep(fsdp_config=fsdp_config, offload_config=offload_config)
 
@@ -270,6 +278,7 @@ class WeightTransferPipeline:
             transfer_link_sharing=self._transfer_link_sharing,
             loads_inserted=h2d_loads_inserted,
             default_passes=default_passes,
+            pairwise_all_to_all=self._pairwise_all_to_all,
         )
         if self._offload_config.graph_weight_offload:
             # The compilation interpreter runs next and must not read storage-free weights.

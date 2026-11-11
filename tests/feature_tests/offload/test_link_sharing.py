@@ -383,6 +383,21 @@ def test_routing_rewrites_only_the_emitted_kernel_name_of_link_collectives(link_
     assert isinstance(single.node, ir._CollectiveKernel), "every pass still sees a functional collective"
 
 
+@pytest.mark.parametrize("link_sharing", [LinkSharing.OFF, LinkSharing.PCIE, LinkSharing.NVLINK])
+def test_pairwise_routing_rewrites_all_to_alls_even_with_link_sharing_off(link_sharing):
+    single = _gather("ag", 1e6)
+    all_to_all = _all_to_all("a2a", 1e6)
+    original_gather_kernel_name = single.node.python_kernel_name
+
+    RouteCollectivesToLinkStream(link_sharing, pairwise_all_to_all=True)([single, all_to_all])
+    link = link_sharing.value
+    assert all_to_all.node.python_kernel_name == f"torch.ops.magi.link_pairwise_all_to_all_single.{link}"
+    expected_gather_kernel_name = (
+        f"torch.ops.magi.link_all_gather.{link}" if link_sharing.collectives_take_turns else original_gather_kernel_name
+    )
+    assert single.node.python_kernel_name == expected_gather_kernel_name
+
+
 _LINK_SLEEP_CYCLES = 50_000_000
 """Arbitrary; tens of milliseconds, far above a one-rank collective."""
 
@@ -441,6 +456,16 @@ def test_link_collectives_match_the_functional_ones_and_queue_behind_the_link(nc
     torch.testing.assert_close(gathered, shard)
     torch.testing.assert_close(coalesced[0], shard)
     torch.testing.assert_close(coalesced[1], other_shard)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="NCCL collectives need CUDA")
+@pytest.mark.parametrize("link_sharing", [LinkSharing.OFF, LinkSharing.PCIE])
+def test_pairwise_all_to_all_matches_the_functional_one(nccl_world_of_one, link_sharing):
+    pairwise_all_to_all = getattr(torch.ops.magi.link_pairwise_all_to_all_single, link_sharing.value)
+    wait_tensor = torch.ops._c10d_functional.wait_tensor.default
+    shard = torch.randn(64, 32, device="cuda")
+
+    torch.testing.assert_close(wait_tensor(pairwise_all_to_all(shard, [64], [64], nccl_world_of_one)), shard)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="link streams need CUDA")
