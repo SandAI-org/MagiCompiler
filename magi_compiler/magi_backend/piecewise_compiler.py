@@ -159,15 +159,12 @@ def _scope_deferred_runtime_asserts(example_inputs: list[Any]):
 
 def _read_generated_code_expected_arity(path: str) -> int | None:
     try:
-        py_files = list(Path(path).rglob("*.py"))
-        if not py_files:
-            return None
-        text = py_files[0].read_text()
-        m = re.search(r"def call\(self, args\):\n\s+([^\n]+)= args", text)
-        if m is None:
-            return None
-        lhs = m.group(1)
-        return len([x for x in lhs.split(",") if x.strip()])
+        for py_file in sorted(Path(path).rglob("*.py")):
+            # Graph partition emits ``Runner.call(self, args)``; without it the wrapper is a module-level ``call(args)``.
+            m = re.search(r"def call\((?:self, )?args\):\n\s+([^\n]+)= args", py_file.read_text())
+            if m is not None:
+                return len([x for x in m.group(1).split(",") if x.strip()])
+        return None
     except Exception:
         return None
 
@@ -335,7 +332,9 @@ class InductorStandaloneAdaptor(CompilerInterface):
 
         # Runtime autotuning uses concrete input sizes;
         # compile-time benchmarks of unbacked dimensions can exceed input storage.
-        current_config: dict[str, Any] = {"triton.autotune_at_compile_time": False}
+        # Graph partition only serves Inductor's own CUDA graphs, which MagiCompiler never enables; before PT 2.10 its
+        # free-symbol walk is exponential in the depth of a chain of multi-output extern kernels (custom ops).
+        current_config: dict[str, Any] = {"triton.autotune_at_compile_time": False, "graph_partition": False}
         if inductor_compile_config is not None:
             current_config.update(inductor_compile_config)
         if isinstance(runtime_shape, int):
