@@ -335,7 +335,9 @@ class InductorStandaloneAdaptor(CompilerInterface):
 
         # Runtime autotuning uses concrete input sizes;
         # compile-time benchmarks of unbacked dimensions can exceed input storage.
-        current_config: dict[str, Any] = {"triton.autotune_at_compile_time": False}
+        # Graph partition only serves Inductor's own CUDA graphs, which MagiCompiler never enables; before PT 2.10 its
+        # free-symbol walk is exponential in the depth of a chain of multi-output extern kernels (custom ops).
+        current_config: dict[str, Any] = {"triton.autotune_at_compile_time": False, "graph_partition": False}
         if inductor_compile_config is not None:
             current_config.update(inductor_compile_config)
         if isinstance(runtime_shape, int):
