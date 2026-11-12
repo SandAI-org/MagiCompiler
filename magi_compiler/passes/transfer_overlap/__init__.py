@@ -26,11 +26,13 @@ accounting and cross-rank agreement are written once, here.
 * ``memory``    -- ``InflightMemoryBudget`` and weight-storage peak accounting.
 * ``rank_sync`` -- keeping a collective-moving placement identical on every rank.
 * ``base``      -- ``OverlapPass``: the build-tasks / assign-launch-indices / commit / log template.
+* ``link_windows`` -- ``LinkSharing``, and the compute time collectives on a shared link leave free.
 """
 
 from .base import DEFAULT_WINDOW_MARGIN_NS, OverlapCallState, OverlapPass
 from .cost import CostView
 from .graph import SnodeGraph
+from .link_windows import LinkSharing, free_time_axis, link_busy_spans_ns
 from .memory import (
     InflightMemoryBudget,
     inflight_peak_bytes,
@@ -65,4 +67,7 @@ __all__ = [
     "latest_legal_launch_index",
     "latest_finish_times_ns",
     "unhoisted_index",
+    "LinkSharing",
+    "free_time_axis",
+    "link_busy_spans_ns",
 ]

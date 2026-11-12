@@ -54,6 +54,7 @@ import hashlib
 from collections.abc import Callable
 from typing import Any, Optional
 
+import sympy
 import torch
 from torch._inductor import ir
 from torch._inductor.runtime.benchmarking import benchmarker
@@ -202,7 +203,8 @@ def _structural_key(snode: BaseSchedulerNode) -> tuple | None:
 
 
 def _is_symbolic(s) -> bool:
-    return isinstance(s, torch.SymInt) or hasattr(s, "node")
+    # IR layouts hold sympy expressions, e.g. a graph all-to-all over the dynamic sequence dim.
+    return isinstance(s, torch.SymInt) or hasattr(s, "node") or (isinstance(s, sympy.Expr) and not s.is_number)
 
 
 def _static(shape) -> tuple:
@@ -465,15 +467,17 @@ def _leaf_collective(snode: BaseSchedulerNode) -> ir.ExternKernel | None:
 
 
 def _collective_spec(node: ir.ExternKernel):
-    """(op_overload, group_name, group_size, [(shape, dtype, device), ...]) for a
-    collective IR node, or None if it isn't a benchmarkable all-gather."""
-    # TODO: support more graph collectives than AG / AG_COALESCED.
-    from magi_compiler.passes.snode_utils import ALL_GATHER_OP, COALESCED_ALL_GATHER_OP
+    """(op_overload, group_name, group_size, [(shape, dtype, device), ...], split_sizes) for a
+    collective IR node, or None if it isn't a benchmarkable all-gather or all-to-all.
+
+    ``split_sizes`` is ``(output_split_sizes, input_split_sizes)`` for an all-to-all, ``()`` otherwise."""
+    # TODO: support more graph collectives than AG / AG_COALESCED / all_to_all_single.
+    from magi_compiler.passes.snode_utils import ALL_TO_ALL_OP, LINK_COLLECTIVE_OPS
 
     op = node.op_overload
-    if op not in (ALL_GATHER_OP, COALESCED_ALL_GATHER_OP):
+    if op not in LINK_COLLECTIVE_OPS:
         return None
-    group_name = node.constant_args[-1]  # (..., group_size, group_name)
+    group_name = node.constant_args[-1]  # (..., group_size | split sizes, group_name)
     from torch.distributed.distributed_c10d import _get_group_size_by_name
 
     group_size = _get_group_size_by_name(group_name)
@@ -481,7 +485,13 @@ def _collective_spec(node: ir.ExternKernel):
     for inp in node.inputs:
         shape = tuple(_concrete_size(s) for s in inp.layout.size)
         specs.append((shape, inp.layout.dtype, inp.layout.device))
-    return op, group_name, group_size, specs
+    split_sizes: tuple = ()
+    if op is ALL_TO_ALL_OP:
+        # Lowering flattens both split-size lists into constant_args, one entry per rank each.
+        flat_split_sizes = [_concrete_size(s) for s in node.constant_args[:-1]]
+        assert len(flat_split_sizes) == 2 * group_size, f"unexpected all_to_all_single args {node.constant_args}"
+        split_sizes = (tuple(flat_split_sizes[:group_size]), tuple(flat_split_sizes[group_size:]))
+    return op, group_name, group_size, specs, split_sizes
 
 
 def _leaf_ce_ag(snode: BaseSchedulerNode) -> ir.ExternKernel | None:
@@ -568,29 +578,40 @@ def _collective_label(snode: BaseSchedulerNode) -> str:
     spec = _collective_spec(node) if node is not None else None
     if spec is None:
         return _snode_label(snode)
-    _op, _group, group_size, specs = spec
+    op, _group, group_size, specs, _split_sizes = spec
     shape0 = "x".join(str(x) for x in specs[0][0]) if specs else "?"
-    return f"all_gather(ws={group_size},n={len(specs)},{shape0})"
+    op_name = str(op).removeprefix("_c10d_functional.").removesuffix(".default")
+    return f"{op_name}(ws={group_size},n={len(specs)},{shape0})"
 
 
-def _nccl_launch_wait(snode: BaseSchedulerNode):
-    """``(launch, wait)`` replaying a functional all-gather, or None."""
+def _nccl_launch_wait(snode: BaseSchedulerNode, pairwise_all_to_all: bool = False):
+    """``(launch, wait)`` replaying a functional all-gather or all-to-all, or None.
+
+    ``pairwise_all_to_all`` replays an all-to-all as the pairwise exchange it is routed to."""
     node = _leaf_collective(snode)
     spec = _collective_spec(node) if node is not None else None
     if spec is None:
         return None
-    from magi_compiler.passes.snode_utils import COALESCED_ALL_GATHER_OP
+    from magi_compiler.passes.snode_utils import ALL_TO_ALL_OP, COALESCED_ALL_GATHER_OP
 
-    op, group_name, group_size, specs = spec
+    op, group_name, group_size, specs, split_sizes = spec
     ins = [torch.empty(shape, dtype=dt, device=dev) for shape, dt, dev in specs]
     if op is COALESCED_ALL_GATHER_OP:
         return (lambda: op(ins, group_size, group_name), lambda outs: [_WAIT_TENSOR_OP(o) for o in outs])
+    if op is ALL_TO_ALL_OP:
+        if pairwise_all_to_all:
+            # Deferred like snode_utils above; importing the module registers torch.ops.magi.link_*.
+            from magi_compiler.passes.weight_offload.runtime import link_collective_op  # noqa: F401
+
+            op = torch.ops.magi.link_pairwise_all_to_all_single.off
+        output_split_sizes, input_split_sizes = split_sizes
+        return (lambda: op(ins[0], list(output_split_sizes), list(input_split_sizes), group_name)), _WAIT_TENSOR_OP
     return (lambda: op(ins[0], group_size, group_name)), _WAIT_TENSOR_OP
 
 
-def _measure_collective_op(snode: BaseSchedulerNode) -> float:
-    """Replay the functional all-gather (+wait) on real tensors and time it."""
-    pair = _nccl_launch_wait(snode)
+def _measure_collective_op(snode: BaseSchedulerNode, pairwise_all_to_all: bool = False) -> float:
+    """Replay the functional collective (+wait) on real tensors and time it."""
+    pair = _nccl_launch_wait(snode, pairwise_all_to_all=pairwise_all_to_all)
     if pair is None:
         return 0.0
     launch, wait = pair
@@ -601,7 +622,7 @@ class ProfilingRuntimeEstimator:
     """Callable ``snode -> ns`` (see module docstring).  Never raises -- any
     measurement failure falls back to the analytical estimate."""
 
-    def __init__(self, sync_across_ranks: bool = False) -> None:
+    def __init__(self, sync_across_ranks: bool = False, pairwise_all_to_all: bool = False) -> None:
         # op -> time table, keyed by structural identity (see module docstring).
         self._table: dict[tuple, ProfileEntry] = {}
         self.n_measured = 0
@@ -609,6 +630,7 @@ class ProfilingRuntimeEstimator:
         # True (profile_sync): SnodeCostProfile calls warm_and_sync() to reconcile
         # costs across ranks.
         self._sync_across_ranks = sync_across_ranks
+        self._pairwise_all_to_all = pairwise_all_to_all
         # Transient {key -> representative snode} for warm_and_sync re-measurement.
         # Kept OFF ProfileEntry: snodes hold unpicklable FakeTensors and the entry
         # is pickled into the fx-graph cache key.
@@ -617,7 +639,9 @@ class ProfilingRuntimeEstimator:
 
     def __deepcopy__(self, memo):
         # Config serialization deepcopies the pass list; return a clean instance.
-        new = ProfilingRuntimeEstimator(sync_across_ranks=self._sync_across_ranks)
+        new = ProfilingRuntimeEstimator(
+            sync_across_ranks=self._sync_across_ranks, pairwise_all_to_all=self._pairwise_all_to_all
+        )
         memo[id(self)] = new
         return new
 
@@ -757,7 +781,7 @@ class ProfilingRuntimeEstimator:
             if _leaf_ce_ag(snode) is not None:
                 return _measure_ce_ag(snode), True
             if contains_collective(snode):
-                return _measure_collective_op(snode), True
+                return _measure_collective_op(snode, pairwise_all_to_all=self._pairwise_all_to_all), True
             if isinstance(snode, ExternKernelSchedulerNode):
                 fixed = _extern_has_internal_collective(snode)
                 with _shapeenv_sandbox(), _suppress_guards():
@@ -767,7 +791,10 @@ class ProfilingRuntimeEstimator:
                 return ns, True
             return self._measure(snode), True
         except BaseException as exc:  # noqa: BLE001
-            magi_logger.warning("warm/sync measure fell back to analytical for %s: %s", snode.get_name(), exc)
+            # Every rank: a fallback on some ranks only skips collectives the others still issue.
+            magi_logger.warning(
+                "warm/sync measure fell back to analytical for %s: %r", snode.get_name(), exc, rank="all", exc_info=True
+            )
             return analytical_runtime_ns(snode), False
 
     def summary(self) -> str:
@@ -875,8 +902,9 @@ class ProfilingRuntimeEstimator:
             spec = _collective_spec(cnode) if cnode is not None else None
             if spec is None:
                 return analytical_runtime_ns(snode)
-            op, _group_name, group_size, specs = spec
-            ckey = ("collective", str(op), group_size, tuple((tuple(shape), str(dt)) for shape, dt, _dev in specs))
+            op, _group_name, group_size, specs, split_sizes = spec
+            shape_key = tuple((tuple(shape), str(dt)) for shape, dt, _dev in specs)
+            ckey = ("collective", str(op), group_size, shape_key, split_sizes)
             # NCCL stays analytical outside profile_sync; only CE supports local measurement here.
             return self._estimate_collective_runtime_ns(
                 snode=snode, key=ckey, kind="collective", label_fn=_collective_label, count_reuse=count_reuse

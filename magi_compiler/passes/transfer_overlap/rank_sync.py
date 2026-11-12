@@ -60,6 +60,11 @@ compiles turn it off.
 +---------------+---------------------------------------+------------+--------------------------------+------------------+
 | Inductor      | H2D load placement                    | none       | --                             | rank-local       |
 +---------------+---------------------------------------+------------+--------------------------------+------------------+
+| backend (end) | deferred materialization: residency   | WORLD      | defer_host_materialization and | compiling ranks  |
+|               | gather, then the host sharing plan    | (Gloo)     | host_weight_sharing != 'off';  | including empty  |
+|               | and chunk rounds (weight_offload.     |            | replaces the first-CUDA-move   | offers           |
+|               | deferred_materialization)             |            | row for that model             |                  |
++---------------+---------------------------------------+------------+--------------------------------+------------------+
 
 What follows from it:
 

@@ -38,17 +38,19 @@ from magi_compiler.passes.fsdp_overlap import (
     rewrite_weight_ag_to_copy_engine,
 )
 from magi_compiler.passes.snode_cost import SnodeCostProfile, SnodeCostTable
-from magi_compiler.passes.transfer_overlap import rank_sync
+from magi_compiler.passes.transfer_overlap import LinkSharing, rank_sync
 from magi_compiler.passes.weight_offload import (
     FsdpShardSource,
     H2dLoadReorder,
     PlainParamSource,
+    RouteCollectivesToLinkStream,
     bind_host_slots_to_graph,
     get_global_host_weight_store,
     insert_h2d_loads,
 )
 from magi_compiler.profiling import ProfilingRuntimeEstimator
 from magi_compiler.utils import magi_logger
+from magi_compiler.utils.device import has_active_nvlink
 
 _MAX_LOGGED_WEIGHT_NAMES = 8
 """Arbitrary cap that keeps the restored-weights warning to one readable line."""
@@ -97,7 +99,13 @@ def _compiles_in_rank_lockstep(*, fsdp_config: FSDPConfig, offload_config: Offlo
 
 
 def build_transfer_overlap_passes(
-    *, fsdp_config: FSDPConfig, offload_config: OffloadConfig, loads_inserted: bool, default_passes: list | None
+    *,
+    fsdp_config: FSDPConfig,
+    offload_config: OffloadConfig,
+    transfer_link_sharing: str,
+    loads_inserted: bool,
+    default_passes: list | None,
+    pairwise_all_to_all: bool = False,
 ) -> list | None:
     """Inductor's ``reorder_for_compute_comm_overlap_passes`` for this graph; None leaves Inductor's own.
 
@@ -105,17 +113,23 @@ def build_transfer_overlap_passes(
     FSDP replaces configured reorders; offload alone keeps only explicitly configured ones.
     Inductor's ``raise_comms``/``sink_waits`` are never added: ``sink_waits`` treats H2D waits
     as collective waits and hoists every dependency-free ``empty`` to the graph start.
+    Without FSDP or loads, ``pairwise_all_to_all`` still routes the graph's all-to-alls.
     """
     if not (fsdp_config.enable_fsdp or _any_rank_inserted_loads(offload_config=offload_config, loads_inserted=loads_inserted)):
-        return None
+        if not pairwise_all_to_all:
+            return None
+        return [*(default_passes or ()), RouteCollectivesToLinkStream(LinkSharing.OFF, pairwise_all_to_all=True)]
 
+    link_sharing = _resolve_link_sharing(transfer_link_sharing)
     costs = SnodeCostTable()
     # Custom ops count as internal collectives and stay at an analytical 0 until
     # warm_and_sync remeasures them. H2D placement reads those costs, so offload
     # needs the same lockstep estimator as FSDP.
     sync_across_ranks = _compiles_in_rank_lockstep(fsdp_config=fsdp_config, offload_config=offload_config)
     estimator = (
-        None if fsdp_config.cost_mode == "analytical" else ProfilingRuntimeEstimator(sync_across_ranks=sync_across_ranks)
+        None
+        if fsdp_config.cost_mode == "analytical"
+        else ProfilingRuntimeEstimator(sync_across_ranks=sync_across_ranks, pairwise_all_to_all=pairwise_all_to_all)
     )
     passes: list = [SnodeCostProfile(costs, estimator)]
 
@@ -135,13 +149,14 @@ def build_transfer_overlap_passes(
                 comm_overlap_window_margin_ns=fsdp_config.comm_overlap_window_margin_ns,
                 runtime_ns_fn=costs,
                 comm_overlap_window_scale=fsdp_config.comm_overlap_window_scale,
+                link_sharing=link_sharing,
             )
         )
     else:
         passes.extend(default_passes or ())
 
     if loads_inserted:
-        # Last: loads are hoisted around the gathers' final positions.
+        # Last: loads are hoisted around the collectives' final positions.
         # Rank-local: placing loads issues no collective.
         passes.append(
             H2dLoadReorder(
@@ -150,9 +165,25 @@ def build_transfer_overlap_passes(
                 ),
                 weight_budget_bytes=_mib_to_bytes(offload_config.offload_max_device_weight_mib),
                 runtime_ns_fn=costs,
+                share_link_with_collectives=link_sharing.loads_take_turns_with_collectives,
             )
         )
+    if link_sharing.collectives_take_turns or pairwise_all_to_all:
+        # After every placement: it rewrites only the kernel name the wrapper emits.
+        passes.append(RouteCollectivesToLinkStream(link_sharing, pairwise_all_to_all=pairwise_all_to_all))
     return passes
+
+
+def _resolve_link_sharing(transfer_link_sharing: str) -> LinkSharing:
+    """Resolve ``transfer_link_sharing``; 'auto' asks NVML whether this GPU has NVLink."""
+    if transfer_link_sharing != "auto":
+        return LinkSharing(transfer_link_sharing)
+    device = torch.cuda.current_device()
+    nvlink_active = has_active_nvlink(device)
+    if nvlink_active is None:
+        magi_logger.info("transfer link sharing: NVML cannot tell whether GPU %d has NVLink; leaving it off", device)
+        return LinkSharing.OFF
+    return LinkSharing.NVLINK if nvlink_active else LinkSharing.PCIE
 
 
 def _validate_weight_transfer_config(
@@ -212,8 +243,10 @@ class WeightTransferPipeline:
         *,
         fsdp_config: FSDPConfig,
         offload_config: OffloadConfig,
+        transfer_link_sharing: str,
         cudagraph_mode: CudaGraphMode,
         disable_graph_split: bool,
+        pairwise_all_to_all: bool = False,
     ) -> None:
         if fsdp_config.enable_fsdp and not disable_graph_split:
             # enable_fsdp is process-wide: split-graph models (e.g. a VAE beside an FSDP DiT)
@@ -222,6 +255,8 @@ class WeightTransferPipeline:
         _validate_weight_transfer_config(fsdp_config=fsdp_config, offload_config=offload_config, cudagraph_mode=cudagraph_mode)
         self._fsdp_config = fsdp_config
         self._offload_config = offload_config
+        self._transfer_link_sharing = transfer_link_sharing
+        self._pairwise_all_to_all = pairwise_all_to_all
         # The compile-cache verdict must be OR-ed over WORLD exactly when this holds.
         self.compiles_in_rank_lockstep = _compiles_in_rank_lockstep(fsdp_config=fsdp_config, offload_config=offload_config)
 
@@ -240,8 +275,10 @@ class WeightTransferPipeline:
         passes = build_transfer_overlap_passes(
             fsdp_config=self._fsdp_config,
             offload_config=self._offload_config,
+            transfer_link_sharing=self._transfer_link_sharing,
             loads_inserted=h2d_loads_inserted,
             default_passes=default_passes,
+            pairwise_all_to_all=self._pairwise_all_to_all,
         )
         if self._offload_config.graph_weight_offload:
             # The compilation interpreter runs next and must not read storage-free weights.
