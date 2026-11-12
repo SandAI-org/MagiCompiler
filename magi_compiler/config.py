@@ -227,6 +227,15 @@ class OffloadConfig(BaseModel):
         ),
     )
     offload_min_shard_mib: int = Field(1, ge=0, description="Minimum local-shard size in MiB for weight offload.")
+    offload_keep_on_device_mib: int = Field(
+        0,
+        ge=0,
+        description=(
+            "Per-GPU MiB of offloadable weights, taken in parameter order up to the first that does not fit, that "
+            "stay on the device with no host copy and never move. 0 offloads every eligible weight. Residents of "
+            "offload_max_device_weight_mib instead keep their pinned host copy."
+        ),
+    )
     offload_host_weight_sharing: Literal["off", "per_numa_node", "per_host_interleaved"] = Field(
         "off",
         description=(
