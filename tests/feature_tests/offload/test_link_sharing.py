@@ -131,6 +131,20 @@ def test_the_free_axis_cuts_out_busy_time_and_keeps_each_span_as_a_point():
     assert blocked_windows_ns == [(50.0, 50.0), (200.0, 200.0)]
 
 
+def test_each_blocked_window_is_one_point_where_its_end_would_round_below_its_start():
+    """Here ``end - busy - (end - start)`` rounds one ulp below ``start - busy``: a window that ends before it starts
+    sent the scheduler's gap walk back in front of it forever."""
+    spans = [
+        (281837.84439970384, 357418.2648154262),
+        (975787.2614907578, 1000837.8956270019),
+        (1910584.1515952419, 2008862.6991990071),
+    ]
+
+    _, blocked_windows_ns = free_time_axis([0.0], spans)
+
+    assert all(start_ns == end_ns for start_ns, end_ns in blocked_windows_ns)
+
+
 def test_a_collective_occupies_the_link_only_until_compute_stalls_on_its_wait():
     """An all-to-all whose result is needed 0.4 ms after launch holds 0.4 ms of compute;
     the rest of it runs while compute waits."""

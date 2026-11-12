@@ -104,5 +104,7 @@ def free_time_axis(
         return time_ns - busy_ns_before_span[span_index] - (min(time_ns, end_ns) - start_ns)
 
     free_prefix_ns = [free_ns_at(time_ns) for time_ns in compute_prefix_ns]
-    blocked_windows_ns = [(free_ns_at(start_ns), free_ns_at(end_ns)) for start_ns, end_ns in busy_spans]
+    # One point for both ends: computed apart, the end can round below the start, and a gap walk that jumps to the
+    # end of the window ahead would then land before that window again and never get past it.
+    blocked_windows_ns = [(point_ns, point_ns) for point_ns in map(free_ns_at, span_starts)]
     return free_prefix_ns, blocked_windows_ns
