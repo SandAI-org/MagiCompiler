@@ -584,10 +584,10 @@ def _collective_label(snode: BaseSchedulerNode) -> str:
     return f"{op_name}(ws={group_size},n={len(specs)},{shape0})"
 
 
-def _nccl_launch_wait(snode: BaseSchedulerNode, pairwise_all_to_all: bool = False):
+def _nccl_launch_wait(snode: BaseSchedulerNode):
     """``(launch, wait)`` replaying a functional all-gather or all-to-all, or None.
 
-    ``pairwise_all_to_all`` replays an all-to-all as the pairwise exchange it is routed to."""
+    The replay dispatches like the graph's own call, so it times whichever kernel backs the op."""
     node = _leaf_collective(snode)
     spec = _collective_spec(node) if node is not None else None
     if spec is None:
@@ -599,19 +599,14 @@ def _nccl_launch_wait(snode: BaseSchedulerNode, pairwise_all_to_all: bool = Fals
     if op is COALESCED_ALL_GATHER_OP:
         return (lambda: op(ins, group_size, group_name), lambda outs: [_WAIT_TENSOR_OP(o) for o in outs])
     if op is ALL_TO_ALL_OP:
-        if pairwise_all_to_all:
-            # Deferred like snode_utils above; importing the module registers torch.ops.magi.link_*.
-            from magi_compiler.passes.weight_offload.runtime import link_collective_op  # noqa: F401
-
-            op = torch.ops.magi.link_pairwise_all_to_all_single.off
         output_split_sizes, input_split_sizes = split_sizes
         return (lambda: op(ins[0], list(output_split_sizes), list(input_split_sizes), group_name)), _WAIT_TENSOR_OP
     return (lambda: op(ins[0], group_size, group_name)), _WAIT_TENSOR_OP
 
 
-def _measure_collective_op(snode: BaseSchedulerNode, pairwise_all_to_all: bool = False) -> float:
+def _measure_collective_op(snode: BaseSchedulerNode) -> float:
     """Replay the functional collective (+wait) on real tensors and time it."""
-    pair = _nccl_launch_wait(snode, pairwise_all_to_all=pairwise_all_to_all)
+    pair = _nccl_launch_wait(snode)
     if pair is None:
         return 0.0
     launch, wait = pair
@@ -622,7 +617,7 @@ class ProfilingRuntimeEstimator:
     """Callable ``snode -> ns`` (see module docstring).  Never raises -- any
     measurement failure falls back to the analytical estimate."""
 
-    def __init__(self, sync_across_ranks: bool = False, pairwise_all_to_all: bool = False) -> None:
+    def __init__(self, sync_across_ranks: bool = False) -> None:
         # op -> time table, keyed by structural identity (see module docstring).
         self._table: dict[tuple, ProfileEntry] = {}
         self.n_measured = 0
@@ -630,7 +625,6 @@ class ProfilingRuntimeEstimator:
         # True (profile_sync): SnodeCostProfile calls warm_and_sync() to reconcile
         # costs across ranks.
         self._sync_across_ranks = sync_across_ranks
-        self._pairwise_all_to_all = pairwise_all_to_all
         # Transient {key -> representative snode} for warm_and_sync re-measurement.
         # Kept OFF ProfileEntry: snodes hold unpicklable FakeTensors and the entry
         # is pickled into the fx-graph cache key.
@@ -639,9 +633,7 @@ class ProfilingRuntimeEstimator:
 
     def __deepcopy__(self, memo):
         # Config serialization deepcopies the pass list; return a clean instance.
-        new = ProfilingRuntimeEstimator(
-            sync_across_ranks=self._sync_across_ranks, pairwise_all_to_all=self._pairwise_all_to_all
-        )
+        new = ProfilingRuntimeEstimator(sync_across_ranks=self._sync_across_ranks)
         memo[id(self)] = new
         return new
 
@@ -781,7 +773,7 @@ class ProfilingRuntimeEstimator:
             if _leaf_ce_ag(snode) is not None:
                 return _measure_ce_ag(snode), True
             if contains_collective(snode):
-                return _measure_collective_op(snode, pairwise_all_to_all=self._pairwise_all_to_all), True
+                return _measure_collective_op(snode), True
             if isinstance(snode, ExternKernelSchedulerNode):
                 fixed = _extern_has_internal_collective(snode)
                 with _shapeenv_sandbox(), _suppress_guards():

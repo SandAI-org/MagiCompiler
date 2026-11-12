@@ -467,16 +467,6 @@ class CompileConfig(BaseSettings):
             "graph weight loads."
         ),
     )
-    pairwise_all_to_all: bool = Field(
-        False,
-        description=(
-            "Run every graph all-to-all (``_c10d_functional.all_to_all_single``) as world_size - 1 pairwise "
-            "send/recv steps, one peer in flight per rank: at step k rank r sends to r + k and receives from r - k. "
-            "On PCIe without NVLink, NCCL's all-to-all runs every peer at once and the transfers contend for the "
-            "same links. The exchange queues on the stream ``transfer_link_sharing`` picks for collectives, or "
-            "on a stream of its own when that is 'off'; profiled costs replay the same exchange."
-        ),
-    )
 
     # ---- torch.compile options keys ----
     post_grad_pass: str = Field(

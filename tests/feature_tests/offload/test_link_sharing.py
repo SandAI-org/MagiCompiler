@@ -397,21 +397,6 @@ def test_routing_rewrites_only_the_emitted_kernel_name_of_link_collectives(link_
     assert isinstance(single.node, ir._CollectiveKernel), "every pass still sees a functional collective"
 
 
-@pytest.mark.parametrize("link_sharing", [LinkSharing.OFF, LinkSharing.PCIE, LinkSharing.NVLINK])
-def test_pairwise_routing_rewrites_all_to_alls_even_with_link_sharing_off(link_sharing):
-    single = _gather("ag", 1e6)
-    all_to_all = _all_to_all("a2a", 1e6)
-    original_gather_kernel_name = single.node.python_kernel_name
-
-    RouteCollectivesToLinkStream(link_sharing, pairwise_all_to_all=True)([single, all_to_all])
-    link = link_sharing.value
-    assert all_to_all.node.python_kernel_name == f"torch.ops.magi.link_pairwise_all_to_all_single.{link}"
-    expected_gather_kernel_name = (
-        f"torch.ops.magi.link_all_gather.{link}" if link_sharing.collectives_take_turns else original_gather_kernel_name
-    )
-    assert single.node.python_kernel_name == expected_gather_kernel_name
-
-
 _LINK_SLEEP_CYCLES = 50_000_000
 """Arbitrary; tens of milliseconds, far above a one-rank collective."""
 
@@ -473,13 +458,31 @@ def test_link_collectives_match_the_functional_ones_and_queue_behind_the_link(nc
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="NCCL collectives need CUDA")
-@pytest.mark.parametrize("link_sharing", [LinkSharing.OFF, LinkSharing.PCIE])
-def test_pairwise_all_to_all_matches_the_functional_one(nccl_world_of_one, link_sharing):
-    pairwise_all_to_all = getattr(torch.ops.magi.link_pairwise_all_to_all_single, link_sharing.value)
-    wait_tensor = torch.ops._c10d_functional.wait_tensor.default
-    shard = torch.randn(64, 32, device="cuda")
+@pytest.mark.parametrize("link_sharing", [LinkSharing.PCIE, LinkSharing.NVLINK])
+def test_link_all_to_all_runs_the_kernel_a_model_registers_for_the_functional_op(nccl_world_of_one, link_sharing):
+    """A model swaps the all-to-all implementation (e.g. pairwise steps on PCIe) without the compiler knowing."""
+    from magi_compiler.passes.weight_offload.runtime.h2d_op import get_h2d_stream
+    from magi_compiler.passes.weight_offload.runtime.link_collective_op import get_nvlink_stream
 
-    torch.testing.assert_close(wait_tensor(pairwise_all_to_all(shard, [64], [64], nccl_world_of_one)), shard)
+    issuing_streams = []
+
+    def model_all_to_all(input, output_split_sizes, input_split_sizes, group_name):
+        issuing_streams.append(torch.cuda.current_stream())
+        return input.flip(0)
+
+    model_library = torch.library.Library("_c10d_functional", "IMPL")
+    model_library.impl("all_to_all_single", model_all_to_all, "CUDA")
+    try:
+        link_all_to_all = getattr(torch.ops.magi.link_all_to_all_single, link_sharing.value)
+        shard = torch.randn(64, 32, device="cuda")
+        exchanged = torch.ops._c10d_functional.wait_tensor.default(link_all_to_all(shard, [64], [64], nccl_world_of_one))
+        torch.cuda.synchronize()
+    finally:
+        model_library._destroy()
+
+    link_stream = get_h2d_stream() if link_sharing is LinkSharing.PCIE else get_nvlink_stream()
+    assert issuing_streams == [link_stream]
+    torch.testing.assert_close(exchanged, shard.flip(0))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="link streams need CUDA")

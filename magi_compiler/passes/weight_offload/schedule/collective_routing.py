@@ -28,7 +28,7 @@ from torch._inductor.scheduler import BaseSchedulerNode
 
 from magi_compiler.utils import magi_logger
 
-from ...snode_utils import ALL_TO_ALL_OP, link_collective_node
+from ...snode_utils import link_collective_node
 from ...transfer_overlap import LinkSharing
 from ..runtime.link_collective_op import link_kernel_name
 
@@ -36,9 +36,8 @@ from ..runtime.link_collective_op import link_kernel_name
 class RouteCollectivesToLinkStream:
     """Reorder pass that never reorders.  Install it last: positions are final by then."""
 
-    def __init__(self, link_sharing: LinkSharing, pairwise_all_to_all: bool = False) -> None:
+    def __init__(self, link_sharing: LinkSharing) -> None:
         self.link_sharing = link_sharing
-        self.pairwise_all_to_all = pairwise_all_to_all
 
     def __call__(self, snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         routed_count_by_kernel: Counter = Counter()
@@ -46,10 +45,7 @@ class RouteCollectivesToLinkStream:
             collective_node = link_collective_node(snode)
             if collective_node is None:
                 continue
-            is_pairwise = self.pairwise_all_to_all and collective_node.op_overload is ALL_TO_ALL_OP
-            if not (is_pairwise or self.link_sharing.collectives_take_turns):
-                continue
-            kernel_name = link_kernel_name(collective_node.op_overload, self.link_sharing, pairwise_all_to_all=is_pairwise)
+            kernel_name = link_kernel_name(collective_node.op_overload, self.link_sharing)
             collective_node.python_kernel_name = kernel_name
             routed_count_by_kernel[kernel_name.removeprefix("torch.ops.magi.")] += 1
         if routed_count_by_kernel:
