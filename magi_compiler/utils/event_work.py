@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""A c10d ``Work`` backed by a plain CUDA event.
+"""A c10d ``Work`` backed by a plain device event.
 
 ``wait_tensor(t)`` resolves to whichever ``Work`` was registered for ``t``, so an
 op that runs on a stream of its own can publish its completion through the
@@ -26,6 +26,8 @@ from __future__ import annotations
 import torch
 import torch._C._distributed_c10d as _c10d
 
+from magi_compiler.accelerator import PLATFORM
+
 
 class EventWork(_c10d.Work):
     """c10d Work whose ``wait()`` is a stream wait on a recorded event."""
@@ -35,5 +37,5 @@ class EventWork(_c10d.Work):
         self._event = event
 
     def wait(self, timeout=None) -> bool:  # noqa: ARG002 - c10d's signature
-        torch.cuda.current_stream().wait_event(self._event)
+        PLATFORM.current_stream().wait_event(self._event)
         return True

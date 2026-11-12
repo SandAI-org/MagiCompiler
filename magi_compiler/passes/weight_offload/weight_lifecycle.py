@@ -54,6 +54,7 @@ import torch
 import torch.nn as nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
+from magi_compiler.accelerator import PLATFORM
 from magi_compiler.utils import magi_logger
 from magi_compiler.utils.torch_threads import intra_op_threads
 
@@ -132,7 +133,7 @@ def _release_resident_weights(
     resident_slots = [slot for slot in host_slots if store.is_resident(slot)]
     if not resident_slots:
         return released_slots
-    torch.cuda.synchronize()
+    PLATFORM.synchronize()
     released_bytes = store.release_resident_weights(resident_slots)
     magi_logger.info(
         "host offload: %s moved to host; freed %d promoted weight(s) (%.1f MiB) on the device",
@@ -237,9 +238,9 @@ def _probe_move_device(fn) -> torch.device | None:
     moved = fn(probe)
     if not isinstance(moved, torch.Tensor) or moved.dtype != probe.dtype:
         return None
-    if moved.is_cuda:
+    if moved.device.type == PLATFORM.device_type:
         return moved.device
-    moved_back = fn(torch.empty(0, device="cuda"))
+    moved_back = fn(torch.empty(0, device=PLATFORM.device_type))
     return moved_back.device if moved_back.dtype == probe.dtype and moved_back.device.type == "cpu" else None
 
 
@@ -315,7 +316,7 @@ def _skip_managed_weights(fn):
 def _install_weight_standin(names: list[str], param: nn.Parameter, host_buffer: torch.Tensor) -> int:
     """Swap one weight for a storage-free CUDA stand-in and adopt its filled host buffer.
     Returns its slot. Stand-in construction temporarily allocates one full shard."""
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = PLATFORM.device()
     device_standin_buffer = torch.empty(host_buffer.shape, dtype=host_buffer.dtype, device=device)
     device_standin_buffer.untyped_storage().resize_(0)
     new_data = (
@@ -485,11 +486,11 @@ def _apply_with_host_offload(self: nn.Module, fn, recurse: bool = True):
     # None unless fn is a pure host<->CUDA move: dtype casts and other conversions get None.
     # Combined device+dtype moves are unsupported once weights are parked (module docstring).
     target = _probe_move_device(fn)
-    if target is not None and target.type == "cuda" and not _is_enclosing_host_materialization(fn):
+    if target is not None and target.type == PLATFORM.device_type and not _is_enclosing_host_materialization(fn):
         _reject_unrecognized_meta_materialization(module=self)
     # Decided once per instance. Weights on the host at the first CUDA move are parked: built on
     # the host, or built on CUDA and moved to the host first. Weights already on CUDA never are.
-    if target is not None and target.type == "cuda" and not state.parking_decided:
+    if target is not None and target.type == PLATFORM.device_type and not state.parking_decided:
         state.parking_decided = True
         _park_cpu_parameters(
             module=self,
@@ -590,7 +591,7 @@ def _allocate_parameter_storage(
 def _materialize_host_weights(module: nn.Module, fn, recurse: bool, *, min_weight_bytes: int, keep_on_device_bytes: int):
     # fn is to_empty's own empty_like, recognized by qualname above.
     target = fn(torch.empty(0, device="meta")).device
-    if target.type != "cuda":
+    if target.type != PLATFORM.device_type:
         return _call_class_apply(module=module, fn=fn, recurse=recurse)
     state: OffloadState = module._magi_offload_state
     state.parking_decided = True

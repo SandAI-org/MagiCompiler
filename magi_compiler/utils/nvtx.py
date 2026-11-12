@@ -17,6 +17,8 @@ from typing import Any, Callable, TypeVar, cast
 
 import torch
 
+from magi_compiler.accelerator import PLATFORM
+
 # fixed the mypy type check missing bug
 # when a func is wrapped
 # issue: https://stackoverflow.com/questions/65621789/mypy-untyped-decorator-makes-function-my-method-untyped
@@ -29,7 +31,7 @@ _EMIT_NVTX_CTX: None | torch.autograd.profiler.emit_nvtx = None
 @torch.library.custom_op("magi_compile::nvtx_range_push", mutates_args=())
 def nvtx_range_push(event_name: str) -> None:
     """torch.ops.magi_compile.nvtx_range_push"""
-    torch.cuda.nvtx.range_push(event_name)
+    PLATFORM.nvtx.range_push(event_name)
 
 
 @nvtx_range_push.register_fake
@@ -40,7 +42,7 @@ def _(event_name: str) -> None:
 @torch.library.custom_op("magi_compile::nvtx_range_pop", mutates_args=())
 def nvtx_range_pop() -> None:
     """torch.ops.magi_compile.nvtx_range_pop"""
-    torch.cuda.nvtx.range_pop()
+    PLATFORM.nvtx.range_pop()
 
 
 @nvtx_range_pop.register_fake
@@ -68,14 +70,14 @@ class add_nvtx_event:
             # so we have no choice but assign a constant event name when compiling
             nvtx_range_push("torch compile region")
         else:
-            torch.cuda.nvtx.range_push(self.enter_name)
+            PLATFORM.nvtx.range_push(self.enter_name)
         return self
 
     def __exit__(self, *excinfo):
         if torch.compiler.is_compiling():
             nvtx_range_pop()
         else:
-            torch.cuda.nvtx.range_pop()
+            PLATFORM.nvtx.range_pop()
 
 
 def instrument_nvtx(func: F) -> F:
@@ -106,21 +108,21 @@ def instrument_nvtx(func: F) -> F:
 
 
 def profile_start(event_name: str, record_shapes: bool = False):
-    torch.cuda.cudart().cudaProfilerStart()
-    torch.cuda.nvtx.range_push(event_name)
+    PLATFORM.profiler_start()
+    PLATFORM.nvtx.range_push(event_name)
     global _EMIT_NVTX_CTX
-    _EMIT_NVTX_CTX = torch.autograd.profiler.emit_nvtx(record_shapes=record_shapes)
+    _EMIT_NVTX_CTX = PLATFORM.emit_nvtx(record_shapes=record_shapes)
     _EMIT_NVTX_CTX.__enter__()
 
 
 def profile_mark(event_name: str):
-    torch.cuda.nvtx.range_pop()
-    torch.cuda.nvtx.range_push(event_name)
+    PLATFORM.nvtx.range_pop()
+    PLATFORM.nvtx.range_push(event_name)
 
 
 def profile_end():
-    torch.cuda.nvtx.range_pop()
-    torch.cuda.cudart().cudaProfilerStop()
+    PLATFORM.nvtx.range_pop()
+    PLATFORM.profiler_stop()
     global _EMIT_NVTX_CTX
     if _EMIT_NVTX_CTX is not None:
         _EMIT_NVTX_CTX.__exit__(None, None, None)

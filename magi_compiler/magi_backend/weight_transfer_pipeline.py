@@ -29,6 +29,7 @@ import torch.distributed as dist
 import torch.fx as fx
 from torch.distributed.tensor import DTensor
 
+from magi_compiler.accelerator import PLATFORM
 from magi_compiler.config import CudaGraphMode, FSDPConfig, OffloadConfig
 from magi_compiler.passes.fsdp_overlap import (
     FsdpAutoBucket,
@@ -120,7 +121,7 @@ def build_transfer_overlap_passes(
     passes: list = [SnodeCostProfile(costs, estimator)]
 
     if fsdp_config.enable_fsdp:
-        if fsdp_config.bucket_mode == "auto":
+        if fsdp_config.bucket_mode == "auto" and PLATFORM.coalesced_all_gather:
             # Ahead of the FSDP reorder, which places the merged gathers;
             # bucketing needs profiled costs and prices the nodes it creates.
             passes.append(
@@ -160,6 +161,9 @@ def _validate_weight_transfer_config(
 ) -> None:
     if fsdp_config.enable_fsdp:
         assert cudagraph_mode == CudaGraphMode.NONE, "fsdp_config.enable_fsdp requires cudagraph_mode=NONE"
+        assert (
+            fsdp_config.transport != "copy_engine" or PLATFORM.has_symm_mem
+        ), "fsdp_config.transport='copy_engine' needs CUDA symmetric memory; use 'nccl'"
     if offload_config.graph_weight_offload:
         assert (
             not offload_config.model_cpu_offload

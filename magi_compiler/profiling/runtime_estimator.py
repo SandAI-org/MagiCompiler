@@ -61,6 +61,7 @@ from torch._inductor.scheduler import BaseSchedulerNode, ExternKernelSchedulerNo
 from torch._inductor.utils import contains_collective, contains_wait
 from torch._inductor.virtualized import V
 
+from magi_compiler.accelerator import PLATFORM
 from magi_compiler.utils import magi_logger
 from magi_compiler.utils.dist_utils import get_cpu_gloo_group
 
@@ -410,7 +411,7 @@ def _measure_extern(snode: ExternKernelSchedulerNode, fixed_iters: bool = False)
 
 
 def _time_fixed(fn, warmup: int = 3, iters: int = 10) -> float:
-    """CUDA-event timing over a FIXED iteration count, in nanoseconds.
+    """Device-event timing over a FIXED iteration count, in nanoseconds.
 
     Fixed, not adaptive: anything that issues a collective must issue the same
     number of them on every rank, or the NCCL counts diverge and the ranks
@@ -418,14 +419,14 @@ def _time_fixed(fn, warmup: int = 3, iters: int = 10) -> float:
     """
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    PLATFORM.synchronize()
+    start = PLATFORM.Event(enable_timing=True)
+    end = PLATFORM.Event(enable_timing=True)
     start.record()
     for _ in range(iters):
         fn()
     end.record()
-    torch.cuda.synchronize()
+    PLATFORM.synchronize()
     return (start.elapsed_time(end) / iters) * 1e6  # ms/iter -> ns
 
 
