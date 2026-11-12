@@ -177,6 +177,11 @@ class H2dLoadReorder(OverlapPass):
         device_only_bytes = sum(task.transfer_bytes for task in device_only_tasks)
         promotable_tasks = [task for task in tasks if task.anchor not in device_only_anchors]
         best_schedule: LoadSchedule | None = None
+        # TODO: take device_only_bytes out of weight_budget_bytes before _iter_budget_splits divides it, and leave
+        # device-only tasks out of its unhoisted in-flight floor. A split whose resident share is below
+        # device_only_bytes clamps the residency search to zero yet still hands the scheduler its full in-flight
+        # share, so on a later compile device-only plus in-flight can exceed the budget (12 MiB budget, 4 MiB
+        # device-only, two 6 MiB loads whose buffers never overlap: 4 + 12 = 16 MiB instead of 4 + 6).
         for resident_budget_bytes, inflight_budget_bytes in self._iter_budget_splits(tasks):
             resident_anchors = device_only_anchors | self._search_resident_weights(
                 tasks=promotable_tasks,
