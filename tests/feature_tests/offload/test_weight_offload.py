@@ -1162,10 +1162,12 @@ def _registered_parameter(module: torch.nn.Module, name: str = "weight"):
     return module._parameters[name]
 
 
-def _install_host_first_hooks(instance, *, min_shard_mib=0.0):
+def _install_host_first_hooks(instance, *, min_shard_mib=0.0, keep_on_device_bytes=0):
     from magi_compiler.passes.weight_offload import install_host_first_hooks
 
-    install_host_first_hooks(instance=instance, min_weight_bytes=int(min_shard_mib * 1024 * 1024))
+    install_host_first_hooks(
+        instance=instance, min_weight_bytes=int(min_shard_mib * 1024 * 1024), keep_on_device_bytes=keep_on_device_bytes
+    )
     return instance
 
 
@@ -1369,6 +1371,35 @@ def test_a_shard_below_the_floor_is_materialized_on_the_device(dist_1rank):
 
     assert _registered_parameter(root.inner.big)._local_tensor.device.type == "cuda"
     assert _registered_parameter(root.inner.small)._local_tensor.device.type == "cuda"
+
+
+@requires_cuda
+def test_shards_within_the_keep_on_device_budget_get_no_host_copy(dist_1rank):
+    """Weights the budget covers are plain device shards: no pinned bytes, no slot, nothing to load."""
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
+
+    root = _shard_on_meta(dist_1rank, rows=256, cols=64)
+    _install_host_first_hooks(root.inner, keep_on_device_bytes=256 * 64 * 2)  # exactly big, the first weight
+
+    root.to_empty(device=torch.device("cuda"))
+
+    big = _registered_parameter(root.inner.big)._local_tensor
+    assert big.device.type == "cuda" and big.untyped_storage().nbytes() == 256 * 64 * 2
+    assert get_global_host_weight_store().slot_for_tensor(big) is None
+    assert _registered_parameter(root.inner.small)._local_tensor.device.type == "cpu", "small is past the budget"
+
+
+@requires_cuda
+def test_a_host_built_module_moves_weights_within_the_keep_on_device_budget_with_torch():
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
+
+    module = _install_host_first_hooks(_CompiledWeightModule(rows=256, cols=64), keep_on_device_bytes=256 * 64 * 4)
+
+    module.to("cuda")
+
+    store = get_global_host_weight_store()
+    assert store.slot_for_tensor(module.big.weight) is None and module.big.weight.untyped_storage().nbytes() > 0
+    assert store.slot_for_tensor(module.small.weight) is not None, "small is past the budget"
 
 
 @requires_cuda
