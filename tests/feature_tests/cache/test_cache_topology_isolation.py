@@ -160,7 +160,9 @@ class TestCompileStateIsolation:
                 return x
 
         probe = Probe()
-        conf = SimpleNamespace(fsdp_config=SimpleNamespace(transport="nccl"))
+        conf = SimpleNamespace(
+            fsdp_config=SimpleNamespace(transport="nccl"), offload_config=SimpleNamespace(graph_weight_offload=False)
+        )
         with patch.dict(os.environ, {"MAGI_COMPILE_TOPOLOGY_KEY": "cp8_dp1"}):
             _magi_compile_bound_method(probe, {"x": 0}, conf, "probe", method_name="forward")
 

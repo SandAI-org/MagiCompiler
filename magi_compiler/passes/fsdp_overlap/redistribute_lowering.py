@@ -18,15 +18,17 @@ import inspect
 import math
 
 import torch
+import torch.distributed as dist
 import torch.fx as fx
+from torch.distributed.tensor import DTensor, Shard
 
 from magi_compiler.utils import magi_logger
 
+from ..snode_utils import ALL_GATHER_OP
 from .node_meta import mark_weight_ag
 
 # The functional collectives we lower a SimpleFSDP weight gather into.
-_ALL_GATHER = torch.ops._c10d_functional.all_gather_into_tensor.default
-_WAIT = torch.ops._c10d_functional.wait_tensor.default
+_WAIT_TENSOR_OP = torch.ops._c10d_functional.wait_tensor.default
 _PAD = torch.ops.aten.constant_pad_nd.default
 _SLICE = torch.ops.aten.slice.Tensor
 _TO_COPY = torch.ops.aten._to_copy.default
@@ -71,10 +73,10 @@ def _input_is_weight(node: fx.Node) -> bool:
     return any(t in name for t in ("parameter", "parameters", "weight", "bias"))
 
 
-def _dtensor_meta(node: fx.Node):
+def _dtensor_meta(node: fx.Node) -> DTensor | None:
     """Return the DTensor example_value carried on a node, or None."""
     ev = node.meta.get("example_value")
-    return ev if getattr(ev, "_spec", None) is not None else None
+    return ev if isinstance(ev, DTensor) else None
 
 
 def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
@@ -97,9 +99,19 @@ def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
     are kept as separate nodes.  Only ``Shard(0)`` is handled; anything else is
     left as the original prim path and logged.
 
-    Returns the number of redistribute pairs lowered.
+    A weight whose mesh is a single rank inside a multi-rank job (expert
+    parallelism as wide as the job leaves each expert mesh one rank) is its own
+    full weight, so it becomes just the ``to_local`` and the cast: a gather there
+    would be a device-to-device copy of the whole weight, and its local-copy cost
+    would be mistaken for collective cost by anything pricing gathers.  A
+    single-process run keeps the gather, so its graph has the same shape a
+    multi-rank run of the same model produces.
+
+    Returns the number of redistribute pairs lowered to a gather.
     """
+    multi_rank = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
     lowered = 0
+    local_only = 0
     skipped = 0
 
     for node in list(graph.graph.nodes):
@@ -123,7 +135,7 @@ def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
 
         spec = in_dt._spec
         placement = spec.placements[0] if len(spec.placements) == 1 else None
-        if placement is None or not getattr(placement, "is_shard", lambda: False)() or placement.dim != 0:
+        if not isinstance(placement, Shard) or placement.dim != 0:
             # Only single-mesh Shard(0) is supported; leave others on the prim path.
             skipped += 1
             continue
@@ -131,7 +143,7 @@ def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
         mesh = spec.mesh
         try:
             group_name = mesh._dim_group_names[0]
-            world = int(mesh.size(0))
+            group_size = int(mesh.size(0))
         except Exception as exc:  # pragma: no cover - defensive
             magi_logger.warning("FSDP lowering skip %s: cannot resolve group/world (%s)", node.name, exc)
             skipped += 1
@@ -141,7 +153,7 @@ def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
         local = in_dt._local_tensor  # FakeTensor with this rank's shard shape
         F = int(full.shape[0])
         L = int(local.shape[0])
-        chunk = math.ceil(F / world)
+        chunk = math.ceil(F / group_size)
 
         # forward_dtype: cast the local shard before the gather (matches torchtitan).
         fwd_dtype = _forward_dtype(node)
@@ -160,6 +172,14 @@ def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
                 cur.meta["example_value"] = local.to(fwd_dtype)
                 cur_dtype = fwd_dtype
 
+        if group_size == 1 and multi_rank:
+            to_local.replace_all_uses_with(cur)
+            graph.graph.erase_node(to_local)
+            graph.graph.erase_node(node)
+            local_only += 1
+            continue
+
+        with graph.graph.inserting_before(node):
             # Pad the local shard up to `chunk` rows when this rank owns fewer
             # (uneven Shard(0): trailing ranks get remainder/empty).
             #
@@ -173,15 +193,15 @@ def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
                 padded.meta["example_value"] = local.new_empty((chunk, *local.shape[1:]), dtype=cur_dtype)
                 cur = padded
 
-            ag = graph.graph.call_function(_ALL_GATHER, (cur, world, group_name))
-            ag.meta["example_value"] = local.new_empty((world * chunk, *local.shape[1:]), dtype=cur_dtype)
-            mark_weight_ag(ag, uneven=world * chunk != F)
+            ag = graph.graph.call_function(ALL_GATHER_OP, (cur, group_size, group_name))
+            ag.meta["example_value"] = local.new_empty((group_size * chunk, *local.shape[1:]), dtype=cur_dtype)
+            mark_weight_ag(ag, uneven=group_size * chunk != F)
 
-            wait = graph.graph.call_function(_WAIT, (ag,))
-            wait.meta["example_value"] = local.new_empty((world * chunk, *local.shape[1:]), dtype=cur_dtype)
+            wait = graph.graph.call_function(_WAIT_TENSOR_OP, (ag,))
+            wait.meta["example_value"] = local.new_empty((group_size * chunk, *local.shape[1:]), dtype=cur_dtype)
 
             result = wait
-            if world * chunk != F:
+            if group_size * chunk != F:
                 sliced = graph.graph.call_function(_SLICE, (wait, 0, 0, F))
                 sliced.meta["example_value"] = local.new_empty((F, *local.shape[1:]), dtype=cur_dtype)
                 result = sliced
@@ -193,10 +213,14 @@ def lower_prim_redistribute_to_collectives(graph: fx.GraphModule) -> int:
         graph.graph.erase_node(node)
         lowered += 1
 
-    if lowered:
+    if lowered or local_only:
         graph.graph.lint()
         graph.recompile()
     magi_logger.info(
-        "FSDP redistribute lowering: lowered %d weight redistribute -> explicit collectives (skipped %d)", lowered, skipped
+        "FSDP redistribute lowering: lowered %d weight redistribute -> explicit collectives, %d on a one-rank mesh "
+        "-> local shard with no gather (skipped %d)",
+        lowered,
+        local_only,
+        skipped,
     )
     return lowered

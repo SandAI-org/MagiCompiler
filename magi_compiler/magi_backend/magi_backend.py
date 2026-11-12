@@ -16,8 +16,9 @@ import ast
 import dataclasses
 import pprint
 import time
+import uuid
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -35,6 +36,7 @@ from magi_compiler.config import CompileConfig, CompileMode, CudaGraphMode, indu
 from magi_compiler.magi_depyf.timeline import observe_lifecycle, observe_lifecycle_context
 from magi_compiler.offload.offload_warpper import OffloadWrapper, is_python_scalar_input, mark_python_scalar_inputs
 from magi_compiler.passes import CustomJointGraphPartitionFn, FullGraphPassManager, PostGradPassManager, pass_context
+from magi_compiler.passes.weight_offload import OffloadCache
 from magi_compiler.utils import compilation_counter, compute_code_hash, compute_graph_hash, compute_hash, magi_logger
 from magi_compiler.utils.visualize import save_fx_graph_visualization
 
@@ -44,6 +46,9 @@ from .cuda_graph_mgr import gen_wrap_func_for_cudagraph
 from .partition_rules import resolve_defined_ops
 from .piecewise_backend import PiecewiseBackend
 from .piecewise_compiler import CompilerInterface, EagerAdaptor, InductorStandaloneAdaptor
+from .weight_transfer_pipeline import WeightTransferPipeline
+
+_OVERLAP_PASSES_KEY = "reorder_for_compute_comm_overlap_passes"
 
 compilation_start_time: float = 0.0
 
@@ -91,6 +96,7 @@ class CompilerManager:
         self.compile_config = compile_config
         self.compiler = make_compiler(compile_config)
         self.disable_cache = compile_config.disable_cache
+        self.offload_cache = OffloadCache(compile_config.offload_config.graph_weight_offload)
 
     @property
     def hash(self) -> str:
@@ -101,9 +107,21 @@ class CompilerManager:
         """Provide compilation context for the duration of compilation to set
         any torch global properties we want to scope to a single Inductor
         compilation (e.g. pass context)."""
-        with observe_lifecycle_context("pass_context", runtime_shape=runtime_shape, subgraph_index=graph_index):
-            with pass_context(runtime_shape, graph_index):
-                yield
+        torch_cache_context = nullcontext()
+        if not self.offload_cache.can_replay_artifact():
+            from torch.compiler import config as compiler_config
+
+            # Without a matching sidecar, scheduling must rebuild residency.
+            # A fresh AOT/FX key forces compilation while preserving artifact export.
+            torch_cache_context = compiler_config.patch(
+                cache_key_tag=f"{compiler_config.cache_key_tag}:offload:{uuid.uuid4().hex}"
+            )
+        with (
+            torch_cache_context,
+            observe_lifecycle_context("pass_context", runtime_shape=runtime_shape, subgraph_index=graph_index),
+            pass_context(runtime_shape, graph_index),
+        ):
+            yield
 
     def initialize_cache(self, cache_dir: Path):
         """
@@ -113,6 +131,7 @@ class CompilerManager:
         cache_dir=/path/to/magi_cache/model_{tag}_rank_{rank}_{topology}/hash_str/[prefix/]
         inside cache_dir, there will be:
         - subgraph_indices.py
+        - host_slots.py (when graph_weight_offload is on)
         - computation_graph.py
 
         for multiple prefixes, they can share the same base cache dir of
@@ -122,6 +141,7 @@ class CompilerManager:
 
         self.cache_dir: Path = cache_dir
         self.cache_file_path: Path = cache_dir / "subgraph_indices.py"
+        self.offload_cache.initialize(cache_dir)
 
         if self.disable_cache:
             magi_logger.info("MagiCompiler's cache is disabled.")
@@ -159,9 +179,31 @@ class CompilerManager:
         data = printer.pformat(serializable)
         with self.cache_file_path.open("w") as f:
             f.write(data)
+        self.offload_cache.save_slot_sidecar()
+
+    def bind_offload_cache(self, graph: fx.GraphModule, *, sync_across_ranks: bool) -> None:
+        """Match the host_slots sidecar to this process's bound weights.
+
+        On a match, install baked->current remap and replay the resident set
+        the placement pass chose at bake time.  On a miss, drop the piecewise
+        indices so ``load()`` cannot replay an artifact whose slot integers
+        belong to another pool.  ``sync_across_ranks`` turns one rank's miss
+        into a miss on every rank; it is required whenever Inductor issues
+        WORLD collectives, since only missing ranks enter Inductor.
+        """
+        if self.disable_cache:
+            return
+        reason = self.offload_cache.prepare_graph_replay(graph, sync_across_ranks=sync_across_ranks)
+        if reason is not None:
+            self.cache.clear()
+            self._remaining_restart_skips = {}
+            if self.compile_config.assert_cache_hit:
+                raise RuntimeError(f"MAGI_COMPILE_ASSERT_CACHE_HIT: {reason}. Re-bake the compile cache.")
 
     @observe_lifecycle("compiler_manager_load")
     def load(self, graph: fx.GraphModule, example_inputs: list[Any], cache_entry: CacheEntry) -> Callable | None:
+        if not self.offload_cache.can_replay_artifact():
+            return None
         if cache_entry not in self.cache:
             return None
 
@@ -189,7 +231,9 @@ class CompilerManager:
             cache_entry.runtime_shape,
             f"Directly load the {cache_entry.graph_index}-th graph from {cache_entry.backend_name} via handle {cache_handle}",
         )
-        return self.compiler.load(graph, example_inputs, cache_entry, cache_handle)
+        compiled = self.compiler.load(graph, example_inputs, cache_entry, cache_handle)
+        compiled = self.offload_cache.wrap_with_slot_remap(compiled) if compiled else None
+        return compiled
 
     @observe_lifecycle("compiler_manager_compile")
     def compile(
@@ -209,7 +253,7 @@ class CompilerManager:
             global compilation_start_time
             compilation_start_time = time.time()
 
-        # Step1: Try loading from the cache
+        # Step1: Try loading from the cache.
         cache_entry = CacheEntry(runtime_shape, graph_index, self.compiler.name)
         compiled_graph = self.load(graph, example_inputs, cache_entry)
         if compiled_graph is not None:
@@ -253,6 +297,11 @@ class CompilerManager:
         self, cache_entry: CacheEntry, cache_handle: CacheHandle | None, runtime_shape: int | None, key: str
     ) -> bool:
         if self.disable_cache:
+            return False
+        if not self.offload_cache.can_store_artifact():
+            # Replay session: artifacts on disk use baked slots.  A freshly
+            # compiled graph would bake this process's slots; mixing the two
+            # under one sidecar is unsafe.
             return False
         if cache_handle is None:
             self.cache.pop(cache_entry, None)
@@ -558,6 +607,9 @@ class MagiBackend:
         self.traced_files = traced_files
         self.inductor_compile_config = inductor_compile_config
         self._configure_custom_passes()
+        self._inductor_compile_config_hash = inductor_compile_config_hash(self.inductor_compile_config)
+        # A RestartAnalysis retrace rebuilds the overlap passes from these, not from the first trace's.
+        self._default_overlap_passes = self.inductor_compile_config.get(_OVERLAP_PASSES_KEY)
         self.compiler_manager: CompilerManager = CompilerManager(self.compile_config)
         self._called_once = False
 
@@ -592,7 +644,7 @@ class MagiBackend:
         hash_key = compute_hash(
             [
                 self.compile_config.hash,
-                inductor_compile_config_hash(self.inductor_compile_config),
+                self._inductor_compile_config_hash,
                 self.compiler_manager.hash,
                 compute_code_hash(self.traced_files),
                 compute_graph_hash(graph, example_inputs),
@@ -604,64 +656,25 @@ class MagiBackend:
         self.local_magi_cache_path.mkdir(parents=True, exist_ok=True)
         self.compiler_manager.initialize_cache(self.local_magi_cache_path)
 
-    def _apply_fsdp_fullgraph_overlap(self, graph: fx.GraphModule, example_inputs) -> None:
-        """Whole-graph FSDP all-gather / compute overlap (disable_graph_split path).
-
-        1. Lower SimpleFSDP weight prim_redistribute -> explicit collectives, bind
-           the gathered weights into symmetric memory when the transport is the copy
-           engine, and optionally bucket them over the whole graph (no region
-           partitioning; buckets break only at dtype changes and the size cap).
-        2. Install the profiling runtime estimator at ``config.estimate_op_runtime``
-           (the analytical roofline is unusable for our sizing decisions).
-        3. Install the latest-safe-launch reorder pass, REPLACING PyTorch's builtin
-           raise_comms/sink_waits, and enable reorder_for_compute_comm_overlap.
-        """
-        fsdp_cfg = self.compile_config.fsdp_config
-        assert (
-            self.compile_config.disable_graph_split
-        ), "fsdp_config.enable_fullgraph_overlap requires disable_graph_split=True"
-        assert (
-            self.compile_config.cudagraph_mode == CudaGraphMode.NONE
-        ), "fsdp_config.enable_fullgraph_overlap requires cudagraph_mode=NONE"
-        assert (
-            fsdp_cfg.transport != "copy_engine" or PLATFORM.has_symm_mem
-        ), "fsdp_config.transport='copy_engine' needs CUDA symmetric memory; use 'nccl'"
-
-        from magi_compiler.passes.fsdp_overlap import FsdpOverlapReorder, lower_and_bucket_full_graph
-        from magi_compiler.profiling import ProfilingRuntimeEstimator
-
-        bucket_size_bytes = int(fsdp_cfg.bucket_size_mib) * 1024 * 1024
-        n_buckets = lower_and_bucket_full_graph(
-            graph,
-            fsdp_cfg.bucket_mode,
-            bucket_size_bytes=bucket_size_bytes,
-            transport=fsdp_cfg.transport,
-            example_inputs=example_inputs,
-            min_shard_bytes=int(fsdp_cfg.symm_min_shard_mib) * 1024 * 1024,
+    @observe_lifecycle("weight_transfer_pipeline")
+    def _apply_weight_transfer_pipeline(self, graph: fx.GraphModule, example_inputs) -> None:
+        weight_transfer_pipeline = WeightTransferPipeline(
+            fsdp_config=self.compile_config.fsdp_config,
+            offload_config=self.compile_config.offload_config,
+            cudagraph_mode=self.compile_config.cudagraph_mode,
+            disable_graph_split=self.compile_config.disable_graph_split,
         )
-        magi_logger.info(
-            "FSDP fullgraph overlap: transport=%s bucket_mode=%s bucket_size=%d MiB created %d buckets",
-            fsdp_cfg.transport,
-            fsdp_cfg.bucket_mode,
-            fsdp_cfg.bucket_size_mib,
-            n_buckets,
+        # Out of the cache key (see __init__): CompileConfig.hash already covers the fsdp/offload configs they come from.
+        passes = weight_transfer_pipeline.rewrite_graph_and_build_scheduler_passes(
+            graph=graph, example_inputs=example_inputs, default_passes=self._default_overlap_passes
         )
-
-        if fsdp_cfg.cost_mode == "analytical":
-            self._fsdp_overlap_estimator = None
-            cost_fn = None  # reorder pass defaults to Inductor's analytical estimate
-        else:  # "profile_sync" -- the default for BOTH single- and multi-rank
-            self._fsdp_overlap_estimator = ProfilingRuntimeEstimator()
-            self._fsdp_overlap_estimator._sync_across_ranks = True
-            cost_fn = self._fsdp_overlap_estimator
-
-        reorder = FsdpOverlapReorder(
-            comm_overlap_window_margin_ns=fsdp_cfg.comm_overlap_window_margin_ns,
-            cost_fn=cost_fn,
-            comm_overlap_window_scale=fsdp_cfg.comm_overlap_window_scale,
-        )
-        self.inductor_compile_config["reorder_for_compute_comm_overlap"] = True
-        self.inductor_compile_config["reorder_for_compute_comm_overlap_passes"] = [reorder]
+        if passes is not None:
+            self.inductor_compile_config["reorder_for_compute_comm_overlap"] = True
+            self.inductor_compile_config[_OVERLAP_PASSES_KEY] = passes
+        if self.compile_config.offload_config.graph_weight_offload:
+            self.compiler_manager.bind_offload_cache(
+                graph, sync_across_ranks=weight_transfer_pipeline.compiles_in_rank_lockstep
+            )
 
     @observe_lifecycle("graph_split")
     def _split_graph(self, graph: fx.GraphModule, example_inputs) -> tuple[fx.GraphModule, list[SplitItem]]:
@@ -679,11 +692,6 @@ class MagiBackend:
         resolved_ops: list[torch._ops.OpOverload] = resolve_defined_ops(fx_split_ops)
         magi_logger.info(f"Setting up FX-level graph split with ops: {fx_split_ops=}")
         magi_logger.info(f"Resolved splitting ops for FX-level graph split: {resolved_ops=}")
-
-        # Step 1.4: whole-graph FSDP overlap. enable_fsdp is a process-wide flag; VAE and other
-        # split-graph models share it with FSDP DiT, so skip unless this graph is fullgraph.
-        if self.compile_config.fsdp_config.enable_fsdp and self.compile_config.disable_graph_split:
-            self._apply_fsdp_fullgraph_overlap(graph, example_inputs)
 
         # Step 2: split graph by ops, we split graph based on resolved_ops, which becomes the partitioned single graph.
         subgraph_id = 0
@@ -744,6 +752,9 @@ class MagiBackend:
 
         mark_python_scalar_inputs(graph)
         self.full_graph_pass_manager(graph)
+
+        # Bind weights on the unsplit graph and install the corresponding scheduler passes.
+        self._apply_weight_transfer_pipeline(graph, example_inputs)
 
         split_gm, piecewise_graphs = self._split_graph(graph, example_inputs)
 

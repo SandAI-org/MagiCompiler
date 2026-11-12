@@ -14,24 +14,22 @@
 
 """Graph-side copy-engine transport: bind eligible weights, then retarget tagged gathers.
 
-``bind_weights_for_copy_engine`` runs between lowering and bucketing so a bucket
-stays all-bound or all-unbound. ``rewrite_weight_ag_to_copy_engine`` retargets
-whatever carries ``node_meta.CE_BOUND``. Operators live in ``symm_mem/``.
+``bind_weights_for_copy_engine`` runs after lowering; ``rewrite_weight_ag_to_copy_engine``
+then retargets whatever carries ``node_meta.CE_BOUND``, one gather per weight -- the
+scheduler-stage bucketing (``FsdpAutoBucket``) merges them later, never across
+transports.  Operators live in ``symm_mem/``.
 """
 
 from __future__ import annotations
 
 from typing import Any, Sequence
 
-import torch
 import torch.fx as fx
 
 from magi_compiler.utils import magi_logger
 
+from ..snode_utils import ALL_GATHER_OP
 from .node_meta import is_ce_bound, is_uneven_shard, is_weight_ag, mark_ce_bound
-
-_ALL_GATHER = torch.ops._c10d_functional.all_gather_into_tensor.default
-_ALL_GATHER_COALESCED = torch.ops._c10d_functional.all_gather_into_tensor_coalesced.default
 
 
 def _weight_holder(src) -> fx.Node | None:
@@ -50,7 +48,7 @@ def copy_engine_weight_candidates(graph: fx.GraphModule) -> list[tuple[fx.Node, 
     """
     candidates: list[tuple[fx.Node, fx.Node]] = []
     for node in graph.graph.nodes:
-        if node.op != "call_function" or node.target is not _ALL_GATHER:
+        if node.op != "call_function" or node.target is not ALL_GATHER_OP:
             continue
         if not is_weight_ag(node) or is_uneven_shard(node):
             continue
@@ -63,9 +61,8 @@ def copy_engine_weight_candidates(graph: fx.GraphModule) -> list[tuple[fx.Node, 
 def bind_weights_for_copy_engine(graph: fx.GraphModule, example_inputs: Sequence[Any] | None, min_shard_bytes: int = 0) -> int:
     """Move eligible weights into symmetric memory and tag the gathers that got served.
 
-    Must run before bucketing. ``example_inputs`` are the live tensors Dynamo
-    captured; without them nothing binds. Returns how many gathers are now
-    copy-engine backed.
+    ``example_inputs`` are the live tensors Dynamo captured; without them nothing
+    binds. Returns how many gathers are now copy-engine backed.
     """
     from magi_compiler.symm_mem.bind import bind_graph_weights
 
@@ -84,19 +81,19 @@ def bind_weights_for_copy_engine(graph: fx.GraphModule, example_inputs: Sequence
 
 def rewrite_weight_ag_to_copy_engine(graph: fx.GraphModule) -> int:
     """Retarget CE_BOUND weight gathers onto copy-engine ops. Returns how many."""
-    from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER, CE_ALL_GATHER_COALESCED
+    from magi_compiler.symm_mem.all_gather import CE_ALL_GATHER
 
     rewritten = 0
     skipped = 0
     for node in graph.graph.nodes:
-        if node.op != "call_function" or node.target not in (_ALL_GATHER, _ALL_GATHER_COALESCED):
+        if node.op != "call_function" or node.target is not ALL_GATHER_OP:
             continue
         if not is_weight_ag(node):
             continue
         if not is_ce_bound(node):
             skipped += 1
             continue
-        node.target = CE_ALL_GATHER if node.target is _ALL_GATHER else CE_ALL_GATHER_COALESCED
+        node.target = CE_ALL_GATHER
         rewritten += 1
 
     if rewritten:

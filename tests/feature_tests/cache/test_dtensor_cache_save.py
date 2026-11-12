@@ -12,23 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SimpleFSDP (DTensor) subgraphs must produce a saveable, reusable compiled artifact.
-
-Bug (400B inference bake): through torch 2.9 Dynamo traces SimpleFSDP's
-``param.redistribute(...).to_local(...)`` into ``prim_redistribute`` / ``prim_to_local``
-closures. AOTAutograd refuses to key a graph that calls them, records no aot_autograd
-artifact, and ``CompiledArtifact.save()`` asserts:
-
-    Failed to save compiled artifact for key 'artifact_shape_None_subgraph_0', skipping cache:
-    CacheInfo(artifacts=defaultdict(<class 'list'>, {'inductor': [...], 'aot_autograd': []}))
-
-so every bake recompiles every subgraph.
-
-Fix: ``_nonce_autograd_cache_key_on_keying_failure`` in piecewise_compiler.py.
-
-Driven through torchrun like the fsdp e2e tests: world=1, and world=2 where the weights are
-real Shard(0) DTensors all-gathered inside the graph.
-"""
+"""SimpleFSDP DTensor graphs produce saved artifacts reusable by a later process."""
 
 from __future__ import annotations
 
