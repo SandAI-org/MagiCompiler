@@ -23,6 +23,9 @@ class MusaPlatform(Platform):
     dispatch_key = "PrivateUse1"
     # Under the default "global" mode torch_musa fails every capture, even a bare ``x * 2``.
     graph_capture_error_mode = "relaxed"
+    runtime_pointwise_autotune = False
+    # MCCL hangs on all_gather_into_tensor_coalesced; keep FSDP weight gathers unbucketed (plain all_gather works).
+    coalesced_all_gather = False
 
     def __init__(self) -> None:
         import torch_musa  # noqa: F401  registers torch.musa and the "musa" device type

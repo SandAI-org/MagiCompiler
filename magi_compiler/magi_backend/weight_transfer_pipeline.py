@@ -121,7 +121,7 @@ def build_transfer_overlap_passes(
     passes: list = [SnodeCostProfile(costs, estimator)]
 
     if fsdp_config.enable_fsdp:
-        if fsdp_config.bucket_mode == "auto":
+        if fsdp_config.bucket_mode == "auto" and PLATFORM.coalesced_all_gather:
             # Ahead of the FSDP reorder, which places the merged gathers;
             # bucketing needs profiled costs and prices the nodes it creates.
             passes.append(

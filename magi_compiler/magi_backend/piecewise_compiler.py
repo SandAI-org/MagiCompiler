@@ -25,6 +25,7 @@ import torch
 import torch.fx as fx
 from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
+from magi_compiler import accelerator
 from magi_compiler.magi_depyf.timeline import observe_lifecycle
 from magi_compiler.utils import compilation_counter, compute_hash, magi_logger
 
@@ -335,6 +336,10 @@ class InductorStandaloneAdaptor(CompilerInterface):
         # Graph partition only serves Inductor's own CUDA graphs, which MagiCompiler never enables; before PT 2.10 its
         # free-symbol walk is exponential in the depth of a chain of multi-output extern kernels (custom ops).
         current_config: dict[str, Any] = {"triton.autotune_at_compile_time": False, "graph_partition": False}
+        if not accelerator.PLATFORM.runtime_pointwise_autotune:
+            # The generated kernels' do_bench reads this process-wide flag, not the per-compile patch, and other
+            # inductor compilations outside this path would still autotune; disable it for watchdog devices (MUSA).
+            torch._inductor.config.triton.autotune_pointwise = False
         if inductor_compile_config is not None:
             current_config.update(inductor_compile_config)
         if isinstance(runtime_shape, int):

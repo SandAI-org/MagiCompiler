@@ -44,6 +44,13 @@ class Platform:
     has_symm_mem = False
     # torch.cuda.graph's default.
     graph_capture_error_mode = "global"
+    # Inductor benchmarks each pointwise-kernel config at runtime with do_bench, which synchronizes; a device whose
+    # kernels hit an execution-time watchdog (MUSA) aborts that benchmark. CUDA has no such watchdog and keeps it.
+    runtime_pointwise_autotune: bool = True
+    # Whether the collective library implements all_gather_into_tensor_coalesced, the merged gather FSDP
+    # auto-bucketing emits. NCCL does; a backend whose library lacks it (MUSA/MCCL) hangs on the coalesced op
+    # while plain all_gather_into_tensor still works.
+    coalesced_all_gather: bool = True
 
     def device(self, index: Optional[int] = None) -> torch.device:
         return torch.device(self.device_type, self.current_device() if index is None else index)
