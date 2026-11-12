@@ -302,6 +302,7 @@ def _magi_compile_bound_method(
         install_host_first_hooks(
             instance=instance,
             min_weight_bytes=conf.offload_config.offload_min_shard_mib * 1024 * 1024,
+            keep_on_device_bytes=conf.offload_config.offload_keep_on_device_mib * 1024 * 1024,
             host_weight_sharing=conf.offload_config.offload_host_weight_sharing,
         )
 
