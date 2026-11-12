@@ -101,7 +101,7 @@ def _h2d_load_bwd(ctx, grad: torch.Tensor):
 
 def _register_h2d_load_op() -> None:
     _H2D_OP_LIBRARY.define(_H2D_LOAD_SCHEMA)
-    _H2D_OP_LIBRARY.impl("h2d_load", _h2d_load, "CUDA")
+    _H2D_OP_LIBRARY.impl("h2d_load", _h2d_load, PLATFORM.dispatch_key)
     _H2D_OP_LIBRARY.impl("h2d_load", _h2d_load_meta, "Meta")
     torch.library.register_autograd("magi::h2d_load", _h2d_load_bwd, lib=_H2D_OP_LIBRARY)
 

@@ -20,6 +20,7 @@ from .base import Platform
 
 class MusaPlatform(Platform):
     device_type = "musa"
+    dispatch_key = "PrivateUse1"
     # Under the default "global" mode torch_musa fails every capture, even a bare ``x * 2``.
     graph_capture_error_mode = "relaxed"
 

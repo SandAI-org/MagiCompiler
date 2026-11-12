@@ -21,6 +21,7 @@ from .base import Platform
 
 class CudaPlatform(Platform):
     device_type = "cuda"
+    dispatch_key = "CUDA"
     nvtx = torch.cuda.nvtx
     graph_cls = torch.cuda.CUDAGraph
     has_symm_mem = True

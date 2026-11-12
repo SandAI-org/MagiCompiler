@@ -35,6 +35,8 @@ class Platform:
     (``PLATFORM.synchronize()``, ``PLATFORM.Stream``, ``PLATFORM.graph(...)``...)."""
 
     device_type: str
+    # Dispatch key of its tensors, which custom-op kernels register under.
+    dispatch_key: str
     nvtx = _NoNvtx
     # CUDA compute capability, which the CUTLASS / TMA paths gate on; (0, 0) keeps them all off.
     sm: tuple[int, int] = (0, 0)
