@@ -170,7 +170,7 @@ def _park_and_probe_sharing_worker(
             name: store.host_buffer(store.slot_for_tensor(param)) for name, param in model.named_parameters()
         }
         result = {
-            "gpu_numa_node": numa.cuda_device_numa_node(device_index),
+            "gpu_numa_node": numa.device_numa_node(device_index),
             "dense_page_numa_nodes": sorted(_numa_pages_of(host_buffer_by_name["dense.weight"])),
             "matches_own_weights": {
                 name: torch.equal(host_buffer, expected_weight_by_name[name])

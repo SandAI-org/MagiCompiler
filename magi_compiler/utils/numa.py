@@ -22,7 +22,7 @@ import platform
 from contextlib import contextmanager
 from typing import Iterator, Literal, Sequence
 
-import torch
+from magi_compiler.accelerator import PLATFORM
 
 from .logger import magi_logger
 
@@ -53,10 +53,13 @@ def online_numa_nodes() -> list[int]:
     return nodes
 
 
-def cuda_device_numa_node(device_index: int) -> int | None:
-    """The NUMA node a CUDA device's PCIe link attaches to, or None when the platform does not say."""
-    properties = torch.cuda.get_device_properties(device_index)
-    pci_address = f"{properties.pci_domain_id:04x}:{properties.pci_bus_id:02x}:{properties.pci_device_id:02x}.0"
+def device_numa_node(device_index: int) -> int | None:
+    """The NUMA node an accelerator's PCIe link attaches to, or None when the platform does not say."""
+    properties = PLATFORM.get_device_properties(device_index)
+    try:
+        pci_address = f"{properties.pci_domain_id:04x}:{properties.pci_bus_id:02x}:{properties.pci_device_id:02x}.0"
+    except AttributeError:  # a device runtime that reports no PCI address
+        return None
     try:
         with open(f"/sys/bus/pci/devices/{pci_address}/numa_node") as numa_node_file:
             numa_node = int(numa_node_file.read())

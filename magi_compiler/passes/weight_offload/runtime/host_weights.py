@@ -30,6 +30,7 @@ from typing import Sequence
 
 import torch
 
+from magi_compiler.accelerator import PLATFORM
 from magi_compiler.utils import magi_logger
 
 from .bandwidth import H2D_PROBE_BYTES, measure_h2d_bandwidth_bytes_per_ns
@@ -190,7 +191,7 @@ class HostWeightStore:
             self._resident_slots.add(slot)
             promoted_bytes += entry.nbytes
         if copied_any_weight:
-            torch.cuda.synchronize()
+            PLATFORM.synchronize()
         return promoted_bytes
 
     def release_resident_weights(self, slots: Sequence[int]) -> int:

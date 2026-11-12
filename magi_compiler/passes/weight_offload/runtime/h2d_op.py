@@ -34,6 +34,7 @@ from functools import lru_cache
 import torch
 import torch._C._distributed_c10d as _c10d
 
+from magi_compiler.accelerator import PLATFORM
 from magi_compiler.utils.event_work import EventWork
 
 from .host_weights import get_global_host_weight_store
@@ -51,7 +52,7 @@ def get_h2d_stream() -> torch.cuda.Stream:
     when it hands each load a disjoint run of compute to hide behind: the DMA
     engines would not go faster for being asked twice at once anyway.
     """
-    return torch.cuda.Stream()
+    return PLATFORM.Stream()
 
 
 def _h2d_load(shard: torch.Tensor, slot: int) -> torch.Tensor:
@@ -73,10 +74,10 @@ def _h2d_load(shard: torch.Tensor, slot: int) -> torch.Tensor:
     copy_stream = get_h2d_stream()
     # loaded_weight may reuse a block the compute stream freed before its kernel finishes;
     # the H2D stream must wait for the compute stream before writing it.
-    copy_stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(copy_stream):
+    copy_stream.wait_stream(PLATFORM.current_stream())
+    with PLATFORM.stream(copy_stream):
         loaded_weight.copy_(copy_source, non_blocking=True)
-        load_done_event = torch.cuda.Event()
+        load_done_event = PLATFORM.Event()
         load_done_event.record(copy_stream)
     loaded_weight.record_stream(copy_stream)
     # The registry takes ownership of the Work.
