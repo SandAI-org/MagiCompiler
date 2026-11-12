@@ -894,9 +894,11 @@ class ProfilingRuntimeEstimator:
             spec = _collective_spec(cnode) if cnode is not None else None
             if spec is None:
                 return analytical_runtime_ns(snode)
-            op, _group_name, group_size, specs, split_sizes = spec
+            op, _group_name, group_size, specs, _split_sizes = spec
             shape_key = tuple((tuple(shape), str(dt)) for shape, dt, _dev in specs)
-            ckey = ("collective", str(op), group_size, shape_key, split_sizes)
+            # No all-to-all split sizes: they are rank-local, so one key could name different exchanges
+            # on different ranks, and warm_and_sync would replay those mismatched exchanges together.
+            ckey = ("collective", str(op), group_size, shape_key)
             # NCCL stays analytical outside profile_sync; only CE supports local measurement here.
             return self._estimate_collective_runtime_ns(
                 snode=snode, key=ckey, kind="collective", label_fn=_collective_label, count_reuse=count_reuse
