@@ -455,6 +455,35 @@ def test_pinned_reservation_failure_is_not_downgraded(monkeypatch):
 
 
 @requires_cuda
+def test_large_pinned_requests_register_through_torchs_cuda_runtime(monkeypatch):
+    """A runtime-only install has no libcudart.so for a by-name lookup; the exact-size region must still pin."""
+    from magi_compiler.cuda import cudart as cudart_lookup
+    from magi_compiler.passes.weight_offload.runtime.host_memory_pool import EXACT_PINNED_MIN_BYTES, HostMemPool
+
+    monkeypatch.setattr(cudart_lookup, "init_cudart", lambda: None)
+    region = HostMemPool(pinned=True).alloc(shape=(EXACT_PINNED_MIN_BYTES,), dtype=torch.uint8)
+    assert region.is_pinned()
+
+
+@requires_cuda
+def test_a_failed_host_registration_is_not_downgraded(monkeypatch):
+    """A cudaHostRegister error must raise instead of returning pageable storage."""
+    from magi_compiler.passes.weight_offload.runtime import host_memory_pool
+
+    cuda_runtime = torch.cuda.cudart()
+
+    class _FailingRuntime:
+        cudaError = cuda_runtime.cudaError
+
+        def cudaHostRegister(self, address, nbytes, flags):
+            return cuda_runtime.cudaError(2)
+
+    monkeypatch.setattr(host_memory_pool.torch.cuda, "cudart", lambda: _FailingRuntime())
+    with pytest.raises(RuntimeError, match="cudaHostRegister .* failed with error code 2"):
+        host_memory_pool.HostMemPool(pinned=True).alloc(shape=(host_memory_pool.EXACT_PINNED_MIN_BYTES,), dtype=torch.uint8)
+
+
+@requires_cuda
 def test_many_shards_share_one_pinned_slab():
     """The sixteen small same-dtype shards share one backing pinned slab."""
     from magi_compiler.passes.weight_offload import get_global_host_weight_store

@@ -27,15 +27,12 @@ everything at once.  What a region holds, and who reads it, is the caller's.
 
 from __future__ import annotations
 
-import ctypes
 import mmap
 import weakref
 from dataclasses import dataclass
 from typing import Sequence
 
 import torch
-
-from magi_compiler.cuda.cudart import init_cudart, pin_memory_in_place
 
 SLAB_BYTES = 1 << 30
 """Default cap on one slab (1 GiB).
@@ -58,10 +55,20 @@ size, slabs keep the count of cudaHostRegister calls low.
 """
 
 
+def _register_host_memory(region: torch.Tensor) -> None:
+    """Page-lock ``region`` in place through the CUDA runtime torch has loaded.
+
+    Looking libcudart up by name would miss runtime-only installs that ship just a versioned ``libcudart.so.N``.
+    """
+    cudart = torch.cuda.cudart()
+    nbytes = region.numel() * region.element_size()
+    error = cudart.cudaHostRegister(region.data_ptr(), nbytes, 0)
+    if error != cudart.cudaError.success:
+        raise RuntimeError(f"cudaHostRegister of a {nbytes / 2**20:.1f} MiB host region failed with error code {int(error)}")
+
+
 def _unregister_host_memory(address: int) -> None:
-    cudart = init_cudart()
-    if cudart is not None:
-        cudart.cudaHostUnregister(ctypes.c_void_p(address))
+    torch.cuda.cudart().cudaHostUnregister(address)
 
 
 def _exact_pinned_region(nbytes: int) -> torch.Tensor:
@@ -71,7 +78,7 @@ def _exact_pinned_region(nbytes: int) -> torch.Tensor:
     """
     mapping = mmap.mmap(-1, nbytes)
     region = torch.frombuffer(mapping, dtype=torch.uint8)
-    pin_memory_in_place(region)
+    _register_host_memory(region)
     if not region.is_pinned():
         raise RuntimeError(f"host pool: could not page-lock a {nbytes / 2**20:.1f} MiB region with cudaHostRegister")
     weakref.finalize(mapping, _unregister_host_memory, region.data_ptr())

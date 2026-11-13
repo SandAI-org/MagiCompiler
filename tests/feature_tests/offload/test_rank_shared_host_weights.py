@@ -498,6 +498,19 @@ def _plan_input(sharing_group: str, nbytes_by_weight_name: dict[str, int], exper
     )
 
 
+@requires_cuda
+def test_shared_regions_register_through_torchs_cuda_runtime(tmp_path, monkeypatch):
+    """A runtime-only install has no libcudart.so for a by-name lookup; the shared mapping must still pin."""
+    from magi_compiler.cuda import cudart as cudart_lookup
+
+    monkeypatch.setattr(cudart_lookup, "init_cudart", lambda: None)
+    region_path = tmp_path / "shared_region"
+    region_nbytes = 1 << 20
+    region_path.write_bytes(bytes(region_nbytes))
+    region = region_module._map_and_pin_shared_memory_file(path=str(region_path), nbytes=region_nbytes)
+    assert region.is_pinned()
+
+
 def test_each_group_shares_only_what_all_its_ranks_hold_identically():
     weights = {"dense": 40, "norm": 40, "expert": 40}
     group_plan_by_sharing_group = _plan_sharing_groups(

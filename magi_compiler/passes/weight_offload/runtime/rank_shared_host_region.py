@@ -35,13 +35,12 @@ from typing import Literal, Mapping
 import torch
 import torch.distributed as dist
 
-from magi_compiler.cuda.cudart import pin_memory_in_place
 from magi_compiler.utils import magi_logger
 from magi_compiler.utils.dist_utils import get_cpu_gloo_group
 from magi_compiler.utils.hash import as_flat_bytes, compute_tensor_fingerprint
 from magi_compiler.utils.numa import NumaPagePolicy, cuda_device_numa_node, numa_page_policy, online_numa_nodes
 
-from .host_memory_pool import ALIGN_BYTES, _unregister_host_memory
+from .host_memory_pool import ALIGN_BYTES, _register_host_memory, _unregister_host_memory
 
 SharingScope = Literal["per_numa_node", "per_host_interleaved"]
 HostWeightSharing = Literal["off", SharingScope]
@@ -346,7 +345,7 @@ def _map_and_pin_shared_memory_file(*, path: str, nbytes: int) -> torch.Tensor:
         "host registration of memfd mappings, else set offload_config.offload_host_weight_sharing='off'."
     )
     try:
-        pin_memory_in_place(mapped_region)
+        _register_host_memory(mapped_region)
     except RuntimeError as error:
         raise RuntimeError(pin_error_message) from error
     if not mapped_region.is_pinned():
