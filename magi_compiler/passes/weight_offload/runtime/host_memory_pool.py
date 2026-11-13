@@ -27,10 +27,7 @@ everything at once.  What a region holds, and who reads it, is the caller's.
 
 from __future__ import annotations
 
-import ctypes
-import functools
 import mmap
-import os
 import weakref
 from dataclasses import dataclass
 from typing import Sequence
@@ -58,28 +55,6 @@ size, slabs keep the count of cudaHostRegister calls low.
 """
 
 
-@functools.cache
-def _loaded_cuda_runtime_library() -> ctypes.CDLL | None:
-    """The libcudart torch has loaded, opened by its mapped path so ctypes reaches that same instance."""
-    with open("/proc/self/maps") as process_maps:
-        for mapping_line in process_maps:
-            mapped_path = mapping_line.split()[-1]
-            if os.path.basename(mapped_path).startswith("libcudart.so"):
-                return ctypes.CDLL(mapped_path)
-    return None
-
-
-def _clear_cuda_runtime_error() -> None:
-    """Reset the last error a failed runtime call leaves behind.
-
-    torch reads that error after every kernel launch, so a failed host (un)registration would otherwise
-    resurface as the error of an unrelated later launch. ``torch.cuda.cudart()`` binds no cudaGetLastError.
-    """
-    cuda_runtime_library = _loaded_cuda_runtime_library()
-    if cuda_runtime_library is not None:
-        cuda_runtime_library.cudaGetLastError()
-
-
 def _register_host_memory(region: torch.Tensor) -> None:
     """Page-lock ``region`` in place through the CUDA runtime torch has loaded.
 
@@ -89,14 +64,11 @@ def _register_host_memory(region: torch.Tensor) -> None:
     nbytes = region.numel() * region.element_size()
     error = cudart.cudaHostRegister(region.data_ptr(), nbytes, 0)
     if error != cudart.cudaError.success:
-        _clear_cuda_runtime_error()
         raise RuntimeError(f"cudaHostRegister of a {nbytes / 2**20:.1f} MiB host region failed with error code {int(error)}")
 
 
 def _unregister_host_memory(address: int) -> None:
-    cudart = torch.cuda.cudart()
-    if cudart.cudaHostUnregister(address) != cudart.cudaError.success:
-        _clear_cuda_runtime_error()
+    torch.cuda.cudart().cudaHostUnregister(address)
 
 
 def _exact_pinned_region(nbytes: int) -> torch.Tensor:
