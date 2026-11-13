@@ -99,5 +99,9 @@ class FoldPythonScalarConstantsPass(MagiInductorPass):
             node.args = tree_map(replace_folded, node.args)
             node.kwargs = tree_map(replace_folded, node.kwargs)
 
-        graph.eliminate_dead_code()
+        # Erase only the folded nodes: graph-wide DCE on this pre-functionalization graph would also drop
+        # user-less in-place ``Tensor.copy_`` call_method nodes, which FX does not treat as impure.
+        for node in reversed(list(folded_values)):
+            if not node.users:
+                graph.erase_node(node)
         graph.lint()

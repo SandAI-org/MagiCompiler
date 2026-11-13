@@ -103,6 +103,7 @@ def _scheduler_passes_worker(rank: int, world_size: int, port: str, out_dir: str
         passes = build_transfer_overlap_passes(
             fsdp_config=FSDPConfig(),
             offload_config=OffloadConfig(graph_weight_offload=True, offload_h2d_bandwidth_gbps=20.0),
+            transfer_link_sharing="off",
             loads_inserted=rank == 0,
             default_passes=None,
         )
@@ -139,6 +140,7 @@ def test_profile_sync_estimator_locks_ranks_for_offload_and_fsdp():
         passes = build_transfer_overlap_passes(
             fsdp_config=FSDPConfig(enable_fsdp=enable_fsdp, cost_mode=cost_mode),
             offload_config=OffloadConfig(graph_weight_offload=graph_weight_offload, offload_h2d_bandwidth_gbps=20.0),
+            transfer_link_sharing="off",
             loads_inserted=graph_weight_offload,
             default_passes=None,
         )
@@ -171,12 +173,17 @@ def test_offload_cache_syncs_whenever_inductor_issues_world_collectives(enable_f
     pipeline = WeightTransferPipeline(
         fsdp_config=fsdp_config,
         offload_config=offload_config,
+        transfer_link_sharing="off",
         cudagraph_mode=CudaGraphMode.NONE,
         disable_graph_split=disable_graph_split,
     )
     assert pipeline.compiles_in_rank_lockstep is expected
     [cost_profile, *_] = build_transfer_overlap_passes(
-        fsdp_config=pipeline._fsdp_config, offload_config=offload_config, loads_inserted=True, default_passes=None
+        fsdp_config=pipeline._fsdp_config,
+        offload_config=offload_config,
+        transfer_link_sharing="off",
+        loads_inserted=True,
+        default_passes=None,
     )
     if cost_profile.estimator is not None:
         assert cost_profile.estimator.sync_across_ranks is pipeline.compiles_in_rank_lockstep
@@ -445,6 +452,35 @@ def test_pinned_reservation_failure_is_not_downgraded(monkeypatch):
     pageable = HostMemPool(pinned=False, slab_bytes=1024).alloc(shape=(8,), dtype=torch.float32)
     assert not pageable.is_pinned()
     assert pageable.shape == (8,)
+
+
+@requires_cuda
+def test_large_pinned_requests_register_through_torchs_cuda_runtime(monkeypatch):
+    """A runtime-only install has no libcudart.so for a by-name lookup; the exact-size region must still pin."""
+    from magi_compiler.cuda import cudart as cudart_lookup
+    from magi_compiler.passes.weight_offload.runtime.host_memory_pool import EXACT_PINNED_MIN_BYTES, HostMemPool
+
+    monkeypatch.setattr(cudart_lookup, "init_cudart", lambda: None)
+    region = HostMemPool(pinned=True).alloc(shape=(EXACT_PINNED_MIN_BYTES,), dtype=torch.uint8)
+    assert region.is_pinned()
+
+
+@requires_cuda
+def test_a_failed_host_registration_is_not_downgraded(monkeypatch):
+    """A cudaHostRegister error must raise instead of returning pageable storage."""
+    from magi_compiler.passes.weight_offload.runtime import host_memory_pool
+
+    cuda_runtime = torch.cuda.cudart()
+
+    class _FailingRuntime:
+        cudaError = cuda_runtime.cudaError
+
+        def cudaHostRegister(self, address, nbytes, flags):
+            return cuda_runtime.cudaError(2)
+
+    monkeypatch.setattr(host_memory_pool.torch.cuda, "cudart", lambda: _FailingRuntime())
+    with pytest.raises(RuntimeError, match="cudaHostRegister .* failed with error code 2"):
+        host_memory_pool.HostMemPool(pinned=True).alloc(shape=(host_memory_pool.EXACT_PINNED_MIN_BYTES,), dtype=torch.uint8)
 
 
 @requires_cuda

@@ -18,7 +18,7 @@ Centralised so that pass-manager / FX passes / runtime modules don't all
 re-implement the same try/except dance around ``torch.cuda``.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 def device_capability(device: int = 0) -> Tuple[int, int]:
@@ -42,3 +42,33 @@ def device_capability(device: int = 0) -> Tuple[int, int]:
 def device_capability_major(device: int = 0) -> int:
     """Convenience wrapper: just the major-capability int (0 if no CUDA)."""
     return device_capability(device)[0]
+
+
+def has_active_nvlink(device: int) -> Optional[bool]:
+    """Whether NVML reports an active NVLink on this CUDA device; None when NVML cannot tell.
+
+    Looked up by PCI bus id, so ``CUDA_VISIBLE_DEVICES`` renumbering does not matter.
+    """
+    try:
+        import pynvml
+        import torch as _torch
+
+        props = _torch.cuda.get_device_properties(device)
+        pci_bus_id = f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:{props.pci_device_id:02x}.0"
+        pynvml.nvmlInit()
+    except Exception:
+        return None
+    try:
+        handle = pynvml.nvmlDeviceGetHandleByPciBusId(pci_bus_id)
+        for link in range(pynvml.NVML_NVLINK_MAX_LINKS):
+            try:
+                if pynvml.nvmlDeviceGetNvLinkState(handle, link) == pynvml.NVML_FEATURE_ENABLED:
+                    return True
+            except pynvml.NVMLError:
+                # NotSupported on a GPU without NVLink, InvalidArgument past its last link.
+                return False
+        return False
+    except pynvml.NVMLError:
+        return None
+    finally:
+        pynvml.nvmlShutdown()

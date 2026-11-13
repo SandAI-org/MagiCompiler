@@ -79,11 +79,11 @@ def collect_host_slot_table(module: nn.Module) -> dict[int, HostSlotMetadata]:
             slot = host_slot(node)
             if slot is None or slot in slot_table:
                 continue
-            host_buffer = store.host_buffer(slot)
+            shape, dtype = store.slot_layout(slot)
             slot_table[int(slot)] = {
                 "name": store.parameter_name(slot),
-                "shape": tuple(int(d) for d in host_buffer.shape),
-                "dtype": str(host_buffer.dtype),
+                "shape": shape,
+                "dtype": str(dtype),
                 "nbytes": int(store.slot_bytes(slot)),
                 "resident": bool(store.is_resident(slot)),
             }

@@ -237,6 +237,20 @@ class OffloadConfig(BaseModel):
             "and the ranks of a host must share a PID namespace."
         ),
     )
+    defer_host_materialization: bool = Field(
+        False,
+        description=(
+            "With graph_weight_offload on a host-built model: the first CUDA move only records each offloadable "
+            "weight's CPU original (e.g. a checkpoint mmap) and binds its slot to a shared zero placeholder, so "
+            "nothing is read or pinned yet. When the first compile of the model has chosen the resident weights, "
+            "and before the compiled graph runs, every weight is copied once: resident ones into device memory "
+            "with no host copy, the rest into pinned host memory (shared per offload_host_weight_sharing). Later "
+            "compiles keep that resident set. Weights without a host copy cannot move back to the host, so the "
+            "model must stay on CUDA. Meta-built (to_empty) models are refused. Unless offload_host_weight_sharing "
+            "is 'off', every compile of the model is a collective over WORLD. "
+            "Env var: MAGI_COMPILE_OFFLOAD_CONFIG__DEFER_HOST_MATERIALIZATION."
+        ),
+    )
     offload_max_device_weight_mib: int = Field(
         0,
         ge=0,
@@ -437,6 +451,20 @@ class CompileConfig(BaseSettings):
         description=(
             "Whole-graph FSDP weight all-gather / compute overlap (lowering + bucketing + reorder + cost "
             "model). Fields reachable via MAGI_COMPILE_FSDP_CONFIG__<FIELD> env vars."
+        ),
+    )
+    transfer_link_sharing: Literal["auto", "pcie", "nvlink", "off"] = Field(
+        "auto",
+        description=(
+            "Which graph transfers take turns on a shared physical link, so none slows another down: FSDP weight "
+            "all-gathers, all-to-alls issued in the graph (e.g. Ulysses attention) and graph weight loads. "
+            "'pcie': without NVLink all three cross the GPU's PCIe link, so they queue on the H2D load stream "
+            "one at a time. 'nvlink': all-gathers and all-to-alls share NVLink and queue on one stream of their own; "
+            "loads overlap them freely. In both, a gather or load is placed only in the compute time the transfers "
+            "it takes turns with leave free, never straddling one. 'off': every transfer keeps its own stream "
+            "and is placed as if alone. 'auto' (default): 'nvlink' when NVML reports an active NVLink on this GPU, "
+            "'pcie' when it reports none, 'off' when it cannot tell. Applies to graphs with FSDP gathers or "
+            "graph weight loads."
         ),
     )
 

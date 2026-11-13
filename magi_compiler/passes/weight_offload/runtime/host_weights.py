@@ -21,10 +21,15 @@ Host-first handoff temporarily allocates one full CUDA shard before freeing its 
 Compiled loads carry process-local slot integers rather than storage pointers.
 Cached artifacts remap these integers through ``using_slot_remap`` and ``host_slots.py``.
 Promotion restores a slot's device copy without discarding its host buffer.
+
+A deferred slot reads a zero placeholder and keeps its CPU original until it is completed
+into its final host buffer, or onto the device with no host copy when it stays resident.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import math
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -44,12 +49,17 @@ class HostWeight:
     without the caller having to remember which parameter a slot belonged to.
     """
 
-    host_buffer: torch.Tensor
+    # None once a deferred slot settled on the device: its only copy is the resident one.
+    host_buffer: torch.Tensor | None
     device_standin: torch.Tensor
     nbytes: int
     # The parameter this shard came from; with shape and dtype it is the identity
     # a cached artifact's slots are matched by in another process (slot_table.py).
     parameter_name: str = ""
+    # Set while deferred: the CPU original, copied once when the slot is completed.
+    pending_source: torch.Tensor | None = None
+    # Slots deferred by one first CUDA move; they are completed together.
+    deferred_group_id: int | None = None
 
 
 class HostWeightStore:
@@ -70,25 +80,26 @@ class HostWeightStore:
         self._slot_by_tensor_id: dict[int, int] = {}
         self._slots_with_h2d_load: set[int] = set()
         self._resident_slots: set[int] = set()
+        # Resident slots whose only copy is on the device; always a subset of _resident_slots.
+        self._device_only_slots: set[int] = set()
         self._bandwidth_bytes_per_ns: float | None = None
+        self._deferred_group_count = 0
 
     def reset(self) -> None:
         """Drop every slot, slab and cached probe.  Tests only."""
         self._weights_by_slot.clear()
         self._pool.reset()
         self._resident_slots.clear()
+        self._device_only_slots.clear()
         self._slots_with_h2d_load.clear()
         self._slot_by_tensor_id.clear()
         self._bandwidth_bytes_per_ns = None
+        self._deferred_group_count = 0
 
-    def _register_weight(
-        self, host_buffer: torch.Tensor, device_standin: torch.Tensor, nbytes: int, parameter_name: str
-    ) -> int:
+    def _register_weight(self, entry: HostWeight) -> int:
         slot = len(self._weights_by_slot)
-        self._weights_by_slot.append(
-            HostWeight(host_buffer=host_buffer, device_standin=device_standin, nbytes=nbytes, parameter_name=parameter_name)
-        )
-        self._slot_by_tensor_id[id(device_standin)] = slot
+        self._weights_by_slot.append(entry)
+        self._slot_by_tensor_id[id(entry.device_standin)] = slot
         return slot
 
     def _weight_for_slot(self, slot: int) -> HostWeight:
@@ -126,18 +137,97 @@ class HostWeightStore:
         existing = self._slot_by_tensor_id.get(id(device_standin))
         if existing is not None:
             return existing
-        if device_standin.untyped_storage().nbytes() != 0:
-            raise ValueError(
-                f"host offload: bind_host_buffer({parameter_name!r}) wants a device tensor with no storage behind it, but got "
-                f"{device_standin.untyped_storage().nbytes()} byte(s).  A tensor that still holds device "
-                "bytes is not an offload candidate -- materialize it in host memory instead."
-            )
+        _check_storage_free_standin(device_standin=device_standin, parameter_name=parameter_name)
         return self._register_weight(
-            host_buffer=host_buffer,
-            device_standin=device_standin,
-            nbytes=host_buffer.numel() * host_buffer.element_size(),
-            parameter_name=parameter_name,
+            HostWeight(
+                host_buffer=host_buffer,
+                device_standin=device_standin,
+                nbytes=host_buffer.numel() * host_buffer.element_size(),
+                parameter_name=parameter_name,
+            )
         )
+
+    def new_deferred_group_id(self) -> int:
+        self._deferred_group_count += 1
+        return self._deferred_group_count
+
+    def bind_deferred_weight(
+        self,
+        *,
+        placeholder: torch.Tensor,
+        device_standin: torch.Tensor,
+        parameter_name: str,
+        pending_source: torch.Tensor,
+        deferred_group_id: int,
+    ) -> int:
+        """Bind a stand-in whose host bytes are not placed yet; returns its slot. Loads read ``placeholder`` until then."""
+        if self._slot_by_tensor_id.get(id(device_standin)) is not None:
+            raise RuntimeError(f"host offload: {parameter_name!r} is already bound to a host slot")
+        _check_storage_free_standin(device_standin=device_standin, parameter_name=parameter_name)
+        return self._register_weight(
+            HostWeight(
+                host_buffer=placeholder,
+                device_standin=device_standin,
+                nbytes=placeholder.numel() * placeholder.element_size(),
+                parameter_name=parameter_name,
+                pending_source=pending_source,
+                deferred_group_id=deferred_group_id,
+            )
+        )
+
+    def is_pending(self, slot: int) -> bool:
+        return self._weight_for_slot(slot).pending_source is not None
+
+    def deferred_group_id(self, slot: int) -> int | None:
+        """The process-local id of the first CUDA move that deferred ``slot``, or None if it was not deferred."""
+        return self._weight_for_slot(slot).deferred_group_id
+
+    def pending_slots_in_groups_of(self, slots: Sequence[int]) -> list[int]:
+        """Every pending slot deferred together with any pending slot in ``slots``."""
+        group_ids = {self._weights_by_slot[slot].deferred_group_id for slot in slots if self.is_pending(slot)}
+        return [
+            slot
+            for slot, entry in enumerate(self._weights_by_slot)
+            if entry.pending_source is not None and entry.deferred_group_id in group_ids
+        ]
+
+    def pending_source(self, slot: int) -> torch.Tensor:
+        """The CPU original of a deferred slot, wherever the model loaded it."""
+        pending_source = self._weight_for_slot(slot).pending_source
+        if pending_source is None:
+            raise RuntimeError(f"host offload: slot {slot} ({self.parameter_name(slot)!r}) is not pending")
+        return pending_source
+
+    def complete_pending_slot_in_host_buffer(self, slot: int, host_buffer: torch.Tensor) -> None:
+        """Replace a deferred slot's placeholder with ``host_buffer``, already filled, and drop its CPU original."""
+        entry = self._pending_entry(slot)
+        self._weights_by_slot[slot] = dataclasses.replace(entry, host_buffer=host_buffer, pending_source=None)
+
+    def complete_pending_slot_on_device(self, slot: int) -> None:
+        """Copy a resident deferred slot's CPU original into its device storage and keep no host copy."""
+        entry = self._pending_entry(slot)
+        if slot not in self._resident_slots:
+            raise RuntimeError(f"host offload: slot {slot} ({entry.parameter_name!r}) is not resident, it needs a host copy")
+        # The stand-in is the Parameter itself for an unsharded weight; this write is not autograd's.
+        with torch.no_grad():
+            entry.device_standin.copy_(entry.pending_source)
+        self._weights_by_slot[slot] = dataclasses.replace(entry, host_buffer=None, pending_source=None)
+        self._device_only_slots.add(slot)
+
+    def _pending_entry(self, slot: int) -> HostWeight:
+        entry = self._weight_for_slot(slot)
+        if entry.pending_source is None:
+            raise RuntimeError(f"host offload: slot {slot} ({entry.parameter_name!r}) is not pending")
+        return entry
+
+    def is_device_only(self, slot: int) -> bool:
+        """Resident with no host copy: a deferred weight that settled on the device."""
+        return slot in self._device_only_slots
+
+    def slot_layout(self, slot: int) -> tuple[tuple[int, ...], torch.dtype]:
+        """Shape and dtype of a slot's shard, also for a slot without a host copy."""
+        device_standin = self._weight_for_slot(slot).device_standin
+        return tuple(int(dim) for dim in device_standin.shape), device_standin.dtype
 
     def slot_for_tensor(self, device_standin: torch.Tensor) -> int | None:
         """The slot this stand-in was adopted under, or None."""
@@ -149,7 +239,10 @@ class HostWeightStore:
 
     def host_buffer(self, slot: int) -> torch.Tensor:
         """The pinned host shard behind ``slot``."""
-        return self._weight_for_slot(slot).host_buffer
+        host_buffer = self._weight_for_slot(slot).host_buffer
+        if host_buffer is None:
+            raise RuntimeError(f"host offload: slot {slot} ({self.parameter_name(slot)!r}) has no host copy")
+        return host_buffer
 
     def copy_source(self, slot: int) -> torch.Tensor:
         """Return the device copy for a resident slot, otherwise the pinned host copy."""
@@ -201,6 +294,13 @@ class HostWeightStore:
         H2D again and ``make_weights_resident`` brings the device copy back.  The
         caller must have synchronized every stream still reading these shards.
         """
+        names_without_host_copy = [self.parameter_name(slot) for slot in slots if slot in self._device_only_slots]
+        if names_without_host_copy:
+            raise RuntimeError(
+                f"host offload: cannot move {len(names_without_host_copy)} weight(s) to the host "
+                f"({', '.join(names_without_host_copy[:8])}): with defer_host_materialization their only copy is "
+                "the resident one on the device, so the model must stay on CUDA"
+            )
         released_bytes = 0
         for slot in slots:
             if slot not in self._resident_slots:
@@ -270,6 +370,29 @@ class HostWeightStore:
             H2D_PROBE_BYTES // 2**20,
         )
         return self._bandwidth_bytes_per_ns
+
+
+def _check_storage_free_standin(*, device_standin: torch.Tensor, parameter_name: str) -> None:
+    standin_bytes = device_standin.untyped_storage().nbytes()
+    if standin_bytes != 0:
+        raise ValueError(
+            f"host offload: bind_host_buffer({parameter_name!r}) wants a device tensor with no storage behind it, but got "
+            f"{standin_bytes} byte(s).  A tensor that still holds device "
+            "bytes is not an offload candidate -- materialize it in host memory instead."
+        )
+
+
+def zero_placeholder_host_buffers(layouts: Sequence[tuple[Sequence[int], torch.dtype]]) -> list[torch.Tensor]:
+    """One pinned all-zero region sized for the largest layout, viewed once per layout.
+
+    Zero bytes read as zero in every dtype, never as an fp8 NaN. The views keep the region
+    alive, so it is freed when the last deferred slot reading it is completed.
+    """
+    nbytes_by_layout = [math.prod(shape) * dtype.itemsize for shape, dtype in layouts]
+    if not nbytes_by_layout:
+        return []
+    zero_region = torch.zeros(max(nbytes_by_layout), dtype=torch.uint8, pin_memory=True)
+    return [zero_region[:nbytes].view(dtype).view(tuple(shape)) for (shape, dtype), nbytes in zip(layouts, nbytes_by_layout)]
 
 
 # Process-wide store.  ``magi::h2d_load`` looks slots up here at runtime; a

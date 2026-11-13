@@ -568,6 +568,31 @@ def test_hooked_internal_collective_keyed_by_replay_inputs():
     assert "RANK_LOCAL_UNMATCHED ok=True" in p.stdout, out[-3000:]
 
 
+_ALL_TO_ALL_PAIRING_HELPER = Path(__file__).parent / "profiling_helper" / "estimator_all_to_all_pairing_helper.py"
+
+
+@requires_cuda
+@pytest.mark.skipif(shutil.which("torchrun") is None, reason="requires torchrun")
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires >=2 GPUs")
+def test_all_to_alls_with_crossed_split_sizes_replay_one_exchange_on_every_rank():
+    """Two valid all-to-alls whose split sizes cross between the ranks must not be keyed apart
+    by those rank-local split sizes: warm_and_sync would then replay a different exchange on
+    each rank under one key, and NCCL would hang on the mismatched sizes."""
+    env = os.environ.copy()
+    env["MAGI_LOGGING_LEVEL"] = "warning"
+    p = subprocess.run(
+        ["torchrun", "--nproc_per_node=2", "--master_port=29683", str(_ALL_TO_ALL_PAIRING_HELPER)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    out = p.stdout + p.stderr
+    assert p.returncode == 0, f"helper failed:\n{out[-3000:]}"
+    assert "A2A_PAIRED ok=True" in p.stdout, out[-3000:]
+    assert "A2A_WARMSYNC ok=True" in p.stdout, out[-3000:]
+
+
 # ===========================================================================
 # COPY-ENGINE GATHER (``fsdp_config.transport="copy_engine"``).
 #
@@ -913,7 +938,7 @@ def test_collective_requery_preserves_measurement_policy_and_reuse_counts(monkey
     monkeypatch.setattr(re_mod, "_leaf_collective", lambda node: launch)
     monkeypatch.setattr(re_mod, "_ce_ag_spec", lambda node: (((8, 4),), torch.bfloat16, 2, "group"))
     monkeypatch.setattr(
-        re_mod, "_collective_spec", lambda node: ("all_gather", "group", 2, [((8, 4), torch.bfloat16, "cuda")])
+        re_mod, "_collective_spec", lambda node: ("all_gather", "group", 2, [((8, 4), torch.bfloat16, "cuda")], ())
     )
     monkeypatch.setattr(re_mod, "analytical_runtime_ns", lambda node: 111.0)
 
