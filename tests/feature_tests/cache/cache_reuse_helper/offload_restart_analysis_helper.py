@@ -30,6 +30,9 @@ def _patch_offload(cfg):
     cfg.offload_config.offload_min_shard_mib = 0
     cfg.cudagraph_mode = CudaGraphMode.NONE
     cfg.disable_graph_split = True
+    # 'auto' adds RouteCollectivesToLinkStream on PCIe or NVLink GPUs, which would make the traced pass list
+    # depend on the CI machine.
+    cfg.transfer_link_sharing = "off"
     return cfg
 
 
