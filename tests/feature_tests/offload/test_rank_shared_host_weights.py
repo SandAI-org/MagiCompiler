@@ -499,15 +499,18 @@ def _plan_input(sharing_group: str, nbytes_by_weight_name: dict[str, int], exper
 
 
 @requires_cuda
-def test_shared_regions_register_through_torchs_cuda_runtime(tmp_path, monkeypatch):
+def test_shared_regions_register_through_torchs_cuda_runtime(monkeypatch):
     """A runtime-only install has no libcudart.so for a by-name lookup; the shared mapping must still pin."""
     from magi_compiler.cuda import cudart as cudart_lookup
 
     monkeypatch.setattr(cudart_lookup, "init_cudart", lambda: None)
-    region_path = tmp_path / "shared_region"
     region_nbytes = 1 << 20
-    region_path.write_bytes(bytes(region_nbytes))
-    region = region_module._map_and_pin_shared_memory_file(path=str(region_path), nbytes=region_nbytes)
+    # A memfd, as a writer creates: a kernel may refuse to page-lock a writable mapping of an ordinary file.
+    file_descriptor = region_module._create_shared_memory_file(region_label="pin_test", nbytes=region_nbytes, numa_policy=None)
+    try:
+        region = region_module._map_and_pin_shared_memory_file(path=f"/proc/self/fd/{file_descriptor}", nbytes=region_nbytes)
+    finally:
+        os.close(file_descriptor)
     assert region.is_pinned()
 
 

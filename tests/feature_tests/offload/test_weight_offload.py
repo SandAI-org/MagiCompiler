@@ -466,21 +466,27 @@ def test_large_pinned_requests_register_through_torchs_cuda_runtime(monkeypatch)
 
 
 @requires_cuda
-def test_a_failed_host_registration_is_not_downgraded(monkeypatch):
-    """A cudaHostRegister error must raise instead of returning pageable storage."""
-    from magi_compiler.passes.weight_offload.runtime import host_memory_pool
+def test_failed_host_registration_calls_raise_and_leave_later_launches_working():
+    """A cudaHostRegister error must raise instead of returning pageable storage.
 
-    cuda_runtime = torch.cuda.cudart()
+    Neither it nor a failed cudaHostUnregister may resurface as the error of the next kernel launch.
+    """
+    import mmap
 
-    class _FailingRuntime:
-        cudaError = cuda_runtime.cudaError
+    from magi_compiler.passes.weight_offload.runtime.host_memory_pool import _register_host_memory, _unregister_host_memory
 
-        def cudaHostRegister(self, address, nbytes, flags):
-            return cuda_runtime.cudaError(2)
-
-    monkeypatch.setattr(host_memory_pool.torch.cuda, "cudart", lambda: _FailingRuntime())
-    with pytest.raises(RuntimeError, match="cudaHostRegister .* failed with error code 2"):
-        host_memory_pool.HostMemPool(pinned=True).alloc(shape=(host_memory_pool.EXACT_PINNED_MIN_BYTES,), dtype=torch.uint8)
+    mapping = mmap.mmap(-1, 4096)
+    region = torch.frombuffer(mapping, dtype=torch.uint8)
+    _register_host_memory(region)
+    try:
+        with pytest.raises(RuntimeError, match="cudaHostRegister .* failed with error code"):
+            _register_host_memory(region)  # the range is already registered
+        torch.randn(4, device="cuda")
+    finally:
+        _unregister_host_memory(region.data_ptr())
+    _unregister_host_memory(region.data_ptr())  # no longer registered
+    torch.randn(4, device="cuda")
+    torch.cuda.synchronize()
 
 
 @requires_cuda
