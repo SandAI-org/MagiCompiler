@@ -18,7 +18,7 @@ Inductor picks int32 indexing whenever the first compile's example sizes fit and
 choice, but MagiCompiler never checks those guards: a graph first compiled on a small input
 (e.g. a 10s video) overflowed its int32 offsets on a larger one (e.g. a 30s video).
 ``PassConfig.force_int64_indexing_for_dynamic_shapes`` makes dynamic-shape kernels index in int64
-while static-shape kernels keep int32.
+while static-shape kernels keep int32, even when a check recorded while tracing bounds the dynamic size.
 """
 
 import pytest
@@ -41,8 +41,20 @@ class _DynamicAndStaticKernels(nn.Module):
         # x * 2 depends on the dynamic dim; weight * 3 only on the static parameter shape.
         return x * 2, self.weight * 3
 
+    def reference(self, x):
+        return x * 2, self.weight * 3
 
-def _compile_and_get_triton_kernels(tmp_path, force_int64_indexing: bool) -> list[str]:
+
+class _BoundedDynamicAndStaticKernels(_DynamicAndStaticKernels):
+    def forward(self, x):
+        # The bound becomes an axiom of the dynamic dim, verified only against the first input.
+        torch._check(x.shape[0] * HIDDEN <= torch.iinfo(torch.int32).max)
+        return x * 2, self.weight * 3
+
+
+def _compile_and_get_triton_kernels(
+    tmp_path, force_int64_indexing: bool, base: type[nn.Module] = _DynamicAndStaticKernels
+) -> list[str]:
     def configure(compile_config):
         # A cache hit would skip codegen and leave no kernel source to inspect.
         compile_config.cache_root_dir = str(tmp_path)
@@ -51,15 +63,14 @@ def _compile_and_get_triton_kernels(tmp_path, force_int64_indexing: bool) -> lis
 
     # magi_compile patches the class in place, so each config needs its own class.
     @magi_compile(dynamic_arg_dims={"x": 0}, config_patch=configure)
-    class CompiledModel(_DynamicAndStaticKernels):
+    class CompiledModel(base):
         pass
 
     model = CompiledModel().cuda()
     x = torch.randn(SMALL_SEQ_LEN, HIDDEN, device="cuda")
     with torch.no_grad():
-        (dynamic_out, static_out), source_codes = run_and_get_code(model, x)
-    torch.testing.assert_close(dynamic_out, x * 2)
-    torch.testing.assert_close(static_out, model.weight * 3)
+        outputs, source_codes = run_and_get_code(model, x)
+        torch.testing.assert_close(outputs, model.reference(x))
     return [kernel for code in source_codes for kernel in code.split("async_compile.triton(")[1:]]
 
 
@@ -74,6 +85,16 @@ def _split_static_and_dynamic_kernel(kernels: list[str]) -> tuple[str, str]:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_dynamic_kernel_uses_int64_and_static_kernel_keeps_int32(tmp_path):
     kernels = _compile_and_get_triton_kernels(tmp_path, force_int64_indexing=True)
+    static_kernel, dynamic_kernel = _split_static_and_dynamic_kernel(kernels)
+
+    assert "'xnumel': 'i64'" in dynamic_kernel
+    assert "xoffset = tl.program_id(0).to(tl.int64) * XBLOCK" in dynamic_kernel
+    assert "xoffset = tl.program_id(0) * XBLOCK" in static_kernel
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_dynamic_kernel_bounded_by_a_traced_check_still_uses_int64(tmp_path):
+    kernels = _compile_and_get_triton_kernels(tmp_path, force_int64_indexing=True, base=_BoundedDynamicAndStaticKernels)
     static_kernel, dynamic_kernel = _split_static_and_dynamic_kernel(kernels)
 
     assert "'xnumel': 'i64'" in dynamic_kernel
