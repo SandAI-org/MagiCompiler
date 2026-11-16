@@ -20,6 +20,7 @@ from abc import abstractmethod
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import torch
 import torch.fx as fx
@@ -71,6 +72,36 @@ def _nonce_autograd_cache_key_on_keying_failure():
         # Entries under a nonce key can never be looked up again; don't let them pile up in the shared cache dir.
         for nonce_key in nonce_keys:
             shutil.rmtree(autograd_cache.AOTAutogradCache._get_tmp_dir_for_key(nonce_key), ignore_errors=True)
+
+
+@contextlib.contextmanager
+def _require_32bit_indexing_for_every_shape():
+    """Let Inductor pick int32 indexing only when int32 holds for every shape the kernel can see.
+
+    Inductor's ``expr_fits_within_32bit`` falls back to the size hint of the first compile's
+    example input and installs a ``<= INT32_MAX`` guard to protect that choice. MagiCompiler
+    reuses one dynamic-shape artifact for all later shapes without checking those guards, so a
+    graph first compiled on a small input (e.g. a 10s video) overflows its int32 offsets on a
+    larger one (e.g. a 30s video). Dropping the hint fallback leaves only the ValueRanges proof,
+    so a kernel whose size depends on an unbounded symbol uses int64. Static sizes are still
+    proven exactly and keep int32.
+
+    ``simd`` and ``triton_utils`` import the function by name, so both bindings are patched:
+    ``simd`` covers pointwise/reduction kernels and the ``INDEX_DTYPE`` of Triton templates,
+    ``triton_utils`` covers size arguments of user-defined Triton kernels.
+    """
+    import torch._inductor.codegen.simd as simd_codegen
+    import torch._inductor.codegen.triton_utils as triton_utils_codegen
+    from torch._inductor.virtualized import V
+
+    int32_max = torch.iinfo(torch.int32).max
+
+    def _fits_within_32bit_for_every_shape(expr) -> bool:
+        return V.graph.sizevars.statically_known_true(expr <= int32_max)
+
+    with patch.object(simd_codegen, "expr_fits_within_32bit", _fits_within_32bit_for_every_shape):
+        with patch.object(triton_utils_codegen, "expr_fits_within_32bit", _fits_within_32bit_for_every_shape):
+            yield
 
 
 def _placeholder_names(graph: fx.GraphModule) -> list[str]:
@@ -358,6 +389,11 @@ class InductorStandaloneAdaptor(CompilerInterface):
             else contextlib.nullcontext()
         )
         stride_ctx, captured_strides = _intercept_inductor_output_strides()
+        index_dtype_ctx = (
+            _require_32bit_indexing_for_every_shape()
+            if self.compile_config.pass_config.force_int64_indexing_for_dynamic_shapes
+            else contextlib.nullcontext()
+        )
 
         try:
             with (
@@ -365,6 +401,7 @@ class InductorStandaloneAdaptor(CompilerInterface):
                 _nonce_autograd_cache_key_on_keying_failure(),
                 functorch_config.patch(autograd_cache_allow_custom_autograd_functions=True),
                 stride_ctx,
+                index_dtype_ctx,
             ):
                 compiled_graph = standalone_compile(
                     graph, example_inputs, dynamic_shapes=dynamic_shapes, options={"config_patches": current_config}
