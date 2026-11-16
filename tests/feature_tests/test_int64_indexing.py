@@ -41,9 +41,6 @@ class _DynamicAndStaticKernels(nn.Module):
         # x * 2 depends on the dynamic dim; weight * 3 only on the static parameter shape.
         return x * 2, self.weight * 3
 
-    def reference(self, x):
-        return x * 2, self.weight * 3
-
 
 class _BoundedDynamicAndStaticKernels(_DynamicAndStaticKernels):
     def forward(self, x):
@@ -70,7 +67,7 @@ def _compile_and_get_triton_kernels(
     x = torch.randn(SMALL_SEQ_LEN, HIDDEN, device="cuda")
     with torch.no_grad():
         outputs, source_codes = run_and_get_code(model, x)
-        torch.testing.assert_close(outputs, model.reference(x))
+        torch.testing.assert_close(outputs, (x * 2, model.weight * 3))
     return [kernel for code in source_codes for kernel in code.split("async_compile.triton(")[1:]]
 
 
