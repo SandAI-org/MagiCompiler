@@ -116,6 +116,17 @@ class PassConfig(BaseModel):
             "Settable via the MAGI_COMPILE_PASS_CONFIG__ENABLE_MM_EPILOGUE_FUSION env var."
         ),
     )
+    force_int64_indexing_for_dynamic_shapes: bool = Field(
+        True,
+        description=(
+            "Generate int64 indexing for every Triton kernel (pointwise, reduction and template) unless int32 holds "
+            "for every shape the kernel can see. Inductor otherwise picks int32 whenever the first compile's "
+            "example sizes fit, and the guard it installs is never checked by MagiCompiler, so a graph first "
+            "compiled on a small input overflows on a larger one. Static-shape kernels still use int32 when they fit. "
+            "Part of the compile cache key, so artifacts built before the switch are not reused. "
+            "Env var: MAGI_COMPILE_PASS_CONFIG__FORCE_INT64_INDEXING_FOR_DYNAMIC_SHAPES (1/0/true/false)."
+        ),
+    )
 
     _HASH_EXCLUDE_FIELDS = frozenset({"cache_root_dir", "disable_cache", "assert_cache_hit"})
 
