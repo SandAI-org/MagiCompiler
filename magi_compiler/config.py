@@ -119,10 +119,11 @@ class PassConfig(BaseModel):
     force_int64_indexing_for_dynamic_shapes: bool = Field(
         True,
         description=(
-            "Generate int64 indexing for every Triton kernel (pointwise, reduction and template) unless int32 holds "
-            "for every shape the kernel can see. Inductor otherwise picks int32 whenever the first compile's "
-            "example sizes fit, and the guard it installs is never checked by MagiCompiler, so a graph first "
-            "compiled on a small input overflows on a larger one. Static-shape kernels still use int32 when they fit. "
+            "Generate int64 indexing for every Triton kernel (pointwise, reduction and template) whose sizes depend "
+            "on a dynamic dim. Inductor otherwise picks int32 whenever the first compile's example sizes fit, or "
+            "whenever the guards recorded while tracing bound them, and MagiCompiler never checks those guards, so "
+            "a graph first compiled on a small input overflows on a larger one. Static-shape kernels still use "
+            "int32 when they fit. "
             "Part of the compile cache key, so artifacts built before the switch are not reused. "
             "Env var: MAGI_COMPILE_PASS_CONFIG__FORCE_INT64_INDEXING_FOR_DYNAMIC_SHAPES (1/0/true/false)."
         ),
@@ -133,6 +134,9 @@ class PassConfig(BaseModel):
     @property
     def hash(self) -> str:
         data = {k: v for k, v in self.model_dump(mode="json").items() if k not in self._HASH_EXCLUDE_FIELDS}
+        if self.force_int64_indexing_for_dynamic_shapes:
+            # Artifacts of the earlier rule, which still trusted the traced guards, must not be reused.
+            data["int64_indexing_rule"] = "any_free_symbol"
         return compute_hash(data)
 
     # Compatible with torch pass

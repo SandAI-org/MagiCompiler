@@ -76,28 +76,30 @@ def _nonce_autograd_cache_key_on_keying_failure():
 
 @contextlib.contextmanager
 def _require_32bit_indexing_for_every_shape():
-    """Let Inductor pick int32 indexing only when int32 holds for every shape the kernel can see.
+    """Let Inductor pick int32 indexing only for sizes free of symbols; any dynamic size uses int64.
 
     Inductor's ``expr_fits_within_32bit`` falls back to the size hint of the first compile's
     example input and installs a ``<= INT32_MAX`` guard to protect that choice. MagiCompiler
     reuses one dynamic-shape artifact for all later shapes without checking those guards, so a
     graph first compiled on a small input (e.g. a 10s video) overflows its int32 offsets on a
-    larger one (e.g. a 30s video). Dropping the hint fallback leaves only the ValueRanges proof,
-    so a kernel whose size depends on an unbounded symbol uses int64. Static sizes are still
-    proven exactly and keep int32.
+    larger one (e.g. a 30s video). A symbolic proof is no way out: ``statically_known_true``
+    takes the guards and runtime asserts recorded while tracing as axioms, and those too only
+    held for the first input. Every size with a free symbol therefore uses int64; a static size
+    keeps int32 when it fits.
 
     ``simd`` and ``triton_utils`` import the function by name, so both bindings are patched:
     ``simd`` covers pointwise/reduction kernels and the ``INDEX_DTYPE`` of Triton templates,
     ``triton_utils`` covers size arguments of user-defined Triton kernels.
     """
+    import sympy
     import torch._inductor.codegen.simd as simd_codegen
     import torch._inductor.codegen.triton_utils as triton_utils_codegen
-    from torch._inductor.virtualized import V
 
     int32_max = torch.iinfo(torch.int32).max
 
     def _fits_within_32bit_for_every_shape(expr) -> bool:
-        return V.graph.sizevars.statically_known_true(expr <= int32_max)
+        expr = sympy.sympify(expr)
+        return not expr.free_symbols and bool(expr <= int32_max)
 
     with patch.object(simd_codegen, "expr_fits_within_32bit", _fits_within_32bit_for_every_shape):
         with patch.object(triton_utils_codegen, "expr_fits_within_32bit", _fits_within_32bit_for_every_shape):
