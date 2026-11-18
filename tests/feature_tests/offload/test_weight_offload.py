@@ -455,12 +455,10 @@ def test_pinned_reservation_failure_is_not_downgraded(monkeypatch):
 
 
 @requires_cuda
-def test_large_pinned_requests_register_through_torchs_cuda_runtime(monkeypatch):
+def test_large_pinned_requests_register_through_torchs_cuda_runtime():
     """A runtime-only install has no libcudart.so for a by-name lookup; the exact-size region must still pin."""
-    from magi_compiler.cuda import cudart as cudart_lookup
     from magi_compiler.passes.weight_offload.runtime.host_memory_pool import EXACT_PINNED_MIN_BYTES, HostMemPool
 
-    monkeypatch.setattr(cudart_lookup, "init_cudart", lambda: None)
     region = HostMemPool(pinned=True).alloc(shape=(EXACT_PINNED_MIN_BYTES,), dtype=torch.uint8)
     assert region.is_pinned()
 

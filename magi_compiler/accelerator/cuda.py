@@ -32,7 +32,12 @@ class CudaPlatform(Platform):
         return tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else (0, 0)
 
     def host_register(self, ptr: int, nbytes: int) -> None:
-        torch.cuda.check_error(torch.cuda.cudart().cudaHostRegister(ptr, nbytes, 0))
+        cudart = torch.cuda.cudart()
+        error = cudart.cudaHostRegister(ptr, nbytes, 0)
+        if error != cudart.cudaError.success:
+            raise RuntimeError(
+                f"cudaHostRegister of a {nbytes / 2**20:.1f} MiB host region failed with error code {int(error)}"
+            )
 
     def host_unregister(self, ptr: int) -> None:
         torch.cuda.cudart().cudaHostUnregister(ptr)
