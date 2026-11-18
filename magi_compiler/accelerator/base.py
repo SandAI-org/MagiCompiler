@@ -59,6 +59,10 @@ class Platform:
         """Page-lock ``nbytes`` of host memory at ``ptr`` in place."""
         raise NotImplementedError
 
+    def host_unregister(self, ptr: int) -> None:
+        """Release the page lock ``host_register`` took at ``ptr``. Runs from a finalizer, so it never raises."""
+        raise NotImplementedError
+
     def emit_nvtx(self, record_shapes: bool = False) -> contextlib.AbstractContextManager:
         """NVTX ranges around every autograd op, for nsys."""
         return contextlib.nullcontext()
@@ -68,6 +72,10 @@ class Platform:
 
     def profiler_stop(self) -> None:
         pass
+
+    def has_active_nvlink(self, device: int) -> Optional[bool]:
+        """Whether ``device`` has an active NVLink; None when the runtime cannot tell."""
+        return None
 
     def __getattr__(self, name: str):
         return getattr(torch.get_device_module(self.device_type), name)

@@ -20,8 +20,8 @@ from functools import lru_cache
 import torch
 import torch._C._distributed_c10d as _c10d
 
-from magi_compiler.utils.event_work import EventWork as _EventWork
 from magi_compiler.utils import magi_logger
+from magi_compiler.utils.event_work import EventWork as _EventWork
 
 from .symm_buffer import lookup_shard
 

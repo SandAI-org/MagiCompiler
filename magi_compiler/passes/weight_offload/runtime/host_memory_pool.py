@@ -27,10 +27,14 @@ everything at once.  What a region holds, and who reads it, is the caller's.
 
 from __future__ import annotations
 
+import mmap
+import weakref
 from dataclasses import dataclass
 from typing import Sequence
 
 import torch
+
+from magi_compiler.accelerator import PLATFORM
 
 SLAB_BYTES = 1 << 30
 """Default cap on one slab (1 GiB).
@@ -43,6 +47,37 @@ gets a slab of its own.
 ALIGN_BYTES = 512
 """Default start alignment of every region: what the DMA engine wants for peak
 host-to-device throughput."""
+
+EXACT_PINNED_MIN_BYTES = 64 << 20
+"""Pinned requests from this size get their own exact-size region registered in place.
+
+torch's pinned allocator rounds every block up to a power of two, so a 960 MiB weight
+reserves 1 GiB and a pinned slab packs 480 MiB weights with 6% left over. Below this
+size, slabs keep the count of cudaHostRegister calls low.
+"""
+
+
+def _register_host_memory(region: torch.Tensor) -> None:
+    """Page-lock ``region`` in place through the device runtime torch has loaded."""
+    PLATFORM.host_register(region.data_ptr(), region.numel() * region.element_size())
+
+
+def _unregister_host_memory(address: int) -> None:
+    PLATFORM.host_unregister(address)
+
+
+def _exact_pinned_region(nbytes: int) -> torch.Tensor:
+    """``nbytes`` of page-aligned anonymous memory, page-locked with cudaHostRegister.
+
+    The mapping stays registered while any view of it lives and is unregistered before it is unmapped.
+    """
+    mapping = mmap.mmap(-1, nbytes)
+    region = torch.frombuffer(mapping, dtype=torch.uint8)
+    _register_host_memory(region)
+    if not region.is_pinned():
+        raise RuntimeError(f"host pool: could not page-lock a {nbytes / 2**20:.1f} MiB region with cudaHostRegister")
+    weakref.finalize(mapping, _unregister_host_memory, region.data_ptr())
+    return region
 
 
 @dataclass
@@ -86,6 +121,11 @@ class HostMemPool:
     def _allocate_slab_region(self, numel: int, dtype: torch.dtype) -> torch.Tensor:
         align_numel = max(1, self._align_bytes // dtype.itemsize)
         padded_numel = (numel + align_numel - 1) // align_numel * align_numel
+
+        if self._pinned and padded_numel * dtype.itemsize >= EXACT_PINNED_MIN_BYTES:
+            storage = _exact_pinned_region(padded_numel * dtype.itemsize).view(dtype)
+            self._slabs.append(_Slab(storage=storage, used_numel=padded_numel))
+            return storage[:numel]
 
         for slab in self._slabs:
             if slab.storage.dtype is not dtype:

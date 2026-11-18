@@ -116,12 +116,27 @@ class PassConfig(BaseModel):
             "Settable via the MAGI_COMPILE_PASS_CONFIG__ENABLE_MM_EPILOGUE_FUSION env var."
         ),
     )
+    force_int64_indexing_for_dynamic_shapes: bool = Field(
+        True,
+        description=(
+            "Generate int64 indexing for every Triton kernel (pointwise, reduction and template) whose sizes depend "
+            "on a dynamic dim. Inductor otherwise picks int32 whenever the first compile's example sizes fit, or "
+            "whenever the guards recorded while tracing bound them, and MagiCompiler never checks those guards, so "
+            "a graph first compiled on a small input overflows on a larger one. Static-shape kernels still use "
+            "int32 when they fit. "
+            "Part of the compile cache key, so artifacts built before the switch are not reused. "
+            "Env var: MAGI_COMPILE_PASS_CONFIG__FORCE_INT64_INDEXING_FOR_DYNAMIC_SHAPES (1/0/true/false)."
+        ),
+    )
 
     _HASH_EXCLUDE_FIELDS = frozenset({"cache_root_dir", "disable_cache", "assert_cache_hit"})
 
     @property
     def hash(self) -> str:
         data = {k: v for k, v in self.model_dump(mode="json").items() if k not in self._HASH_EXCLUDE_FIELDS}
+        if self.force_int64_indexing_for_dynamic_shapes:
+            # Artifacts of the earlier rule, which still trusted the traced guards, must not be reused.
+            data["int64_indexing_rule"] = "any_free_symbol"
         return compute_hash(data)
 
     # Compatible with torch pass
@@ -244,6 +259,20 @@ class OffloadConfig(BaseModel):
             "per host, interleaved over its NUMA nodes. NUMA placement is best effort. FSDP shards and to_empty weights "
             "stay private. When enabled, every WORLD rank must move the same compiled models to CUDA in the same order, "
             "and the ranks of a host must share a PID namespace."
+        ),
+    )
+    defer_host_materialization: bool = Field(
+        False,
+        description=(
+            "With graph_weight_offload on a host-built model: the first CUDA move only records each offloadable "
+            "weight's CPU original (e.g. a checkpoint mmap) and binds its slot to a shared zero placeholder, so "
+            "nothing is read or pinned yet. When the first compile of the model has chosen the resident weights, "
+            "and before the compiled graph runs, every weight is copied once: resident ones into device memory "
+            "with no host copy, the rest into pinned host memory (shared per offload_host_weight_sharing). Later "
+            "compiles keep that resident set. Weights without a host copy cannot move back to the host, so the "
+            "model must stay on CUDA. Meta-built (to_empty) models are refused. Unless offload_host_weight_sharing "
+            "is 'off', every compile of the model is a collective over WORLD. "
+            "Env var: MAGI_COMPILE_OFFLOAD_CONFIG__DEFER_HOST_MATERIALIZATION."
         ),
     )
     offload_max_device_weight_mib: int = Field(
@@ -446,6 +475,20 @@ class CompileConfig(BaseSettings):
         description=(
             "Whole-graph FSDP weight all-gather / compute overlap (lowering + bucketing + reorder + cost "
             "model). Fields reachable via MAGI_COMPILE_FSDP_CONFIG__<FIELD> env vars."
+        ),
+    )
+    transfer_link_sharing: Literal["auto", "pcie", "nvlink", "off"] = Field(
+        "auto",
+        description=(
+            "Which graph transfers take turns on a shared physical link, so none slows another down: FSDP weight "
+            "all-gathers, all-to-alls issued in the graph (e.g. Ulysses attention) and graph weight loads. "
+            "'pcie': without NVLink all three cross the GPU's PCIe link, so they queue on the H2D load stream "
+            "one at a time. 'nvlink': all-gathers and all-to-alls share NVLink and queue on one stream of their own; "
+            "loads overlap them freely. In both, a gather or load is placed only in the compute time the transfers "
+            "it takes turns with leave free, never straddling one. 'off': every transfer keeps its own stream "
+            "and is placed as if alone. 'auto' (default): 'nvlink' when NVML reports an active NVLink on this GPU, "
+            "'pcie' when it reports none, 'off' when it cannot tell. Applies to graphs with FSDP gathers or "
+            "graph weight loads."
         ),
     )
 

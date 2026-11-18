@@ -570,6 +570,53 @@ def test_a_lone_unhideable_load_is_bought_out_only_when_asked():
     assert resident, "given the budget, the transfer stops happening"
 
 
+def _settle_weight_on_device(cpu_original: torch.Tensor) -> int:
+    """Defer a weight, promote it, and complete it on the device, leaving it with no host copy."""
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
+    from magi_compiler.passes.weight_offload.runtime.host_weights import zero_placeholder_host_buffers
+
+    store = get_global_host_weight_store()
+    device_standin = torch.empty_like(cpu_original, device="cuda")
+    device_standin.untyped_storage().resize_(0)
+    (placeholder,) = zero_placeholder_host_buffers([(cpu_original.shape, cpu_original.dtype)])
+    slot = store.bind_deferred_weight(
+        placeholder=placeholder,
+        device_standin=device_standin,
+        parameter_name="settled",
+        pending_source=cpu_original,
+        deferred_group_id=store.new_deferred_group_id(),
+    )
+    store.make_weight_resident(slot)
+    store.complete_pending_slot_on_device(slot)
+    return slot
+
+
+@requires_cuda
+@pytest.mark.usefixtures("reset_host_weight_store")
+def test_a_weight_without_host_copy_spends_the_residency_budget_first():
+    """A later compile must keep a device-only weight resident and charge it to the budget,
+    so the budget it alone fills cannot also buy out an earlier, unhideable load."""
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
+
+    host_shard = torch.randn(4 * BYTES_PER_MIB // 2, device="cuda", dtype=torch.bfloat16)
+    host_slot = _park_weight_in_host_store(host_shard)
+    device_only_slot = _settle_weight_on_device(torch.randn(4 * BYTES_PER_MIB // 2, dtype=torch.bfloat16))
+    order = [
+        _load_node("ld_host", 4, slot=host_slot),
+        _wait_node("w_host", "ld_host"),
+        _compute_node("user_host", 1e6, deps=["w_host"]),
+        _load_node("ld_device", 4, slot=device_only_slot),
+        _wait_node("w_device", "ld_device"),
+        _compute_node("user_device", 1e6, deps=["w_device"]),
+    ]
+
+    _reordered_node_names(order, max_resident_bytes=4 * BYTES_PER_MIB)
+
+    store = get_global_host_weight_store()
+    assert store.is_resident(device_only_slot) and store.is_device_only(device_only_slot)
+    assert not store.is_resident(host_slot) and host_shard.untyped_storage().nbytes() == 0
+
+
 def _equal_boundary_order():
     """``ld0.last_user_index`` lands exactly on where ld1 wants to start."""
     return [

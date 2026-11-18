@@ -18,6 +18,10 @@ Runs after cost profiling and optional bucketing on the unsplit graph.
 Each task uses the original launch's next boundary as its deadline and
 ``transfer_duration_ns * scale + margin`` as its transfer window; gathers are never delayed.
 Single and coalesced gathers share dependency validation and rank agreement.
+
+When collectives take turns on a shared link (``LinkSharing``), the gathers queue on
+one stream with the graph's other link collectives (all-to-alls above all), so they
+are placed on the compute time those leave free and never straddle one.
 """
 
 from __future__ import annotations
@@ -38,11 +42,14 @@ from magi_compiler.passes.snode_utils import (
 from magi_compiler.passes.transfer_overlap import (
     DEFAULT_WINDOW_MARGIN_NS,
     CostView,
+    LinkSharing,
     OverlapCallState,
     OverlapPass,
     SnodeGraph,
     TransferTask,
     enforce_launch_order,
+    free_time_axis,
+    link_busy_spans_ns,
     rank_sync,
     schedule_transfers_alap,
 )
@@ -59,6 +66,9 @@ class FsdpOverlapCallState(OverlapCallState):
     placement_mode: str = "abort"  # "slot", "pinned" or "abort"; identical on every rank
     sync_group: object = None
     world_size: int = 1
+    # Set by assign_launch_indices when gathers take turns with other link collectives.
+    link_collective_count: int = 0
+    link_collective_busy_ns: float = 0.0
 
 
 class FsdpOverlapReorder(OverlapPass):
@@ -72,12 +82,14 @@ class FsdpOverlapReorder(OverlapPass):
         comm_overlap_window_margin_ns: float = DEFAULT_WINDOW_MARGIN_NS,
         runtime_ns_fn=None,
         comm_overlap_window_scale: float = 1.0,
+        link_sharing: LinkSharing = LinkSharing.OFF,
     ) -> None:
         super().__init__(runtime_ns_fn)
         self.comm_overlap_window_margin_ns = comm_overlap_window_margin_ns
         # required_overlap_ns = transfer_duration_ns * scale + margin: collectives are
         # measured in isolation but run concurrent with the compute that hides them.
         self.comm_overlap_window_scale = comm_overlap_window_scale
+        self.link_sharing = link_sharing
 
     # -- OverlapPass hooks ------------------------------------------------
     def has_transfer_candidates(self, order: list[BaseSchedulerNode]) -> bool:
@@ -139,9 +151,19 @@ class FsdpOverlapReorder(OverlapPass):
         moving_nodes = {m for t in tasks for m in t.moving_nodes}
         original_cost_view = cost
         overlap_cost_view = CostView(lambda s: 0.0 if s in moving_nodes else original_cost_view(s))
+        placement_prefix_ns = overlap_cost_view.compute_prefix_ns(graph.order)
+        blocked_windows_ns: list[tuple[float, float]] = []
+        if self.link_sharing.collectives_take_turns:
+            # Planned gathers are what is being placed; every other link collective stays put.
+            busy_spans = link_busy_spans_ns(
+                graph, overlap_cost_view, placement_prefix_ns, excluded_snodes={task.anchor for task in tasks}
+            )
+            placement_prefix_ns, blocked_windows_ns = free_time_axis(placement_prefix_ns, busy_spans)
+            call_state.link_collective_count = len(busy_spans)
+            call_state.link_collective_busy_ns = sum(end_ns - start_ns for start_ns, end_ns in busy_spans)
         # No in-flight byte budget on gathers.
         schedule_result = schedule_transfers_alap(
-            tasks, overlap_cost_view.compute_prefix_ns(graph.order), graph.original_index_by_node, float("inf")
+            tasks, placement_prefix_ns, graph.original_index_by_node, float("inf"), blocked_windows_ns=blocked_windows_ns
         )
         launch_index_by_anchor = schedule_result.launch_index_by_anchor
         if call_state.world_size > 1 and call_state.placement_mode != "pinned":
@@ -180,6 +202,14 @@ class FsdpOverlapReorder(OverlapPass):
         magi_logger.info(
             "FSDP overlap reorder: repositioned %d/%d weight all-gather launch(es)", moved_count, len(call_state.launches)
         )
+        if self.link_sharing.collectives_take_turns and call_state.link_collective_count:
+            magi_logger.info(
+                "FSDP overlap reorder: gathers placed around %d other collective(s) on the %s link; "
+                "those occupy %.1fms of compute",
+                call_state.link_collective_count,
+                self.link_sharing.value,
+                call_state.link_collective_busy_ns / 1e6,
+            )
 
     # -- moving-node detection --------------------------------------------
     def _collect_moving_nodes(self, launch, graph: SnodeGraph, cost: CostView) -> list[BaseSchedulerNode]:

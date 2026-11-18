@@ -52,6 +52,8 @@ class ScheduleResult:
     unhidden_ns_by_anchor: Mapping[BaseSchedulerNode, float]
     # The in-flight budget, not the bus, is what left these transfers partly unhidden.
     inflight_budget_limited_anchors: frozenset
+    # Longer than their gap: each runs into a blocked window and holds that collective back.
+    window_straddling_anchors: frozenset = frozenset()
 
     @property
     def total_unhidden_ns(self) -> float:

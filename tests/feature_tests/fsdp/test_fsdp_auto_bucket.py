@@ -299,6 +299,8 @@ def _run_coalesce_e2e(*extra: str) -> subprocess.CompletedProcess:
     # The FX graph is the same with and without the scheduler pass, so a shared
     # cache would replay another run's artifact and skip the pass under test.
     env["TORCHINDUCTOR_FORCE_DISABLE_CACHES"] = "1"
+    # The helper counts functional gathers in the generated code; link sharing would rename them.
+    env["MAGI_COMPILE_TRANSFER_LINK_SHARING"] = "off"
     with tempfile.TemporaryDirectory(prefix="magi_auto_bucket_") as cache_root:
         env["MAGI_COMPILE_CACHE_ROOT_DIR"] = cache_root
         return subprocess.run(

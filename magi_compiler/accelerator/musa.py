@@ -44,3 +44,6 @@ class MusaPlatform(Platform):
         err = self._musart.musaHostRegister(ctypes.c_void_p(ptr), ctypes.c_size_t(nbytes), 0)
         if err != 0:
             raise RuntimeError(f"musaHostRegister failed with error {err}")
+
+    def host_unregister(self, ptr: int) -> None:
+        self._musart.musaHostUnregister(ctypes.c_void_p(ptr))
