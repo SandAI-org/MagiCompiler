@@ -11,6 +11,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+from torch._dynamo.symbolic_convert import TensorifyState
 
 from magi_compiler import magi_compile, magi_register_custom_op
 from magi_compiler.config import get_compile_config
@@ -55,11 +56,12 @@ class TinyBlock(nn.Module):
         return x + y
 
 
-@magi_compile(dynamic_arg_dims={"x": 0, "permute": 0})
+@magi_compile(model_tag=lambda block: block.tag, dynamic_arg_dims={"x": 0, "permute": 0})
 class CompiledBlock(nn.Module):
-    def __init__(self):
+    def __init__(self, tag: str | None = None):
         super().__init__()
         self.layer = TinyBlock()
+        self.tag = tag
 
     def forward(
         self, x: torch.Tensor, permute: torch.Tensor, dispatcher: TwoGroupDispatcher, use_boundary: bool
@@ -71,9 +73,9 @@ class CompiledBlock(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self):
+    def __init__(self, tag: str | None = None):
         super().__init__()
-        self.block = CompiledBlock()
+        self.block = CompiledBlock(tag)
 
     def forward(self, x: torch.Tensor, routing: torch.Tensor, use_boundary: bool = True) -> torch.Tensor:
         dispatcher = TwoGroupDispatcher(routing)
@@ -105,9 +107,30 @@ def _collect_new_run_dirs(cache_root: Path, before: set[str]) -> list[Path]:
     return [p for p in all_runs if str(p) not in before]
 
 
+def _record_float_specializations() -> list[str]:
+    """The float symbols a TensorifyScalarRestartAnalysis asks Dynamo to specialize, in order."""
+    names: list[str] = []
+    specialize = TensorifyState.specialize.__func__
+
+    def record(cls, index: str) -> None:
+        names.append(index)
+        specialize(cls, index)
+
+    TensorifyState.specialize = classmethod(record)
+    return names
+
+
+def _force_float_specializations(names: list[str]) -> None:
+    """Dynamo specializes these floats on its first trace, as a stale TensorifyState entry made it do."""
+    should_specialize = TensorifyState.should_specialize.__func__
+    TensorifyState.should_specialize = classmethod(lambda cls, index: index in names or should_specialize(cls, index))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True)
+    parser.add_argument("--tags", default="", help="comma-separated model tags, built and called in order")
+    parser.add_argument("--force-float-specializations", default="", help="comma-separated float symbol names")
     args = parser.parse_args()
 
     config = get_compile_config()
@@ -115,17 +138,21 @@ def main() -> None:
     run_dirs_before = {str(p) for p in cache_root.rglob("run_*") if p.is_dir()}
 
     torch._dynamo.reset()
-    torch.manual_seed(2026)
-    torch.cuda.manual_seed_all(2026)
+    float_specializations = _record_float_specializations()
+    if args.force_float_specializations:
+        _force_float_specializations(args.force_float_specializations.split(","))
 
-    model = Model().eval()
-    x = torch.randn(SEQ_LEN, HIDDEN, device=DEVICE, dtype=DTYPE)
+    x = torch.randn(SEQ_LEN, HIDDEN, device=DEVICE, dtype=DTYPE, generator=torch.Generator(DEVICE).manual_seed(2026))
     group0 = SEQ_LEN // 2
     group1 = SEQ_LEN - group0
     routing = torch.tensor([0] * group0 + [1] * group1, device=DEVICE, dtype=torch.long)
 
-    with torch.no_grad():
-        out = model(x, routing, True)
+    for tag in args.tags.split(",") if args.tags else [None]:
+        torch.manual_seed(2026)
+        torch.cuda.manual_seed_all(2026)
+        model = Model(tag).eval()
+        with torch.no_grad():
+            out = model(x, routing, True)
 
     new_run_dirs = _collect_new_run_dirs(cache_root, run_dirs_before)
     run_events = {}
@@ -138,6 +165,7 @@ def main() -> None:
         "mean": float(out.float().mean().item()),
         "new_run_dirs": [str(p) for p in new_run_dirs],
         "subgraph0_events_by_run": run_events,
+        "float_specializations": float_specializations,
     }
     with open(args.output, "w") as f:
         json.dump(payload, f)

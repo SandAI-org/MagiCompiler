@@ -65,6 +65,13 @@ class PostGradPassManager(CustomGraphPass):
         magi_logger.info("Run PostGradPassManager")
 
         ctx = get_pass_context()
+        if ctx.expect_restart_analysis:
+            # Lowering runs collectives that ranks which did restart never reach; fail before them, not at their timeout.
+            raise RuntimeError(
+                f"MAGI_COMPILE_ASSERT_CACHE_HIT: expected a restart-analysis replay for runtime_shape={ctx.runtime_shape} "
+                f"graph_index={ctx.subgraph_index} but it is compiling from scratch: the trace took the post-restart "
+                "path on its first attempt (e.g. a float specialization left by an earlier compile)."
+            )
         shape = ctx.runtime_shape
         for pass_ in self.passes:
             applied = pass_(graph)
