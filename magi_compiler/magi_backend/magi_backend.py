@@ -36,6 +36,7 @@ from magi_compiler.config import CompileConfig, CompileMode, CudaGraphMode, indu
 from magi_compiler.magi_depyf.timeline import observe_lifecycle, observe_lifecycle_context
 from magi_compiler.offload.offload_warpper import OffloadWrapper, is_python_scalar_input, mark_python_scalar_inputs
 from magi_compiler.passes import CustomJointGraphPartitionFn, FullGraphPassManager, PostGradPassManager, pass_context
+from magi_compiler.passes.snode_utils import waits_follow_their_collectives
 from magi_compiler.passes.weight_offload import OffloadCache, materialize_deferred_host_weights
 from magi_compiler.utils import compilation_counter, compute_code_hash, compute_graph_hash, compute_hash, magi_logger
 from magi_compiler.utils.visualize import save_fx_graph_visualization
@@ -669,6 +670,8 @@ class MagiBackend:
         passes = weight_transfer_pipeline.rewrite_graph_and_build_scheduler_passes(
             graph=graph, example_inputs=example_inputs, default_passes=self._default_overlap_passes
         )
+        if passes is None and not PLATFORM.concurrent_collectives:
+            passes = [waits_follow_their_collectives]
         if passes is not None:
             self.inductor_compile_config["reorder_for_compute_comm_overlap"] = True
             self.inductor_compile_config[_OVERLAP_PASSES_KEY] = passes

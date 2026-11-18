@@ -51,6 +51,10 @@ class Platform:
     # auto-bucketing emits. NCCL does; a backend whose library lacks it (MUSA/MCCL) hangs on the coalesced op
     # while plain all_gather_into_tensor still works.
     coalesced_all_gather: bool = True
+    # Whether collectives on different communicators may be in flight together. NCCL's may; MCCL's hang once one
+    # is launched before another's wait (the MUSA watchdog then kills the stalled kernel), so Inductor schedules
+    # every wait right after its collective there.
+    concurrent_collectives: bool = True
 
     def device(self, index: Optional[int] = None) -> torch.device:
         return torch.device(self.device_type, self.current_device() if index is None else index)
