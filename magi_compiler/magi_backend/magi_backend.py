@@ -102,7 +102,9 @@ class CompilerManager:
         return self.compiler.hash
 
     @contextmanager
-    def compile_context(self, runtime_shape: int | None = None, graph_index: int | None = None):
+    def compile_context(
+        self, runtime_shape: int | None = None, graph_index: int | None = None, expect_restart_analysis: bool = False
+    ):
         """Provide compilation context for the duration of compilation to set
         any torch global properties we want to scope to a single Inductor
         compilation (e.g. pass context)."""
@@ -118,7 +120,7 @@ class CompilerManager:
         with (
             torch_cache_context,
             observe_lifecycle_context("pass_context", runtime_shape=runtime_shape, subgraph_index=graph_index),
-            pass_context(runtime_shape, graph_index),
+            pass_context(runtime_shape, graph_index, expect_restart_analysis),
         ):
             yield
 
@@ -258,6 +260,7 @@ class CompilerManager:
         if compiled_graph is not None:
             return compiled_graph
 
+        expect_restart_analysis = False
         if self.compile_config.assert_cache_hit:
             if cache_entry not in self.cache:
                 raise RuntimeError(
@@ -275,15 +278,22 @@ class CompilerManager:
             # Fall through to normal compile path: standalone_compile will trigger
             # TensorifyScalarRestartAnalysis (same as bake), dynamo re-traces, and
             # on retry load() succeeds (graph shape matches cached artifact).
+            expect_restart_analysis = True
 
         # Step2: Compile the graph
         key = f"artifact_shape_{runtime_shape}_subgraph_{graph_index}"
 
-        with self.compile_context(runtime_shape, graph_index):
+        with self.compile_context(runtime_shape, graph_index, expect_restart_analysis):
             compiled_graph, cache_handle = self.compiler.compile(
                 graph, example_inputs, inductor_compile_config, runtime_shape, key
             )
             assert compiled_graph is not None, "Failed to compile the graph"
+        if expect_restart_analysis:
+            # An Inductor cache hit skips the post-grad passes, so the PostGradPassManager check never ran.
+            raise RuntimeError(
+                f"MAGI_COMPILE_ASSERT_CACHE_HIT: expected a restart-analysis replay for runtime_shape={runtime_shape} "
+                f"graph_index={graph_index} but the compile returned without restarting."
+            )
 
         # Step3: Store the artifact in the cache
         self._maybe_store_cache_entry(cache_entry, cache_handle, runtime_shape, key)

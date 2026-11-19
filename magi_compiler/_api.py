@@ -28,7 +28,7 @@ from unittest.mock import patch
 import torch
 from torch import distributed as dist
 from torch import nn
-from torch._dynamo.symbolic_convert import InliningInstructionTranslator
+from torch._dynamo.symbolic_convert import InliningInstructionTranslator, TensorifyState
 
 from magi_compiler.config import debug_dump_path, inductor_cache_dump_path, triton_cache_dump_path
 from magi_compiler.cuda.cudart import pin_memory_in_place
@@ -500,6 +500,15 @@ def _compilation_context(state: MagiCompileState):
     (a full snapshot-restore), which also catches any implicit config
     mutations made by Dynamo internals during compilation.
 
+    Float specializations: ``TensorifyState`` is emptied on entry and on exit.
+    A ``TensorifyScalarRestartAnalysis`` records the float inputs to specialize
+    by symbol name ("zf0", ...) and Dynamo leaves them set once that compile
+    succeeds; every later frame names its floats from "zf0" again, so a stale
+    entry specializes them on the first attempt and skips the restart. Ranks
+    whose compile histories differ would then take different compile paths
+    (skip-and-recompile vs restart-and-load) and pair the collectives inside
+    compilation across those paths.
+
     Tracing hooks:
     - _hijack_inline_call: collect traced Python source files for
       compilation cache invalidation.
@@ -539,7 +548,11 @@ def _compilation_context(state: MagiCompileState):
         ),
         explain_compilation(_debug_dump_path.as_posix()),
     ):
-        yield
+        TensorifyState.clear()
+        try:
+            yield
+        finally:
+            TensorifyState.clear()
 
 
 # Collect all relevant files traced by Dynamo, re-compile the model when any of these files change.

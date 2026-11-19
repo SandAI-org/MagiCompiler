@@ -8,6 +8,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -78,3 +79,60 @@ def test_assert_cache_hit_succeeds_with_restart_analysis(tmp_path: Path):
     payload_verify = json.loads(out_verify.read_text())
     assert payload_verify["shape"] == payload_bake["shape"]
     assert abs(payload_bake["sum"] - payload_verify["sum"]) < 1e-2
+
+
+HELPER = Path(__file__).parent / "cache_reuse_helper" / "restart_analysis_cache_helper.py"
+
+
+def _run_helper(
+    tmp_path: Path, name: str, *args: str, assert_cache_hit: bool = False
+) -> tuple[subprocess.CompletedProcess, dict]:
+    """One helper process on the cache under ``tmp_path``, as a bake or a deploy that loads it is."""
+    env = {**os.environ, "MAGI_LOGGING_LEVEL": "info", "MAGI_COMPILE_CACHE_ROOT_DIR": str(tmp_path / "cache")}
+    if assert_cache_hit:
+        env["MAGI_COMPILE_ASSERT_CACHE_HIT"] = "1"
+    output = tmp_path / f"{name}.json"
+    proc = subprocess.run(
+        [sys.executable, str(HELPER), "--output", str(output), *args], env=env, capture_output=True, text=True
+    )
+    return proc, json.loads(output.read_text()) if output.exists() else {}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "inductor_cache, failure",
+    [("kept", "but the compile returned without restarting"), ("dropped", "but it is compiling from scratch")],
+)
+def test_assert_cache_hit_fails_fast_when_the_recorded_restart_does_not_happen(
+    tmp_path: Path, inductor_cache: str, failure: str
+):
+    """The cache says this subgraph restarts before it loads; a verify whose trace already specialized the float (a
+    stale float specialization) compiles it from scratch instead, and on several ranks only that rank enters
+    Inductor's collectives, so the others wait for it until the collective timeout. Assert mode must fail first,
+    whether Inductor's own cache returns the graph or Inductor lowers it."""
+    bake, payload = _run_helper(tmp_path, "bake")
+    assert bake.returncode == 0, bake.stderr
+    assert payload["float_specializations"], "the bake did not restart, test precondition violated"
+    if inductor_cache == "dropped":
+        shutil.rmtree(tmp_path / "cache" / "inductor_cache")
+
+    names = ",".join(payload["float_specializations"])
+    verify, _ = _run_helper(tmp_path, "verify", "--force-float-specializations", names, assert_cache_hit=True)
+    assert verify.returncode != 0, f"verify compiled from scratch instead of failing\nstderr:\n{verify.stderr}"
+    assert "MAGI_COMPILE_ASSERT_CACHE_HIT: expected a restart-analysis replay" in verify.stderr, verify.stderr
+    assert failure in verify.stderr, verify.stderr
+    assert "standalone_compile raised RestartAnalysis" not in verify.stderr
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_assert_cache_hit_loads_a_model_after_another_model_restarted_in_the_same_process(tmp_path: Path):
+    """Bakes compile one model each, a deploy compiles both in one process: the first model's restart must not keep
+    its float specialized into the second's trace, which then names the same float."""
+    for tag in "ab":
+        bake, _ = _run_helper(tmp_path, f"bake_{tag}", "--tags", tag)
+        assert bake.returncode == 0, bake.stderr
+
+    verify, payload = _run_helper(tmp_path, "verify", "--tags", "a,b", assert_cache_hit=True)
+    assert verify.returncode == 0, verify.stderr
+    assert verify.stderr.count("standalone_compile raised RestartAnalysis") == 2, verify.stderr
+    assert payload["float_specializations"][0] == payload["float_specializations"][1], "the models name different floats"
