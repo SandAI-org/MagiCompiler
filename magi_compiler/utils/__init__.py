@@ -15,7 +15,6 @@
 
 from ._utils import *
 from .compile_counter import compilation_counter
-from .device import device_capability, device_capability_major
 from .envs import set_env_var
 from .hash import (
     compute_code_hash,
@@ -43,6 +42,4 @@ __all__ = [
     "SingletonMeta",
     "instrument_nvtx",
     "add_nvtx_event",
-    "device_capability",
-    "device_capability_major",
 ]

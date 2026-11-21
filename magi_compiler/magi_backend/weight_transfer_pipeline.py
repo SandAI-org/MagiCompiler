@@ -29,6 +29,7 @@ import torch.distributed as dist
 import torch.fx as fx
 from torch.distributed.tensor import DTensor
 
+from magi_compiler.accelerator import PLATFORM
 from magi_compiler.config import CudaGraphMode, FSDPConfig, OffloadConfig
 from magi_compiler.passes.fsdp_overlap import (
     FsdpAutoBucket,
@@ -50,7 +51,6 @@ from magi_compiler.passes.weight_offload import (
 )
 from magi_compiler.profiling import ProfilingRuntimeEstimator
 from magi_compiler.utils import magi_logger
-from magi_compiler.utils.device import has_active_nvlink
 
 _MAX_LOGGED_WEIGHT_NAMES = 8
 """Arbitrary cap that keeps the restored-weights warning to one readable line."""
@@ -128,7 +128,7 @@ def build_transfer_overlap_passes(
     passes: list = [SnodeCostProfile(costs, estimator)]
 
     if fsdp_config.enable_fsdp:
-        if fsdp_config.bucket_mode == "auto":
+        if fsdp_config.bucket_mode == "auto" and PLATFORM.coalesced_all_gather:
             # Ahead of the FSDP reorder, which places the merged gathers;
             # bucketing needs profiled costs and prices the nodes it creates.
             passes.append(
@@ -172,8 +172,8 @@ def _resolve_link_sharing(transfer_link_sharing: str) -> LinkSharing:
     """Resolve ``transfer_link_sharing``; 'auto' asks NVML whether this GPU has NVLink."""
     if transfer_link_sharing != "auto":
         return LinkSharing(transfer_link_sharing)
-    device = torch.cuda.current_device()
-    nvlink_active = has_active_nvlink(device)
+    device = PLATFORM.current_device()
+    nvlink_active = PLATFORM.has_active_nvlink(device)
     if nvlink_active is None:
         magi_logger.info("transfer link sharing: NVML cannot tell whether GPU %d has NVLink; leaving it off", device)
         return LinkSharing.OFF
@@ -185,6 +185,9 @@ def _validate_weight_transfer_config(
 ) -> None:
     if fsdp_config.enable_fsdp:
         assert cudagraph_mode == CudaGraphMode.NONE, "fsdp_config.enable_fsdp requires cudagraph_mode=NONE"
+        assert (
+            fsdp_config.transport != "copy_engine" or PLATFORM.has_symm_mem
+        ), "fsdp_config.transport='copy_engine' needs CUDA symmetric memory; use 'nccl'"
     if offload_config.graph_weight_offload:
         assert (
             not offload_config.model_cpu_offload

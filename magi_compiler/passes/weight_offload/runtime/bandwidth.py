@@ -24,11 +24,13 @@ from __future__ import annotations
 
 import torch
 
+from magi_compiler.accelerator import PLATFORM
+
 H2D_PROBE_BYTES = 64 << 20
 
 FALLBACK_H2D_BYTES_PER_NS = 20.0
-"""~20 GB/s: a conservative PCIe Gen4 x16 pinned transfer, used when CUDA is
-unavailable. Under-estimating bandwidth over-estimates the load, which makes the
+"""~20 GB/s: a conservative PCIe Gen4 x16 pinned transfer, used when no accelerator
+is available. Under-estimating bandwidth over-estimates the load, which makes the
 reorder pass hoist further than needed -- slower but never incorrect."""
 
 
@@ -38,17 +40,17 @@ H2D_PROBE_ITERATIONS = 20
 def _allocate_probe_buffers() -> tuple[torch.Tensor, torch.Tensor]:
     """Pinned source and device destination with the driver's mapping warmed."""
     host_source = torch.empty(H2D_PROBE_BYTES, dtype=torch.uint8, device="cpu", pin_memory=True)
-    device_destination = torch.empty(H2D_PROBE_BYTES, dtype=torch.uint8, device="cuda")
+    device_destination = torch.empty(H2D_PROBE_BYTES, dtype=torch.uint8, device=PLATFORM.device_type)
     for _ in range(2):
         device_destination.copy_(host_source, non_blocking=True)
-    torch.cuda.current_stream().synchronize()
+    PLATFORM.current_stream().synchronize()
     return host_source, device_destination
 
 
 def _measure_copy_time_ns(host_source: torch.Tensor, device_destination: torch.Tensor) -> float:
     """Nanoseconds for ``H2D_PROBE_ITERATIONS`` back-to-back copies."""
-    stream = torch.cuda.current_stream()
-    start_event, end_event = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    stream = PLATFORM.current_stream()
+    start_event, end_event = PLATFORM.Event(enable_timing=True), PLATFORM.Event(enable_timing=True)
     start_event.record(stream)
     for _ in range(H2D_PROBE_ITERATIONS):
         device_destination.copy_(host_source, non_blocking=True)
@@ -62,7 +64,7 @@ def measure_h2d_bandwidth_bytes_per_ns() -> float:
 
     Ranks sharing a host link are not lined up, so the result can exceed the
     contended bandwidth; set ``offload_h2d_bandwidth_gbps`` to pin it."""
-    if not torch.cuda.is_available():
+    if not PLATFORM.is_available():
         return FALLBACK_H2D_BYTES_PER_NS
     buffers = _allocate_probe_buffers()
     elapsed_ns = _measure_copy_time_ns(*buffers)

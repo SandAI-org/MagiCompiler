@@ -170,7 +170,7 @@ def _park_and_probe_sharing_worker(
             name: store.host_buffer(store.slot_for_tensor(param)) for name, param in model.named_parameters()
         }
         result = {
-            "gpu_numa_node": numa.cuda_device_numa_node(device_index),
+            "gpu_numa_node": numa.device_numa_node(device_index),
             "dense_page_numa_nodes": sorted(_numa_pages_of(host_buffer_by_name["dense.weight"])),
             "matches_own_weights": {
                 name: torch.equal(host_buffer, expected_weight_by_name[name])
@@ -499,11 +499,9 @@ def _plan_input(sharing_group: str, nbytes_by_weight_name: dict[str, int], exper
 
 
 @requires_cuda
-def test_shared_regions_register_through_torchs_cuda_runtime(monkeypatch):
+def test_shared_regions_register_through_torchs_cuda_runtime():
     """A runtime-only install has no libcudart.so for a by-name lookup; the shared mapping must still pin."""
-    from magi_compiler.cuda import cudart as cudart_lookup
 
-    monkeypatch.setattr(cudart_lookup, "init_cudart", lambda: None)
     region_nbytes = 1 << 20
     # A memfd, as a writer creates: a kernel may refuse to page-lock a writable mapping of an ordinary file.
     file_descriptor = region_module._create_shared_memory_file(region_label="pin_test", nbytes=region_nbytes, numa_policy=None)

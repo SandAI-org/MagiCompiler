@@ -34,6 +34,8 @@ from typing import Sequence
 
 import torch
 
+from magi_compiler.accelerator import PLATFORM
+
 SLAB_BYTES = 1 << 30
 """Default cap on one slab (1 GiB).
 
@@ -56,19 +58,12 @@ size, slabs keep the count of cudaHostRegister calls low.
 
 
 def _register_host_memory(region: torch.Tensor) -> None:
-    """Page-lock ``region`` in place through the CUDA runtime torch has loaded.
-
-    Looking libcudart up by name would miss runtime-only installs that ship just a versioned ``libcudart.so.N``.
-    """
-    cudart = torch.cuda.cudart()
-    nbytes = region.numel() * region.element_size()
-    error = cudart.cudaHostRegister(region.data_ptr(), nbytes, 0)
-    if error != cudart.cudaError.success:
-        raise RuntimeError(f"cudaHostRegister of a {nbytes / 2**20:.1f} MiB host region failed with error code {int(error)}")
+    """Page-lock ``region`` in place through the device runtime torch has loaded."""
+    PLATFORM.host_register(region.data_ptr(), region.numel() * region.element_size())
 
 
 def _unregister_host_memory(address: int) -> None:
-    torch.cuda.cudart().cudaHostUnregister(address)
+    PLATFORM.host_unregister(address)
 
 
 def _exact_pinned_region(nbytes: int) -> torch.Tensor:

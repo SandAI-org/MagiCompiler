@@ -56,6 +56,7 @@ import torch
 import torch.nn as nn
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
+from magi_compiler.accelerator import PLATFORM
 from magi_compiler.utils import magi_logger
 from magi_compiler.utils.torch_threads import intra_op_threads
 
@@ -75,6 +76,7 @@ _TO_EMPTY_QUALNAME = "Module.to_empty.<locals>.<lambda>"
 class OffloadState:
     hooks_installed: bool = False
     min_weight_bytes: int = 0
+    keep_on_device_bytes: int = 0
     host_weight_sharing: HostWeightSharing = "off"
     defer_host_materialization: bool = False
     parking_decided: bool = False
@@ -134,7 +136,7 @@ def _release_resident_weights(
     resident_slots = [slot for slot in host_slots if store.is_resident(slot)]
     if not resident_slots:
         return released_slots
-    torch.cuda.synchronize()
+    PLATFORM.synchronize()
     released_bytes = store.release_resident_weights(resident_slots)
     magi_logger.info(
         "host offload: %s moved to host; freed %d promoted weight(s) (%.1f MiB) on the device",
@@ -239,9 +241,9 @@ def _probe_move_device(fn) -> torch.device | None:
     moved = fn(probe)
     if not isinstance(moved, torch.Tensor) or moved.dtype != probe.dtype:
         return None
-    if moved.is_cuda:
+    if moved.device.type == PLATFORM.device_type:
         return moved.device
-    moved_back = fn(torch.empty(0, device="cuda"))
+    moved_back = fn(torch.empty(0, device=PLATFORM.device_type))
     return moved_back.device if moved_back.dtype == probe.dtype and moved_back.device.type == "cpu" else None
 
 
@@ -315,10 +317,9 @@ def _skip_managed_weights(fn):
 # A move may arrive under inference mode, and placement later writes these stand-ins outside it.
 @torch.inference_mode(False)
 def _swap_in_storage_free_standin(param: nn.Parameter, like: torch.Tensor) -> torch.Tensor:
-    """Give ``param`` a storage-free CUDA payload shaped like ``like``; return the tensor slots key on.
+    """Give ``param`` a storage-free device payload shaped like ``like``; return the tensor slots key on.
     Stand-in construction temporarily allocates one full shard."""
-    device = torch.device("cuda", torch.cuda.current_device())
-    device_standin_buffer = torch.empty(like.shape, dtype=like.dtype, device=device)
+    device_standin_buffer = torch.empty(like.shape, dtype=like.dtype, device=PLATFORM.device())
     device_standin_buffer.untyped_storage().resize_(0)
     new_data = (
         _rebuild_dtensor(param=param, local=device_standin_buffer) if isinstance(param, DTensor) else device_standin_buffer
@@ -348,15 +349,24 @@ def _install_weight_standins(module: nn.Module, parked_parameters: list[tuple[li
     return sum(host_buffer.numel() * host_buffer.element_size() for _, _, host_buffer in parked_parameters)
 
 
-def _collect_cpu_parameters_to_park(module: nn.Module, min_weight_bytes: int) -> list[tuple[list[str], nn.Parameter]]:
-    """Contiguous CPU weights of at least ``min_weight_bytes``, grouped by identity with every tied registration."""
+def _collect_cpu_parameters_to_park(
+    module: nn.Module, min_weight_bytes: int, keep_on_device_bytes: int = 0
+) -> list[tuple[list[str], nn.Parameter]]:
+    """Contiguous CPU weights of at least ``min_weight_bytes``, grouped by identity with every tied registration,
+    less the leading ones that fit ``keep_on_device_bytes``."""
     parameters_by_identity: dict[int, tuple[list[str], nn.Parameter]] = {}
     for name, param in module.named_parameters(remove_duplicate=False):
         if param.device.type != "cpu" or param.numel() * param.element_size() < min_weight_bytes:
             continue
         if param.is_contiguous():
             parameters_by_identity.setdefault(id(param), ([], param))[0].append(name)
-    return list(parameters_by_identity.values())
+    parameters = list(parameters_by_identity.values())
+    for index, (_, param) in enumerate(parameters):
+        nbytes = param.numel() * param.element_size()
+        if nbytes > keep_on_device_bytes:
+            return parameters[index:]
+        keep_on_device_bytes -= nbytes
+    return []
 
 
 def _park_in_private_host_buffer(names: list[str], param: nn.Parameter) -> int:
@@ -427,10 +437,14 @@ def _park_parameters(
 
 
 @torch.inference_mode(False)
-def _park_cpu_parameters(module: nn.Module, *, min_weight_bytes: int, host_weight_sharing: HostWeightSharing) -> int:
+def _park_cpu_parameters(
+    module: nn.Module, *, min_weight_bytes: int, keep_on_device_bytes: int, host_weight_sharing: HostWeightSharing
+) -> int:
     """Hand off each weight before copying the next to avoid retaining all pageable originals."""
     cpu_parameters = (
-        _collect_cpu_parameters_to_park(module=module, min_weight_bytes=min_weight_bytes)
+        _collect_cpu_parameters_to_park(
+            module=module, min_weight_bytes=min_weight_bytes, keep_on_device_bytes=keep_on_device_bytes
+        )
         if _can_park_on_first_cuda_move(module)
         else []
     )
@@ -512,21 +526,31 @@ def _apply_with_host_offload(self: nn.Module, fn, recurse: bool = True):
                 f"host offload: {type(self).__name__} is built on meta, but defer_host_materialization supports "
                 "host-built models only: to_empty would allocate host buffers before compilation picks residents"
             )
-        return _materialize_host_weights(module=self, fn=fn, recurse=recurse, min_weight_bytes=state.min_weight_bytes)
+        return _materialize_host_weights(
+            module=self,
+            fn=fn,
+            recurse=recurse,
+            min_weight_bytes=state.min_weight_bytes,
+            keep_on_device_bytes=state.keep_on_device_bytes,
+        )
     # None unless fn is a pure host<->CUDA move: dtype casts and other conversions get None.
     # Combined device+dtype moves are unsupported once weights are parked (module docstring).
     target = _probe_move_device(fn)
-    if target is not None and target.type == "cuda" and not _is_enclosing_host_materialization(fn):
+    if target is not None and target.type == PLATFORM.device_type and not _is_enclosing_host_materialization(fn):
         _reject_unrecognized_meta_materialization(module=self)
     # Decided once per instance. Weights on the host at the first CUDA move are parked: built on
     # the host, or built on CUDA and moved to the host first. Weights already on CUDA never are.
-    if target is not None and target.type == "cuda" and not state.parking_decided:
+    if target is not None and target.type == PLATFORM.device_type and not state.parking_decided:
         state.parking_decided = True
         if state.defer_host_materialization:
+            # Deferral leaves the residents to the compile, so it has no device-kept prefix to honor.
             _defer_cpu_parameters(module=self, min_weight_bytes=state.min_weight_bytes)
         else:
             _park_cpu_parameters(
-                module=self, min_weight_bytes=state.min_weight_bytes, host_weight_sharing=state.host_weight_sharing
+                module=self,
+                min_weight_bytes=state.min_weight_bytes,
+                keep_on_device_bytes=state.keep_on_device_bytes,
+                host_weight_sharing=state.host_weight_sharing,
             )
     if target is None:
         _reject_cast_after_handoff(module=self, fn=fn)
@@ -549,7 +573,9 @@ def _apply_with_host_offload(self: nn.Module, fn, recurse: bool = True):
     )
 
 
-def _select_meta_weight_names(module: nn.Module, *, recurse: bool, min_weight_bytes: int) -> dict[int, str]:
+def _select_meta_weight_names(
+    module: nn.Module, *, recurse: bool, min_weight_bytes: int, keep_on_device_bytes: int = 0
+) -> dict[int, str]:
     # Resolve candidates before _apply starts swapping parameter objects.
     selected_names_by_param_id = {}
     materialized_weight_names = []
@@ -559,7 +585,8 @@ def _select_meta_weight_names(module: nn.Module, *, recurse: bool, min_weight_by
             continue
         local_weight = _local_weight_tensor(param)
         # Layout and materialization diagnostics include only size-eligible weights.
-        if local_weight.numel() * local_weight.element_size() < min_weight_bytes:
+        nbytes = local_weight.numel() * local_weight.element_size()
+        if nbytes < min_weight_bytes:
             continue
         if not local_weight.is_contiguous():
             # Flat host reservations and H2D outputs cannot preserve this stride.
@@ -570,6 +597,10 @@ def _select_meta_weight_names(module: nn.Module, *, recurse: bool, min_weight_by
             # emptying it at handoff would leave that reader without an H2D load.
             materialized_weight_names.append(_normalize_parameter_name(name))
             continue
+        if nbytes <= keep_on_device_bytes:
+            keep_on_device_bytes -= nbytes
+            continue
+        keep_on_device_bytes = 0
         selected_names_by_param_id[id(param)] = _normalize_parameter_name(name)
 
     if noncontiguous_weight_names:
@@ -611,14 +642,16 @@ def _allocate_parameter_storage(
     return _rebuild_dtensor(param=tensor, local=host_buffer) if isinstance(tensor, DTensor) else host_buffer
 
 
-def _materialize_host_weights(module: nn.Module, fn, recurse: bool, *, min_weight_bytes: int):
+def _materialize_host_weights(module: nn.Module, fn, recurse: bool, *, min_weight_bytes: int, keep_on_device_bytes: int):
     # fn is to_empty's own empty_like, recognized by qualname above.
     target = fn(torch.empty(0, device="meta")).device
-    if target.type != "cuda":
+    if target.type != PLATFORM.device_type:
         return _call_class_apply(module=module, fn=fn, recurse=recurse)
     state: OffloadState = module._magi_offload_state
     state.parking_decided = True
-    selected_names_by_param_id = _select_meta_weight_names(module=module, recurse=recurse, min_weight_bytes=min_weight_bytes)
+    selected_names_by_param_id = _select_meta_weight_names(
+        module=module, recurse=recurse, min_weight_bytes=min_weight_bytes, keep_on_device_bytes=keep_on_device_bytes
+    )
     if not selected_names_by_param_id:
         return _call_class_apply(module=module, fn=fn, recurse=recurse)
 
@@ -691,6 +724,7 @@ def install_host_first_hooks(
     instance: nn.Module,
     *,
     min_weight_bytes: int,
+    keep_on_device_bytes: int = 0,
     host_weight_sharing: HostWeightSharing = "off",
     defer_host_materialization: bool = False,
 ) -> None:
@@ -701,6 +735,7 @@ def install_host_first_hooks(
     if state.hooks_installed:
         return
     state.min_weight_bytes = min_weight_bytes
+    state.keep_on_device_bytes = keep_on_device_bytes
     state.host_weight_sharing = host_weight_sharing
     state.defer_host_materialization = defer_host_materialization
     instance._apply = _apply_with_host_offload.__get__(instance, type(instance))

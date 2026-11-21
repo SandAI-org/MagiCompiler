@@ -30,8 +30,8 @@ from torch import distributed as dist
 from torch import nn
 from torch._dynamo.symbolic_convert import InliningInstructionTranslator, TensorifyState
 
+from magi_compiler.accelerator import PLATFORM, pin_memory_in_place
 from magi_compiler.config import debug_dump_path, inductor_cache_dump_path, triton_cache_dump_path
-from magi_compiler.cuda.cudart import pin_memory_in_place
 from magi_compiler.magi_backend.magi_compiler_base import MagiCompileState
 from magi_compiler.utils import compilation_counter, envs, magi_logger
 from magi_compiler.utils.compile_time_monitor import CompileMonitor
@@ -302,6 +302,7 @@ def _magi_compile_bound_method(
         install_host_first_hooks(
             instance=instance,
             min_weight_bytes=conf.offload_config.offload_min_shard_mib * 1024 * 1024,
+            keep_on_device_bytes=conf.offload_config.offload_keep_on_device_mib * 1024 * 1024,
             host_weight_sharing=conf.offload_config.offload_host_weight_sharing,
             defer_host_materialization=conf.offload_config.defer_host_materialization,
         )
@@ -829,7 +830,7 @@ def _patch_cpu_offload_apply(cls: type[nn.Module], conf: CompileConfig):
         is_to_cuda = False
         if is_to_lambda and not getattr(self, "_magi_offloaded_once", False):
             try:
-                is_to_cuda = fn(torch.empty(0, device="cpu")).is_cuda
+                is_to_cuda = fn(torch.empty(0, device="cpu")).device.type == PLATFORM.device_type
             except Exception:
                 pass
 
