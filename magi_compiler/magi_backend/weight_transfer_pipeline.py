@@ -296,5 +296,5 @@ class WeightTransferPipeline:
         )
         if bound_weight_count == 0:
             return False
-        insert_h2d_loads(graph)
+        insert_h2d_loads(graph, max_inflight_bytes=_mib_to_bytes(self._offload_config.offload_max_inflight_load_mib))
         return True

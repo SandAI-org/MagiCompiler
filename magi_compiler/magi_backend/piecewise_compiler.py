@@ -251,23 +251,32 @@ def _register_custom_op_fallbacks(graph: fx.GraphModule) -> None:
     so an op first met deep in a chain of custom ops formats a string exponential in the chain's depth. A model's
     graph under graph weight offload, one graph for the whole model, never finished compiling.
     """
+    from torch._inductor import config as inductor_config
     from torch._inductor.decomposition import decompositions
-    from torch._inductor.lowering import lowerings, make_fallback, tag_to_layout_constraint
+    from torch._inductor.lowering import FALLBACK_ALLOW_LIST, lowerings, make_fallback, tag_to_layout_constraint
     from torch._library.utils import get_layout_constraint_tag, is_builtin
 
+    if not inductor_config.implicit_fallbacks:
+        return
     for module in graph.modules():
         if not isinstance(module, fx.GraphModule):
             continue
         for node in module.graph.nodes:
             if node.op != "call_function":
                 continue
-            # A mutating op reaches Inductor as auto_functionalized's first argument.
-            for op in (node.target, *node.args):
+            target = node.target
+            # ``torch.ops.ns.op(x)`` leaves the packet in a Dynamo graph; Inductor meets one of its overloads.
+            if isinstance(target, torch._ops.OpOverloadPacket):
+                ops = [getattr(target, name) for name in target.overloads()]
+            else:
+                ops = [target]
+            for op in ops:
                 if (
                     isinstance(op, torch._ops.OpOverload)
                     and not is_builtin(op)
                     and op not in lowerings
                     and op not in decompositions
+                    and op.name().split(".")[0] not in FALLBACK_ALLOW_LIST
                 ):
                     tag = get_layout_constraint_tag(op, with_default=True)
                     make_fallback(op, layout_constraint=tag_to_layout_constraint(tag))

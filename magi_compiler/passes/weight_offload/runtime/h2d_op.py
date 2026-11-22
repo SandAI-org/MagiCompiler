@@ -35,14 +35,13 @@ from functools import lru_cache
 import torch
 import torch._C._distributed_c10d as _c10d
 
-from magi_compiler.config import get_compile_config
 from magi_compiler.cuda.event_work import EventWork
 
 from .host_weights import get_global_host_weight_store
 from .slot_remap import resolve_runtime_host_slot
 
 _H2D_OP_LIBRARY = torch.library.Library("magi", "FRAGMENT")
-_H2D_LOAD_SCHEMA = "h2d_load(Tensor shard, int slot) -> Tensor"
+_H2D_LOAD_SCHEMA = "h2d_load(Tensor shard, int slot, int max_inflight_bytes=0) -> Tensor"
 
 
 @lru_cache(maxsize=1)
@@ -65,10 +64,13 @@ class _InflightLoads:
         self.nbytes = 0
 
     def add(self, done: torch.cuda.Event, nbytes: int, cap: int) -> None:
-        """Track a load, then drop the finished ones and wait for the oldest while more than *cap* bytes remain."""
+        """Track a load, then drop the finished ones and wait for the oldest while more than *cap* bytes remain.
+
+        The newest load is never waited on: waiting for the copy just issued would drain the device's queue.
+        """
         self._loads.append((done, nbytes))
         self.nbytes += nbytes
-        while self._loads and (self.nbytes > cap or self._loads[0][0].query()):
+        while len(self._loads) > 1 and (self.nbytes > cap or self._loads[0][0].query()):
             oldest, size = self._loads.popleft()
             oldest.synchronize()
             self.nbytes -= size
@@ -77,7 +79,7 @@ class _InflightLoads:
 _INFLIGHT_LOADS = _InflightLoads()
 
 
-def _h2d_load(shard: torch.Tensor, slot: int) -> torch.Tensor:
+def _h2d_load(shard: torch.Tensor, slot: int, max_inflight_bytes: int = 0) -> torch.Tensor:
     # Resident slots copy from the device; other slots copy from pinned host storage.
     slot = resolve_runtime_host_slot(slot)
     store = get_global_host_weight_store()
@@ -103,15 +105,14 @@ def _h2d_load(shard: torch.Tensor, slot: int) -> torch.Tensor:
         load_done_event.record(copy_stream)
     loaded_weight.record_stream(copy_stream)
     # Bound how far the host runs ahead: record_stream holds each buffer until the device is past its free.
-    cap_mib = get_compile_config().offload_config.offload_max_inflight_load_mib
-    if cap_mib:
-        _INFLIGHT_LOADS.add(load_done_event, loaded_weight.nbytes, cap_mib << 20)
+    if max_inflight_bytes:
+        _INFLIGHT_LOADS.add(load_done_event, loaded_weight.nbytes, max_inflight_bytes)
     # The registry takes ownership of the Work.
     _c10d._register_work(loaded_weight, EventWork(load_done_event))
     return loaded_weight
 
 
-def _h2d_load_meta(shard: torch.Tensor, slot: int) -> torch.Tensor:
+def _h2d_load_meta(shard: torch.Tensor, slot: int, max_inflight_bytes: int = 0) -> torch.Tensor:
     return torch.empty_like(shard)
 
 

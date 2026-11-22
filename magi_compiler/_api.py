@@ -39,7 +39,7 @@ from magi_compiler.utils.hash import as_flat_bytes, compute_tensor_fingerprint
 from magi_compiler.utils.host_memory import fmt_host_mem
 from magi_compiler.utils.torch_threads import intra_op_threads
 
-from .config import CompileConfig, CompileMode, get_compile_config
+from .config import CompileConfig, CompileMode
 
 
 # =============================================================================
@@ -296,13 +296,6 @@ def _magi_compile_bound_method(
                 "piecewise subgraph would spend it again, and no load can be hoisted across a split. "
                 f"Set disable_graph_split=True in {type(instance).__name__}'s config_patch, or disable "
                 "graph_weight_offload for this model."
-            )
-        inflight_cap_mib = conf.offload_config.offload_max_inflight_load_mib
-        if inflight_cap_mib != get_compile_config().offload_config.offload_max_inflight_load_mib:
-            raise ValueError(
-                "offload_config.offload_max_inflight_load_mib is process-wide: magi::h2d_load reads it from the "
-                f"global config, so {type(instance).__name__}'s config_patch value {inflight_cap_mib} would not "
-                "apply. Set it on get_compile_config() or through its env var instead."
             )
         from magi_compiler.passes.weight_offload import install_host_first_hooks
 

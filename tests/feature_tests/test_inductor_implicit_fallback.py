@@ -18,15 +18,15 @@ Inductor lowers a custom op it has no lowering for to a fallback it creates on m
 arguments at INFO, a string built whatever the log level. Each argument prints the extern kernels upstream of it, a
 shared one once per path, so an op first met at the end of a chain of custom ops formats a string exponential in the
 chain's depth: one graph holding a whole model of such ops never finished compiling. MagiCompiler registers the same
-fallbacks before Inductor lowers a graph.
+fallbacks before Inductor lowers a graph, so Inductor never formats that string.
 """
 
 from unittest.mock import patch
 
-import pytest
 import torch
 import torch._inductor.config as inductor_config
 from torch._inductor import exc
+from torch._inductor.lowering import lowerings
 
 from magi_compiler import magi_compile, magi_register_custom_op
 
@@ -35,26 +35,6 @@ DEPTH = 8
 
 def _pair_meta(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.empty_like(a), torch.empty_like(a)
-
-
-def _chain(pair, tail):
-    def run(x: torch.Tensor, depth: int) -> torch.Tensor:
-        s, y = x, x
-        for _ in range(depth):
-            s, y = pair(s, y)
-        return tail(s, y)
-
-    return run
-
-
-@magi_register_custom_op("test_implicit_fallback::pair", infer_output_meta_fn=_pair_meta)
-def pair(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    return (a + b) * 0.5, (a - b) * 0.5
-
-
-@magi_register_custom_op("test_implicit_fallback::tail")
-def tail(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    return a * b
 
 
 @magi_register_custom_op("test_magi_fallback::pair", infer_output_meta_fn=_pair_meta)
@@ -77,35 +57,25 @@ def _(x):
     return None
 
 
-def test_implicit_fallback_formats_a_string_exponential_in_chain_depth():
-    formatted: list[int] = []
-    operator_str = exc.OperatorIssue.operator_str
+@torch.library.custom_op("test_magi_fallback::scale", mutates_args=())
+def scale(x: torch.Tensor) -> torch.Tensor:
+    return x * 2
 
-    def measured(target, args, kwargs):
-        text = operator_str(target, args, kwargs)
-        if target == torch.ops.test_implicit_fallback.tail.default:
-            formatted.append(len(text))
-        return text
 
-    run = _chain(pair, tail)
-    x = torch.randn(64, 8)
-    with patch.object(exc.OperatorIssue, "operator_str", staticmethod(measured)), inductor_config.patch(fx_graph_cache=False):
-        for depth in (DEPTH, DEPTH + 2):
-            torch._dynamo.reset()
-            torch.compile(lambda t, d=depth: run(t, d), backend="inductor", fullgraph=True)(x)
-            # The first compile registered the fallback; meet the op again for the first time.
-            torch._inductor.lowering.lowerings.pop(torch.ops.test_implicit_fallback.tail.default, None)
-    if not formatted:
-        pytest.skip("this PyTorch formats the implicit fallback's log line lazily")
-    shallow, deep = formatted
-    assert deep > 3 * shallow
+@scale.register_fake
+def _(x):
+    return torch.empty_like(x)
 
 
 class _Chain(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = _chain(magi_pair, magi_tail)(x, DEPTH)
+        s, y = x, x
+        for _ in range(DEPTH):
+            s, y = magi_pair(s, y)
+        out = magi_tail(s, y)
         bump_(out)
-        return out
+        # Through its packet: the Dynamo graph holds an OpOverloadPacket, not an overload.
+        return torch.ops.test_magi_fallback.scale(out)
 
 
 def test_magi_compile_never_takes_the_implicit_fallback():
@@ -117,5 +87,6 @@ def test_magi_compile_never_takes_the_implicit_fallback():
     with patch.object(exc.OperatorIssue, "operator_str", staticmethod(formatted)), inductor_config.patch(fx_graph_cache=False):
         out = magi_compile(_Chain(), dynamic_arg_dims={"x": 0})(x)
     torch.testing.assert_close(out, _Chain()(x))
-    for op in (torch.ops.test_magi_fallback.pair, torch.ops.test_magi_fallback.tail, torch.ops.test_magi_fallback.bump_):
-        assert op.default in torch._inductor.lowering.lowerings
+    ops = torch.ops.test_magi_fallback
+    for op in (ops.pair, ops.tail, ops.bump_, ops.scale):
+        assert op.default in lowerings

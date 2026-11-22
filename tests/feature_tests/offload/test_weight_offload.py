@@ -777,12 +777,10 @@ def test_wait_tensor_is_what_synchronizes_the_load():
 
 @requires_cuda
 def test_h2d_load_waits_for_the_oldest_load_past_the_inflight_cap(monkeypatch):
-    """Past ``offload_max_inflight_load_mib`` the host waits for its oldest load, so the bytes it has issued and
-    the device may not have finished stay under the cap; at 0 nothing is tracked."""
-    from magi_compiler.config import get_compile_config
+    """Past its ``max_inflight_bytes`` the host waits for its oldest load, so the bytes it has issued and the device
+    may not have finished stay under the cap, the newest load aside; at 0 nothing is tracked."""
     from magi_compiler.passes.weight_offload.runtime import h2d_op
 
-    offload_config = get_compile_config().offload_config
     tracker = h2d_op._InflightLoads()
     monkeypatch.setattr(h2d_op, "_INFLIGHT_LOADS", tracker)
     # 1 MiB a load: two fit under a 2 MiB cap, a third makes the host wait for the first.
@@ -798,21 +796,25 @@ def test_h2d_load_waits_for_the_oldest_load_past_the_inflight_cap(monkeypatch):
 
     monkeypatch.setattr(torch.cuda.Event, "synchronize", observe_synchronize)
 
-    monkeypatch.setattr(offload_config, "offload_max_inflight_load_mib", 0)
-    _WAIT_TENSOR_OP(h2d_op.H2D_LOAD(weights[0], slots[0]))
+    _WAIT_TENSOR_OP(h2d_op.H2D_LOAD(weights[0], slots[0], 0))
     assert tracker.nbytes == 0 and not waited, "a cap of 0 must leave the loads untracked"
 
-    monkeypatch.setattr(offload_config, "offload_max_inflight_load_mib", 2)
     # The load stream queues behind the compute stream, so no load finishes before the host has issued all three.
     torch.cuda._sleep(50_000_000)
     outs = []
     for weight, slot in zip(weights, slots):
-        outs.append(h2d_op.H2D_LOAD(weight, slot))
+        outs.append(h2d_op.H2D_LOAD(weight, slot, 2 << 20))
         assert tracker.nbytes <= 2 << 20
     assert waited, "the third load must make the host wait for the oldest"
     for out, want in zip(outs, expected):
         _WAIT_TENSOR_OP(out)
         torch.testing.assert_close(out, want)
+
+    # Under a cap below one load, the host still never waits for the load it just issued.
+    torch.cuda._sleep(50_000_000)
+    for weight, slot in zip(weights, slots):
+        _WAIT_TENSOR_OP(h2d_op.H2D_LOAD(weight, slot, 1))
+        assert tracker.nbytes == 1 << 20, "only the newest load stays in flight"
 
 
 @requires_cuda
@@ -1674,25 +1676,45 @@ def test_graph_weight_offload_refuses_split_graphs_before_parking_anything():
     assert get_offload_state(module) is None
 
 
-def test_graph_weight_offload_refuses_a_per_model_inflight_cap_before_parking_anything():
-    """magi::h2d_load reads the in-flight cap from the global config, so a config_patch value must fail at setup."""
+@requires_cuda
+@pytest.mark.usefixtures("no_process_group")
+def test_a_models_config_patch_sets_its_loads_inflight_cap(monkeypatch):
+    """The in-flight cap is the compiled model's own: its config_patch value reaches every load it runs."""
     from magi_compiler import magi_compile
-    from magi_compiler.config import CompileMode, get_compile_config
-    from magi_compiler.passes.weight_offload.weight_lifecycle import get_offload_state
+    from magi_compiler.config import CompileMode, CudaGraphMode, get_compile_config
+    from magi_compiler.passes.weight_offload.runtime import h2d_op
+
+    caps = []
+
+    class _RecordingLoads(h2d_op._InflightLoads):
+        def add(self, done, nbytes, cap):
+            caps.append(cap)
+            super().add(done, nbytes, cap)
+
+    monkeypatch.setattr(h2d_op, "_INFLIGHT_LOADS", _RecordingLoads())
 
     def patch(cfg):
         cfg.compile_mode = CompileMode.MAGI_COMPILE
-        cfg.offload_config.graph_weight_offload = True
+        cfg.cudagraph_mode = CudaGraphMode.NONE
         cfg.disable_graph_split = True
-        cfg.offload_config.offload_max_inflight_load_mib = (
-            get_compile_config().offload_config.offload_max_inflight_load_mib + 1
-        )
+        cfg.fsdp_config.cost_mode = "analytical"
+        cfg.offload_config.graph_weight_offload = True
+        cfg.offload_config.offload_min_shard_mib = 0
+        cfg.offload_config.offload_h2d_bandwidth_gbps = 48.0
+        cfg.offload_config.offload_max_inflight_load_mib = 3
         return cfg
 
-    module = _CompiledWeightModule(rows=256, cols=64)
-    with pytest.raises(ValueError, match="offload_max_inflight_load_mib is process-wide"):
-        magi_compile(module, config_patch=patch, dynamic_arg_dims={"x": 0})
-    assert get_offload_state(module) is None
+    assert get_compile_config().offload_config.offload_max_inflight_load_mib == 0
+    torch.manual_seed(0)
+    reference = _CompiledWeightModule(rows=256, cols=64).eval()
+    module = _CompiledWeightModule(rows=256, cols=64).eval()
+    module.load_state_dict(reference.state_dict())
+    module = magi_compile(module, config_patch=patch, dynamic_arg_dims={"x": 0})
+    module.cuda()
+    inputs = torch.randn(8, 64, device="cuda")
+    with torch.no_grad():
+        torch.testing.assert_close(module(inputs), reference.cuda()(inputs))
+    assert caps and set(caps) == {3 << 20}
 
 
 @requires_cuda
