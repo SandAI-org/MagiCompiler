@@ -1674,6 +1674,27 @@ def test_graph_weight_offload_refuses_split_graphs_before_parking_anything():
     assert get_offload_state(module) is None
 
 
+def test_graph_weight_offload_refuses_a_per_model_inflight_cap_before_parking_anything():
+    """magi::h2d_load reads the in-flight cap from the global config, so a config_patch value must fail at setup."""
+    from magi_compiler import magi_compile
+    from magi_compiler.config import CompileMode, get_compile_config
+    from magi_compiler.passes.weight_offload.weight_lifecycle import get_offload_state
+
+    def patch(cfg):
+        cfg.compile_mode = CompileMode.MAGI_COMPILE
+        cfg.offload_config.graph_weight_offload = True
+        cfg.disable_graph_split = True
+        cfg.offload_config.offload_max_inflight_load_mib = (
+            get_compile_config().offload_config.offload_max_inflight_load_mib + 1
+        )
+        return cfg
+
+    module = _CompiledWeightModule(rows=256, cols=64)
+    with pytest.raises(ValueError, match="offload_max_inflight_load_mib is process-wide"):
+        magi_compile(module, config_patch=patch, dynamic_arg_dims={"x": 0})
+    assert get_offload_state(module) is None
+
+
 @requires_cuda
 @pytest.mark.usefixtures("no_process_group")
 def test_a_training_graph_over_an_offloaded_weight_fails_to_compile():
