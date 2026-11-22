@@ -776,6 +776,46 @@ def test_wait_tensor_is_what_synchronizes_the_load():
 
 
 @requires_cuda
+def test_h2d_load_waits_for_the_oldest_load_past_the_inflight_cap(monkeypatch):
+    """Past ``offload_max_inflight_load_mib`` the host waits for its oldest load, so the bytes it has issued and
+    the device may not have finished stay under the cap; at 0 nothing is tracked."""
+    from magi_compiler.config import get_compile_config
+    from magi_compiler.passes.weight_offload.runtime import h2d_op
+
+    offload_config = get_compile_config().offload_config
+    tracker = h2d_op._InflightLoads()
+    monkeypatch.setattr(h2d_op, "_INFLIGHT_LOADS", tracker)
+    # 1 MiB a load: two fit under a 2 MiB cap, a third makes the host wait for the first.
+    weights = [torch.randn(1024, 512, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    expected = [w.clone() for w in weights]
+    slots = [_park_weight_in_host_store(w) for w in weights]
+    waited = []
+    original_synchronize = torch.cuda.Event.synchronize
+
+    def observe_synchronize(event):
+        waited.append(event)
+        return original_synchronize(event)
+
+    monkeypatch.setattr(torch.cuda.Event, "synchronize", observe_synchronize)
+
+    monkeypatch.setattr(offload_config, "offload_max_inflight_load_mib", 0)
+    _WAIT_TENSOR_OP(h2d_op.H2D_LOAD(weights[0], slots[0]))
+    assert tracker.nbytes == 0 and not waited, "a cap of 0 must leave the loads untracked"
+
+    monkeypatch.setattr(offload_config, "offload_max_inflight_load_mib", 2)
+    # The load stream queues behind the compute stream, so no load finishes before the host has issued all three.
+    torch.cuda._sleep(50_000_000)
+    outs = []
+    for weight, slot in zip(weights, slots):
+        outs.append(h2d_op.H2D_LOAD(weight, slot))
+        assert tracker.nbytes <= 2 << 20
+    assert waited, "the third load must make the host wait for the oldest"
+    for out, want in zip(outs, expected):
+        _WAIT_TENSOR_OP(out)
+        torch.testing.assert_close(out, want)
+
+
+@requires_cuda
 def test_h2d_load_meta_kernel_preserves_layout():
     """Inductor traces the op with fake tensors; a wrong meta shape shows up as a
     lowering error far away from here."""

@@ -29,11 +29,13 @@ come from ``slot``.
 
 from __future__ import annotations
 
+from collections import deque
 from functools import lru_cache
 
 import torch
 import torch._C._distributed_c10d as _c10d
 
+from magi_compiler.config import get_compile_config
 from magi_compiler.cuda.event_work import EventWork
 
 from .host_weights import get_global_host_weight_store
@@ -53,6 +55,26 @@ def get_h2d_stream() -> torch.cuda.Stream:
     Without NVLink, NCCL collectives that share the PCIe link queue here too (``link_collective_op``).
     """
     return torch.cuda.Stream()
+
+
+class _InflightLoads:
+    """The H2D loads the host has issued and the device may not have finished, oldest first."""
+
+    def __init__(self) -> None:
+        self._loads: deque[tuple[torch.cuda.Event, int]] = deque()
+        self.nbytes = 0
+
+    def add(self, done: torch.cuda.Event, nbytes: int, cap: int) -> None:
+        """Track a load, then drop the finished ones and wait for the oldest while more than *cap* bytes remain."""
+        self._loads.append((done, nbytes))
+        self.nbytes += nbytes
+        while self._loads and (self.nbytes > cap or self._loads[0][0].query()):
+            oldest, size = self._loads.popleft()
+            oldest.synchronize()
+            self.nbytes -= size
+
+
+_INFLIGHT_LOADS = _InflightLoads()
 
 
 def _h2d_load(shard: torch.Tensor, slot: int) -> torch.Tensor:
@@ -80,6 +102,10 @@ def _h2d_load(shard: torch.Tensor, slot: int) -> torch.Tensor:
         load_done_event = torch.cuda.Event()
         load_done_event.record(copy_stream)
     loaded_weight.record_stream(copy_stream)
+    # Bound how far the host runs ahead: record_stream holds each buffer until the device is past its free.
+    cap_mib = get_compile_config().offload_config.offload_max_inflight_load_mib
+    if cap_mib:
+        _INFLIGHT_LOADS.add(load_done_event, loaded_weight.nbytes, cap_mib << 20)
     # The registry takes ownership of the Work.
     _c10d._register_work(loaded_weight, EventWork(load_done_event))
     return loaded_weight
