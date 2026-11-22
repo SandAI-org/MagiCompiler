@@ -24,11 +24,10 @@ from ...snode_utils import ir_node_bytes, is_multi_output
 def host_slot_of_load(load: BaseSchedulerNode) -> int:
     """The host-pool slot a load pulls.
 
-    Inductor flattens a custom op's non-tensor arguments into ``constant_args``,
-    and ``h2d_load(Tensor shard, int slot)`` has exactly one: the slot.
+    Inductor flattens a custom op's non-tensor arguments into ``constant_args``, and
+    ``h2d_load(Tensor shard, int slot, int max_inflight_bytes=0)`` lists the slot first.
     """
-    (slot,) = load.node.constant_args
-    return int(slot)
+    return int(load.node.constant_args[0])
 
 
 def load_bytes(group: list[BaseSchedulerNode]) -> int:

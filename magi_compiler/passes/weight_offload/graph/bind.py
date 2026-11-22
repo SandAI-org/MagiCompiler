@@ -170,15 +170,21 @@ def bind_host_slots_to_graph(graph: fx.GraphModule, example_inputs: Sequence[Any
     return len(agreed_candidates)
 
 
-def insert_h2d_loads(graph: fx.GraphModule) -> int:
-    """Splice a load in for every tagged weight.
+def insert_h2d_loads(graph: fx.GraphModule, max_inflight_bytes: int = 0) -> int:
+    """Splice a load in for every tagged weight, each capping the loads in flight at *max_inflight_bytes* (0: no cap).
 
     Returns how many load nodes were inserted.
     """
     original_index_by_node = {n: i for i, n in enumerate(graph.graph.nodes)}
     weight_nodes = [n for n in graph.graph.nodes if host_slot(n) is not None]
     inserted_load_count = sum(
-        _insert_weight_load(graph=graph, weight_node=h, host_slot=host_slot(h), original_index_by_node=original_index_by_node)
+        _insert_weight_load(
+            graph=graph,
+            weight_node=h,
+            host_slot=host_slot(h),
+            max_inflight_bytes=max_inflight_bytes,
+            original_index_by_node=original_index_by_node,
+        )
         for h in weight_nodes
     )
 
@@ -189,7 +195,9 @@ def insert_h2d_loads(graph: fx.GraphModule) -> int:
     return inserted_load_count
 
 
-def _insert_weight_load(graph: fx.GraphModule, weight_node: fx.Node, host_slot: int, original_index_by_node) -> int:
+def _insert_weight_load(
+    graph: fx.GraphModule, weight_node: fx.Node, host_slot: int, max_inflight_bytes: int, original_index_by_node
+) -> int:
     """Insert a load for ``weight_node`` in front of its first reader and re-point its readers at it.
 
     The load has to sit above every reader, so whatever the graph does to the
@@ -204,7 +212,7 @@ def _insert_weight_load(graph: fx.GraphModule, weight_node: fx.Node, host_slot: 
     first_reader = min(readers, key=lambda n: original_index_by_node.get(n, len(original_index_by_node)))
     example_value = weight_node.meta.get("example_value")
     with graph.graph.inserting_before(first_reader):
-        load = graph.graph.call_function(H2D_LOAD, (weight_node, host_slot))
+        load = graph.graph.call_function(H2D_LOAD, (weight_node, host_slot, max_inflight_bytes))
         load.meta["example_value"] = example_value
         wait = graph.graph.call_function(_WAIT_TENSOR_OP, (load,))
         wait.meta["example_value"] = example_value

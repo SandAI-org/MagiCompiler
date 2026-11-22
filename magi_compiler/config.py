@@ -276,6 +276,18 @@ class OffloadConfig(BaseModel):
             "0 disables residency and allows the unhoisted peak plus one largest load in flight."
         ),
     )
+    offload_max_inflight_load_mib: int = Field(
+        0,
+        ge=0,
+        description=(
+            "Per-GPU cap in MiB on the H2D loads the host has issued and the device has not finished; past it, the "
+            "host waits for the oldest. The caching allocator recycles a load's buffer only once the device reaches "
+            "the point where the host freed it (record_stream), so a host running far ahead of the device keeps every "
+            "load in between cached and unusable, until an allocation fails and the allocator synchronizes and "
+            "returns its whole cache, the device idle meanwhile. The newest load is never waited on. 0 disables the "
+            "cap. Baked into each magi::h2d_load of the model's graph. Env var: MAGI_COMPILE_OFFLOAD_CONFIG__OFFLOAD_MAX_INFLIGHT_LOAD_MIB."
+        ),
+    )
     offload_h2d_bandwidth_gbps: float = Field(
         0.0,
         ge=0.0,
