@@ -380,7 +380,12 @@ def _park_in_shared_chunk(names: list[str], param: nn.Parameter, chunk: SharedHo
             _normalize_parameter_name(names[0]),
         )
         return _park_in_private_host_buffer(names=names, param=param)
-    return _install_weight_standin(names=names, param=param, host_buffer=host_buffer)
+    slot = _install_weight_standin(names=names, param=param, host_buffer=host_buffer)
+    store = get_global_host_weight_store()
+    # Skip when unit tests mock _install_weight_standin without registering a slot.
+    if store.slot_for_tensor(_local_weight_tensor(param)) == slot:
+        store.set_host_sharing_group_size(slot, chunk.group_size)
+    return slot
 
 
 def _park_shared_chunk(chunk: SharedHostChunk, chunk_parameters: list[tuple[list[str], nn.Parameter]]) -> list[int]:

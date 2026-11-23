@@ -728,3 +728,40 @@ def test_public_compile_config_shared_inference_matches_private(tmp_path, sharin
     mp.spawn(_compiled_inference_worker, args=(_free_port(), str(tmp_path), sharing_scope), nprocs=2, join=True)
     for rank in range(2):
         assert (tmp_path / f"{rank}.txt").read_text() == "shared and private inference match"
+
+
+def _classify_deferred_sharing_worker(rank: int, port: str, result_dir: str) -> None:
+    from magi_compiler.passes.weight_offload import (
+        classify_deferred_host_weight_sharing,
+        get_global_host_weight_store,
+        install_host_first_hooks,
+    )
+
+    _init_process_group(rank=rank, world_size=2, port=port, timeout_seconds=30)
+    torch.cuda.set_device(rank % torch.cuda.device_count())
+    store = get_global_host_weight_store()
+    try:
+        model = _ReplicatedModelWithExpert(rank)
+        install_host_first_hooks(
+            model, min_weight_bytes=0, host_weight_sharing="per_host_interleaved", defer_host_materialization=True
+        )
+        model.cuda()
+        classify_deferred_host_weight_sharing(
+            example_inputs=list(model.parameters()), host_weight_sharing="per_host_interleaved", region_label="classify"
+        )
+        group_size_by_name = {
+            name: store.host_sharing_group_size(store.slot_for_tensor(param)) for name, param in model.named_parameters()
+        }
+        with open(os.path.join(result_dir, f"{rank}.json"), "w") as result_file:
+            json.dump(group_size_by_name, result_file)
+    finally:
+        store.reset()
+        dist.destroy_process_group()
+
+
+@requires_cuda
+def test_classify_deferred_host_weight_sharing_distinguishes_shared_and_private(tmp_path) -> None:
+    """Before placement runs, deferred classification must tag identical weights with group size and EP shards with 1."""
+    mp.spawn(_classify_deferred_sharing_worker, args=(_free_port(), str(tmp_path)), nprocs=2, join=True)
+    for rank in range(2):
+        assert json.loads((tmp_path / f"{rank}.json").read_text()) == {"dense.weight": 2, "expert.weight": 1}

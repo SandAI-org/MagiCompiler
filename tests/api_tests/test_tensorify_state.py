@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from types import SimpleNamespace
 
 from torch._dynamo.symbolic_convert import TensorifyState
@@ -36,3 +37,25 @@ def test_compilation_context_neither_reads_nor_leaves_float_specializations(tmp_
         assert TensorifyState.empty()
     finally:
         TensorifyState.clear()
+
+
+def test_compilation_context_preserves_unrelated_env_vars_set_inside(tmp_path, monkeypatch):
+    """Unrelated env vars set during compilation (e.g. by lazy imports) must survive context exit,
+    while the cache env vars managed by _compilation_context are still restored."""
+    sentinel_key = "_MAGI_TEST_LAZY_IMPORT_ENV"
+    monkeypatch.delenv(sentinel_key, raising=False)
+    monkeypatch.delenv("TRITON_CACHE_AUTOTUNING", raising=False)
+    state = SimpleNamespace(
+        compile_config=SimpleNamespace(cache_root_dir=str(tmp_path)),
+        model_tag="env_isolation",
+        traced_files=set(),
+        original_code_for_hook=test_compilation_context_preserves_unrelated_env_vars_set_inside.__code__,
+    )
+    try:
+        with _compilation_context(state):
+            os.environ[sentinel_key] = "/tmp/lazy_import_sentinel"
+            assert os.environ["TRITON_CACHE_AUTOTUNING"] == "1"
+        assert os.environ.get(sentinel_key) == "/tmp/lazy_import_sentinel"
+        assert "TRITON_CACHE_AUTOTUNING" not in os.environ
+    finally:
+        os.environ.pop(sentinel_key, None)

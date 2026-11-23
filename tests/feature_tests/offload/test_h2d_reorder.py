@@ -827,3 +827,98 @@ def test_large_transfer_keeps_the_window_under_inflight_pressure():
     assert out.index("big") < out.index("moe"), "the large transfer claims the fat kernel"
     assert out.index("small") > out.index("after_big"), "the small one is not dragged across it"
     assert out.index("small") < out.index("ws")
+
+
+def test_pick_weight_for_deficit_prefers_rank_private_over_host_shared():
+    """Host-shared weights save 1/G Host RAM per HBM byte, so rank-private weights must win residency first."""
+    shared_small = H2dLoadTask(
+        anchor=FakeSnode("shared", "load"),
+        moving_nodes=(),
+        host_slot=0,
+        host_sharing_group_size=8,
+        deadline_index=1,
+        last_user_index=2,
+        required_overlap_ns=0.0,
+        earliest_launch_index=0,
+        transfer_bytes=2 * BYTES_PER_MIB,
+    )
+    private_large = H2dLoadTask(
+        anchor=FakeSnode("private", "load"),
+        moving_nodes=(),
+        host_slot=1,
+        host_sharing_group_size=1,
+        deadline_index=1,
+        last_user_index=2,
+        required_overlap_ns=0.0,
+        earliest_launch_index=0,
+        transfer_bytes=4 * BYTES_PER_MIB,
+    )
+
+    # Small deficit where shared_small would win on size alone; private_large must be picked instead.
+    picked = H2dLoadReorder._pick_weight_for_deficit(
+        candidates=[shared_small, private_large],
+        deficit_bytes=1 * BYTES_PER_MIB,
+        remaining_resident_bytes=4 * BYTES_PER_MIB,
+    )
+    assert picked is private_large
+
+    # When the remaining budget cannot fit the private weight, fall back to the affordable shared weight.
+    fallback = H2dLoadReorder._pick_weight_for_deficit(
+        candidates=[shared_small, private_large],
+        deficit_bytes=1 * BYTES_PER_MIB,
+        remaining_resident_bytes=3 * BYTES_PER_MIB,
+    )
+    assert fallback is shared_small
+
+
+@requires_cuda
+@pytest.mark.usefixtures("reset_host_weight_store")
+def test_h2d_reorder_promotes_rank_private_slot_before_host_shared_slot():
+    """With a 4 MiB residency budget, H2dLoadReorder must promote the 4 MiB rank-private weight over the 2 MiB shared one."""
+    from magi_compiler.passes.weight_offload import get_global_host_weight_store
+
+    store = get_global_host_weight_store()
+    shared_shard = torch.randn(2 * BYTES_PER_MIB // 2, device="cuda", dtype=torch.bfloat16)
+    private_shard = torch.randn(4 * BYTES_PER_MIB // 2, device="cuda", dtype=torch.bfloat16)
+    shared_slot = _park_weight_in_host_store(shared_shard, name="dense.weight")
+    private_slot = _park_weight_in_host_store(private_shard, name="expert.weight")
+    store.set_host_sharing_group_size(shared_slot, 8)
+    store.set_host_sharing_group_size(private_slot, 1)
+
+    order = [
+        _compute_node("c0", 4e5),
+        _load_node("ld_shared", 2, slot=shared_slot),
+        _wait_node("w_shared", "ld_shared"),
+        _compute_node("u_shared", 1e5, deps=["w_shared"]),
+        _load_node("ld_private", 4, slot=private_slot),
+        _wait_node("w_private", "ld_private"),
+        _compute_node("u_private", 1e5, deps=["w_private"]),
+    ]
+    _reordered_node_names(order, bandwidth_bytes_per_ns=10.0, max_resident_bytes=4 * BYTES_PER_MIB)
+
+    assert store.is_resident(private_slot)
+    assert not store.is_resident(shared_slot)
+
+
+def test_search_resident_weights_brackets_below_one_256th_on_compute_rich_graphs():
+    """Long compute-rich graphs can have feasible densities << 1/256; search must still spend the budget."""
+    order = []
+    for i in range(10):
+        # 500 ms compute per layer at 10 GB/s -> 5 GB overlap/layer >> 8 MiB weight (density ~0.0016 << 1/256).
+        order.append(_compute_node(f"c{i}", 5e8))
+        order.append(_load_node(f"l{i}", 8, slot=i))
+        order.append(_wait_node(f"w{i}", f"l{i}"))
+        order.append(_compute_node(f"u{i}", 0.0, deps=[f"w{i}"]))
+    graph = SnodeGraph(order)
+    cost = CostView(lambda s: s.runtime_ns)
+    reorder = H2dLoadReorder(bandwidth_bytes_per_ns=10.0, window_margin_ns=0.0, runtime_ns_fn=lambda s: s.runtime_ns)
+    tasks = reorder.build_transfer_tasks(graph=graph, cost=cost, call_state=H2dLoadCallState())
+    compute_prefix_ns = cost.compute_prefix_ns(graph.order)
+
+    resident_anchors = reorder._search_resident_weights(
+        tasks=tasks,
+        compute_prefix_ns=compute_prefix_ns,
+        resident_budget_bytes=40 * BYTES_PER_MIB,
+    )
+    resident_bytes = sum(t.transfer_bytes for t in tasks if t.anchor in resident_anchors)
+    assert resident_bytes == 40 * BYTES_PER_MIB

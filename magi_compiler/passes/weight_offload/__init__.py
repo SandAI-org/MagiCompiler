@@ -31,7 +31,7 @@ Layout, in the order a compile meets it:
 """
 
 from .cache.offload_cache import OffloadCache
-from .deferred_materialization import materialize_deferred_host_weights
+from .deferred_materialization import classify_deferred_host_weight_sharing, materialize_deferred_host_weights
 from .graph.bind import bind_host_slots_to_graph, insert_h2d_loads
 from .graph.weight_source import FsdpShardSource, PlainParamSource
 from .node_meta import is_host_offloaded
@@ -42,6 +42,7 @@ from .weight_lifecycle import handoff_host_weights_if_pending, install_host_firs
 
 __all__ = [
     "bind_host_slots_to_graph",
+    "classify_deferred_host_weight_sharing",
     "insert_h2d_loads",
     "OffloadCache",
     "H2dLoadReorder",
