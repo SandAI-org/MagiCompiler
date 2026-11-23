@@ -421,10 +421,7 @@ class H2dLoadReorder(OverlapPass):
         if resident_budget_bytes <= 0:
             return frozenset()
         zero_anchors, zero_feasible = self._select_resident_for_density(
-            tasks=tasks,
-            compute_prefix_ns=compute_prefix_ns,
-            resident_budget_bytes=resident_budget_bytes,
-            trial_density=0.0,
+            tasks=tasks, compute_prefix_ns=compute_prefix_ns, resident_budget_bytes=resident_budget_bytes, trial_density=0.0
         )
         if zero_feasible:
             return zero_anchors

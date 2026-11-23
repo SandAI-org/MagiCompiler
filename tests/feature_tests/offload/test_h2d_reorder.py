@@ -856,17 +856,13 @@ def test_pick_weight_for_deficit_prefers_rank_private_over_host_shared():
 
     # Small deficit where shared_small would win on size alone; private_large must be picked instead.
     picked = H2dLoadReorder._pick_weight_for_deficit(
-        candidates=[shared_small, private_large],
-        deficit_bytes=1 * BYTES_PER_MIB,
-        remaining_resident_bytes=4 * BYTES_PER_MIB,
+        candidates=[shared_small, private_large], deficit_bytes=1 * BYTES_PER_MIB, remaining_resident_bytes=4 * BYTES_PER_MIB
     )
     assert picked is private_large
 
     # When the remaining budget cannot fit the private weight, fall back to the affordable shared weight.
     fallback = H2dLoadReorder._pick_weight_for_deficit(
-        candidates=[shared_small, private_large],
-        deficit_bytes=1 * BYTES_PER_MIB,
-        remaining_resident_bytes=3 * BYTES_PER_MIB,
+        candidates=[shared_small, private_large], deficit_bytes=1 * BYTES_PER_MIB, remaining_resident_bytes=3 * BYTES_PER_MIB
     )
     assert fallback is shared_small
 
@@ -916,9 +912,7 @@ def test_search_resident_weights_brackets_below_one_256th_on_compute_rich_graphs
     compute_prefix_ns = cost.compute_prefix_ns(graph.order)
 
     resident_anchors = reorder._search_resident_weights(
-        tasks=tasks,
-        compute_prefix_ns=compute_prefix_ns,
-        resident_budget_bytes=40 * BYTES_PER_MIB,
+        tasks=tasks, compute_prefix_ns=compute_prefix_ns, resident_budget_bytes=40 * BYTES_PER_MIB
     )
     resident_bytes = sum(t.transfer_bytes for t in tasks if t.anchor in resident_anchors)
     assert resident_bytes == 40 * BYTES_PER_MIB
