@@ -138,6 +138,22 @@ def is_compute(snode: BaseSchedulerNode) -> bool:
     return not issues_comm(snode) and not is_h2d_load(snode) and not contains_wait(snode)
 
 
+def waits_follow_their_collectives(snodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+    """Reorder pass that schedules each wait right after its collective, so no two collectives are ever in flight."""
+    waits = [snode for snode in snodes if contains_wait(snode)]
+    order, placed = [], set()
+    for snode in snodes:
+        if snode in placed:
+            continue
+        order.append(snode)
+        if contains_collective(snode):
+            outputs = snode.get_buffer_names()
+            own = [w for w in waits if w not in placed and any(dep.name in outputs for dep in w.read_writes.reads)]
+            placed.update(own)
+            order += own
+    return order
+
+
 def is_multi_output(snode: BaseSchedulerNode) -> bool:
     """A custom op's result reaches its readers through one of these, not directly."""
     return isinstance(snode.node, ir.MultiOutput)

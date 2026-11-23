@@ -37,7 +37,8 @@ from typing import Callable
 import torch
 import torch._C._distributed_c10d as _c10d
 
-from magi_compiler.cuda.event_work import EventWork
+from magi_compiler.accelerator import PLATFORM
+from magi_compiler.utils.event_work import EventWork
 
 from ...snode_utils import ALL_GATHER_OP, ALL_TO_ALL_OP, COALESCED_ALL_GATHER_OP
 from ...transfer_overlap import LinkSharing
@@ -54,7 +55,7 @@ _FUNCTIONAL_WAIT = torch.ops._c10d_functional.wait_tensor.default
 @lru_cache(maxsize=1)
 def get_nvlink_stream() -> torch.cuda.Stream:
     """The stream every collective queues on when the collectives share NVLink."""
-    return torch.cuda.Stream()
+    return PLATFORM.Stream()
 
 
 _LINK_STREAM_GETTER_BY_LINK: dict[LinkSharing, Callable[[], torch.cuda.Stream]] = {
@@ -77,17 +78,17 @@ def link_kernel_name(collective_op: torch._ops.OpOverload, link_sharing: LinkSha
 
 def _queue_behind_compute(link_stream: torch.cuda.Stream) -> None:
     # Inputs come from the compute stream, and an output allocated there may reuse a block it just freed.
-    link_stream.wait_stream(torch.cuda.current_stream())
+    link_stream.wait_stream(PLATFORM.current_stream())
 
 
 def _publish_link_completion(
     outputs: list[torch.Tensor], link_stream: torch.cuda.Stream, wait_for_collective: Callable[[], object]
 ) -> None:
     """Hold the link stream behind the collective, and hand the graph's ``wait_tensor`` an event after it."""
-    with torch.cuda.stream(link_stream):
+    with PLATFORM.stream(link_stream):
         # The link stream, not compute, waits for NCCL here.
         wait_for_collective()
-        collective_done_event = torch.cuda.Event()
+        collective_done_event = PLATFORM.Event()
         collective_done_event.record(link_stream)
     for tensor in outputs:
         _c10d._register_work(tensor, EventWork(collective_done_event))
@@ -97,7 +98,7 @@ def _link_all_gather(link_stream: torch.cuda.Stream, shard: torch.Tensor, group_
     # Allocated on the compute stream, like the load outputs; record_stream keeps it until the link is past it.
     gathered = torch.empty(_gathered_shape(shard, group_size), dtype=shard.dtype, device=shard.device)
     _queue_behind_compute(link_stream)
-    with torch.cuda.stream(link_stream):
+    with PLATFORM.stream(link_stream):
         _FUNCTIONAL_ALL_GATHER_OUT(shard, group_size, group_name, out=gathered)
     shard.record_stream(link_stream)
     gathered.record_stream(link_stream)
@@ -108,9 +109,9 @@ def _link_all_gather(link_stream: torch.cuda.Stream, shard: torch.Tensor, group_
 def _link_all_gather_coalesced(
     link_stream: torch.cuda.Stream, shards: list[torch.Tensor], group_size: int, group_name: str
 ) -> list[torch.Tensor]:
-    compute_stream = torch.cuda.current_stream()
+    compute_stream = PLATFORM.current_stream()
     _queue_behind_compute(link_stream)
-    with torch.cuda.stream(link_stream):
+    with PLATFORM.stream(link_stream):
         # No out variant exists: outputs come from the link stream's pool and must outlive their compute readers.
         gathered = list(_FUNCTIONAL_ALL_GATHER_COALESCED(shards, group_size, group_name))
     for shard in shards:
@@ -130,10 +131,10 @@ def _link_all_to_all_single(
     input_split_sizes: list[int],
     group_name: str,
 ) -> torch.Tensor:
-    compute_stream = torch.cuda.current_stream()
+    compute_stream = PLATFORM.current_stream()
     send_tensor = send_tensor.contiguous()
     _queue_behind_compute(link_stream)
-    with torch.cuda.stream(link_stream):
+    with PLATFORM.stream(link_stream):
         # The graph's own op rather than c10d's: whichever kernel backs it is what the cost profile measured.
         received = _FUNCTIONAL_ALL_TO_ALL(send_tensor, output_split_sizes, input_split_sizes, group_name)
     send_tensor.record_stream(link_stream)

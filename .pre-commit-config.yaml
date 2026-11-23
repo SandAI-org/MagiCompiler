@@ -7,6 +7,13 @@ repos:
         entry: python3 ./.github/codestyle/copyright.hook
         language: system
         files: \.(c|cc|cxx|cpp|cu|cuh|h|hpp|hxx|proto|py|sh)$
+    -   id: device_agnostic
+        name: device_agnostic
+        description: Device differences live in magi_compiler/accelerator; elsewhere use PLATFORM, not torch.cuda or a device-type check.
+        entry: torch\.cuda\.[\w.]+\(|==\s*["'](cuda|musa)["']
+        language: pygrep
+        files: ^magi_compiler/.*\.py$
+        exclude: ^magi_compiler/(accelerator/|symm_mem/|magi_depyf/example/)
 -   repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.4.0
     hooks:
