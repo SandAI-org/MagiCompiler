@@ -531,21 +531,18 @@ def _compilation_context(state: MagiCompileState):
         patch.object(torch._dynamo.config, "force_nn_module_property_static_shapes", False),
         patch.object(torch._dynamo.config, "enable_aot_compile", True),
         _hijack_inline_call_to_collect_traced_files(state),
-        patch.dict(
-            os.environ,
-            {
-                "TORCHINDUCTOR_CACHE_DIR": (_inductor_cache_dump_path).as_posix(),
-                "TRITON_CACHE_DIR": (_triton_cache_dump_path).as_posix(),
-                # Enable Triton autotune result disk cache.  With
-                # autotune_at_compile_time=False, autotuning runs on the first
-                # forward pass.  This flag persists the selected configs as
-                # .autotune.json in TRITON_CACHE_DIR (which points to
-                # persistent AFS).  Subsequent cold starts (verify pods) read
-                # the cached results and skip benchmarking entirely,
-                # eliminating ~3-5 min first-forward overhead.
-                "TRITON_CACHE_AUTOTUNING": "1",
-            },
-        ),
+        # Scope only the cache env vars; patch.dict(os.environ, ...) clears and restores the whole environ on exit,
+        # wiping unrelated env vars set by lazy imports during compilation.
+        envs.set_env_var("TORCHINDUCTOR_CACHE_DIR", _inductor_cache_dump_path.as_posix()),
+        envs.set_env_var("TRITON_CACHE_DIR", _triton_cache_dump_path.as_posix()),
+        # Enable Triton autotune result disk cache.  With
+        # autotune_at_compile_time=False, autotuning runs on the first
+        # forward pass.  This flag persists the selected configs as
+        # .autotune.json in TRITON_CACHE_DIR (which points to
+        # persistent AFS).  Subsequent cold starts (verify pods) read
+        # the cached results and skip benchmarking entirely,
+        # eliminating ~3-5 min first-forward overhead.
+        envs.set_env_var("TRITON_CACHE_AUTOTUNING", "1"),
         explain_compilation(_debug_dump_path.as_posix()),
     ):
         TensorifyState.clear()

@@ -60,6 +60,8 @@ class HostWeight:
     pending_source: torch.Tensor | None = None
     # Slots deferred by one first CUDA move; they are completed together.
     deferred_group_id: int | None = None
+    # Ranks sharing one host copy when offloaded (>1: host-shared, 1: rank-private).
+    host_sharing_group_size: int = 1
 
 
 class HostWeightStore:
@@ -223,6 +225,19 @@ class HostWeightStore:
     def is_device_only(self, slot: int) -> bool:
         """Resident with no host copy: a deferred weight that settled on the device."""
         return slot in self._device_only_slots
+
+    def host_sharing_group_size(self, slot: int) -> int:
+        """Ranks sharing one host copy for ``slot`` (1 for rank-private or unbound slots)."""
+        if 0 <= slot < len(self._weights_by_slot):
+            return self._weights_by_slot[slot].host_sharing_group_size
+        return 1
+
+    def set_host_sharing_group_size(self, slot: int, group_size: int) -> None:
+        """Record how many ranks share ``slot``'s host copy when offloaded."""
+        entry = self._weight_for_slot(slot)
+        normalized = max(1, group_size)
+        if entry.host_sharing_group_size != normalized:
+            self._weights_by_slot[slot] = dataclasses.replace(entry, host_sharing_group_size=normalized)
 
     def slot_layout(self, slot: int) -> tuple[tuple[int, ...], torch.dtype]:
         """Shape and dtype of a slot's shard, also for a slot without a host copy."""

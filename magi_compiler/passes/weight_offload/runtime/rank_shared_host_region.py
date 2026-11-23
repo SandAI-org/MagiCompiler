@@ -100,6 +100,7 @@ class SharedHostChunk:
     def __init__(self, *, plan: SharedHostParkingPlan, chunk: _Chunk) -> None:
         self.is_writer = dist.get_rank() == plan.writer_rank
         self.is_shared = chunk.nbytes > 0
+        self.group_size = plan.group_size if self.is_shared else 1
         self.weight_names = tuple(chunk.slice_by_weight_name)
         self._plan = plan
         self._chunk = chunk
@@ -171,12 +172,17 @@ class SharedHostChunk:
 @dataclass(frozen=True)
 class SharedHostParkingPlan:
     writer_rank: int
+    group_size: int
     chunks: tuple[_Chunk, ...]
     round_count: int
     region_label: str
     numa_policy: _NumaPolicy | None
     parking_threads: int
     gloo_group: dist.ProcessGroup
+
+    @property
+    def shared_weight_names(self) -> frozenset[str]:
+        return frozenset(name for chunk in self.chunks for name in chunk.slice_by_weight_name)
 
     def open_chunk(self, round_index: int) -> SharedHostChunk:
         """Every rank, every round: groups with fewer chunks than ``round_count`` take part with an empty one."""
@@ -215,6 +221,7 @@ def plan_shared_host_parking(
     host_rank_count = sum(plan_input.hostname == local_plan_input.hostname for plan_input in plan_input_by_rank)
     return SharedHostParkingPlan(
         writer_rank=local_group_plan.ranks[0],
+        group_size=len(local_group_plan.ranks),
         chunks=local_group_plan.chunks,
         round_count=round_count,
         region_label=region_label,

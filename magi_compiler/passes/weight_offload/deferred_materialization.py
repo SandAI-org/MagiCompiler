@@ -24,6 +24,8 @@ other ranks of its sharing group when they hold it identically.
 
 from __future__ import annotations
 
+import ctypes
+import gc
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -44,6 +46,35 @@ from .runtime.rank_shared_host_region import HostWeightSharing, SharedHostChunk,
 class _HostCopyBytes:
     private_bytes: int
     shared_bytes: int
+
+
+def classify_deferred_host_weight_sharing(
+    example_inputs: Sequence[Any], *, host_weight_sharing: HostWeightSharing, region_label: str
+) -> None:
+    """Record host-sharing group size for deferred slots before placement chooses residents.
+
+    Unless ``host_weight_sharing`` is "off", this is a collective over WORLD on every compile.
+    """
+    if host_weight_sharing == "off":
+        return
+    store = get_global_host_weight_store()
+    graph_input_slots = _host_slots_of_graph_inputs(example_inputs=example_inputs, store=store)
+    pending_slots = store.pending_slots_in_groups_of(graph_input_slots)
+    if not _any_rank_has_pending_slots(has_pending_slots=bool(pending_slots), host_weight_sharing=host_weight_sharing):
+        return
+    weight_key_by_slot = _shared_weight_key_by_slot(
+        store=store, graph_input_slots=graph_input_slots, pending_slots=pending_slots
+    )
+    parking_plan = plan_shared_host_parking(
+        tensor_by_weight_name={key: store.pending_source(slot) for slot, key in weight_key_by_slot.items()},
+        region_label=region_label,
+        sharing_scope=host_weight_sharing,
+    )
+    if parking_plan is None:
+        return
+    shared_keys = parking_plan.shared_weight_names
+    for slot, key in weight_key_by_slot.items():
+        store.set_host_sharing_group_size(slot, parking_plan.group_size if key in shared_keys else 1)
 
 
 def materialize_deferred_host_weights(
@@ -75,6 +106,7 @@ def materialize_deferred_host_weights(
     # Last: a shared region's writer may still have needed these CPU originals.
     for slot in resident_slots:
         store.complete_pending_slot_on_device(slot)
+    _release_host_memory()
     magi_logger.info(
         "host offload: %s materialized %d deferred weight(s): %.1f MiB resident on the device only, "
         "%.1f MiB in private pinned host memory, %.1f MiB in a rank-shared region",
@@ -84,6 +116,14 @@ def materialize_deferred_host_weights(
         host_copy_bytes.private_bytes / 2**20,
         host_copy_bytes.shared_bytes / 2**20,
     )
+
+
+def _release_host_memory() -> None:
+    """Return freed CPU originals' heap pages and cached host blocks to the OS."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch._C._host_emptyCache()
+    ctypes.CDLL("libc.so.6").malloc_trim(0)
 
 
 def _host_slots_of_graph_inputs(*, example_inputs: Sequence[Any], store: HostWeightStore) -> list[int]:

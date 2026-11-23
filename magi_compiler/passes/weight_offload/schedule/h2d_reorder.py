@@ -66,6 +66,9 @@ _MAX_BUDGET_SPLIT_ROUNDS = 5
 _DENSITY_SEARCH_STEPS = 8
 """Bisection steps for the target bus density; 8 lands within 0.4% of it."""
 
+_MAX_DENSITY_BRACKET_HALVINGS = 32
+"""Geometric halvings before bisection so compute-rich graphs can reach densities below 1/256."""
+
 
 @dataclass(frozen=True, eq=False)
 class H2dLoadTask(TransferTask):
@@ -75,6 +78,8 @@ class H2dLoadTask(TransferTask):
     """
 
     host_slot: int = field(kw_only=True)  # host-pool slot this load pulls
+    # Ranks sharing this weight's host copy when offloaded (>1: host-shared, 1: rank-private).
+    host_sharing_group_size: int = field(default=1, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -137,7 +142,10 @@ class H2dLoadReorder(OverlapPass):
     def build_transfer_tasks(
         self, graph: SnodeGraph, cost: CostView, call_state: H2dLoadCallState
     ) -> list[H2dLoadTask] | None:
+        from ..runtime.host_weights import get_global_host_weight_store
+
         original_index_by_node = graph.original_index_by_node
+        store = get_global_host_weight_store()
         tasks: list[H2dLoadTask] = []
         for load in (s for s in graph.order if is_h2d_load(s)):
             moving_nodes, waits = self._load_nodes_and_waits(load=load, graph=graph)
@@ -146,11 +154,13 @@ class H2dLoadReorder(OverlapPass):
                 continue
             transfer_bytes = load_bytes(moving_nodes)
             required_overlap_ns = transfer_bytes / self.bandwidth_bytes_per_ns * self.window_scale + self.window_margin_ns
+            host_slot = host_slot_of_load(load)
             tasks.append(
                 H2dLoadTask(
                     anchor=load,
                     moving_nodes=tuple(moving_nodes),
-                    host_slot=host_slot_of_load(load),
+                    host_slot=host_slot,
+                    host_sharing_group_size=store.host_sharing_group_size(host_slot),
                     deadline_index=min(original_index_by_node[w] for w in waits),
                     last_user_index=graph.last_user_index(moving_nodes, waits),
                     required_overlap_ns=required_overlap_ns,
@@ -266,6 +276,17 @@ class H2dLoadReorder(OverlapPass):
             schedule_result.total_unhidden_ns / 1e6,
             schedule_result.inflight_budget_limited_unhidden_ns / 1e6,
         )
+        if any(p.host_sharing_group_size > 1 for p in tasks):
+            private_resident = [p for p in tasks if p.anchor in resident_anchors and p.host_sharing_group_size == 1]
+            shared_resident = [p for p in tasks if p.anchor in resident_anchors and p.host_sharing_group_size > 1]
+            magi_logger.info(
+                "h2d load reorder: resident breakdown: %.1f MiB rank-private (%d load(s)), "
+                "%.1f MiB host-shared (%d load(s))",
+                sum(p.transfer_bytes for p in private_resident) / 2**20,
+                len(private_resident),
+                sum(p.transfer_bytes for p in shared_resident) / 2**20,
+                len(shared_resident),
+            )
         if self.share_link_with_collectives:
             straddling_anchors = schedule_result.window_straddling_anchors
             magi_logger.info(
@@ -357,7 +378,7 @@ class H2dLoadReorder(OverlapPass):
         bus_tasks: list = []
         pending_transfer_bytes = resident_bytes = 0
         is_density_feasible = True
-        for task in sorted(tasks, key=lambda t: (t.deadline_index, -t.transfer_bytes)):
+        for task in sorted(tasks, key=lambda t: (t.deadline_index, t.host_sharing_group_size, -t.transfer_bytes)):
             pending_transfer_bytes += task.transfer_bytes
             bus_tasks.append(task)
             allowed_transfer_bytes = (
@@ -380,22 +401,57 @@ class H2dLoadReorder(OverlapPass):
 
     @staticmethod
     def _pick_weight_for_deficit(candidates, deficit_bytes: float, remaining_resident_bytes: int):
-        """Smallest affordable weight covering the deficit, or largest affordable partial relief."""
-        affordable_weights = [p for p in candidates if p.transfer_bytes <= remaining_resident_bytes]
+        """Prefer weights with the smallest host-sharing group (highest Host RAM saved per HBM byte),
+        then pick the smallest affordable weight covering the deficit or the largest partial relief."""
+        affordable_weights = [p for p in candidates if 0 < p.transfer_bytes <= remaining_resident_bytes]
         if not affordable_weights:
             return None
-        covering_weights = [p for p in affordable_weights if p.transfer_bytes >= deficit_bytes]
+        min_sharing_group = min(p.host_sharing_group_size for p in affordable_weights)
+        preferred_weights = [p for p in affordable_weights if p.host_sharing_group_size == min_sharing_group]
+        covering_weights = [p for p in preferred_weights if p.transfer_bytes >= deficit_bytes]
         return (
             min(covering_weights, key=lambda p: p.transfer_bytes)
             if covering_weights
-            else max(affordable_weights, key=lambda p: p.transfer_bytes)
+            else max(preferred_weights, key=lambda p: p.transfer_bytes)
         )
 
     def _search_resident_weights(self, tasks, compute_prefix_ns, resident_budget_bytes) -> frozenset:
         """Search for the lowest feasible bus density within the residency budget.
         If none fits, use ``bus_utilization`` and spend the available budget there."""
+        if resident_budget_bytes <= 0:
+            return frozenset()
+        zero_anchors, zero_feasible = self._select_resident_for_density(
+            tasks=tasks, compute_prefix_ns=compute_prefix_ns, resident_budget_bytes=resident_budget_bytes, trial_density=0.0
+        )
+        if zero_feasible:
+            return zero_anchors
+        best_resident_anchors, upper_feasible = self._select_resident_for_density(
+            tasks=tasks,
+            compute_prefix_ns=compute_prefix_ns,
+            resident_budget_bytes=resident_budget_bytes,
+            trial_density=self.bus_utilization,
+        )
+        if not upper_feasible:
+            return best_resident_anchors
+
+        # Halve geometrically first so long compute-heavy graphs (feasible density << 1/256)
+        # still bracket the transition instead of stopping with unspent residency budget.
         min_density, max_density = 0.0, self.bus_utilization
-        best_resident_anchors: frozenset | None = None
+        for _ in range(_MAX_DENSITY_BRACKET_HALVINGS):
+            trial_density = max_density / 2
+            resident_anchors, is_density_feasible = self._select_resident_for_density(
+                tasks=tasks,
+                compute_prefix_ns=compute_prefix_ns,
+                resident_budget_bytes=resident_budget_bytes,
+                trial_density=trial_density,
+            )
+            if is_density_feasible:
+                best_resident_anchors = resident_anchors
+                max_density = trial_density
+            else:
+                min_density = trial_density
+                break
+
         for _ in range(_DENSITY_SEARCH_STEPS):
             trial_density = (min_density + max_density) / 2
             resident_anchors, is_density_feasible = self._select_resident_for_density(
@@ -409,15 +465,7 @@ class H2dLoadReorder(OverlapPass):
                 max_density = trial_density
             else:
                 min_density = trial_density
-        if best_resident_anchors is not None:
-            return best_resident_anchors
-        resident_anchors, _ = self._select_resident_for_density(
-            tasks=tasks,
-            compute_prefix_ns=compute_prefix_ns,
-            resident_budget_bytes=resident_budget_bytes,
-            trial_density=self.bus_utilization,
-        )
-        return resident_anchors
+        return best_resident_anchors
 
     # -- committing --------------------------------------------------------
     @staticmethod
