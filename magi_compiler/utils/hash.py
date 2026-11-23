@@ -103,6 +103,7 @@ def compute_module_state_hash(obj: object) -> str:
 
 
 TENSOR_FINGERPRINT_SAMPLE_BYTES = 4096
+TENSOR_FINGERPRINT_SAMPLE_BLOCKS = 4
 
 
 def as_flat_bytes(tensor: torch.Tensor) -> torch.Tensor:
@@ -110,14 +111,23 @@ def as_flat_bytes(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def compute_tensor_fingerprint(tensor: torch.Tensor) -> bytes:
-    """Hash shape, dtype and up to 4 KiB of evenly sampled CPU tensor bytes.
-    A match requires byte-for-byte verification before sharing storage."""
+    """Hash shape, dtype and up to 4 KiB of CPU tensor bytes in contiguous blocks.
+
+    Block sampling touches O(1) OS pages on large file-backed mmap tensors instead of faulting
+    thousands of scattered pages. A match still requires byte-for-byte verification before sharing.
+    """
     sha256_hash = hashlib.sha256(f"{tuple(tensor.shape)},{tensor.dtype}".encode())
     tensor_bytes = as_flat_bytes(tensor)
-    if tensor_bytes.numel() > TENSOR_FINGERPRINT_SAMPLE_BYTES:
-        sample_indices = torch.linspace(0, tensor_bytes.numel() - 1, TENSOR_FINGERPRINT_SAMPLE_BYTES, dtype=torch.float64)
-        tensor_bytes = tensor_bytes[sample_indices.long()]
-    sha256_hash.update(tensor_bytes.numpy().tobytes())
+    nbytes = tensor_bytes.numel()
+    raw_view = memoryview(tensor_bytes.numpy())
+    if nbytes <= TENSOR_FINGERPRINT_SAMPLE_BYTES:
+        sha256_hash.update(raw_view)
+        return sha256_hash.digest()
+    block_bytes = TENSOR_FINGERPRINT_SAMPLE_BYTES // TENSOR_FINGERPRINT_SAMPLE_BLOCKS
+    max_offset = nbytes - block_bytes
+    for block_index in range(TENSOR_FINGERPRINT_SAMPLE_BLOCKS):
+        offset = (max_offset * block_index) // (TENSOR_FINGERPRINT_SAMPLE_BLOCKS - 1)
+        sha256_hash.update(raw_view[offset : offset + block_bytes])
     return sha256_hash.digest()
 
 

@@ -370,3 +370,47 @@ def test_fingerprint_samples_the_middle_of_large_tensors():
     assert compute_tensor_fingerprint(a) != compute_tensor_fingerprint(b)
     assert compute_tensor_fingerprint(a) == compute_tensor_fingerprint(a.clone())
     assert compute_tensor_fingerprint(a) != compute_tensor_fingerprint(a.view(1024, 1024))
+
+
+def test_fingerprint_touches_bounded_pages_on_file_mmap(tmp_path):
+    """Block sampling must touch O(1) OS pages on a large file-backed mmap tensor."""
+    import ctypes
+    import mmap
+    import sys
+
+    if sys.platform != "linux":
+        return
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    size = 16 << 20
+    backing = tmp_path / "weights.bin"
+    with open(backing, "wb") as handle:
+        handle.write(bytes(size))
+        handle.flush()
+        os.fsync(handle.fileno())
+    fd = os.open(backing, os.O_RDONLY)
+    try:
+        os.posix_fadvise(fd, 0, size, os.POSIX_FADV_DONTNEED)
+        mm = mmap.mmap(fd, size, access=mmap.ACCESS_READ)
+    finally:
+        os.close(fd)
+    try:
+        tensor = torch.frombuffer(mm, dtype=torch.uint8)
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_ubyte)]
+        libc.mincore.restype = ctypes.c_int
+        num_pages = size // page_size
+        vec = (ctypes.c_ubyte * num_pages)()
+        assert libc.mincore(ctypes.c_void_p(tensor.data_ptr()), ctypes.c_size_t(size), vec) == 0
+        before_pages = sum(1 for entry in vec if entry & 1)
+        if before_pages > num_pages // 2:
+            # Filesystem (e.g. tmpfs) ignores POSIX_FADV_DONTNEED; cannot measure fault count.
+            return
+        digest = compute_tensor_fingerprint(tensor)
+        assert len(digest) == 32
+        assert libc.mincore(ctypes.c_void_p(tensor.data_ptr()), ctypes.c_size_t(size), vec) == 0
+        faulted_pages = sum(1 for entry in vec if entry & 1) - before_pages
+        # Linux readahead can pull a few contiguous pages per block, still far below 4096 scattered pages.
+        assert faulted_pages < 256, f"expected bounded page faults, got {faulted_pages}/{num_pages} faulted pages"
+    finally:
+        del tensor
+        mm.close()
