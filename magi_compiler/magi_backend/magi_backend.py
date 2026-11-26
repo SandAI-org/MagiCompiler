@@ -203,7 +203,21 @@ class CompilerManager:
             self.cache.clear()
             self._remaining_restart_skips = {}
             if self.compile_config.assert_cache_hit:
-                raise RuntimeError(f"MAGI_COMPILE_ASSERT_CACHE_HIT: {reason}. Re-bake the compile cache.")
+                raise RuntimeError(
+                    f"MAGI_COMPILE_ASSERT_CACHE_HIT: {self._unbaked_cache_dir() or reason}. Re-bake the compile cache."
+                )
+
+    def _unbaked_cache_dir(self) -> str | None:
+        """Why nothing can hit when no bake wrote this hash's directory, else None.
+
+        Every lookup misses there, and the first one (the host_slots sidecar, or a subgraph's index entry) would
+        otherwise be reported as the cause."""
+        if self.cache_file_path.exists():
+            return None
+        return (
+            f"no compile cache under {self.cache_dir}: nothing was baked under this hash, which covers the compile and "
+            "Inductor configs, the device name, the torch build, the traced code, and the graph and its inputs"
+        )
 
     @observe_lifecycle("compiler_manager_load")
     def load(self, graph: fx.GraphModule, example_inputs: list[Any], cache_entry: CacheEntry) -> Callable | None:
@@ -267,6 +281,8 @@ class CompilerManager:
         expect_restart_analysis = False
         if self.compile_config.assert_cache_hit:
             if cache_entry not in self.cache:
+                if unbaked := self._unbaked_cache_dir():
+                    raise RuntimeError(f"MAGI_COMPILE_ASSERT_CACHE_HIT: {unbaked}. Re-bake the compile cache.")
                 raise RuntimeError(
                     f"MAGI_COMPILE_ASSERT_CACHE_HIT: cache miss for runtime_shape={runtime_shape} "
                     f"graph_index={graph_index}. The pre-baked compile cache does not cover this subgraph."
