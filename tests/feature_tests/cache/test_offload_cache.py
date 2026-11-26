@@ -406,14 +406,21 @@ def test_save_to_file_writes_host_slots_sidecar(tmp_path: Path):
 
 
 @requires_cuda
-def test_bind_miss_raises_when_assert_cache_hit(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("baked_index", "reason"), [(True, "offload host_slots sidecar missing"), (False, "no compile cache under ")]
+)
+def test_bind_miss_raises_when_assert_cache_hit(tmp_path: Path, baked_index: bool, reason: str):
+    """Without a bake under this hash the whole directory is empty, so the sidecar, read first, is missing too; the
+    error names the directory instead, as a verify on a GPU reporting another device name than the bake's hit it."""
     slot, _ = _park_test_weight()
     conf = CompileConfig()
     conf.offload_config.graph_weight_offload = True
     conf.assert_cache_hit = True
+    if baked_index:
+        (tmp_path / "subgraph_indices.py").write_text("{}")
     compiler_manager = CompilerManager(conf)
     compiler_manager.initialize_cache(tmp_path)
-    with pytest.raises(RuntimeError, match="host_slots sidecar"):
+    with pytest.raises(RuntimeError, match=f"MAGI_COMPILE_ASSERT_CACHE_HIT: {reason}"):
         compiler_manager.bind_offload_cache(_make_slot_tagged_graph(slot), sync_across_ranks=False)
 
 
