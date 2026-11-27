@@ -514,6 +514,21 @@ def test_shared_regions_register_through_torchs_cuda_runtime(monkeypatch):
     assert region.is_pinned()
 
 
+def test_a_python_without_os_memfd_create_still_creates_a_memfd(monkeypatch):
+    """A conda Python built on glibc 2.17 has no ``os.memfd_create``; the region is created through libc instead."""
+    monkeypatch.delattr(os, "memfd_create", raising=False)
+    region_nbytes = 1 << 20
+    file_descriptor = region_module._create_shared_memory_file(
+        region_label="no_os_memfd", nbytes=region_nbytes, numa_policy=None
+    )
+    try:
+        assert os.readlink(f"/proc/self/fd/{file_descriptor}").startswith("/memfd:magi_offload_no_os_memfd")
+        assert os.fstat(file_descriptor).st_size == region_nbytes
+        assert not os.get_inheritable(file_descriptor)
+    finally:
+        os.close(file_descriptor)
+
+
 def test_each_group_shares_only_what_all_its_ranks_hold_identically():
     weights = {"dense": 40, "norm": 40, "expert": 40}
     group_plan_by_sharing_group = _plan_sharing_groups(
