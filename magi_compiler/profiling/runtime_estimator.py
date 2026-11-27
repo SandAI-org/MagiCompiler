@@ -336,13 +336,16 @@ def _extern_replay_fn(snode: ExternKernelSchedulerNode):
     target, args, kwargs = inputs
 
     # Replay eagerly, decoupled from the enclosing compile:
-    # * dynamo.disable: an op whose impl contains torch.compile'd regions would
-    #   re-enter Dynamo mid-compile and blow up; we want the eager kernel time.
+    # * dynamo.disable + force_eager: an op whose impl contains torch.compile'd
+    #   regions would otherwise compile them mid-compile (dynamo.disable alone
+    #   does not stop that), and the exit of that compile clears the enclosing
+    #   one's pt2 compile events, failing it; we want the eager kernel time.
     # * no_grad: match the inference forward -- some ops branch on
     #   torch.is_grad_enabled() into incompatible paths.
     @torch._dynamo.disable
     def _call():
-        return target(*args, **kwargs)
+        with torch.compiler.set_stance("force_eager"):
+            return target(*args, **kwargs)
 
     def fn():
         with torch.no_grad():
