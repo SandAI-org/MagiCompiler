@@ -23,6 +23,7 @@ An allocation-time ENOSPC keeps that chunk's weights private."""
 
 from __future__ import annotations
 
+import ctypes
 import errno
 import mmap
 import os
@@ -322,8 +323,26 @@ def _plan_group_chunks(group_plan_inputs: list[_RankPlanInput]) -> tuple[_Chunk,
     return tuple(chunks)
 
 
+# <linux/memfd.h>
+_MFD_CLOEXEC = 0x0001
+
+
+def _memfd_create(name: str) -> int:
+    """A close-on-exec memfd. A Python built against a glibc older than 2.27 (conda's 2.17 sysroot, as some vendor
+    images ship) has no ``os.memfd_create``; the running glibc's ``memfd_create`` makes the same call."""
+    if hasattr(os, "memfd_create"):
+        return os.memfd_create(name, os.MFD_CLOEXEC)
+    memfd_create = ctypes.CDLL(None, use_errno=True).memfd_create
+    memfd_create.argtypes, memfd_create.restype = (ctypes.c_char_p, ctypes.c_uint), ctypes.c_int
+    file_descriptor = memfd_create(name.encode(), _MFD_CLOEXEC)
+    if file_descriptor < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return file_descriptor
+
+
 def _create_shared_memory_file(*, region_label: str, nbytes: int, numa_policy: _NumaPolicy | None) -> int:
-    file_descriptor = os.memfd_create(f"magi_offload_{region_label}", os.MFD_CLOEXEC)
+    file_descriptor = _memfd_create(f"magi_offload_{region_label}")
     try:
         page_policy = (
             nullcontext()
