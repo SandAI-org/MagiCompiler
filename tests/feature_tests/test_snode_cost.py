@@ -26,6 +26,8 @@ import gc
 import pickle
 
 import pytest
+import torch
+from torch._dynamo.utils import dynamo_timed, get_chromium_event_logger
 from torch._inductor import ir
 
 from magi_compiler.passes import snode_cost, snode_utils
@@ -241,3 +243,15 @@ def test_requery_is_not_counted_as_a_reuse(monkeypatch):
     assert estimator(s) == 7.0
     assert estimator.estimate_without_reuse_count(s) == 7.0
     assert estimator.table[("k",)].reuse_count == 1 and estimator.n_cache_hits == 1
+
+
+def test_replay_runs_compiled_regions_eagerly_inside_the_enclosing_compile(monkeypatch):
+    @torch.compile(backend="eager")
+    def compiled_region(x):
+        return x * 2
+
+    torch._dynamo.reset()
+    monkeypatch.setattr(runtime_estimator, "_extern_replay_inputs", lambda snode: (compiled_region, (torch.ones(4),), {}))
+    with dynamo_timed("enclosing_compile", log_pt2_compile_event=True):
+        runtime_estimator._extern_replay_fn(object())()
+        assert "enclosing_compile" in get_chromium_event_logger().get_pt2_compile_substack()
